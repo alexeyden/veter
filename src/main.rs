@@ -58,6 +58,41 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
+
+        // Shift+PageUp/Down for scrollback
+        if self.modifiers.shift_key() {
+            match &event.logical_key {
+                Key::Named(NamedKey::PageUp) => {
+                    if let Some(parser) = &mut self.parser {
+                        let rows = parser.screen().size().0 as usize;
+                        let screen = parser.screen_mut();
+                        screen.set_scrollback(screen.scrollback() + rows);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::PageDown) => {
+                    if let Some(parser) = &mut self.parser {
+                        let rows = parser.screen().size().0 as usize;
+                        let screen = parser.screen_mut();
+                        screen.set_scrollback(screen.scrollback().saturating_sub(rows));
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Any non-scroll key resets scrollback to bottom
+        if let Some(parser) = &mut self.parser {
+            parser.screen_mut().set_scrollback(0);
+        }
+
         let pty = match &self.pty {
             Some(p) => p,
             None => return,
@@ -207,7 +242,7 @@ impl ApplicationHandler for App {
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
         // Create PTY and parser
-        let parser = vt100::Parser::new(term_rows, term_cols, 0);
+        let parser = vt100::Parser::new(term_rows, term_cols, 10000);
         let pty = pty::Pty::new(term_rows, term_cols).expect("Failed to create PTY");
 
         // Start PTY reader thread
@@ -274,6 +309,28 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        let ch = self
+                            .term_renderer
+                            .as_ref()
+                            .map(|t| t.cell_height)
+                            .unwrap_or(20.0);
+                        (pos.y as f32 / ch) as isize
+                    }
+                };
+                if let Some(parser) = &mut self.parser {
+                    let screen = parser.screen_mut();
+                    let current = screen.scrollback() as isize;
+                    screen.set_scrollback((current + lines).max(0) as usize);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
@@ -288,8 +345,14 @@ impl ApplicationHandler for App {
                 canvas.set_size(size.width, size.height, 1.0);
                 canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(30, 30, 30));
 
-                if let (Some(parser), Some(tr)) = (&self.parser, &mut self.term_renderer) {
-                    tr.render(canvas, parser.screen());
+                if let (Some(parser), Some(tr)) = (&mut self.parser, &mut self.term_renderer) {
+                    // Probe actual scrollback buffer size (no public accessor)
+                    let current = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(usize::MAX);
+                    let max_scrollback = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(current);
+
+                    tr.render(canvas, parser.screen(), max_scrollback);
                 }
 
                 canvas.flush();

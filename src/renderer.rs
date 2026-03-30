@@ -320,10 +320,10 @@ impl TerminalRenderer {
         (cols.max(1), rows.max(1))
     }
 
-    pub fn render<T: Renderer>(&mut self, canvas: &mut Canvas<T>, screen: &vt100::Screen) {
+    pub fn render<T: Renderer>(&mut self, canvas: &mut Canvas<T>, screen: &vt100::Screen, max_scrollback: usize) {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
-        let show_cursor = !screen.hide_cursor();
+        let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
         let default_bg = Color::rgb(30, 30, 30);
 
         // Draw cell backgrounds
@@ -458,6 +458,25 @@ impl TerminalRenderer {
                 },
                 &Paint::color(Color::white()),
             );
+        }
+
+        // Draw scrollbar when scrolled back
+        let scrollback = screen.scrollback();
+        if scrollback > 0 && max_scrollback > 0 {
+            let track_height = rows as f32 * self.cell_height;
+            let total_lines = (max_scrollback + rows as usize) as f32;
+            let thumb_ratio = (rows as f32 / total_lines).clamp(0.05, 1.0);
+            let thumb_height = (thumb_ratio * track_height).max(16.0);
+            let available = track_height - thumb_height;
+            // scrollback=max → thumb at top, scrollback=0 → thumb at bottom
+            let thumb_y = ((max_scrollback - scrollback) as f32 / max_scrollback as f32) * available;
+
+            let bar_width = 6.0;
+            let bar_x = cols as f32 * self.cell_width - bar_width - 2.0;
+
+            let mut path = Path::new();
+            path.rounded_rect(bar_x, thumb_y, bar_width, thumb_height, 3.0);
+            canvas.fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, 90)));
         }
     }
 }
