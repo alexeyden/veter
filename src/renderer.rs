@@ -4,6 +4,8 @@ use femtovg::{
     Atlas, Canvas, Color, DrawCommand, GlyphDrawCommands, ImageFlags, ImageSource, Paint, Path,
     Quad, Renderer,
 };
+
+use crate::vge;
 use imgref::{Img, ImgRef};
 use parley::{
     layout::{Alignment, Layout, PositionedLayoutItem},
@@ -12,7 +14,7 @@ use parley::{
 };
 use rgb::RGBA8;
 use swash::{
-    scale::{image::Content, Render, ScaleContext, Scaler, Source, StrikeWith},
+    scale::{image::Content, Render, ScaleContext, Source, StrikeWith},
     zeno::Format,
     FontRef,
 };
@@ -103,6 +105,7 @@ fn key_to_color(key: u32) -> Color {
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 struct GlyphCacheKey {
     glyph_id: u16,
+    font_id: u16, // 0 = primary, 1+ = fallback index + 1
     font_size_tenths: u32,
 }
 
@@ -139,12 +142,15 @@ impl GlyphCache {
     fn get_or_render<T: Renderer>(
         &mut self,
         canvas: &mut Canvas<T>,
-        scaler: &mut Scaler<'_>,
+        scale_cx: &mut ScaleContext,
+        font_ref: FontRef<'_>,
         glyph_id: u16,
         font_size: f32,
+        font_id: u16,
     ) -> Option<RenderedGlyph> {
         let key = GlyphCacheKey {
             glyph_id,
+            font_id,
             font_size_tenths: (font_size * 10.0) as u32,
         };
 
@@ -152,7 +158,8 @@ impl GlyphCache {
             return *cached;
         }
 
-        let result = self.render_glyph(canvas, scaler, glyph_id);
+        let mut scaler = scale_cx.builder(font_ref).size(font_size).hint(true).build();
+        let result = self.render_glyph(canvas, &mut scaler, glyph_id);
         self.entries.insert(key, result);
         result
     }
@@ -160,7 +167,7 @@ impl GlyphCache {
     fn render_glyph<T: Renderer>(
         &mut self,
         canvas: &mut Canvas<T>,
-        scaler: &mut Scaler<'_>,
+        scaler: &mut swash::scale::Scaler<'_>,
         glyph_id: u16,
     ) -> Option<RenderedGlyph> {
         let image = Render::new(&[
@@ -242,11 +249,99 @@ impl GlyphCache {
     }
 }
 
+// --- Font fallback ---
+
+struct FallbackFont {
+    data: Vec<u8>,
+    index: usize,
+    source_ptr: usize, // pointer identity from Parley's font cache
+}
+
+/// Resolved glyph: which font and glyph ID to use for a character.
+#[derive(Copy, Clone)]
+struct ResolvedGlyph {
+    glyph_id: u16,
+    font_id: u16, // 0 = primary, 1+ = fallback index + 1
+}
+
+/// Resolve a character to a fallback font. Uses Parley for font discovery.
+/// Kept as a free function so the caller can pass disjoint struct fields.
+fn resolve_fallback(
+    font_cx: &mut FontContext,
+    layout_cx: &mut LayoutContext<Color>,
+    fallback_fonts: &mut Vec<FallbackFont>,
+    char_font_map: &mut HashMap<char, Option<ResolvedGlyph>>,
+    ch: char,
+    font_size: f32,
+) -> Option<ResolvedGlyph> {
+    if let Some(&cached) = char_font_map.get(&ch) {
+        return cached;
+    }
+
+    let s = String::from(ch);
+    let mut builder = layout_cx.ranged_builder(font_cx, &s, 1.0, false);
+    builder.push_default(StyleProperty::Brush(Color::white()));
+    builder.push_default(FontStack::from("system-ui"));
+    builder.push_default(StyleProperty::FontSize(font_size));
+    let mut layout: Layout<Color> = builder.build(&s);
+    layout.break_all_lines(None);
+    layout.align(None, Alignment::Start, AlignmentOptions::default());
+
+    for line in layout.lines() {
+        for item in line.items() {
+            if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                let run = glyph_run.run();
+                let font = run.font();
+                let data_ref = font.data.as_ref();
+                let index = font.index as usize;
+
+                let font_ref = FontRef::from_index(data_ref, index).unwrap();
+                let glyph_id = font_ref.charmap().map(ch);
+
+                if glyph_id != 0 {
+                    let source_ptr = data_ref.as_ptr() as usize;
+                    let fb_idx = fallback_fonts
+                        .iter()
+                        .position(|fb| fb.source_ptr == source_ptr && fb.index == index)
+                        .unwrap_or_else(|| {
+                            let idx = fallback_fonts.len();
+                            fallback_fonts.push(FallbackFont {
+                                data: data_ref.to_vec(),
+                                index,
+                                source_ptr,
+                            });
+                            idx
+                        });
+
+                    let resolved = ResolvedGlyph {
+                        glyph_id,
+                        font_id: (fb_idx + 1) as u16,
+                    };
+                    char_font_map.insert(ch, Some(resolved));
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+
+    char_font_map.insert(ch, None);
+    None
+}
+
 // --- Terminal renderer ---
 
 pub struct TerminalRenderer {
+    // Primary font
     font_data: Vec<u8>,
     font_index: usize,
+
+    // Font fallback (separate fields for disjoint borrowing)
+    font_cx: FontContext,
+    layout_cx: LayoutContext<Color>,
+    fallback_fonts: Vec<FallbackFont>,
+    char_font_map: HashMap<char, Option<ResolvedGlyph>>,
+
+    // Rendering
     font_size: f32,
     pub cell_width: f32,
     pub cell_height: f32,
@@ -274,27 +369,26 @@ impl TerminalRenderer {
         let mut cell_height = (font_size * 1.2).ceil();
         let mut ascent = font_size;
 
-        for line in layout.lines() {
-            for item in line.items() {
-                if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                    let run = glyph_run.run();
-                    let font = run.font();
-                    font_data = font.data.as_ref().to_vec();
-                    font_index = font.index as usize;
+        if let Some(glyph_run) = layout.lines().next().and_then(|line| {
+            line.items().find_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(g) => Some(g),
+                _ => None,
+            })
+        }) {
+            let run = glyph_run.run();
+            let font = run.font();
+            font_data = font.data.as_ref().to_vec();
+            font_index = font.index as usize;
 
-                    let font_ref = FontRef::from_index(&font_data, font_index).unwrap();
-                    let metrics = font_ref.metrics(&[]).scale(font_size);
-                    ascent = metrics.ascent;
-                    cell_height = (metrics.ascent + metrics.descent + metrics.leading).ceil();
+            let font_ref = FontRef::from_index(&font_data, font_index).unwrap();
+            let metrics = font_ref.metrics(&[]).scale(font_size);
+            ascent = metrics.ascent;
+            cell_height = (metrics.ascent + metrics.descent + metrics.leading).ceil();
 
-                    let glyph_metrics = font_ref.glyph_metrics(&[]).scale(font_size);
-                    let charmap = font_ref.charmap();
-                    let m_glyph = charmap.map('M');
-                    cell_width = glyph_metrics.advance_width(m_glyph).ceil();
-                    break;
-                }
-            }
-            break;
+            let glyph_metrics = font_ref.glyph_metrics(&[]).scale(font_size);
+            let charmap = font_ref.charmap();
+            let m_glyph = charmap.map('M');
+            cell_width = glyph_metrics.advance_width(m_glyph).ceil();
         }
 
         eprintln!(
@@ -305,6 +399,10 @@ impl TerminalRenderer {
         Self {
             font_data,
             font_index,
+            font_cx,
+            layout_cx,
+            fallback_fonts: Vec::new(),
+            char_font_map: HashMap::new(),
             font_size,
             cell_width,
             cell_height,
@@ -320,7 +418,214 @@ impl TerminalRenderer {
         (cols.max(1), rows.max(1))
     }
 
-    pub fn render<T: Renderer>(&mut self, canvas: &mut Canvas<T>, screen: &vt100::Screen, max_scrollback: usize) {
+    pub fn ascent(&self) -> f32 {
+        self.ascent
+    }
+
+    /// Resolve a single character to (glyph_id, font_id), using the primary
+    /// font when possible and falling back to Parley-discovered fonts.
+    fn resolve_glyph(&mut self, ch: char) -> Option<(u16, u16)> {
+        let primary_ref = FontRef::from_index(&self.font_data, self.font_index).unwrap();
+        let gid = primary_ref.charmap().map(ch);
+        if gid != 0 {
+            return Some((gid, 0));
+        }
+        let resolved = resolve_fallback(
+            &mut self.font_cx,
+            &mut self.layout_cx,
+            &mut self.fallback_fonts,
+            &mut self.char_font_map,
+            ch,
+            self.font_size,
+        )?;
+        Some((resolved.glyph_id, resolved.font_id))
+    }
+
+    fn font_ref_for(&self, font_id: u16) -> FontRef<'_> {
+        if font_id == 0 {
+            FontRef::from_index(&self.font_data, self.font_index).unwrap()
+        } else {
+            let fb = &self.fallback_fonts[(font_id - 1) as usize];
+            FontRef::from_index(&fb.data, fb.index).unwrap()
+        }
+    }
+
+    /// Draw arbitrary text at a pixel-baseline coordinate, with alignment.
+    /// Used by VGE DrawText (§7.4). Bold/italic in `font_style` are not
+    /// implemented yet (the cell-grid renderer doesn't carry weight
+    /// variants in its glyph cache); underline and strikethrough are
+    /// applied as simple horizontal rules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_vge_text<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        x_px: f32,
+        y_px: f32,
+        text: &str,
+        color: Color,
+        align: vge::command::Align,
+        font_style: vge::command::FontStyle,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        // First pass: resolve each char and measure width.
+        struct CharInfo {
+            ch: char,
+            glyph_id: u16,
+            font_id: u16,
+            advance: f32,
+        }
+        let mut infos: Vec<CharInfo> = Vec::with_capacity(text.len());
+        let mut total_width = 0.0f32;
+        for ch in text.chars() {
+            let Some((glyph_id, font_id)) = self.resolve_glyph(ch) else {
+                continue;
+            };
+            let font_ref = self.font_ref_for(font_id);
+            let advance = font_ref
+                .glyph_metrics(&[])
+                .scale(self.font_size)
+                .advance_width(glyph_id);
+            total_width += advance;
+            infos.push(CharInfo {
+                ch,
+                glyph_id,
+                font_id,
+                advance,
+            });
+        }
+
+        let start_x = match align {
+            vge::command::Align::Left => x_px,
+            vge::command::Align::Center => x_px - total_width * 0.5,
+            vge::command::Align::Right => x_px - total_width,
+        };
+
+        // Second pass: rasterize and batch.
+        let mut alpha_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
+        let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
+        let mut x = start_x;
+        for info in &infos {
+            // Skip whitespace (no glyph to rasterize, just advance).
+            if info.ch == ' ' {
+                x += info.advance;
+                continue;
+            }
+            // Build the FontRef from disjoint fields so we can pass &mut
+            // to glyph_cache without overlapping the &self borrow.
+            let rendered = if info.font_id == 0 {
+                let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
+                self.glyph_cache.get_or_render(
+                    canvas,
+                    &mut self.scale_cx,
+                    fr,
+                    info.glyph_id,
+                    self.font_size,
+                    0,
+                )
+            } else {
+                let fb = &self.fallback_fonts[(info.font_id - 1) as usize];
+                let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
+                self.glyph_cache.get_or_render(
+                    canvas,
+                    &mut self.scale_cx,
+                    fr,
+                    info.glyph_id,
+                    self.font_size,
+                    info.font_id,
+                )
+            };
+            let rendered = match rendered {
+                Some(r) => r,
+                None => {
+                    x += info.advance;
+                    continue;
+                }
+            };
+            let it = 1.0 / TEXTURE_SIZE as f32;
+            let mut q = Quad::default();
+            q.x0 = x + rendered.offset_x as f32;
+            q.y0 = y_px - rendered.offset_y as f32;
+            q.x1 = q.x0 + rendered.width as f32;
+            q.y1 = q.y0 + rendered.height as f32;
+            q.s0 = rendered.atlas_x as f32 * it;
+            q.t0 = rendered.atlas_y as f32 * it;
+            q.s1 = (rendered.atlas_x + rendered.width) as f32 * it;
+            q.t1 = (rendered.atlas_y + rendered.height) as f32 * it;
+            if rendered.color_glyph {
+                color_batches
+                    .entry(rendered.texture_index)
+                    .or_default()
+                    .push(q);
+            } else {
+                alpha_batches
+                    .entry(rendered.texture_index)
+                    .or_default()
+                    .push(q);
+            }
+            x += info.advance;
+        }
+
+        if !alpha_batches.is_empty() {
+            let cmds: Vec<DrawCommand> = alpha_batches
+                .into_iter()
+                .map(|(tex_idx, quads)| DrawCommand {
+                    image_id: self.glyph_cache.textures[tex_idx].image_id,
+                    quads,
+                })
+                .collect();
+            canvas.draw_glyph_commands(
+                GlyphDrawCommands {
+                    alpha_glyphs: cmds,
+                    color_glyphs: vec![],
+                },
+                &Paint::color(color),
+            );
+        }
+        if !color_batches.is_empty() {
+            let cmds: Vec<DrawCommand> = color_batches
+                .into_iter()
+                .map(|(tex_idx, quads)| DrawCommand {
+                    image_id: self.glyph_cache.textures[tex_idx].image_id,
+                    quads,
+                })
+                .collect();
+            canvas.draw_glyph_commands(
+                GlyphDrawCommands {
+                    alpha_glyphs: vec![],
+                    color_glyphs: cmds,
+                },
+                &Paint::color(Color::white()),
+            );
+        }
+
+        // Underline and strikethrough rules.
+        if font_style.underline() || font_style.strikethrough() {
+            let mut path = Path::new();
+            let thickness = (self.font_size / 16.0).max(1.0);
+            if font_style.underline() {
+                let uy = y_px + (self.cell_height - self.ascent) * 0.5;
+                path.rect(start_x, uy, total_width, thickness);
+            }
+            if font_style.strikethrough() {
+                let sy = y_px - self.ascent * 0.35;
+                path.rect(start_x, sy, total_width, thickness);
+            }
+            canvas.fill_path(&path, &Paint::color(color));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        screen: &vt100::Screen,
+        max_scrollback: usize,
+        vge_state: &vge::VgeState,
+        top_of_live_screen: i64,
+    ) {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
@@ -352,9 +657,8 @@ impl TerminalRenderer {
         }
 
         // Draw glyphs
-        let font_ref = FontRef::from_index(&self.font_data, self.font_index).unwrap();
-        let charmap = font_ref.charmap();
-        let mut scaler = self.scale_cx.builder(font_ref).size(self.font_size).hint(true).build();
+        let primary_ref = FontRef::from_index(&self.font_data, self.font_index).unwrap();
+        let primary_charmap = primary_ref.charmap();
 
         // Batch quads by (fg_color, texture_index) for alpha glyphs
         let mut alpha_batches: HashMap<u32, HashMap<usize, Vec<Quad>>> = HashMap::new();
@@ -375,10 +679,26 @@ impl TerminalRenderer {
                     _ => continue,
                 };
 
-                let glyph_id = charmap.map(ch);
-                if glyph_id == 0 {
-                    continue;
-                }
+                // Resolve font: try primary, then fallback
+                let (glyph_id, font_id) = {
+                    let gid = primary_charmap.map(ch);
+                    if gid != 0 {
+                        (gid, 0u16)
+                    } else {
+                        // Fallback resolution uses disjoint fields from font_data
+                        match resolve_fallback(
+                            &mut self.font_cx,
+                            &mut self.layout_cx,
+                            &mut self.fallback_fonts,
+                            &mut self.char_font_map,
+                            ch,
+                            self.font_size,
+                        ) {
+                            Some(rg) => (rg.glyph_id, rg.font_id),
+                            None => continue,
+                        }
+                    }
+                };
 
                 let is_cursor = show_cursor && row == cursor_row && col == cursor_col;
                 let (fg, _) = resolve_cell_colors(&cell, is_cursor);
@@ -386,12 +706,31 @@ impl TerminalRenderer {
                 let x = col as f32 * self.cell_width;
                 let y = row as f32 * self.cell_height + self.ascent;
 
-                let rendered = match self.glyph_cache.get_or_render(
-                    canvas,
-                    &mut scaler,
-                    glyph_id,
-                    self.font_size,
-                ) {
+                // Get font ref for rendering (primary or fallback)
+                let rendered = if font_id == 0 {
+                    let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
+                    self.glyph_cache.get_or_render(
+                        canvas,
+                        &mut self.scale_cx,
+                        fr,
+                        glyph_id,
+                        self.font_size,
+                        0,
+                    )
+                } else {
+                    let fb = &self.fallback_fonts[(font_id - 1) as usize];
+                    let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
+                    self.glyph_cache.get_or_render(
+                        canvas,
+                        &mut self.scale_cx,
+                        fr,
+                        glyph_id,
+                        self.font_size,
+                        font_id,
+                    )
+                };
+
+                let rendered = match rendered {
                     Some(r) => r,
                     None => continue,
                 };
@@ -460,6 +799,17 @@ impl TerminalRenderer {
             );
         }
 
+        // VGE elements render above text but below the scrollbar (§9).
+        vge::render::render_elements(
+            canvas,
+            self,
+            vge_state,
+            top_of_live_screen,
+            rows,
+            cols,
+            screen.scrollback(),
+        );
+
         // Draw scrollbar when scrolled back
         let scrollback = screen.scrollback();
         if scrollback > 0 && max_scrollback > 0 {
@@ -468,8 +818,8 @@ impl TerminalRenderer {
             let thumb_ratio = (rows as f32 / total_lines).clamp(0.05, 1.0);
             let thumb_height = (thumb_ratio * track_height).max(16.0);
             let available = track_height - thumb_height;
-            // scrollback=max → thumb at top, scrollback=0 → thumb at bottom
-            let thumb_y = ((max_scrollback - scrollback) as f32 / max_scrollback as f32) * available;
+            let thumb_y =
+                ((max_scrollback - scrollback) as f32 / max_scrollback as f32) * available;
 
             let bar_width = 6.0;
             let bar_x = cols as f32 * self.cell_width - bar_width - 2.0;

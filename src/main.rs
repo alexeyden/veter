@@ -1,5 +1,6 @@
 mod pty;
 mod renderer;
+mod vge;
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -25,6 +26,7 @@ struct App {
     pty: Option<pty::Pty>,
     term_renderer: Option<renderer::TerminalRenderer>,
     rx: Option<mpsc::Receiver<Vec<u8>>>,
+    vge: Option<vge::VgeEngine>,
 
     // GL state (dropped in reverse-creation order so the EGL surface
     // is destroyed while the Wayland window still exists)
@@ -49,6 +51,7 @@ impl App {
             pty: None,
             term_renderer: None,
             rx: None,
+            vge: None,
             proxy,
             modifiers: ModifiersState::empty(),
         }
@@ -183,10 +186,28 @@ impl App {
             Some(p) => p,
             None => return false,
         };
+        let engine = match &mut self.vge {
+            Some(e) => e,
+            None => return false,
+        };
+        let pty = match &self.pty {
+            Some(p) => p,
+            None => return false,
+        };
 
         loop {
             match rx.try_recv() {
-                Ok(data) => parser.process(&data),
+                Ok(data) => {
+                    let passthrough = engine.process_pty_chunk(&data);
+                    if !passthrough.is_empty() {
+                        parser.process(&passthrough);
+                    }
+                    engine.after_vt100_process(parser);
+                    let resp = engine.take_responses();
+                    if !resp.is_empty() {
+                        let _ = pty.write_all(&resp);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => return true,
                 Err(mpsc::TryRecvError::Disconnected) => return false,
             }
@@ -241,6 +262,13 @@ impl ApplicationHandler for App {
         let term_renderer = renderer::TerminalRenderer::new(&mut canvas, font_size);
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
+        // VGE engine: needs cell pixel dimensions and HiDPI scale factor.
+        let cell_px = (
+            term_renderer.cell_width.round() as u16,
+            term_renderer.cell_height.round() as u16,
+        );
+        let vge_engine = vge::VgeEngine::new(cell_px, window.scale_factor() as f32);
+
         // Create PTY and parser
         let parser = vt100::Parser::new(term_rows, term_cols, 10000);
         let pty = pty::Pty::new(term_rows, term_cols).expect("Failed to create PTY");
@@ -279,6 +307,7 @@ impl ApplicationHandler for App {
         self.pty = Some(pty);
         self.term_renderer = Some(term_renderer);
         self.rx = Some(rx);
+        self.vge = Some(vge_engine);
 
         self.window.as_ref().unwrap().request_redraw();
     }
@@ -345,14 +374,28 @@ impl ApplicationHandler for App {
                 canvas.set_size(size.width, size.height, 1.0);
                 canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(30, 30, 30));
 
-                if let (Some(parser), Some(tr)) = (&mut self.parser, &mut self.term_renderer) {
+                if let (Some(parser), Some(tr), Some(engine)) =
+                    (&mut self.parser, &mut self.term_renderer, &mut self.vge)
+                {
+                    // Drop GPU resources for any images that were
+                    // dropped since the last frame.
+                    for gpu_id in engine.take_pending_image_deletes() {
+                        canvas.delete_image(gpu_id);
+                    }
+
                     // Probe actual scrollback buffer size (no public accessor)
                     let current = parser.screen().scrollback();
                     parser.screen_mut().set_scrollback(usize::MAX);
                     let max_scrollback = parser.screen().scrollback();
                     parser.screen_mut().set_scrollback(current);
 
-                    tr.render(canvas, parser.screen(), max_scrollback);
+                    tr.render(
+                        canvas,
+                        parser.screen(),
+                        max_scrollback,
+                        &engine.state,
+                        engine.top_of_live_screen(),
+                    );
                 }
 
                 canvas.flush();
