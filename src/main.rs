@@ -105,12 +105,12 @@ impl App {
         if self.modifiers.control_key() {
             match &event.logical_key {
                 Key::Character(c) => {
-                    if let Some(ch) = c.chars().next() {
-                        if ch.is_ascii_alphabetic() {
-                            let ctrl = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
-                            let _ = pty.write_all(&[ctrl]);
-                            return;
-                        }
+                    if let Some(ch) = c.chars().next()
+                        && ch.is_ascii_alphabetic()
+                    {
+                        let ctrl = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+                        let _ = pty.write_all(&[ctrl]);
+                        return;
                     }
                 }
                 Key::Named(NamedKey::Space) => {
@@ -122,13 +122,14 @@ impl App {
         }
 
         // Alt+key: send ESC prefix
-        if self.modifiers.alt_key() && !self.modifiers.control_key() {
-            if let Some(text) = &event.text {
-                let mut bytes = vec![0x1b];
-                bytes.extend_from_slice(text.as_bytes());
-                let _ = pty.write_all(&bytes);
-                return;
-            }
+        if self.modifiers.alt_key()
+            && !self.modifiers.control_key()
+            && let Some(text) = &event.text
+        {
+            let mut bytes = vec![0x1b];
+            bytes.extend_from_slice(text.as_bytes());
+            let _ = pty.write_all(&bytes);
+            return;
         }
 
         // Named keys

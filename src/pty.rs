@@ -21,7 +21,7 @@ impl Pty {
         };
 
         let result = unsafe { forkpty(Some(&winsize), None) }
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         match result {
             ForkptyResult::Child => {
@@ -38,7 +38,7 @@ impl Pty {
         let mut written = 0;
         while written < data.len() {
             let n = nix::unistd::write(&self.master, &data[written..])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             written += n;
         }
         Ok(())
@@ -58,7 +58,7 @@ impl Pty {
 
     pub fn dup_master(&self) -> io::Result<OwnedFd> {
         let fd = nix::unistd::dup(self.master.as_raw_fd())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }

@@ -682,7 +682,6 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             }
             Ok(Command::SetGlobalStyle { id, style })
         }
-        // Image commands deferred to a later phase.
         CMD_UPLOAD_IMAGE => {
             let id = read_id(&mut r, false)?;
             let encoding = r.u8()?;

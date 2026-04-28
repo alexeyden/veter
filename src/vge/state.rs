@@ -57,11 +57,6 @@ pub struct UploadedImage {
     pub height: u32,
     pub pixels: Vec<RGBA8>,
     pub gpu: Cell<Option<ImageId>>,
-    /// Byte size of the *uploaded* representation (Raw bytes or WebP
-    /// file). Currently used only for diagnostics; will feed a
-    /// per-process byte-budget enforcement layer in a future phase.
-    #[allow(dead_code)]
-    pub byte_size: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -715,7 +710,6 @@ impl VgeEngine {
                 height: b.height,
                 pixels,
                 gpu: Cell::new(None),
-                byte_size: b.data.len() as u32,
             },
         );
         Ok(Vec::new())

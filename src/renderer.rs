@@ -328,6 +328,91 @@ fn resolve_fallback(
     None
 }
 
+// --- Glyph-batch helpers (used by both DrawText render paths) ---
+
+fn align_offset(anchor_x: f32, total_width: f32, align: vge::command::Align) -> f32 {
+    match align {
+        vge::command::Align::Left => anchor_x,
+        vge::command::Align::Center => anchor_x - total_width * 0.5,
+        vge::command::Align::Right => anchor_x - total_width,
+    }
+}
+
+/// Build the textured quad for one rasterised glyph and append it to
+/// the appropriate batch (color vs alpha) keyed by atlas texture.
+fn push_glyph_quad(
+    alpha_batches: &mut HashMap<usize, Vec<Quad>>,
+    color_batches: &mut HashMap<usize, Vec<Quad>>,
+    rendered: RenderedGlyph,
+    pen_x: f32,
+    pen_y: f32,
+) {
+    let it = 1.0 / TEXTURE_SIZE as f32;
+    let mut q = Quad::default();
+    q.x0 = pen_x + rendered.offset_x as f32;
+    q.y0 = pen_y - rendered.offset_y as f32;
+    q.x1 = q.x0 + rendered.width as f32;
+    q.y1 = q.y0 + rendered.height as f32;
+    q.s0 = rendered.atlas_x as f32 * it;
+    q.t0 = rendered.atlas_y as f32 * it;
+    q.s1 = (rendered.atlas_x + rendered.width) as f32 * it;
+    q.t1 = (rendered.atlas_y + rendered.height) as f32 * it;
+    if rendered.color_glyph {
+        color_batches
+            .entry(rendered.texture_index)
+            .or_default()
+            .push(q);
+    } else {
+        alpha_batches
+            .entry(rendered.texture_index)
+            .or_default()
+            .push(q);
+    }
+}
+
+/// Drain alpha + color glyph batches to the canvas with one
+/// `draw_glyph_commands` call per group.
+fn emit_glyph_batches<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    glyph_cache: &GlyphCache,
+    alpha_batches: HashMap<usize, Vec<Quad>>,
+    color_batches: HashMap<usize, Vec<Quad>>,
+    color: Color,
+) {
+    if !alpha_batches.is_empty() {
+        let cmds: Vec<DrawCommand> = alpha_batches
+            .into_iter()
+            .map(|(tex_idx, quads)| DrawCommand {
+                image_id: glyph_cache.textures[tex_idx].image_id,
+                quads,
+            })
+            .collect();
+        canvas.draw_glyph_commands(
+            GlyphDrawCommands {
+                alpha_glyphs: cmds,
+                color_glyphs: vec![],
+            },
+            &Paint::color(color),
+        );
+    }
+    if !color_batches.is_empty() {
+        let cmds: Vec<DrawCommand> = color_batches
+            .into_iter()
+            .map(|(tex_idx, quads)| DrawCommand {
+                image_id: glyph_cache.textures[tex_idx].image_id,
+                quads,
+            })
+            .collect();
+        canvas.draw_glyph_commands(
+            GlyphDrawCommands {
+                alpha_glyphs: vec![],
+                color_glyphs: cmds,
+            },
+            &Paint::color(Color::white()),
+        );
+    }
+}
+
 // --- Terminal renderer ---
 
 pub struct TerminalRenderer {
@@ -451,10 +536,11 @@ impl TerminalRenderer {
     }
 
     /// Draw arbitrary text at a pixel-baseline coordinate, with alignment.
-    /// Used by VGE DrawText (§7.4). Bold/italic in `font_style` are not
-    /// implemented yet (the cell-grid renderer doesn't carry weight
-    /// variants in its glyph cache); underline and strikethrough are
-    /// applied as simple horizontal rules.
+    /// Used by VGE DrawText (§7.4). Bold and italic both route through
+    /// a Parley layout pass so the system's actual styled font face
+    /// gets resolved; plain text uses the cell renderer's faster
+    /// per-char path. Underline and strikethrough are applied as
+    /// horizontal rules over the rendered glyphs.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_vge_text<T: Renderer>(
         &mut self,
@@ -470,7 +556,42 @@ impl TerminalRenderer {
             return;
         }
 
-        // First pass: resolve each char and measure width.
+        // Render the glyphs themselves and recover the actual rendered
+        // extent (start_x, total_width) so we can stack underline /
+        // strikethrough rules on top.
+        let (start_x, total_width) = if font_style.bold() || font_style.italic() {
+            self.draw_text_styled(canvas, x_px, y_px, text, color, align, font_style)
+        } else {
+            self.draw_text_plain(canvas, x_px, y_px, text, color, align)
+        };
+
+        if font_style.underline() || font_style.strikethrough() {
+            let mut path = Path::new();
+            let thickness = (self.font_size / 16.0).max(1.0);
+            if font_style.underline() {
+                let uy = y_px + (self.cell_height - self.ascent) * 0.5;
+                path.rect(start_x, uy, total_width, thickness);
+            }
+            if font_style.strikethrough() {
+                let sy = y_px - self.ascent * 0.35;
+                path.rect(start_x, sy, total_width, thickness);
+            }
+            canvas.fill_path(&path, &Paint::color(color));
+        }
+    }
+
+    /// Per-char glyph rendering for plain (no bold/italic) text. Reuses
+    /// the cell renderer's primary font + fallback chain. Returns
+    /// `(start_x, total_width)` for stacking underline/strike.
+    fn draw_text_plain<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        x_px: f32,
+        y_px: f32,
+        text: &str,
+        color: Color,
+        align: vge::command::Align,
+    ) -> (f32, f32) {
         struct CharInfo {
             ch: char,
             glyph_id: u16,
@@ -497,24 +618,16 @@ impl TerminalRenderer {
             });
         }
 
-        let start_x = match align {
-            vge::command::Align::Left => x_px,
-            vge::command::Align::Center => x_px - total_width * 0.5,
-            vge::command::Align::Right => x_px - total_width,
-        };
+        let start_x = align_offset(x_px, total_width, align);
 
-        // Second pass: rasterize and batch.
         let mut alpha_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
         let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
         let mut x = start_x;
         for info in &infos {
-            // Skip whitespace (no glyph to rasterize, just advance).
             if info.ch == ' ' {
                 x += info.advance;
                 continue;
             }
-            // Build the FontRef from disjoint fields so we can pass &mut
-            // to glyph_cache without overlapping the &self borrow.
             let rendered = if info.font_id == 0 {
                 let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
                 self.glyph_cache.get_or_render(
@@ -544,77 +657,141 @@ impl TerminalRenderer {
                     continue;
                 }
             };
-            let it = 1.0 / TEXTURE_SIZE as f32;
-            let mut q = Quad::default();
-            q.x0 = x + rendered.offset_x as f32;
-            q.y0 = y_px - rendered.offset_y as f32;
-            q.x1 = q.x0 + rendered.width as f32;
-            q.y1 = q.y0 + rendered.height as f32;
-            q.s0 = rendered.atlas_x as f32 * it;
-            q.t0 = rendered.atlas_y as f32 * it;
-            q.s1 = (rendered.atlas_x + rendered.width) as f32 * it;
-            q.t1 = (rendered.atlas_y + rendered.height) as f32 * it;
-            if rendered.color_glyph {
-                color_batches
-                    .entry(rendered.texture_index)
-                    .or_default()
-                    .push(q);
-            } else {
-                alpha_batches
-                    .entry(rendered.texture_index)
-                    .or_default()
-                    .push(q);
-            }
+            push_glyph_quad(
+                &mut alpha_batches,
+                &mut color_batches,
+                rendered,
+                x,
+                y_px,
+            );
             x += info.advance;
         }
 
-        if !alpha_batches.is_empty() {
-            let cmds: Vec<DrawCommand> = alpha_batches
-                .into_iter()
-                .map(|(tex_idx, quads)| DrawCommand {
-                    image_id: self.glyph_cache.textures[tex_idx].image_id,
-                    quads,
-                })
-                .collect();
-            canvas.draw_glyph_commands(
-                GlyphDrawCommands {
-                    alpha_glyphs: cmds,
-                    color_glyphs: vec![],
-                },
-                &Paint::color(color),
-            );
+        emit_glyph_batches(canvas, &self.glyph_cache, alpha_batches, color_batches, color);
+        (start_x, total_width)
+    }
+
+    /// Bold/italic-capable text rendering via Parley layout. Asks
+    /// Parley to resolve a font face that matches the requested weight
+    /// and slant, walks the resulting GlyphRuns, and routes each glyph
+    /// through the existing GlyphCache. Different font faces (regular
+    /// vs bold vs italic) end up under distinct font_ids in
+    /// `fallback_fonts` and so cache independently.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_styled<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        x_px: f32,
+        y_px: f32,
+        text: &str,
+        color: Color,
+        align: vge::command::Align,
+        font_style: vge::command::FontStyle,
+    ) -> (f32, f32) {
+        use parley::style::{FontStyle as PStyle, FontWeight};
+
+        let weight = if font_style.bold() {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        let pstyle = if font_style.italic() {
+            PStyle::Italic
+        } else {
+            PStyle::Normal
+        };
+
+        let mut builder = self
+            .layout_cx
+            .ranged_builder(&mut self.font_cx, text, 1.0, false);
+        builder.push_default(StyleProperty::Brush(Color::white()));
+        builder.push_default(FontStack::from("monospace"));
+        builder.push_default(StyleProperty::FontSize(self.font_size));
+        builder.push_default(StyleProperty::FontWeight(weight));
+        builder.push_default(StyleProperty::FontStyle(pstyle));
+        let mut layout: Layout<Color> = builder.build(text);
+        layout.break_all_lines(None);
+        layout.align(None, Alignment::Start, AlignmentOptions::default());
+
+        let total_width = layout.width();
+        let start_x = align_offset(x_px, total_width, align);
+
+        // Pass 1: walk runs, register fonts, collect per-glyph info
+        // (since iterating mutates self.fallback_fonts and we need
+        // independent borrows for cache lookups in pass 2).
+        struct G {
+            x: f32,
+            y: f32,
+            glyph_id: u16,
+            font_id: u16,
         }
-        if !color_batches.is_empty() {
-            let cmds: Vec<DrawCommand> = color_batches
-                .into_iter()
-                .map(|(tex_idx, quads)| DrawCommand {
-                    image_id: self.glyph_cache.textures[tex_idx].image_id,
-                    quads,
-                })
-                .collect();
-            canvas.draw_glyph_commands(
-                GlyphDrawCommands {
-                    alpha_glyphs: vec![],
-                    color_glyphs: cmds,
-                },
-                &Paint::color(Color::white()),
+        let mut glyphs: Vec<G> = Vec::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                if let PositionedLayoutItem::GlyphRun(run_layout) = item {
+                    let run = run_layout.run();
+                    let font = run.font();
+                    let data_ref = font.data.as_ref();
+                    let font_index = font.index as usize;
+                    let source_ptr = data_ref.as_ptr() as usize;
+
+                    let font_id = match self.fallback_fonts.iter().position(|fb| {
+                        fb.source_ptr == source_ptr && fb.index == font_index
+                    }) {
+                        Some(i) => (i + 1) as u16,
+                        None => {
+                            let i = self.fallback_fonts.len();
+                            self.fallback_fonts.push(FallbackFont {
+                                data: data_ref.to_vec(),
+                                index: font_index,
+                                source_ptr,
+                            });
+                            (i + 1) as u16
+                        }
+                    };
+
+                    let run_x = run_layout.offset();
+                    for glyph in run_layout.glyphs() {
+                        glyphs.push(G {
+                            x: run_x + glyph.x,
+                            y: glyph.y,
+                            glyph_id: glyph.id as u16,
+                            font_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Pass 2: render with disjoint borrows.
+        let mut alpha_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
+        let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
+        for g in &glyphs {
+            let fb = &self.fallback_fonts[(g.font_id - 1) as usize];
+            let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
+            let rendered = self.glyph_cache.get_or_render(
+                canvas,
+                &mut self.scale_cx,
+                fr,
+                g.glyph_id,
+                self.font_size,
+                g.font_id,
+            );
+            let rendered = match rendered {
+                Some(r) => r,
+                None => continue,
+            };
+            push_glyph_quad(
+                &mut alpha_batches,
+                &mut color_batches,
+                rendered,
+                start_x + g.x,
+                y_px + g.y,
             );
         }
 
-        // Underline and strikethrough rules.
-        if font_style.underline() || font_style.strikethrough() {
-            let mut path = Path::new();
-            let thickness = (self.font_size / 16.0).max(1.0);
-            if font_style.underline() {
-                let uy = y_px + (self.cell_height - self.ascent) * 0.5;
-                path.rect(start_x, uy, total_width, thickness);
-            }
-            if font_style.strikethrough() {
-                let sy = y_px - self.ascent * 0.35;
-                path.rect(start_x, sy, total_width, thickness);
-            }
-            canvas.fill_path(&path, &Paint::color(color));
-        }
+        emit_glyph_batches(canvas, &self.glyph_cache, alpha_batches, color_batches, color);
+        (start_x, total_width)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -643,7 +820,7 @@ impl TerminalRenderer {
                 }
 
                 let is_cursor = show_cursor && row == cursor_row && col == cursor_col;
-                let (_, bg) = resolve_cell_colors(&cell, is_cursor);
+                let (_, bg) = resolve_cell_colors(cell, is_cursor);
                 let w = if cell.is_wide() { 2.0 } else { 1.0 };
 
                 if bg != default_bg {
@@ -701,7 +878,7 @@ impl TerminalRenderer {
                 };
 
                 let is_cursor = show_cursor && row == cursor_row && col == cursor_col;
-                let (fg, _) = resolve_cell_colors(&cell, is_cursor);
+                let (fg, _) = resolve_cell_colors(cell, is_cursor);
 
                 let x = col as f32 * self.cell_width;
                 let y = row as f32 * self.cell_height + self.ascent;
