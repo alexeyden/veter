@@ -108,6 +108,8 @@ u32  max_text_bytes            // per DrawText / UpdateText
 u32  max_image_bytes           // per UploadImage
 u32  max_images                // concurrent uploaded images
 u8   supported_image_encodings // bitmask: bit0=Raw, bit1=WebP
+u8   max_nesting_depth         // parent-child nesting cap (§9); 0
+                               // means parenting not supported
 ```
 
 If the terminal does not support the extension, no response is emitted; the
@@ -116,6 +118,12 @@ client SHOULD time out (e.g. 250 ms) and fall back to text-only mode.
 A client MUST NOT send any other command before receiving the probe
 response. If a higher protocol version exists in future, the terminal
 returns its highest known version and the client picks `min(client, term)`.
+
+The body length is the source of truth for which fields are present. A
+client reading a shorter body MUST treat missing trailing fields as
+zero (e.g. `max_nesting_depth = 0`, meaning no parenting). A terminal
+emitting a longer body than this client knows about MUST be tolerated
+by skipping unknown trailing bytes.
 
 ## 3. Commands (client → terminal)
 
@@ -138,6 +146,7 @@ later sections.
 | 0x0C | UploadImage        | §8.2         |
 | 0x0D | DropImage          | §8.2         |
 | 0x0E | ClearAll           | §6.7         |
+| 0x0F | UpdateSize         | §9.5         |
 
 All other frame_type values are reserved and MUST be rejected with
 `err_unknown_command`.
@@ -171,6 +180,7 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x0032 | err_image_decode        | Image bytes failed to decode (e.g. bad WebP)     |
 | 0x0033 | err_duplicate_image_id  | image ID already in use (UploadImage)            |
 | 0x0034 | err_too_many_images     | Image budget exhausted                           |
+| 0x0040 | err_max_nesting_depth   | parenting would exceed advertised cap            |
 | 0x00FF | err_internal            | Terminal-side failure                            |
 
 After an `Err` response, the terminal's state is unchanged: failed commands
@@ -198,6 +208,11 @@ Coordinates are `f32` and may carry sub-cell offsets. They are not snapped
 to the cell grid by the terminal.
 
 ### 5.2 Element origins and scrollback anchoring
+
+Scrollback anchoring applies only to **top-level** elements (those with
+no parent — see §9.1). For child elements the origin is interpreted in
+the parent's interior coordinates instead, and lifecycle is governed
+by the parent.
 
 Element origins are in cell units, but the `y` component is interpreted as
 **viewport-relative at command-processing time**, where "viewport" means
@@ -263,6 +278,10 @@ DrawCommand[] commands          ; n_commands of them, §7
 point         origin
 u8            is_visible        ; 0 or 1
 i32           draw_order
+; optional trailing block — see §9.4 for the full layout. If the body
+; ends here, the element is top-level with no parent and no clip.
+[u8           extra_flags]
+[...          parent_id / size fields, see §9.4]
 ```
 
 Behavior:
@@ -274,9 +293,14 @@ Behavior:
 - If `id` is non-empty and already in use, the entire command fails with
   `err_duplicate_id`. (Client-side replace = explicit `DeleteElement`
   followed by `CreateElement`.)
-- Origin is interpreted per §5.2 to derive `anchor_line` and `sub_row`.
+- For top-level elements (no parent), origin is interpreted per §5.2
+  to derive `anchor_line` and `sub_row`. For child elements (§9.1),
+  origin is in the parent's interior coordinates and there is no
+  scrollback anchoring.
 - Draw order ties broken by creation order: among elements with equal
-  `draw_order`, later-created elements draw on top.
+  `draw_order`, later-created elements draw on top. Draw order is
+  scoped per parent: only siblings under the same parent are compared
+  to each other.
 - Response: empty Ok.
 
 Because IDs are picked client-side, the client can pipeline a
@@ -287,7 +311,9 @@ ID in a single envelope without waiting for the create's response.
 
 Body: `string id`. Response: empty Ok.
 
-Unknown ID → `err_unknown_element`.
+Unknown ID → `err_unknown_element`. If the deleted element has
+descendants (§9), they are deleted too — the response is `Ok`
+regardless of how many were destroyed.
 
 ### 6.3 UpdateCommands (0x05) / UpdateCommand (0x06)
 
@@ -664,21 +690,270 @@ Image data is held verbatim by the terminal (Raw stays Raw, WebP stays
 WebP); decoding to a renderable representation is implementation-defined
 and may be lazy or eager.
 
-## 9. Rendering semantics
+## 9. Element parenting and clipping
+
+This section gives elements two related capabilities. **Parenting**
+groups elements into a tree, with shared lifecycle and a parent-relative
+coordinate space for children. **Clipping** is an optional rectangular
+mask attached to any element — anything that would render outside it
+(the element's own commands or any descendants) is clipped away.
+
+Together they let a client build scrollable widgets (chat panes, logs,
+lists) without re-uploading content on every scroll tick. The
+"viewport" pattern is just a clip element whose children move via
+`UpdateOrigin` to give the appearance of scrolling — see §9.9.
+
+### 9.1 Parenting
+
+Every element optionally has a **parent** (another element, by ID).
+Parenting is fixed at create time. There is no `Reparent` operation;
+the client recreates if it needs to change parents.
+
+- **Top-level elements** (no parent) anchor their origin to a scrollback
+  line per §5.2.
+- **Child elements** (with a parent) have origins in the parent's
+  coordinate space (parent's origin = (0, 0) for the child). They do
+  not anchor to scrollback; their lifecycle is governed by the parent.
+  When the parent is deleted, evicted, or destroyed by reset, the
+  descendants go with it.
+
+Any element can be a parent — it doesn't need a clip rect or any
+special flag. A parent without a clip just acts as a group: a single
+draw_order slot, shared lifecycle, parent-relative children.
+
+Cycles are impossible: `parent_id` MUST already exist in the element
+table when its child is created.
+
+### 9.2 Clipping
+
+An element has a **clip rect** if and only if it was created with the
+`size` field (§9.4) or has had one set via `UpdateSize` (§9.5).
+
+When the clip rect is set, it is the axis-aligned rect
+`(origin.x, origin.y, size.x, size.y)` in the element's coordinate
+space (parent's space, or the screen for a top-level element). At
+render time:
+
+1. The renderer pushes a scissor for that rect.
+2. Render the element's descendants in `(draw_order, creation_order)`
+   order.
+3. Render the element's own `commands` (its `DrawCmd[]`) **on top of
+   the descendants**, still inside the same clip.
+4. Pop the scissor.
+
+If the element has no clip rect, steps 1 and 4 are skipped — its
+children and own commands draw freely (and whatever ancestor clip is
+on the GPU stack still applies).
+
+**Element commands render after children.** This is deliberate. It
+matches the typical decoration use case: borders, edge fades, frames,
+overlays, and scroll indicators all want to draw on top of their
+contents. Backgrounds, when needed, are added as a low-`draw_order`
+child rather than as a parent command.
+
+### 9.3 Coordinate system
+
+For a top-level element, `origin` is interpreted per §5.2 (y is
+scrollback-relative at command-processing time).
+
+For a child element, `origin` is the offset within the parent's
+coordinate space: a child at `(5, 3)` whose parent has effective
+on-screen position `(P_x, P_y)` renders at `(P_x + 5, P_y + 3)`.
+Origins are `f32` and may be fractional.
+
+There is no separate "scroll offset" field. To scroll content within a
+clipped parent, the client moves the child(ren) via `UpdateOrigin` — see
+the cookbook in §9.9.
+
+### 9.4 CreateElement extension
+
+`CreateElement` (§6.1) gains a single optional trailing block, gated by
+a flags byte. The base layout (no trailing bytes) is still valid and
+produces a top-level element with no parent and no clip.
+
+```
+CreateElement (with parent / clip):
+  string        id
+  varu          n_commands
+  DrawCommand[] commands
+  point         origin
+  u8            is_visible
+  i32           draw_order
+  u8            extra_flags          ; bit0 = has_parent
+                                     ; bit1 = has_size
+                                     ; bits 2..7 reserved (must be 0)
+  ; if bit0 (has_parent):
+  string        parent_id
+  ; if bit1 (has_size):
+  point         size                 ; clip rect width, height in cell
+                                     ; units; clip rect is
+                                     ; (origin.x, origin.y, w, h) in
+                                     ; parent's coords (or the screen
+                                     ; for top-level)
+```
+
+Validation:
+
+- If `bit0` is set, `parent_id` MUST be non-empty and MUST already
+  resolve to an existing element, else `err_unknown_element`, atomic.
+- If `bit1` is set, `size`'s components MUST be finite and `>= 0`,
+  else `err_bad_payload`. A `size` of `(0, 0)` is permitted and clips
+  every descendant pixel; clients use it for "collapse without
+  delete".
+- If the resulting tree depth would exceed advertised
+  `max_nesting_depth` (§9.7), → `err_max_nesting_depth`, atomic.
+- Any reserved bit set in `extra_flags` → `err_bad_payload`.
+- Trailing-byte presence is decided strictly by body length. If the
+  body ends after `draw_order` there is no `extra_flags`. Trailing
+  bytes that don't form a complete optional block are
+  `err_bad_payload`.
+
+### 9.5 UpdateSize (0x0F)
+
+Body:
+
+```
+string id
+point  new_size
+```
+
+Sets the named element's clip rect size to `new_size`. If the element
+had no clip rect before, it now does. To remove clipping, recreate the
+element.
+
+Errors:
+
+- Empty id → `err_bad_payload`.
+- Unknown id → `err_unknown_element`.
+- `new_size` components non-finite or negative → `err_bad_payload`.
+
+Response: empty Ok.
+
+### 9.6 Lifecycle and cascading
+
+- `DeleteElement` (§6.2) on any element deletes its entire subtree.
+- `ClearAll` (§6.7) wipes every element on the current screen including
+  parents and descendants.
+- Scrollback eviction (§5.2) of a top-level element cascades to its
+  subtree.
+- Reset (§5.6) wipes everything.
+- `UpdateOrigin` on a parent moves its whole subtree (the descendants'
+  origins are parent-relative and unchanged; their *screen* positions
+  move with the parent).
+- `UpdateVisibility` on a parent with `is_visible = false` skips
+  rendering of the entire subtree. Descendants' own `is_visible` is
+  preserved.
+- `UpdateSize` only affects the element's own clip rect; it does not
+  cascade.
+
+### 9.7 Nesting limits
+
+The probe response advertises `max_nesting_depth` (§2.1, recommended
+**16**). A `CreateElement` whose `parent_id` resolves to an element
+already at depth `max_nesting_depth − 1` fails atomically with
+`err_max_nesting_depth`. `max_nesting_depth = 0` means parenting is
+unsupported on this terminal; clients should fall back to flat
+top-level elements (and client-side scrolling).
+
+The total-element budget (`max_elements`) still applies and counts
+every element regardless of position in the tree.
+
+### 9.8 Rendering details (informational)
+
+The reference renderer (femtovg) implements clipping via
+`canvas.scissor(...)` and the parent-relative translation via
+`canvas.translate(...)`, paired with `canvas.save()` /
+`canvas.restore()` to maintain a stack across nested clips.
+Pixel-level filtering / anti-aliasing at the clip boundary is
+implementation-defined.
+
+Femtovg's scissor is axis-aligned rectangular only (potentially
+rotated by the current transform stack). Non-rectangular clip shapes
+are out of scope for v1.
+
+Render order at each level:
+
+1. Push the parent's translate (and scissor if it has a clip rect).
+2. Render each child recursively, sorted by
+   `(child.draw_order, child.creation_order)` ascending.
+3. Render the parent's own `commands` (its `DrawCmd[]`) on top.
+4. Pop the scissor / translate.
+
+Across different parents, the parents' own draw orders take
+precedence — the entire subtree of a lower-draw-order parent renders
+before the entire subtree of a higher-draw-order parent.
+
+### 9.9 Cookbook: scrollable viewport
+
+The recommended pattern for a scrollable widget is two elements:
+
+```
+clip-element        (has size = pane bounds; parent_id = whatever)
+└── content-group   (no size; parent_id = clip-element)
+    ├── line-1, line-2, line-3, … line-N    (parent_id = content-group)
+```
+
+To **set up**: create the clip-element, then the content-group as its
+child, then all the line elements as children of the content-group.
+The lines lay out at their natural positions inside the content-group's
+coordinate space.
+
+To **scroll** by Δ cells: send one `UpdateOrigin` on the
+content-group with the new origin. All grandchildren visually shift
+together; lines outside the clip-element's bounds disappear. One
+~30-byte envelope per scroll tick, regardless of how many lines are in
+the widget.
+
+To **draw a frame, edge fade, or scroll indicator** that should not
+scroll: put it in the clip-element's own `commands` (which render on
+top of children, §9.2) or as a sibling of the clip-element (above it
+in draw_order).
+
+To **draw a background** that does scroll with the content: a child of
+the content-group with low draw_order. To **draw a background** that
+does not scroll: a low-draw-order child of the clip-element (sibling
+of the content-group).
+
+### 9.10 Interaction with input
+
+VGE itself delivers no mouse events. The client TUI receives wheel /
+click events from the terminal via existing VT100 mouse reporting,
+hit-tests against its own model of which clip rect is where, and sends
+`UpdateOrigin` on the appropriate content-group accordingly. This
+keeps the protocol stateless on input and lets the client own all
+interaction policy (scroll acceleration, kinetic scrolling, focus,
+etc.).
+
+### 9.11 Future work (deferred)
+
+Possible additions for later versions:
+
+- `Reparent` / `MoveElement` — change an element's parent. Deliberately
+  excluded today: parenting at create time gives a much simpler tree
+  invariant, and the client can always recreate.
+- Removing a clip rect post-create. Today the only way to "unclip" is
+  to recreate the element. A flag on `UpdateSize` could clear it; not
+  worth the byte yet.
+- Non-rectangular clip shapes. Requires a different renderer
+  technique (offscreen targets or stencil) and is out of scope.
+
+## 10. Rendering semantics
 
 - The terminal's text layer always renders below all VGE elements. There
   is no protocol for placing graphics below text.
 - Cell backgrounds (from text attributes) render before glyphs and before
   VGE elements, so a colored cell background is visible through any
   transparent regions of overlaid graphics.
-- Within VGE, elements render sorted by `(draw_order, creation_order)`
-  ascending; later in this ordering = on top.
+- Within VGE, top-level elements render sorted by `(draw_order,
+  creation_order)` ascending; later in this ordering = on top. With
+  parenting (§9), draw-order comparison is scoped per parent, and a
+  parent's own commands render after its children — see §9.2 / §9.8.
 - Anti-aliasing and stroke caps/joins are implementation-defined; this
   spec does not require pixel-identical rendering across implementations.
 - Premultiplication: colors on the wire are straight (not premultiplied).
   Premultiplication for blending is the renderer's concern.
 
-## 10. Limits and budgeting
+## 11. Limits and budgeting
 
 The terminal advertises hard limits via the probe response. The client is
 responsible for staying within them. Over-limit operations fail atomically
@@ -692,13 +967,15 @@ with the relevant error code. A non-exhaustive list:
   `UploadImage`.
 - `max_images`: number of concurrently-uploaded images in the session
   image table (§8).
+- `max_nesting_depth`: parent-child tree depth (§9.7). 0 means
+  parenting unsupported.
 
 The reference implementation in this repo SHOULD start with: 4096
 elements, 4096 commands per element, 1 MiB text per command, 32 MiB per
-image, 1024 concurrent images. These numbers can be tuned without
-breaking the protocol.
+image, 1024 concurrent images, 16 levels of parent nesting. These
+numbers can be tuned without breaking the protocol.
 
-## 11. Interaction with existing terminal state
+## 12. Interaction with existing terminal state
 
 - A bell, scroll, or any normal text output does not affect VGE state.
 - Cursor position is independent of element origins.
@@ -709,7 +986,7 @@ breaking the protocol.
   copy/pasteable in any form by this protocol).
 - VGE issues no DA/DA2/DA3 changes; clients detect support solely via §2.
 
-## 12. Open issues / future work
+## 13. Open issues / future work
 
 These are intentionally deferred and are not part of v1:
 
