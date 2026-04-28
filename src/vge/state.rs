@@ -92,27 +92,35 @@ pub struct Element {
     pub creation_seq: u64,
 }
 
-pub struct VgeState {
-    pub elements: HashMap<String, Element>,
-    /// Global style table (§7.3). Resolved at render time when an element
-    /// references a style by ID.
-    ///
-    /// Session-scoped: this and `images` will move to a separate
-    /// `SharedTables` struct when alt-screen support lands (§5.4).
+/// Session-scoped state that is shared between the main and alternate
+/// screens (§5.4). Image and style tables live here; only the element
+/// table is per-screen.
+pub struct SharedTables {
     pub styles: HashMap<String, ConcreteStyle>,
-    /// Image table (§8). Uploaded images live here keyed by their
-    /// client-supplied ID. Same session scoping note as `styles`.
     pub images: HashMap<String, UploadedImage>,
-    creation_counter: u64,
-    next_anonymous: u64,
 }
 
-impl VgeState {
+impl SharedTables {
+    pub fn new() -> Self {
+        Self {
+            styles: HashMap::new(),
+            images: HashMap::new(),
+        }
+    }
+}
+
+/// Per-screen element table plus its monotonic counters. The main and
+/// alternate screen each own one of these (§5.4).
+pub struct ElementSet {
+    pub elements: HashMap<String, Element>,
+    pub creation_counter: u64,
+    pub next_anonymous: u64,
+}
+
+impl ElementSet {
     pub fn new() -> Self {
         Self {
             elements: HashMap::new(),
-            styles: HashMap::new(),
-            images: HashMap::new(),
             creation_counter: 0,
             next_anonymous: 0,
         }
@@ -129,12 +137,63 @@ impl VgeState {
         self.next_anonymous += 1;
         format!("\0anon\0{n}")
     }
+}
 
-    /// Iterate top-level elements (parent: None) in render order:
-    /// ascending (draw_order, creation_seq). Children are walked
-    /// recursively from the renderer per §9.8.
+pub struct VgeState {
+    pub shared: SharedTables,
+    main: ElementSet,
+    alt: Option<ElementSet>,
+    on_alt: bool,
+}
+
+impl VgeState {
+    pub fn new() -> Self {
+        Self {
+            shared: SharedTables::new(),
+            main: ElementSet::new(),
+            alt: None,
+            on_alt: false,
+        }
+    }
+
+    /// True iff the engine is currently on the alternate screen.
+    pub fn on_alt(&self) -> bool {
+        self.on_alt
+    }
+
+    /// Borrow the active element set (current screen).
+    pub fn current(&self) -> &ElementSet {
+        if self.on_alt {
+            self.alt.as_ref().expect("on_alt without alt set")
+        } else {
+            &self.main
+        }
+    }
+
+    fn current_mut(&mut self) -> &mut ElementSet {
+        if self.on_alt {
+            self.alt.as_mut().expect("on_alt without alt set")
+        } else {
+            &mut self.main
+        }
+    }
+
+    /// Convenience accessor for the current screen's element table.
+    pub fn elements(&self) -> &HashMap<String, Element> {
+        &self.current().elements
+    }
+
+    /// Mutable accessor for the current screen's element table.
+    pub fn elements_mut(&mut self) -> &mut HashMap<String, Element> {
+        &mut self.current_mut().elements
+    }
+
+    /// Iterate top-level elements (parent: None) on the current screen
+    /// in render order: ascending (draw_order, creation_seq). Children
+    /// are walked recursively from the renderer per §9.8.
     pub fn top_level_sorted(&self) -> Vec<&Element> {
         let mut v: Vec<&Element> = self
+            .current()
             .elements
             .values()
             .filter(|e| e.parent.is_none())
@@ -143,19 +202,56 @@ impl VgeState {
         v
     }
 
-    /// Iterate the direct children of `parent_key` in render order.
+    /// Iterate the direct children of `parent_key` on the current
+    /// screen in render order.
     pub fn children_sorted(&self, parent_key: &str) -> Vec<&Element> {
-        let parent = match self.elements.get(parent_key) {
+        let elements = &self.current().elements;
+        let parent = match elements.get(parent_key) {
             Some(p) => p,
             None => return Vec::new(),
         };
         let mut v: Vec<&Element> = parent
             .children
             .iter()
-            .filter_map(|k| self.elements.get(k))
+            .filter_map(|k| elements.get(k))
             .collect();
         v.sort_by_key(|e| (e.draw_order, e.creation_seq));
         v
+    }
+
+    /// Switch to the alt screen with a fresh empty element set, per
+    /// §5.4. No-op if already on alt.
+    pub fn enter_alt_screen(&mut self) {
+        if !self.on_alt {
+            self.alt = Some(ElementSet::new());
+            self.on_alt = true;
+        }
+    }
+
+    /// Drop the alt set and restore main, per §5.4. No-op if already on
+    /// main.
+    pub fn leave_alt_screen(&mut self) {
+        if self.on_alt {
+            self.alt = None;
+            self.on_alt = false;
+        }
+    }
+
+    /// Wipe everything for §5.6 reset (RIS / DECSTR). Returns any GPU
+    /// image handles whose CPU-side counterparts are now gone, so the
+    /// caller can free them on the canvas.
+    pub fn reset(&mut self) -> Vec<femtovg::ImageId> {
+        let mut deletes = Vec::new();
+        for (_, img) in self.shared.images.drain() {
+            if let Some(gpu) = img.gpu.get() {
+                deletes.push(gpu);
+            }
+        }
+        self.shared.styles.clear();
+        self.main = ElementSet::new();
+        self.alt = None;
+        self.on_alt = false;
+        deletes
     }
 }
 
@@ -345,12 +441,32 @@ impl VgeEngine {
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that
     /// should be forwarded to vt100. Any complete VGE envelopes are
     /// processed and their responses queued in `take_responses()`.
+    /// Side-channel events from the APC parser (resets) are applied to
+    /// engine state immediately.
     pub fn process_pty_chunk(&mut self, input: &[u8]) -> Vec<u8> {
         let out = self.apc.feed(input);
         for payload in out.payloads {
             self.handle_envelope_payload(&payload);
         }
+        for ev in out.events {
+            self.handle_terminal_event(ev);
+        }
         out.passthrough
+    }
+
+    /// React to a side-channel terminal event observed in the byte
+    /// stream (currently: §5.6 resets).
+    fn handle_terminal_event(&mut self, ev: vge_protocol::TerminalEvent) {
+        use vge_protocol::TerminalEvent::*;
+        match ev {
+            HardReset | SoftReset => {
+                let deletes = self.state.reset();
+                self.pending_image_deletes.extend(deletes);
+                // Reset the line tracker too: scrollback state will be
+                // re-derived after vt100 finishes its own reset.
+                self.line_tracker = LineTracker::new();
+            }
+        }
     }
 
     /// Take queued response bytes (an APC envelope) ready to write to the
@@ -359,12 +475,24 @@ impl VgeEngine {
         std::mem::take(&mut self.pending_response_bytes)
     }
 
-    /// Update top-of-live-screen tracking. Call after every
-    /// `parser.process(...)`. Also evicts elements whose anchor_line has
-    /// fallen off the bottom of scrollback.
+    /// Update top-of-live-screen tracking and react to alt-screen
+    /// transitions. Call after every `parser.process(...)`. Also evicts
+    /// elements whose anchor_line has fallen off the bottom of
+    /// scrollback (main screen only — alt screen has no scrollback).
     pub fn after_vt100_process(&mut self, parser: &mut vt100::Parser) {
-        self.line_tracker.update(parser);
-        self.evict();
+        // §5.4 — detect screen transitions by polling vt100.
+        let now_alt = parser.screen().alternate_screen();
+        if now_alt && !self.state.on_alt() {
+            self.state.enter_alt_screen();
+        } else if !now_alt && self.state.on_alt() {
+            self.state.leave_alt_screen();
+        }
+
+        // Scrollback anchoring is only meaningful on the main screen.
+        if !self.state.on_alt() {
+            self.line_tracker.update(parser);
+            self.evict();
+        }
     }
 
     fn evict(&mut self) {
@@ -377,7 +505,7 @@ impl VgeEngine {
         // cascade.
         let to_evict: Vec<String> = self
             .state
-            .elements
+            .elements()
             .iter()
             .filter(|(_, e)| e.parent.is_none() && e.anchor_line < oldest_visible)
             .map(|(k, _)| k.clone())
@@ -512,7 +640,7 @@ impl VgeEngine {
                 self.cmd_update_draw_order(&id, draw_order)
             }
             Command::ClearAll => {
-                self.state.elements.clear();
+                self.state.elements_mut().clear();
                 Ok(Vec::new())
             }
             Command::SetGlobalStyle { id, style } => self.cmd_set_global_style(id, style),
@@ -538,7 +666,7 @@ impl VgeEngine {
         }
         let el = self
             .state
-            .elements
+            .elements_mut()
             .get_mut(id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         el.clip_size = Some(new_size);
@@ -552,7 +680,7 @@ impl VgeEngine {
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         // ID validation already done by the parser (non-empty, ≤64 bytes).
         // Upsert per §7.3 — no error on existing ID.
-        self.state.styles.insert(id, style);
+        self.state.shared.styles.insert(id, style);
         Ok(Vec::new())
     }
 
@@ -564,10 +692,10 @@ impl VgeEngine {
         if b.id.is_empty() || b.id.len() > 64 {
             return Err((ERR_BAD_PAYLOAD, "image id"));
         }
-        if self.state.images.contains_key(&b.id) {
+        if self.state.shared.images.contains_key(&b.id) {
             return Err((ERR_DUPLICATE_IMAGE_ID, "image id in use"));
         }
-        if self.state.images.len() as u32 >= self.limits.max_images {
+        if self.state.shared.images.len() as u32 >= self.limits.max_images {
             return Err((ERR_TOO_MANY_IMAGES, "image budget exhausted"));
         }
         if b.data.len() as u64 > self.limits.max_image_bytes as u64 {
@@ -580,7 +708,7 @@ impl VgeEngine {
             _ => return Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
         };
 
-        self.state.images.insert(
+        self.state.shared.images.insert(
             b.id,
             UploadedImage {
                 width: b.width,
@@ -597,7 +725,7 @@ impl VgeEngine {
         if id.is_empty() {
             return Err((ERR_BAD_PAYLOAD, "empty image id"));
         }
-        match self.state.images.remove(id) {
+        match self.state.shared.images.remove(id) {
             None => Err((ERR_UNKNOWN_IMAGE, "image id not found")),
             Some(img) => {
                 if let Some(gpu) = img.gpu.get() {
@@ -615,7 +743,7 @@ impl VgeEngine {
         // Validate without mutating, then commit.
         let el = self
             .state
-            .elements
+            .elements()
             .get(&b.id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         if b.command_index >= el.commands.len() {
@@ -624,10 +752,10 @@ impl VgeEngine {
         if !matches!(el.commands[b.command_index], DrawCmd::DrawImage { .. }) {
             return Err((ERR_BAD_PAYLOAD, "command at index is not DrawImage"));
         }
-        if !self.state.images.contains_key(&b.new_image_id) {
+        if !self.state.shared.images.contains_key(&b.new_image_id) {
             return Err((ERR_UNKNOWN_IMAGE, "new_image_id not found"));
         }
-        let el = self.state.elements.get_mut(&b.id).unwrap();
+        let el = self.state.elements_mut().get_mut(&b.id).unwrap();
         if let DrawCmd::DrawImage {
             image_id,
             target_rect: _,
@@ -651,7 +779,7 @@ impl VgeEngine {
             // §7.5: DrawImage references must resolve at command-processing
             // time, atomically.
             if let DrawCmd::DrawImage { image_id, .. } = c
-                && !self.state.images.contains_key(image_id)
+                && !self.state.shared.images.contains_key(image_id)
             {
                 return Err((ERR_UNKNOWN_IMAGE, "DrawImage references unknown image"));
             }
@@ -663,17 +791,17 @@ impl VgeEngine {
         &mut self,
         b: CreateElementBody,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
-        if !b.id.is_empty() && self.state.elements.contains_key(&b.id) {
+        if !b.id.is_empty() && self.state.elements().contains_key(&b.id) {
             return Err((ERR_DUPLICATE_ID, "id in use"));
         }
-        if self.state.elements.len() as u32 >= self.limits.max_elements {
+        if self.state.elements().len() as u32 >= self.limits.max_elements {
             return Err((ERR_TOO_MANY_ELEMENTS, "element budget exhausted"));
         }
         self.validate_commands(&b.commands)?;
 
         // §9.4 — validate parent and depth before mutating state.
         if let Some(parent_id) = &b.parent {
-            if !self.state.elements.contains_key(parent_id) {
+            if !self.state.elements().contains_key(parent_id) {
                 return Err((ERR_UNKNOWN_ELEMENT, "parent_id not found"));
             }
             // depth = parent's depth + 1
@@ -684,12 +812,12 @@ impl VgeEngine {
         }
 
         let key = if b.id.is_empty() {
-            self.state.anonymous_key()
+            self.state.current_mut().anonymous_key()
         } else {
             b.id.clone()
         };
         let id_field = if b.id.is_empty() { None } else { Some(b.id) };
-        let seq = self.state.next_seq();
+        let seq = self.state.current_mut().next_seq();
 
         // For top-level elements, anchor to scrollback. For children,
         // store origin verbatim (parent-relative).
@@ -699,7 +827,7 @@ impl VgeEngine {
             (0, 0.0)
         };
 
-        self.state.elements.insert(
+        self.state.elements_mut().insert(
             key.clone(),
             Element {
                 id: id_field,
@@ -719,7 +847,7 @@ impl VgeEngine {
 
         // Register with parent's children list.
         if let Some(parent_id) = &b.parent
-            && let Some(parent) = self.state.elements.get_mut(parent_id)
+            && let Some(parent) = self.state.elements_mut().get_mut(parent_id)
         {
             parent.children.push(key);
         }
@@ -733,7 +861,7 @@ impl VgeEngine {
     fn depth_of(&self, id: &str) -> usize {
         let mut depth = 0usize;
         let mut cur = id.to_owned();
-        while let Some(el) = self.state.elements.get(&cur) {
+        while let Some(el) = self.state.elements().get(&cur) {
             match &el.parent {
                 Some(p) => {
                     depth += 1;
@@ -760,13 +888,13 @@ impl VgeEngine {
         if id.is_empty() {
             return Err((ERR_BAD_PAYLOAD, "empty id"));
         }
-        if !self.state.elements.contains_key(id) {
+        if !self.state.elements().contains_key(id) {
             return Err((ERR_UNKNOWN_ELEMENT, "id not found"));
         }
         // Detach from parent's children list, then cascade.
-        let parent_key = self.state.elements.get(id).and_then(|e| e.parent.clone());
+        let parent_key = self.state.elements().get(id).and_then(|e| e.parent.clone());
         if let Some(p) = parent_key
-            && let Some(parent) = self.state.elements.get_mut(&p)
+            && let Some(parent) = self.state.elements_mut().get_mut(&p)
         {
             parent.children.retain(|c| c != id);
         }
@@ -779,7 +907,7 @@ impl VgeEngine {
     /// (currently only DrawImage references images, but images live in
     /// the shared image table — element deletion does not free them).
     fn delete_subtree(&mut self, id: &str) {
-        let el = match self.state.elements.remove(id) {
+        let el = match self.state.elements_mut().remove(id) {
             Some(e) => e,
             None => return,
         };
@@ -792,11 +920,11 @@ impl VgeEngine {
         &mut self,
         b: UpdateCommandsBody,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
-        if !self.state.elements.contains_key(&b.id) {
+        if !self.state.elements().contains_key(&b.id) {
             return Err((ERR_UNKNOWN_ELEMENT, "id not found"));
         }
         self.validate_commands(&b.commands)?;
-        let el = self.state.elements.get_mut(&b.id).unwrap();
+        let el = self.state.elements_mut().get_mut(&b.id).unwrap();
         el.commands = b.commands;
         Ok(Vec::new())
     }
@@ -810,7 +938,7 @@ impl VgeEngine {
         {
             let el = self
                 .state
-                .elements
+                .elements()
                 .get(&b.id)
                 .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
             if b.index >= el.commands.len() {
@@ -823,11 +951,11 @@ impl VgeEngine {
             return Err((ERR_TEXT_RANGE, "text too long"));
         }
         if let DrawCmd::DrawImage { image_id, .. } = &b.command
-            && !self.state.images.contains_key(image_id)
+            && !self.state.shared.images.contains_key(image_id)
         {
             return Err((ERR_UNKNOWN_IMAGE, "DrawImage references unknown image"));
         }
-        let el = self.state.elements.get_mut(&b.id).unwrap();
+        let el = self.state.elements_mut().get_mut(&b.id).unwrap();
         el.commands[b.index] = b.command;
         Ok(Vec::new())
     }
@@ -839,7 +967,7 @@ impl VgeEngine {
         let max_text = self.limits.max_text_bytes as usize;
         let el = self
             .state
-            .elements
+            .elements_mut()
             .get_mut(&b.id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         if b.command_index >= el.commands.len() {
@@ -879,7 +1007,7 @@ impl VgeEngine {
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         let is_top_level = self
             .state
-            .elements
+            .elements()
             .get(id)
             .map(|e| e.parent.is_none())
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
@@ -891,7 +1019,7 @@ impl VgeEngine {
         } else {
             (0, 0.0)
         };
-        let el = self.state.elements.get_mut(id).unwrap();
+        let el = self.state.elements_mut().get_mut(id).unwrap();
         el.anchor_line = anchor;
         el.sub_row = sub;
         el.origin_x = origin.x;
@@ -906,7 +1034,7 @@ impl VgeEngine {
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         let el = self
             .state
-            .elements
+            .elements_mut()
             .get_mut(id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         el.is_visible = is_visible;
@@ -920,7 +1048,7 @@ impl VgeEngine {
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         let el = self
             .state
-            .elements
+            .elements_mut()
             .get_mut(id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         el.draw_order = draw_order;
@@ -1065,8 +1193,8 @@ mod tests {
         append_command(&mut frames, CMD_CREATE_ELEMENT, 1, &body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert!(engine.state.elements.contains_key("rect"));
-        let el = &engine.state.elements["rect"];
+        assert!(engine.state.elements().contains_key("rect"));
+        let el = &engine.state.elements()["rect"];
         assert_eq!(el.anchor_line, 3); // top_of_live_screen=0 + floor(3.0)
         assert_eq!(el.origin_x, 5.0);
         assert!(el.is_visible);
@@ -1079,7 +1207,7 @@ mod tests {
         let _ = engine.take_responses(); // discard previous OK
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert!(!engine.state.elements.contains_key("rect"));
+        assert!(!engine.state.elements().contains_key("rect"));
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
         let mut r = Reader::new(&payload);
@@ -1157,8 +1285,8 @@ mod tests {
         append_command(&mut frames, CMD_SET_GLOBAL_STYLE, 2, &body2.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert_eq!(engine.state.styles.len(), 1);
-        let s = engine.state.styles.get("accent").unwrap();
+        assert_eq!(engine.state.shared.styles.len(), 1);
+        let s = engine.state.shared.styles.get("accent").unwrap();
         match s {
             command::ConcreteStyle::Flat(c) => {
                 assert!((c.g - 1.0).abs() < 1e-3, "second set should win (green)");
@@ -1193,7 +1321,7 @@ mod tests {
         append_command(&mut frames, CMD_CREATE_ELEMENT, 1, &body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert!(engine.state.elements.contains_key("widget"));
+        assert!(engine.state.elements().contains_key("widget"));
     }
 
     #[test]
@@ -1213,7 +1341,7 @@ mod tests {
         let err_body = r.take(body_len).unwrap();
         let mut er = Reader::new(err_body);
         assert_eq!(er.u16().unwrap(), ERR_UNKNOWN_COMMAND);
-        assert!(engine.state.elements.is_empty());
+        assert!(engine.state.elements().is_empty());
     }
 
     /// Build an `UploadImage` body for a 2x2 RGBA8 raw image (red,
@@ -1240,8 +1368,8 @@ mod tests {
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &body);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert_eq!(engine.state.images.len(), 1);
-        let img = engine.state.images.get("logo").unwrap();
+        assert_eq!(engine.state.shared.images.len(), 1);
+        let img = engine.state.shared.images.get("logo").unwrap();
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.pixels.len(), 4);
@@ -1261,7 +1389,7 @@ mod tests {
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert!(engine.state.images.is_empty());
+        assert!(engine.state.shared.images.is_empty());
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
         let mut r = Reader::new(&payload);
@@ -1287,7 +1415,7 @@ mod tests {
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.images.is_empty());
+        assert!(engine.state.shared.images.is_empty());
     }
 
     #[test]
@@ -1299,7 +1427,7 @@ mod tests {
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 2, &body);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        assert_eq!(engine.state.images.len(), 1);
+        assert_eq!(engine.state.shared.images.len(), 1);
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
         let mut r = Reader::new(&payload);
@@ -1329,7 +1457,7 @@ mod tests {
         drop_body.str("logo");
         append_command(&mut frames, CMD_DROP_IMAGE, 2, &drop_body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.images.is_empty());
+        assert!(engine.state.shared.images.is_empty());
     }
 
     #[test]
@@ -1387,7 +1515,7 @@ mod tests {
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload);
         append_command(&mut frames, CMD_CREATE_ELEMENT, 2, &create);
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements.contains_key("widget"));
+        assert!(engine.state.elements().contains_key("widget"));
     }
 
     #[test]
@@ -1398,7 +1526,7 @@ mod tests {
         append_command(&mut frames, CMD_CREATE_ELEMENT, 1, &create);
         engine.process_pty_chunk(&build_envelope(&frames));
         // Atomic failure: no element added.
-        assert!(engine.state.elements.is_empty());
+        assert!(engine.state.elements().is_empty());
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
         let mut r = Reader::new(&payload);
@@ -1430,7 +1558,7 @@ mod tests {
         append_command(&mut frames, CMD_UPDATE_IMAGE, 4, &upd.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
 
-        let el = engine.state.elements.get("widget").unwrap();
+        let el = engine.state.elements().get("widget").unwrap();
         match &el.commands[0] {
             command::DrawCmd::DrawImage { image_id, .. } => assert_eq!(image_id, "b"),
             _ => panic!("expected DrawImage"),
@@ -1453,7 +1581,7 @@ mod tests {
         engine.process_pty_chunk(&build_envelope(&frames));
 
         // Element still references the original.
-        let el = engine.state.elements.get("widget").unwrap();
+        let el = engine.state.elements().get("widget").unwrap();
         match &el.commands[0] {
             command::DrawCmd::DrawImage { image_id, .. } => assert_eq!(image_id, "a"),
             _ => panic!("expected DrawImage"),
@@ -1474,8 +1602,8 @@ mod tests {
         engine.process_pty_chunk(&build_envelope(&frames));
         // Element still exists, but image table entry is gone.
         // Render-time fallback to magenta is GUI-only and not asserted here.
-        assert!(engine.state.elements.contains_key("widget"));
-        assert!(!engine.state.images.contains_key("logo"));
+        assert!(engine.state.elements().contains_key("widget"));
+        assert!(!engine.state.shared.images.contains_key("logo"));
     }
 
     /// Build a v2-layout `CreateElement` body with `extra_flags`.
@@ -1532,10 +1660,10 @@ mod tests {
             &create_with_tree("child", (3.0, 2.0), Some("root"), None),
         );
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements.contains_key("root"));
-        assert!(engine.state.elements.contains_key("child"));
-        assert_eq!(engine.state.elements["root"].children, vec!["child".to_string()]);
-        assert_eq!(engine.state.elements["child"].parent.as_deref(), Some("root"));
+        assert!(engine.state.elements().contains_key("root"));
+        assert!(engine.state.elements().contains_key("child"));
+        assert_eq!(engine.state.elements()["root"].children, vec!["child".to_string()]);
+        assert_eq!(engine.state.elements()["child"].parent.as_deref(), Some("root"));
     }
 
     #[test]
@@ -1549,7 +1677,7 @@ mod tests {
             &create_with_tree("orphan", (0.0, 0.0), Some("does-not-exist"), None),
         );
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements.is_empty());
+        assert!(engine.state.elements().is_empty());
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
         let mut r = Reader::new(&payload);
@@ -1592,14 +1720,14 @@ mod tests {
             &create_with_tree("gc", (0.0, 0.0), Some("c1"), None),
         );
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert_eq!(engine.state.elements.len(), 4);
+        assert_eq!(engine.state.elements().len(), 4);
 
         let mut del = Writer::new();
         del.str("root");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 5, &del.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements.is_empty());
+        assert!(engine.state.elements().is_empty());
     }
 
     #[test]
@@ -1632,8 +1760,8 @@ mod tests {
             &create_with_tree("e16", (0.0, 0.0), Some("e15"), None),
         );
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements.contains_key("e15"));
-        assert!(!engine.state.elements.contains_key("e16"));
+        assert!(engine.state.elements().contains_key("e15"));
+        assert!(!engine.state.elements().contains_key("e16"));
         // Last response must be err_max_nesting_depth.
         let response = engine.take_responses();
         let payload = unwrap_t2c_envelope(&response);
@@ -1669,7 +1797,7 @@ mod tests {
         );
         // Element starts with no clip.
         engine.process_pty_chunk(&build_envelope(&frames));
-        assert!(engine.state.elements["widget"].clip_size.is_none());
+        assert!(engine.state.elements()["widget"].clip_size.is_none());
 
         // UpdateSize sets it.
         let mut body = Writer::new();
@@ -1679,9 +1807,149 @@ mod tests {
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPDATE_SIZE, 2, &body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
-        let sz = engine.state.elements["widget"].clip_size.unwrap();
+        let sz = engine.state.elements()["widget"].clip_size.unwrap();
         assert_eq!(sz.x, 40.0);
         assert_eq!(sz.y, 10.0);
+    }
+
+    // --- §5.4 alt-screen tests ---
+
+    #[test]
+    fn alt_screen_swap_preserves_main_elements() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+
+        // Create a main-screen element via VGE.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("main-el", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements().contains_key("main-el"));
+
+        // Manually flip to alt screen (mimicking what alt-screen
+        // detection would do after vt100 saw DECSET 1049 h).
+        engine.state.enter_alt_screen();
+        assert!(engine.state.on_alt());
+        // Alt screen starts empty.
+        assert!(engine.state.elements().is_empty());
+
+        // Create something on alt.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_with_tree("alt-el", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements().contains_key("alt-el"));
+        assert!(!engine.state.elements().contains_key("main-el"));
+
+        // Leave alt — main set restored, alt set dropped.
+        engine.state.leave_alt_screen();
+        assert!(!engine.state.on_alt());
+        assert!(engine.state.elements().contains_key("main-el"));
+        assert!(!engine.state.elements().contains_key("alt-el"));
+    }
+
+    #[test]
+    fn alt_screen_shares_image_and_style_tables() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // Upload an image and a style on main.
+        let upload = upload_raw_2x2("logo");
+        let mut style_body = Writer::new();
+        style_body.str("accent");
+        style_body.u8(STYLE_FLAT);
+        style_body.u8(COLOR_RGBA8888);
+        style_body.u8(0xFF);
+        style_body.u8(0x00);
+        style_body.u8(0x00);
+        style_body.u8(0xFF);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload);
+        append_command(&mut frames, CMD_SET_GLOBAL_STYLE, 2, &style_body.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        // Switch to alt — image + style still resolvable.
+        engine.state.enter_alt_screen();
+        assert!(engine.state.shared.images.contains_key("logo"));
+        assert!(engine.state.shared.styles.contains_key("accent"));
+
+        // Drop image while on alt; main shouldn't see it on return either.
+        let mut drop_body = Writer::new();
+        drop_body.str("logo");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_DROP_IMAGE, 3, &drop_body.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(!engine.state.shared.images.contains_key("logo"));
+        engine.state.leave_alt_screen();
+        assert!(!engine.state.shared.images.contains_key("logo"));
+    }
+
+    // --- §5.6 reset tests ---
+
+    #[test]
+    fn ris_wipes_state() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let upload = upload_raw_2x2("logo");
+        let mut style_body = Writer::new();
+        style_body.str("a");
+        style_body.u8(STYLE_FLAT);
+        style_body.u8(COLOR_RGBA8888);
+        style_body.u8(0xFF);
+        style_body.u8(0x00);
+        style_body.u8(0x00);
+        style_body.u8(0xFF);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload);
+        append_command(&mut frames, CMD_SET_GLOBAL_STYLE, 2, &style_body.buf);
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_with_tree("el", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert_eq!(engine.state.elements().len(), 1);
+        assert_eq!(engine.state.shared.images.len(), 1);
+        assert_eq!(engine.state.shared.styles.len(), 1);
+
+        // Now feed RIS as a raw byte stream. Engine sees the event and
+        // wipes itself.
+        engine.process_pty_chunk(b"\x1bc");
+        assert!(engine.state.elements().is_empty());
+        assert!(engine.state.shared.images.is_empty());
+        assert!(engine.state.shared.styles.is_empty());
+        assert!(!engine.state.on_alt());
+    }
+
+    #[test]
+    fn decstr_wipes_state() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("el", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(!engine.state.elements().is_empty());
+
+        engine.process_pty_chunk(b"\x1b[!p");
+        assert!(engine.state.elements().is_empty());
+    }
+
+    #[test]
+    fn reset_while_on_alt_returns_to_main() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.state.enter_alt_screen();
+        assert!(engine.state.on_alt());
+        engine.process_pty_chunk(b"\x1bc");
+        assert!(!engine.state.on_alt());
     }
 }
 

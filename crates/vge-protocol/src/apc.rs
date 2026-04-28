@@ -1,9 +1,14 @@
-// Streaming APC envelope extractor (§1.1–1.3).
+// Streaming APC envelope extractor (§1.1–1.3) plus side-channel
+// observation of a few VT control sequences relevant to VGE state
+// (resets, §5.6).
 //
 // Splits the PTY byte stream into:
 //   * `passthrough`: bytes destined for the regular VT parser.
 //   * `payloads`:    one Vec<u8> per fully-received VGE APC envelope, with
 //                    byte-stuffing already reversed.
+//   * `events`:      observational notifications about VT sequences seen
+//                    in the stream (e.g. RIS, DECSTR). Bytes still pass
+//                    through to vt100 unchanged.
 //
 // Non-VGE APC sequences (e.g. iTerm-style `ESC _G...`) pass through verbatim
 // so the underlying VT parser can still handle them. A VGE envelope is
@@ -12,6 +17,21 @@
 // receive, so we never match it here).
 
 use super::frame::{APC_OPEN, ESC, MARKER_C2T, ST_CLOSE};
+
+/// Side-channel events extracted from the byte stream while it flows
+/// past us toward vt100. The bytes themselves still pass through; these
+/// just notify the engine of state transitions worth reacting to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// `ESC c` — full reset (§5.6 RIS). VGE state must wipe.
+    HardReset,
+    /// `ESC [ ! p` — DECSTR soft reset (§5.6). VGE state must wipe.
+    SoftReset,
+}
+
+/// Cap on CSI body length we'll buffer for matching. Long sequences
+/// (mostly mode set/reset chains) past this just reset the observer.
+const CSI_BUF_CAP: usize = 32;
 
 #[derive(Debug)]
 enum State {
@@ -33,6 +53,10 @@ enum State {
     /// Saw 0x1B inside `ApcOther`; the next byte decides whether ST closes
     /// the envelope.
     ApcOtherEsc,
+    /// Inside an `ESC [` CSI sequence. Bytes pass through; we observe to
+    /// detect specific finalizers (DECSTR right now). `buf` holds the
+    /// parameter / intermediate bytes seen so far.
+    Csi { buf: Vec<u8> },
 }
 
 pub struct ApcStream {
@@ -50,6 +74,8 @@ pub struct Output {
     pub passthrough: Vec<u8>,
     /// Fully-received, un-stuffed VGE payloads (one per envelope).
     pub payloads: Vec<Vec<u8>>,
+    /// Side-channel events observed in the stream.
+    pub events: Vec<TerminalEvent>,
 }
 
 impl Output {
@@ -104,17 +130,35 @@ impl ApcStream {
                 APC_OPEN => State::ApcPrefix {
                     marker_buf: Vec::with_capacity(3),
                 },
-                _ => {
-                    // Not APC — emit the deferred ESC + this byte and return
-                    // to Idle. (Other ESC-led sequences are vt100's problem.)
+                b'[' => {
+                    // CSI start — ESC + [ go to vt100, we observe the
+                    // body for DECSTR.
                     out.push_pass(ESC);
-                    if b == ESC {
-                        // Two ESCs in a row: hold the second as pending again.
-                        State::EscPending
-                    } else {
-                        out.push_pass(b);
-                        State::Idle
+                    out.push_pass(b'[');
+                    State::Csi {
+                        buf: Vec::with_capacity(8),
                     }
+                }
+                b'c' => {
+                    // RIS — full terminal reset (§5.6).
+                    out.push_pass(ESC);
+                    out.push_pass(b'c');
+                    out.events.push(TerminalEvent::HardReset);
+                    State::Idle
+                }
+                ESC => {
+                    // Two ESCs in a row: emit the deferred ESC and hold
+                    // the second as pending again.
+                    out.push_pass(ESC);
+                    State::EscPending
+                }
+                _ => {
+                    // Not APC, not CSI, not RIS — emit the deferred ESC
+                    // + this byte. Other ESC-led sequences are vt100's
+                    // problem.
+                    out.push_pass(ESC);
+                    out.push_pass(b);
+                    State::Idle
                 }
             },
             State::ApcPrefix { mut marker_buf } => {
@@ -183,6 +227,28 @@ impl ApcStream {
                     State::Idle
                 }
             },
+            State::Csi { mut buf } => {
+                out.push_pass(b);
+                // Final byte? CSI finals are 0x40..=0x7E.
+                if (0x40..=0x7E).contains(&b) {
+                    // DECSTR is `ESC [ ! p` — no params, single
+                    // intermediate `!`, final `p`.
+                    if buf.as_slice() == b"!" && b == b'p' {
+                        out.events.push(TerminalEvent::SoftReset);
+                    }
+                    State::Idle
+                } else {
+                    buf.push(b);
+                    if buf.len() > CSI_BUF_CAP {
+                        // Pathological / unrecognised — give up on
+                        // matching but keep passing bytes until we hit
+                        // a final.
+                        State::Csi { buf: Vec::new() }
+                    } else {
+                        State::Csi { buf }
+                    }
+                }
+            }
         };
     }
 }
@@ -272,5 +338,61 @@ mod tests {
         assert_eq!(out.payloads.len(), 2);
         assert_eq!(&out.payloads[0], b"one");
         assert_eq!(&out.payloads[1], b"two");
+    }
+
+    #[test]
+    fn ris_emits_hard_reset_event_and_passes_through() {
+        let mut s = ApcStream::new();
+        let out = s.feed(&[ESC, b'c']);
+        assert_eq!(out.passthrough, vec![ESC, b'c']);
+        assert_eq!(out.events, vec![TerminalEvent::HardReset]);
+        assert!(out.payloads.is_empty());
+    }
+
+    #[test]
+    fn decstr_emits_soft_reset_event_and_passes_through() {
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[!p");
+        assert_eq!(out.passthrough, b"\x1b[!p");
+        assert_eq!(out.events, vec![TerminalEvent::SoftReset]);
+        assert!(out.payloads.is_empty());
+    }
+
+    #[test]
+    fn other_csi_passes_through_without_events() {
+        let mut s = ApcStream::new();
+        // CSI cursor home + a private-mode set; no VGE-relevant events.
+        let out = s.feed(b"\x1b[H\x1b[?1049h");
+        assert_eq!(out.passthrough, b"\x1b[H\x1b[?1049h");
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn ris_split_across_chunks() {
+        let mut s = ApcStream::new();
+        let mut all = Output::default();
+        for chunk in &[&b"\x1b"[..], &b"c"[..]] {
+            let o = s.feed(chunk);
+            all.passthrough.extend(o.passthrough);
+            all.events.extend(o.events);
+        }
+        assert_eq!(all.passthrough, b"\x1bc");
+        assert_eq!(all.events, vec![TerminalEvent::HardReset]);
+    }
+
+    #[test]
+    fn decstr_split_across_chunks() {
+        let bytes = b"\x1b[!p";
+        for split in 1..bytes.len() {
+            let mut s = ApcStream::new();
+            let mut all = Output::default();
+            for chunk in &[&bytes[..split], &bytes[split..]] {
+                let o = s.feed(chunk);
+                all.passthrough.extend(o.passthrough);
+                all.events.extend(o.events);
+            }
+            assert_eq!(all.passthrough, bytes, "split {split}");
+            assert_eq!(all.events, vec![TerminalEvent::SoftReset], "split {split}");
+        }
     }
 }

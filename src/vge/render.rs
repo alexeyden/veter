@@ -292,8 +292,8 @@ fn render_element<T: Renderer>(
             canvas,
             renderer,
             cmd,
-            &state.styles,
-            &state.images,
+            &state.shared.styles,
+            &state.shared.images,
             ox,
             oy,
             cell_w,
@@ -313,7 +313,7 @@ fn render_element<T: Renderer>(
 /// can't be referenced as parent by anyone).
 fn element_storage_key(state: &VgeState, el: &super::state::Element) -> Option<String> {
     if let Some(id) = &el.id
-        && state.elements.contains_key(id)
+        && state.elements().contains_key(id)
     {
         return Some(id.clone());
     }
