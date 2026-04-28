@@ -22,6 +22,7 @@ pub const CMD_UPDATE_DRAW_ORDER: u8 = 0x0B;
 pub const CMD_UPLOAD_IMAGE: u8 = 0x0C;
 pub const CMD_DROP_IMAGE: u8 = 0x0D;
 pub const CMD_CLEAR_ALL: u8 = 0x0E;
+pub const CMD_UPDATE_SIZE: u8 = 0x0F;
 
 // §4 response codes
 pub const RSP_OK: u8 = 0x01;
@@ -43,6 +44,7 @@ pub const ERR_IMAGE_TOO_LARGE: u16 = 0x0031;
 pub const ERR_IMAGE_DECODE: u16 = 0x0032;
 pub const ERR_DUPLICATE_IMAGE_ID: u16 = 0x0033;
 pub const ERR_TOO_MANY_IMAGES: u16 = 0x0034;
+pub const ERR_MAX_NESTING_DEPTH: u16 = 0x0040;
 pub const ERR_INTERNAL: u16 = 0x00FF;
 
 // §7.1 draw command opcodes

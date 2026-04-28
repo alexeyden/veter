@@ -14,6 +14,7 @@ use vge_protocol::command::{
     self, Command, ConcreteStyle, CreateElementBody, DrawCmd, UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
+use vge_protocol::codec::Point as ProtoPoint;
 use vge_protocol::envelope::{append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ProbeBody};
 use vge_protocol::frame::*;
 
@@ -25,12 +26,12 @@ pub struct Limits {
     pub max_image_bytes: u32,
     pub max_images: u32,
     pub supported_image_encodings: u8,
+    pub max_nesting_depth: u8,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        // Recommended budget (spec §10). Phase III now actually
-        // implements images, so the image fields are no longer zero.
+        // Recommended budget (spec §10).
         Self {
             max_elements: 4096,
             max_commands_per_element: 4096,
@@ -38,6 +39,7 @@ impl Default for Limits {
             max_image_bytes: 32 * 1024 * 1024,
             max_images: 1024,
             supported_image_encodings: 0b11, // bit0 Raw, bit1 WebP
+            max_nesting_depth: 16,
         }
     }
 }
@@ -69,9 +71,22 @@ pub struct Element {
     #[allow(dead_code)]
     pub id: Option<String>,
     pub commands: Vec<DrawCmd>,
-    pub anchor_line: i64, // absolute scrollback line
-    pub sub_row: f32,
+    /// Storage key of the parent element, if any. None = top-level
+    /// (anchor_line / sub_row are meaningful). Some = child (origin_x /
+    /// origin_y are parent-relative; anchor_line is unused).
+    pub parent: Option<String>,
+    /// Storage keys of direct children, in creation order. Maintained
+    /// alongside `parent` so subtree traversal doesn't have to scan
+    /// the whole element table.
+    pub children: Vec<String>,
+    /// Clip rect size (§9.2). If `Some`, descendants and the element's
+    /// own commands are clipped to the rect at
+    /// `(origin, origin + size)` in the element's coordinate space.
+    pub clip_size: Option<ProtoPoint>,
+    pub anchor_line: i64, // absolute scrollback line (top-level only)
+    pub sub_row: f32,     // top-level only
     pub origin_x: f32,
+    pub origin_y: f32, // for child elements; for top-level, redundant with sub_row
     pub is_visible: bool,
     pub draw_order: i32,
     pub creation_seq: u64,
@@ -115,9 +130,30 @@ impl VgeState {
         format!("\0anon\0{n}")
     }
 
-    /// Iterate elements in render order: ascending (draw_order, creation_seq).
-    pub fn render_sorted(&self) -> Vec<&Element> {
-        let mut v: Vec<&Element> = self.elements.values().collect();
+    /// Iterate top-level elements (parent: None) in render order:
+    /// ascending (draw_order, creation_seq). Children are walked
+    /// recursively from the renderer per §9.8.
+    pub fn top_level_sorted(&self) -> Vec<&Element> {
+        let mut v: Vec<&Element> = self
+            .elements
+            .values()
+            .filter(|e| e.parent.is_none())
+            .collect();
+        v.sort_by_key(|e| (e.draw_order, e.creation_seq));
+        v
+    }
+
+    /// Iterate the direct children of `parent_key` in render order.
+    pub fn children_sorted(&self, parent_key: &str) -> Vec<&Element> {
+        let parent = match self.elements.get(parent_key) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let mut v: Vec<&Element> = parent
+            .children
+            .iter()
+            .filter_map(|k| self.elements.get(k))
+            .collect();
         v.sort_by_key(|e| (e.draw_order, e.creation_seq));
         v
     }
@@ -337,9 +373,18 @@ impl VgeEngine {
         }
         let oldest_visible = self.line_tracker.top_of_live_screen
             - self.line_tracker.history_cap as i64;
-        self.state
+        // Eviction applies only to top-level elements. Their subtrees
+        // cascade.
+        let to_evict: Vec<String> = self
+            .state
             .elements
-            .retain(|_, e| e.anchor_line >= oldest_visible);
+            .iter()
+            .filter(|(_, e)| e.parent.is_none() && e.anchor_line < oldest_visible)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in to_evict {
+            self.delete_subtree(&key);
+        }
     }
 
     fn handle_envelope_payload(&mut self, payload: &[u8]) {
@@ -450,6 +495,7 @@ impl VgeEngine {
                     max_image_bytes: self.limits.max_image_bytes,
                     max_images: self.limits.max_images,
                     supported_image_encodings: self.limits.supported_image_encodings,
+                    max_nesting_depth: self.limits.max_nesting_depth,
                 };
                 Ok(pb.encode())
             }
@@ -473,7 +519,30 @@ impl VgeEngine {
             Command::UploadImage(b) => self.cmd_upload_image(b),
             Command::DropImage { id } => self.cmd_drop_image(&id),
             Command::UpdateImage(b) => self.cmd_update_image(b),
+            Command::UpdateSize { id, new_size } => self.cmd_update_size(&id, new_size),
         }
+    }
+
+    fn cmd_update_size(
+        &mut self,
+        id: &str,
+        new_size: ProtoPoint,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        if id.is_empty() {
+            return Err((ERR_BAD_PAYLOAD, "empty id"));
+        }
+        if !new_size.x.is_finite() || !new_size.y.is_finite()
+            || new_size.x < 0.0 || new_size.y < 0.0
+        {
+            return Err((ERR_BAD_PAYLOAD, "size must be finite and non-negative"));
+        }
+        let el = self
+            .state
+            .elements
+            .get_mut(id)
+            .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
+        el.clip_size = Some(new_size);
+        Ok(Vec::new())
     }
 
     fn cmd_set_global_style(
@@ -602,7 +671,18 @@ impl VgeEngine {
         }
         self.validate_commands(&b.commands)?;
 
-        let (anchor, sub) = self.anchor_from_origin(b.origin);
+        // §9.4 — validate parent and depth before mutating state.
+        if let Some(parent_id) = &b.parent {
+            if !self.state.elements.contains_key(parent_id) {
+                return Err((ERR_UNKNOWN_ELEMENT, "parent_id not found"));
+            }
+            // depth = parent's depth + 1
+            let parent_depth = self.depth_of(parent_id);
+            if parent_depth + 1 >= self.limits.max_nesting_depth as usize {
+                return Err((ERR_MAX_NESTING_DEPTH, "would exceed max_nesting_depth"));
+            }
+        }
+
         let key = if b.id.is_empty() {
             self.state.anonymous_key()
         } else {
@@ -610,20 +690,62 @@ impl VgeEngine {
         };
         let id_field = if b.id.is_empty() { None } else { Some(b.id) };
         let seq = self.state.next_seq();
+
+        // For top-level elements, anchor to scrollback. For children,
+        // store origin verbatim (parent-relative).
+        let (anchor, sub) = if b.parent.is_none() {
+            self.anchor_from_origin(b.origin)
+        } else {
+            (0, 0.0)
+        };
+
         self.state.elements.insert(
-            key,
+            key.clone(),
             Element {
                 id: id_field,
                 commands: b.commands,
+                parent: b.parent.clone(),
+                children: Vec::new(),
+                clip_size: b.size,
                 anchor_line: anchor,
                 sub_row: sub,
                 origin_x: b.origin.x,
+                origin_y: b.origin.y,
                 is_visible: b.is_visible,
                 draw_order: b.draw_order,
                 creation_seq: seq,
             },
         );
+
+        // Register with parent's children list.
+        if let Some(parent_id) = &b.parent
+            && let Some(parent) = self.state.elements.get_mut(parent_id)
+        {
+            parent.children.push(key);
+        }
+
         Ok(Vec::new())
+    }
+
+    /// Walk the parent chain to compute an element's depth. Top-level
+    /// elements return 0. Bounded by `max_nesting_depth` (so worst-case
+    /// O(16)).
+    fn depth_of(&self, id: &str) -> usize {
+        let mut depth = 0usize;
+        let mut cur = id.to_owned();
+        while let Some(el) = self.state.elements.get(&cur) {
+            match &el.parent {
+                Some(p) => {
+                    depth += 1;
+                    cur = p.clone();
+                }
+                None => break,
+            }
+            if depth > self.limits.max_nesting_depth as usize {
+                break; // safety against cycles (shouldn't be possible)
+            }
+        }
+        depth
     }
 
     fn anchor_from_origin(&self, origin: Point) -> (i64, f32) {
@@ -638,10 +760,32 @@ impl VgeEngine {
         if id.is_empty() {
             return Err((ERR_BAD_PAYLOAD, "empty id"));
         }
-        if self.state.elements.remove(id).is_none() {
+        if !self.state.elements.contains_key(id) {
             return Err((ERR_UNKNOWN_ELEMENT, "id not found"));
         }
+        // Detach from parent's children list, then cascade.
+        let parent_key = self.state.elements.get(id).and_then(|e| e.parent.clone());
+        if let Some(p) = parent_key
+            && let Some(parent) = self.state.elements.get_mut(&p)
+        {
+            parent.children.retain(|c| c != id);
+        }
+        self.delete_subtree(id);
         Ok(Vec::new())
+    }
+
+    /// Remove `id` and all its descendants from the element table.
+    /// Queues GPU image handles for deletion if any descendant held one
+    /// (currently only DrawImage references images, but images live in
+    /// the shared image table — element deletion does not free them).
+    fn delete_subtree(&mut self, id: &str) {
+        let el = match self.state.elements.remove(id) {
+            Some(e) => e,
+            None => return,
+        };
+        for child in el.children {
+            self.delete_subtree(&child);
+        }
     }
 
     fn cmd_update_commands(
@@ -733,15 +877,25 @@ impl VgeEngine {
         id: &str,
         origin: Point,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
-        let (anchor, sub) = self.anchor_from_origin(origin);
-        let el = self
+        let is_top_level = self
             .state
             .elements
-            .get_mut(id)
+            .get(id)
+            .map(|e| e.parent.is_none())
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
+        // Re-anchor only for top-level elements (origin.y is
+        // scrollback-relative); for children, origin is parent-relative
+        // and stored verbatim.
+        let (anchor, sub) = if is_top_level {
+            self.anchor_from_origin(origin)
+        } else {
+            (0, 0.0)
+        };
+        let el = self.state.elements.get_mut(id).unwrap();
         el.anchor_line = anchor;
         el.sub_row = sub;
         el.origin_x = origin.x;
+        el.origin_y = origin.y;
         Ok(Vec::new())
     }
 
@@ -851,7 +1005,7 @@ mod tests {
         let _payload_len = r.u32().unwrap();
         assert_eq!(r.u8().unwrap(), RSP_PROBE);
         assert_eq!(r.u32().unwrap(), 7); // request_id echoed
-        assert_eq!(r.u32().unwrap(), 31); // body_len for ProbeBody
+        assert_eq!(r.u32().unwrap(), 32); // body_len for ProbeBody (incl. max_nesting_depth)
     }
 
     #[test]
@@ -1322,6 +1476,212 @@ mod tests {
         // Render-time fallback to magenta is GUI-only and not asserted here.
         assert!(engine.state.elements.contains_key("widget"));
         assert!(!engine.state.images.contains_key("logo"));
+    }
+
+    /// Build a v2-layout `CreateElement` body with `extra_flags`.
+    /// `parent` and `size` are the optional pieces; pass None to skip.
+    fn create_with_tree(
+        id: &str,
+        origin: (f32, f32),
+        parent: Option<&str>,
+        size: Option<(f32, f32)>,
+    ) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.varu(0); // n_commands = 0 (bare grouping element)
+        w.f32(origin.0);
+        w.f32(origin.1);
+        w.u8(1); // is_visible
+        for b in 0i32.to_le_bytes() {
+            w.u8(b);
+        }
+        if parent.is_some() || size.is_some() {
+            let mut flags: u8 = 0;
+            if parent.is_some() {
+                flags |= 0b01;
+            }
+            if size.is_some() {
+                flags |= 0b10;
+            }
+            w.u8(flags);
+            if let Some(p) = parent {
+                w.str(p);
+            }
+            if let Some((sx, sy)) = size {
+                w.f32(sx);
+                w.f32(sy);
+            }
+        }
+        w.buf
+    }
+
+    #[test]
+    fn create_child_element_succeeds() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("root", (0.0, 0.0), None, Some((40.0, 10.0))),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_with_tree("child", (3.0, 2.0), Some("root"), None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements.contains_key("root"));
+        assert!(engine.state.elements.contains_key("child"));
+        assert_eq!(engine.state.elements["root"].children, vec!["child".to_string()]);
+        assert_eq!(engine.state.elements["child"].parent.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn create_with_unknown_parent_atomically_fails() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("orphan", (0.0, 0.0), Some("does-not-exist"), None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements.is_empty());
+        let response = engine.take_responses();
+        let payload = unwrap_t2c_envelope(&response);
+        let mut r = Reader::new(&payload);
+        let _ = r.u8();
+        let _ = r.u32();
+        assert_eq!(r.u8().unwrap(), RSP_ERR);
+        let _ = r.u32();
+        let body_len = r.u32().unwrap() as usize;
+        let err_body = r.take(body_len).unwrap();
+        let mut er = Reader::new(err_body);
+        assert_eq!(er.u16().unwrap(), ERR_UNKNOWN_ELEMENT);
+    }
+
+    #[test]
+    fn delete_parent_cascades_to_children() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("root", (0.0, 0.0), None, None),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_with_tree("c1", (0.0, 0.0), Some("root"), None),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_with_tree("c2", (0.0, 0.0), Some("root"), None),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            4,
+            &create_with_tree("gc", (0.0, 0.0), Some("c1"), None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert_eq!(engine.state.elements.len(), 4);
+
+        let mut del = Writer::new();
+        del.str("root");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_DELETE_ELEMENT, 5, &del.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements.is_empty());
+    }
+
+    #[test]
+    fn nesting_depth_cap_enforced() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // Depth limit = 16 by default. Build a chain of 16 elements
+        // (e0 → e1 → … → e15), then attempt e16, which should fail.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            0,
+            &create_with_tree("e0", (0.0, 0.0), None, None),
+        );
+        for i in 1..16 {
+            let id = format!("e{i}");
+            let parent = format!("e{}", i - 1);
+            append_command(
+                &mut frames,
+                CMD_CREATE_ELEMENT,
+                i as u32,
+                &create_with_tree(&id, (0.0, 0.0), Some(&parent), None),
+            );
+        }
+        // 16th level child should be rejected.
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            16,
+            &create_with_tree("e16", (0.0, 0.0), Some("e15"), None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements.contains_key("e15"));
+        assert!(!engine.state.elements.contains_key("e16"));
+        // Last response must be err_max_nesting_depth.
+        let response = engine.take_responses();
+        let payload = unwrap_t2c_envelope(&response);
+        // Walk all 17 frames; the last is the failure.
+        let mut r = Reader::new(&payload);
+        let _ = r.u8();
+        let _ = r.u32();
+        let mut last_was_err_depth = false;
+        while !r.at_end() {
+            let ty = r.u8().unwrap();
+            let _ = r.u32();
+            let body_len = r.u32().unwrap() as usize;
+            let body = r.take(body_len).unwrap();
+            if ty == RSP_ERR {
+                let mut er = Reader::new(body);
+                if er.u16().unwrap() == ERR_MAX_NESTING_DEPTH {
+                    last_was_err_depth = true;
+                }
+            }
+        }
+        assert!(last_was_err_depth);
+    }
+
+    #[test]
+    fn update_size_sets_clip() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("widget", (0.0, 0.0), None, None),
+        );
+        // Element starts with no clip.
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements["widget"].clip_size.is_none());
+
+        // UpdateSize sets it.
+        let mut body = Writer::new();
+        body.str("widget");
+        body.f32(40.0);
+        body.f32(10.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPDATE_SIZE, 2, &body.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let sz = engine.state.elements["widget"].clip_size.unwrap();
+        assert_eq!(sz.x, 40.0);
+        assert_eq!(sz.y, 10.0);
     }
 }
 

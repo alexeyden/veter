@@ -133,6 +133,26 @@ enum Cmd {
         #[arg(long)]
         image: String,
     },
+
+    /// CreateElement with no draw commands (a bare grouping/clip element,
+    /// §9.1). Useful as the parent of a 2-level scrolling-viewport pattern.
+    CreateGroup {
+        id: String,
+        /// Element origin "x,y" in cell units.
+        #[arg(long = "at", value_parser = parse_point, default_value = "0,0")]
+        at: Point,
+        #[arg(long, default_value_t = 0)]
+        draw_order: i32,
+        #[command(flatten)]
+        tree: ParentArgs,
+    },
+
+    /// Set or update an element's clip rect size (§9.5).
+    UpdateSize {
+        id: String,
+        #[arg(long, value_parser = parse_point)]
+        size: Point,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -170,6 +190,20 @@ impl StyleArgs {
     }
 }
 
+/// Shared parent / clip arguments (§9.4).
+#[derive(Debug, clap::Args, Clone)]
+struct ParentArgs {
+    /// Parent element id. The parent must exist when this command is
+    /// processed (§9.1).
+    #[arg(long)]
+    parent: Option<String>,
+
+    /// Clip rect size "w,h" in cell units; if set, anything inside the
+    /// element is clipped to (origin, origin + size). See §9.2.
+    #[arg(long = "clip", value_parser = parse_point)]
+    clip_size: Option<Point>,
+}
+
 #[derive(Debug, clap::Args)]
 struct SetStyleArgs {
     id: String,
@@ -198,6 +232,8 @@ struct CreateRectArgs {
     draw_order: i32,
     #[command(flatten)]
     style: StyleArgs,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -220,6 +256,8 @@ struct CreateTextArgs {
     draw_order: i32,
     #[command(flatten)]
     style: StyleArgs,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -234,6 +272,8 @@ struct FillPolygonArgs {
     draw_order: i32,
     #[command(flatten)]
     style: StyleArgs,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -250,6 +290,8 @@ struct DrawLinesArgs {
     draw_order: i32,
     #[command(flatten)]
     style: StyleArgs,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -266,6 +308,8 @@ struct DrawLineStripArgs {
     draw_order: i32,
     #[command(flatten)]
     style: StyleArgs,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -307,6 +351,8 @@ struct CreateImageArgs {
     offset: Point,
     #[arg(long, default_value_t = 0)]
     draw_order: i32,
+    #[command(flatten)]
+    tree: ParentArgs,
 }
 
 fn main() -> Result<()> {
@@ -604,6 +650,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::CreateText(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -617,6 +665,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::FillPolygon(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -627,6 +677,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::DrawLines(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -638,6 +690,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::DrawLineStrip(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -649,6 +703,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::UploadRaw(a) => {
             let data = std::fs::read(&a.file)
@@ -698,12 +754,29 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             origin: a.at,
             is_visible: true,
             draw_order: a.draw_order,
+            parent: a.tree.parent,
+            size: a.tree.clip_size,
         }),
         Cmd::UpdateImage { id, index, image } => Command::UpdateImage(UpdateImageBody {
             id,
             command_index: index as usize,
             new_image_id: image,
         }),
+        Cmd::CreateGroup {
+            id,
+            at,
+            draw_order,
+            tree,
+        } => Command::CreateElement(CreateElementBody {
+            id,
+            commands: vec![],
+            origin: at,
+            is_visible: true,
+            draw_order,
+            parent: tree.parent,
+            size: tree.clip_size,
+        }),
+        Cmd::UpdateSize { id, size } => Command::UpdateSize { id, new_size: size },
     })
 }
 

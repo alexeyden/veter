@@ -31,6 +31,7 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::UploadImage(_) => CMD_UPLOAD_IMAGE,
         Command::DropImage { .. } => CMD_DROP_IMAGE,
         Command::UpdateImage(_) => CMD_UPDATE_IMAGE,
+        Command::UpdateSize { .. } => CMD_UPDATE_SIZE,
     }
 }
 
@@ -66,6 +67,10 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::UploadImage(b) => write_upload_image(&mut w, b),
         Command::DropImage { id } => w.str(id),
         Command::UpdateImage(b) => write_update_image(&mut w, b),
+        Command::UpdateSize { id, new_size } => {
+            w.str(id);
+            write_point(&mut w, *new_size);
+        }
     }
     w.buf
 }
@@ -390,6 +395,26 @@ fn write_create_element(w: &mut Writer, b: &CreateElementBody) {
     for byte in b.draw_order.to_le_bytes() {
         w.u8(byte);
     }
+    // §9.4 trailing block. Emit only if at least one optional field is
+    // present, so v1-style bodies stay backwards-compatible on the wire.
+    let has_parent = b.parent.is_some();
+    let has_size = b.size.is_some();
+    if has_parent || has_size {
+        let mut flags: u8 = 0;
+        if has_parent {
+            flags |= 0b01;
+        }
+        if has_size {
+            flags |= 0b10;
+        }
+        w.u8(flags);
+        if let Some(p) = &b.parent {
+            w.str(p);
+        }
+        if let Some(sz) = &b.size {
+            write_point(w, *sz);
+        }
+    }
 }
 
 fn write_update_commands(w: &mut Writer, b: &UpdateCommandsBody) {
@@ -470,6 +495,8 @@ mod tests {
             origin: Point { x: 5.0, y: 3.0 },
             is_visible: true,
             draw_order: 0,
+            parent: None,
+            size: None,
         }));
     }
 
@@ -487,6 +514,8 @@ mod tests {
             origin: Point { x: 10.0, y: 4.0 },
             is_visible: true,
             draw_order: 1,
+            parent: None,
+            size: None,
         }));
     }
 
@@ -515,6 +544,8 @@ mod tests {
             origin: Point { x: 0.0, y: 0.0 },
             is_visible: true,
             draw_order: 0,
+            parent: None,
+            size: None,
         }));
     }
 
@@ -542,6 +573,8 @@ mod tests {
             origin: Point { x: 0.0, y: 0.0 },
             is_visible: true,
             draw_order: 0,
+            parent: None,
+            size: None,
         }));
     }
 
@@ -595,6 +628,53 @@ mod tests {
     }
 
     #[test]
+    fn create_element_with_parent_and_clip_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "scrollable".into(),
+            commands: vec![],
+            origin: Point { x: 5.0, y: 3.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: Some("root".into()),
+            size: Some(Point { x: 40.0, y: 12.0 }),
+        }));
+    }
+
+    #[test]
+    fn create_element_parent_only_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "child".into(),
+            commands: vec![],
+            origin: Point { x: 0.0, y: 0.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: Some("parent".into()),
+            size: None,
+        }));
+    }
+
+    #[test]
+    fn create_element_size_only_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "viewport".into(),
+            commands: vec![],
+            origin: Point { x: 0.0, y: 0.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: None,
+            size: Some(Point { x: 80.0, y: 24.0 }),
+        }));
+    }
+
+    #[test]
+    fn update_size_roundtrip() {
+        roundtrip(Command::UpdateSize {
+            id: "viewport".into(),
+            new_size: Point { x: 50.0, y: 10.0 },
+        });
+    }
+
+    #[test]
     fn create_element_with_draw_image_roundtrip() {
         roundtrip(Command::CreateElement(CreateElementBody {
             id: "pic".into(),
@@ -610,6 +690,8 @@ mod tests {
             origin: Point { x: 5.0, y: 3.0 },
             is_visible: true,
             draw_order: 0,
+            parent: None,
+            size: None,
         }));
     }
 

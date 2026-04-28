@@ -199,50 +199,129 @@ fn stroke_paint(base: Paint, line_width_px: f32) -> Paint {
 
 /// Render every VGE element to `canvas`, anchored to the live screen via
 /// `top_of_live_screen` and clipped to the visible viewport.
+///
+/// Renders the element tree depth-first per §9.8: each top-level
+/// element in (draw_order, creation_seq) order; for each element, its
+/// children render first (recursively), then the element's own
+/// commands ON TOP, all inside the element's clip rect (if any).
 pub fn render_elements<T: Renderer>(
     canvas: &mut Canvas<T>,
     renderer: &mut TerminalRenderer,
     state: &VgeState,
     top_of_live_screen: i64,
     screen_rows: u16,
-    screen_cols: u16,
+    _screen_cols: u16,
     scrollback: usize,
 ) {
     let cell_w = renderer.cell_width;
     let cell_h = renderer.cell_height;
     let stroke_scale = (cell_w + cell_h) * 0.5;
-
     let visible_top = top_of_live_screen - scrollback as i64;
     let max_row = screen_rows as f32;
 
-    for el in state.render_sorted() {
+    for el in state.top_level_sorted() {
         if !el.is_visible {
             continue;
         }
         let row_f = (el.anchor_line - visible_top) as f32 + el.sub_row;
-        if row_f < -64.0 || row_f > max_row + 64.0 {
+        // Quick reject for far-off-screen top-level subtrees.
+        if row_f < -1024.0 || row_f > max_row + 1024.0 {
             continue;
         }
-
         let ox = el.origin_x * cell_w;
         let oy = row_f * cell_h;
-        let _ = screen_cols;
+        render_element(
+            canvas,
+            renderer,
+            state,
+            el,
+            ox,
+            oy,
+            cell_w,
+            cell_h,
+            stroke_scale,
+        );
+    }
+}
 
-        for cmd in &el.commands {
-            render_cmd(
+#[allow(clippy::too_many_arguments)]
+fn render_element<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    renderer: &mut TerminalRenderer,
+    state: &VgeState,
+    el: &super::state::Element,
+    ox: f32,
+    oy: f32,
+    cell_w: f32,
+    cell_h: f32,
+    stroke_scale: f32,
+) {
+    if !el.is_visible {
+        return;
+    }
+    canvas.save();
+    if let Some(size) = el.clip_size {
+        canvas.intersect_scissor(ox, oy, size.x * cell_w, size.y * cell_h);
+    }
+
+    // Children first, in (draw_order, creation_seq) order.
+    let key = element_storage_key(state, el);
+    if let Some(k) = key.as_deref() {
+        for child in state.children_sorted(k) {
+            // Child origins are parent-relative; child-of-child computes
+            // the same way recursively.
+            let child_ox = ox + child.origin_x * cell_w;
+            let child_oy = oy + child.origin_y * cell_h;
+            render_element(
                 canvas,
                 renderer,
-                cmd,
-                &state.styles,
-                &state.images,
-                ox,
-                oy,
+                state,
+                child,
+                child_ox,
+                child_oy,
                 cell_w,
                 cell_h,
                 stroke_scale,
             );
         }
     }
+
+    // Element's own commands render ON TOP of children (§9.2).
+    for cmd in &el.commands {
+        render_cmd(
+            canvas,
+            renderer,
+            cmd,
+            &state.styles,
+            &state.images,
+            ox,
+            oy,
+            cell_w,
+            cell_h,
+            stroke_scale,
+        );
+    }
+
+    canvas.restore();
+}
+
+/// Recover the storage key under which `el` lives in the element table.
+/// Named elements use their id as key; anonymous elements use a synthetic
+/// key. Since anonymous elements can't be parents, we look up by id when
+/// known and otherwise scan (only needed for anonymous elements with
+/// children, which the protocol doesn't permit — anonymous elements
+/// can't be referenced as parent by anyone).
+fn element_storage_key(state: &VgeState, el: &super::state::Element) -> Option<String> {
+    if let Some(id) = &el.id
+        && state.elements.contains_key(id)
+    {
+        return Some(id.clone());
+    }
+    // Anonymous: walk the table to find the matching reference. This is
+    // only reached when an anonymous element is rendered, which means it
+    // has no children to look up — so we can safely return None and skip
+    // the children pass.
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

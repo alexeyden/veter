@@ -16,6 +16,8 @@ pub struct ProbeBody {
     pub max_image_bytes: u32,
     pub max_images: u32,
     pub supported_image_encodings: u8,
+    /// Parent-child nesting cap (§9.7). 0 means parenting unsupported.
+    pub max_nesting_depth: u8,
 }
 
 impl ProbeBody {
@@ -31,6 +33,7 @@ impl ProbeBody {
         w.u32(self.max_image_bytes);
         w.u32(self.max_images);
         w.u8(self.supported_image_encodings);
+        w.u8(self.max_nesting_depth);
         w.buf
     }
 }
@@ -104,8 +107,9 @@ mod tests {
             max_image_bytes: 0,
             max_images: 0,
             supported_image_encodings: 0,
+            max_nesting_depth: 16,
         };
-        assert_eq!(pb.encode().len(), 31);
+        assert_eq!(pb.encode().len(), 32);
     }
 
     #[test]

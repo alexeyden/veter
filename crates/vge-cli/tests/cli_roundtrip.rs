@@ -253,3 +253,70 @@ fn linear_gradient_round_trip() {
         _ => panic!("expected CreateElement"),
     }
 }
+
+#[test]
+fn create_group_with_parent_and_clip_round_trip() {
+    let env = run_cli(&[
+        "create-group",
+        "scrollable",
+        "--at",
+        "5,3",
+        "--parent",
+        "root",
+        "--clip",
+        "40,12",
+    ]);
+    let frames = parse_envelope(&env);
+    let (ty, _, body) = &frames[0];
+    let cmd = parse(*ty, body).unwrap();
+    match cmd {
+        Command::CreateElement(b) => {
+            assert_eq!(b.id, "scrollable");
+            assert!(b.commands.is_empty());
+            assert_eq!(b.parent.as_deref(), Some("root"));
+            let sz = b.size.expect("clip size");
+            assert_eq!(sz.x, 40.0);
+            assert_eq!(sz.y, 12.0);
+        }
+        _ => panic!("expected CreateElement"),
+    }
+}
+
+#[test]
+fn create_rect_with_parent_round_trip() {
+    let env = run_cli(&[
+        "create-rect",
+        "line-1",
+        "--at",
+        "0,0",
+        "--size",
+        "10,1",
+        "--color",
+        "ffffffff",
+        "--parent",
+        "content",
+    ]);
+    let frames = parse_envelope(&env);
+    let (ty, _, body) = &frames[0];
+    let cmd = parse(*ty, body).unwrap();
+    match cmd {
+        Command::CreateElement(b) => assert_eq!(b.parent.as_deref(), Some("content")),
+        _ => panic!("expected CreateElement"),
+    }
+}
+
+#[test]
+fn update_size_round_trip() {
+    let env = run_cli(&["update-size", "viewport", "--size", "30,8"]);
+    let frames = parse_envelope(&env);
+    let (ty, _, body) = &frames[0];
+    let cmd = parse(*ty, body).unwrap();
+    match cmd {
+        Command::UpdateSize { id, new_size } => {
+            assert_eq!(id, "viewport");
+            assert_eq!(new_size.x, 30.0);
+            assert_eq!(new_size.y, 8.0);
+        }
+        _ => panic!("expected UpdateSize"),
+    }
+}

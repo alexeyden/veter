@@ -203,6 +203,10 @@ pub struct CreateElementBody {
     pub origin: Point,
     pub is_visible: bool,
     pub draw_order: i32,
+    /// If `Some`, this element's parent ID (§9.1). MUST be non-empty.
+    pub parent: Option<String>,
+    /// If `Some`, this element has a clip rect (§9.2) of this size.
+    pub size: Option<Point>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +274,7 @@ pub enum Command {
     UploadImage(UploadImageBody),
     DropImage { id: String },
     UpdateImage(UpdateImageBody),
+    UpdateSize { id: String, new_size: Point },
 }
 
 const MAX_ID_BYTES: usize = 64;
@@ -553,6 +558,27 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             let origin = r.point()?;
             let is_visible = r.u8()? != 0;
             let draw_order = r.i32()?;
+            // §9.4 optional trailing block. Presence is decided strictly
+            // by remaining body bytes — old/v1 clients omit this entirely.
+            let mut parent: Option<String> = None;
+            let mut size: Option<Point> = None;
+            if !r.at_end() {
+                let extra_flags = r.u8()?;
+                // Reserved bits must be zero.
+                if extra_flags & !0b11 != 0 {
+                    return Err(ERR_BAD_PAYLOAD);
+                }
+                if extra_flags & 0b01 != 0 {
+                    parent = Some(read_id(&mut r, false)?);
+                }
+                if extra_flags & 0b10 != 0 {
+                    let p = r.point()?;
+                    if !p.x.is_finite() || !p.y.is_finite() || p.x < 0.0 || p.y < 0.0 {
+                        return Err(ERR_BAD_PAYLOAD);
+                    }
+                    size = Some(p);
+                }
+            }
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
             }
@@ -562,6 +588,8 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 origin,
                 is_visible,
                 draw_order,
+                parent,
+                size,
             }))
         }
         CMD_DELETE_ELEMENT => {
@@ -691,6 +719,19 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 command_index,
                 new_image_id,
             }))
+        }
+        CMD_UPDATE_SIZE => {
+            let id = read_id(&mut r, false)?;
+            let new_size = r.point()?;
+            if !new_size.x.is_finite() || !new_size.y.is_finite()
+                || new_size.x < 0.0 || new_size.y < 0.0
+            {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            if !r.at_end() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            Ok(Command::UpdateSize { id, new_size })
         }
         _ => Err(ERR_UNKNOWN_COMMAND),
     }
