@@ -27,6 +27,11 @@ pub enum TerminalEvent {
     HardReset,
     /// `ESC [ ! p` — DECSTR soft reset (§5.6). VGE state must wipe.
     SoftReset,
+    /// `ESC [ 6 n` — DSR cursor-position query. The host app must
+    /// reply with `ESC [ <row> ; <col> R`. vt100 parses but does not
+    /// reply, so the engine emits the response itself after vt100
+    /// finishes processing the chunk.
+    CursorPositionQuery,
 }
 
 /// Cap on CSI body length we'll buffer for matching. Long sequences
@@ -231,10 +236,13 @@ impl ApcStream {
                 out.push_pass(b);
                 // Final byte? CSI finals are 0x40..=0x7E.
                 if (0x40..=0x7E).contains(&b) {
-                    // DECSTR is `ESC [ ! p` — no params, single
-                    // intermediate `!`, final `p`.
+                    // DECSTR is `ESC [ ! p`.
                     if buf.as_slice() == b"!" && b == b'p' {
                         out.events.push(TerminalEvent::SoftReset);
+                    }
+                    // DSR cursor-position query is `ESC [ 6 n`.
+                    if buf.as_slice() == b"6" && b == b'n' {
+                        out.events.push(TerminalEvent::CursorPositionQuery);
                     }
                     State::Idle
                 } else {
@@ -355,6 +363,15 @@ mod tests {
         let out = s.feed(b"\x1b[!p");
         assert_eq!(out.passthrough, b"\x1b[!p");
         assert_eq!(out.events, vec![TerminalEvent::SoftReset]);
+        assert!(out.payloads.is_empty());
+    }
+
+    #[test]
+    fn dsr_cursor_query_emits_event_and_passes_through() {
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[6n");
+        assert_eq!(out.passthrough, b"\x1b[6n");
+        assert_eq!(out.events, vec![TerminalEvent::CursorPositionQuery]);
         assert!(out.payloads.is_empty());
     }
 

@@ -393,6 +393,11 @@ pub struct VgeEngine {
     /// but whose GPU resources still need releasing. The renderer drains
     /// this on each frame.
     pending_image_deletes: Vec<ImageId>,
+    /// Number of `\x1b[6n` DSR cursor-position queries seen in the
+    /// byte stream that haven't been answered yet. We need to wait
+    /// until vt100 has processed the chunk so the reply reflects
+    /// post-process cursor state.
+    pending_cursor_queries: u32,
 }
 
 impl VgeEngine {
@@ -406,6 +411,7 @@ impl VgeEngine {
             line_tracker: LineTracker::new(),
             pending_response_bytes: Vec::new(),
             pending_image_deletes: Vec::new(),
+            pending_cursor_queries: 0,
         }
     }
 
@@ -450,7 +456,7 @@ impl VgeEngine {
     }
 
     /// React to a side-channel terminal event observed in the byte
-    /// stream (currently: §5.6 resets).
+    /// stream (resets, cursor-position queries, etc.).
     fn handle_terminal_event(&mut self, ev: vge_protocol::TerminalEvent) {
         use vge_protocol::TerminalEvent::*;
         match ev {
@@ -461,6 +467,11 @@ impl VgeEngine {
                 // re-derived after vt100 finishes its own reset.
                 self.line_tracker = LineTracker::new();
             }
+            CursorPositionQuery => {
+                // Queue; we reply after vt100 processes the chunk so
+                // the cursor position reflects post-chunk state.
+                self.pending_cursor_queries += 1;
+            }
         }
     }
 
@@ -468,6 +479,23 @@ impl VgeEngine {
     /// PTY master.
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response_bytes)
+    }
+
+    /// Reply to any pending DSR cursor-position queries with the
+    /// current cursor location. vt100 reports 0-indexed; DSR is
+    /// 1-indexed. The bytes are queued in `pending_response_bytes`,
+    /// which the host writes to the PTY master alongside VGE
+    /// response envelopes.
+    fn answer_pending_cursor_queries(&mut self, parser: &vt100::Parser) {
+        if self.pending_cursor_queries == 0 {
+            return;
+        }
+        let (row, col) = parser.screen().cursor_position();
+        let resp = format!("\x1b[{};{}R", row as u32 + 1, col as u32 + 1);
+        for _ in 0..self.pending_cursor_queries {
+            self.pending_response_bytes.extend_from_slice(resp.as_bytes());
+        }
+        self.pending_cursor_queries = 0;
     }
 
     /// Update top-of-live-screen tracking and react to alt-screen
@@ -482,6 +510,9 @@ impl VgeEngine {
         } else if !now_alt && self.state.on_alt() {
             self.state.leave_alt_screen();
         }
+
+        // Reply to DSR queries (cursor position is now post-process).
+        self.answer_pending_cursor_queries(parser);
 
         // Scrollback anchoring is only meaningful on the main screen.
         if !self.state.on_alt() {
@@ -1944,6 +1975,30 @@ mod tests {
         assert!(engine.state.on_alt());
         engine.process_pty_chunk(b"\x1bc");
         assert!(!engine.state.on_alt());
+    }
+
+    #[test]
+    fn dsr_query_emits_cursor_position_reply() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        // Move the cursor to (row=4, col=11) by writing some text.
+        // vt100 reports 0-indexed; DSR replies must be 1-indexed.
+        let pre = b"\n\n\n\n           "; // 4 newlines + 11 spaces
+        let pass = engine.process_pty_chunk(pre);
+        parser.process(&pass);
+        engine.after_vt100_process(&mut parser);
+        // Drain any responses queued so far (none expected from text).
+        let _ = engine.take_responses();
+
+        // Send a cursor-position query; engine queues, vt100 ingests
+        // the bytes (passthrough), then we drive after_vt100_process.
+        let pass = engine.process_pty_chunk(b"\x1b[6n");
+        parser.process(&pass);
+        engine.after_vt100_process(&mut parser);
+
+        let reply = engine.take_responses();
+        let s = std::str::from_utf8(&reply).unwrap();
+        assert_eq!(s, "\x1b[5;12R");
     }
 }
 
