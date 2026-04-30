@@ -1,3 +1,3 @@
 [workspace]
-members = ["vterm", "vge-protocol", "vge-cli"]
+members = ["vterm", "vge-protocol", "vge-cli", "tools/vcat"]
 resolver = "2"
