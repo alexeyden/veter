@@ -1,0 +1,11 @@
+[package]
+name = "breakout"
+version = "0.1.0"
+edition = "2024"
+description = "Breakout demo over the VGE protocol."
+
+[dependencies]
+vge-protocol = { path = "../../vge-protocol" }
+anyhow = "1"
+nix = { version = "0.29", features = ["term", "poll"] }
+libc = "0.2"

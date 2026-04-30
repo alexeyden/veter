@@ -515,27 +515,31 @@ body[kind]:
   1 HorizontalLineTo:     f32 x        ; current y unchanged
   2 VerticalLineTo:       f32 y        ; current x unchanged
   3 CubicBezierTo:        point c0, point c1, point dst
-  4 ArcCircleTo:          u8 flags, f32 radius, point dst
+  4 ArcEllipseTo:         u8 flags, f32 rx, f32 ry, f32 rotation, point dst
                           ; flags: bit0 = large_arc, bit1 = sweep
-  5 ArcEllipseTo:         u8 flags, f32 rx, f32 ry, f32 rotation, point dst
-                          ; flags as above; rotation in radians
-  6 ClosePath:            (no body)
-  7 QuadraticBezierTo:    point c, point dst
+                          ; rotation in radians
+  5 ClosePath:            (no body)
+  6 QuadraticBezierTo:    point c, point dst
 ```
 
-`kind` values outside 0–7 are reserved and MUST be rejected with
+`kind` values outside 0–6 are reserved and MUST be rejected with
 `err_bad_payload`. In particular, a `kind` byte with bit 7 set is
 reserved (it had a meaning in earlier drafts and is now invalid).
 
-Arc semantics for kinds 4 and 5 follow SVG path arcs: an arc connects
-the previous current-point to `dst`, sweeping around an implied
-center such that the arc has the given radius/radii and rotation, with
-the `large_arc` and `sweep` flags selecting which of the four
-candidate arcs to use. `rotation` is in radians and applies to the
-ellipse's x-axis (kind 5 only; kind 4 is always axis-aligned, but
-"axis" is in cell units and so is anisotropic — see §5.1). Degenerate
-inputs follow SVG: zero radius collapses to a `LineTo`, and
-out-of-range radii are uniformly scaled up to just reach `dst`.
+Arc semantics for kind 4 follow SVG path arcs: an arc connects the
+previous current-point to `dst`, sweeping around an implied center
+such that the arc has the given `rx`/`ry` and rotation, with the
+`large_arc` and `sweep` flags selecting which of the four candidate
+arcs to use. `rotation` is in radians and applies to the ellipse's
+x-axis. Degenerate inputs follow SVG: zero radius collapses to a
+`LineTo`, and out-of-range radii are uniformly scaled up to just
+reach `dst`.
+
+There is intentionally no "circular arc" form (single-radius). Cells
+are anisotropic — a single-radius arc is rarely visually circular —
+so the protocol expects clients to compute compensated `rx`/`ry`
+themselves using the cell pixel dimensions from the probe response
+when they want a true visual circle.
 
 Coordinates, control points, arc radii, and `line_width` are all `f32`
 cell-units (anisotropic — §5.1).

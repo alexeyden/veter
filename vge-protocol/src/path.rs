@@ -25,16 +25,11 @@ pub enum PathNode {
         c1: Point,
         dst: Point,
     },
-    QuadraticBezierTo {
-        c: Point,
-        dst: Point,
-    },
-    ArcCircleTo {
-        large: bool,
-        sweep: bool,
-        radius: f32,
-        dst: Point,
-    },
+    /// Elliptic arc, SVG endpoint parameterisation. With anisotropic
+    /// terminal cells (the typical case), an "ArcCircleTo" with a single
+    /// radius isn't actually circular on screen; clients that want a
+    /// visual circle must compensate using cell pixel dims from the
+    /// probe response and pass the right rx/ry here.
     ArcEllipseTo {
         large: bool,
         sweep: bool,
@@ -44,6 +39,10 @@ pub enum PathNode {
         dst: Point,
     },
     ClosePath,
+    QuadraticBezierTo {
+        c: Point,
+        dst: Point,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,10 +55,9 @@ pub const NODE_LINE_TO: u8 = 0;
 pub const NODE_HLINE_TO: u8 = 1;
 pub const NODE_VLINE_TO: u8 = 2;
 pub const NODE_CUBIC_TO: u8 = 3;
-pub const NODE_ARC_CIRCLE: u8 = 4;
-pub const NODE_ARC_ELLIPSE: u8 = 5;
-pub const NODE_CLOSE: u8 = 6;
-pub const NODE_QUAD_TO: u8 = 7;
+pub const NODE_ARC_ELLIPSE: u8 = 4;
+pub const NODE_CLOSE: u8 = 5;
+pub const NODE_QUAD_TO: u8 = 6;
 
 fn read_node(r: &mut Reader<'_>) -> DecodeResult<PathNode> {
     let kind = r.u8()?;
@@ -76,19 +74,6 @@ fn read_node(r: &mut Reader<'_>) -> DecodeResult<PathNode> {
             c: r.point()?,
             dst: r.point()?,
         }),
-        NODE_ARC_CIRCLE => {
-            let flags = r.u8()?;
-            let radius = r.f32()?;
-            if !radius.is_finite() {
-                return Err(DecodeError::bad_payload());
-            }
-            Ok(PathNode::ArcCircleTo {
-                large: flags & 0x01 != 0,
-                sweep: flags & 0x02 != 0,
-                radius,
-                dst: r.point()?,
-            })
-        }
         NODE_ARC_ELLIPSE => {
             let flags = r.u8()?;
             let rx = r.f32()?;
@@ -228,10 +213,21 @@ pub fn arc_to_beziers(
 
     let mut out = Vec::with_capacity(n_segments);
     let mut t = theta1;
-    let (mut sx, mut sy) = ellipse_point(cx, cy, rx, ry, cos_phi, sin_phi, t);
-    for _ in 0..n_segments {
+    // First segment starts at p0 exactly — the canvas's pen is at p0
+    // (the caller's `bezier_to` runs from there), so anchoring c1 to
+    // `ellipse_point(theta1)` instead would offset the bezier's start
+    // tangent by the FP drift between the two and produce a sub-pixel
+    // kink at the start of the arc.
+    let (mut sx, mut sy) = (p0.x, p0.y);
+    for i in 0..n_segments {
         let t_next = t + segment_delta;
-        let (ex, ey) = ellipse_point(cx, cy, rx, ry, cos_phi, sin_phi, t_next);
+        let (ex, ey) = if i == n_segments - 1 {
+            // Last segment ends at p1 exactly so the caller can close
+            // the path cleanly through this point.
+            (p1.x, p1.y)
+        } else {
+            ellipse_point(cx, cy, rx, ry, cos_phi, sin_phi, t_next)
+        };
         let (sdx, sdy) = ellipse_derivative(rx, ry, cos_phi, sin_phi, t);
         let (edx, edy) = ellipse_derivative(rx, ry, cos_phi, sin_phi, t_next);
         let c1 = Point {
@@ -307,8 +303,8 @@ mod tests {
         // start = (0, 0)
         w.f32(0.0);
         w.f32(0.0);
-        // 8 nodes
-        w.varu(8);
+        // 7 nodes
+        w.varu(7);
 
         // LineTo
         write_node(&mut w, NODE_LINE_TO);
@@ -330,12 +326,6 @@ mod tests {
         for f in [11.0f32, 12.0, 13.0, 14.0] {
             w.f32(f);
         }
-        // Arc circle (large=1, sweep=0)
-        write_node(&mut w, NODE_ARC_CIRCLE);
-        w.u8(0x01);
-        w.f32(2.5);
-        w.f32(15.0);
-        w.f32(16.0);
         // Arc ellipse (large=0, sweep=1)
         write_node(&mut w, NODE_ARC_ELLIPSE);
         w.u8(0x02);
@@ -353,22 +343,13 @@ mod tests {
         assert_eq!(segs.len(), 1);
         let s = &segs[0];
         assert_eq!(s.start, Point { x: 0.0, y: 0.0 });
-        assert_eq!(s.nodes.len(), 8);
+        assert_eq!(s.nodes.len(), 7);
         assert_eq!(s.nodes[0], PathNode::LineTo { dst: Point { x: 1.0, y: 2.0 } });
         assert_eq!(s.nodes[1], PathNode::HorizontalLineTo { x: 3.0 });
         assert_eq!(s.nodes[2], PathNode::VerticalLineTo { y: 4.0 });
         assert!(matches!(s.nodes[3], PathNode::CubicBezierTo { .. }));
         assert!(matches!(s.nodes[4], PathNode::QuadraticBezierTo { .. }));
         match s.nodes[5] {
-            PathNode::ArcCircleTo { large, sweep, radius, dst } => {
-                assert!(large);
-                assert!(!sweep);
-                assert_eq!(radius, 2.5);
-                assert_eq!(dst, Point { x: 15.0, y: 16.0 });
-            }
-            _ => panic!("wrong node"),
-        }
-        match s.nodes[6] {
             PathNode::ArcEllipseTo { large, sweep, rx, ry, rotation, dst } => {
                 assert!(!large);
                 assert!(sweep);
@@ -378,7 +359,7 @@ mod tests {
             }
             _ => panic!("wrong node"),
         }
-        assert_eq!(s.nodes[7], PathNode::ClosePath);
+        assert_eq!(s.nodes[6], PathNode::ClosePath);
     }
 
     #[test]
@@ -450,5 +431,60 @@ mod tests {
         let (_, _, end) = beziers[beziers.len() - 1];
         assert!((end.x - -1.0).abs() < 1e-4);
         assert!(end.y.abs() < 1e-4);
+    }
+
+    #[test]
+    fn brick_corners_are_geometrically_symmetric() {
+        // The four rounded-rectangle corners should produce
+        // mirror-image bezier control points. If they don't,
+        // arc_to_beziers has an asymmetry bug.
+        // Brick body: (1.08, 2.4) - (43.92, 21.6); rx_px = ry_px = 2.25.
+        let r = 2.25;
+        let cases = [
+            // (label, p0, p1)
+            ("TL", Point { x: 1.08, y: 4.65 }, Point { x: 3.33, y: 2.4 }),
+            ("TR", Point { x: 41.67, y: 2.4 }, Point { x: 43.92, y: 4.65 }),
+            ("BR", Point { x: 43.92, y: 19.35 }, Point { x: 41.67, y: 21.6 }),
+            ("BL", Point { x: 3.33, y: 21.6 }, Point { x: 1.08, y: 19.35 }),
+        ];
+        for (label, p0, p1) in cases {
+            let bz = arc_to_beziers(p0, p1, r, r, 0.0, false, true);
+            assert_eq!(bz.len(), 1, "{label}: expected single segment");
+            let (c1, c2, end) = bz[0];
+            // Each corner's bezier should land exactly on p1.
+            assert_eq!(end, p1, "{label}: end != p1");
+            // c1 is offset from p0 by alpha * tangent_at_p0 (length should
+            // match for all corners).
+            let len_c1 = ((c1.x - p0.x).powi(2) + (c1.y - p0.y).powi(2)).sqrt();
+            let len_c2 = ((c2.x - p1.x).powi(2) + (c2.y - p1.y).powi(2)).sqrt();
+            eprintln!(
+                "{label}: p0={p0:?} c1={c1:?} c2={c2:?} p1={p1:?} |c1-p0|={len_c1} |c2-p1|={len_c2}"
+            );
+            // All four should have the same |c1-p0| and |c2-p1|.
+            assert!(
+                (len_c1 - 1.2427).abs() < 0.01,
+                "{label}: |c1-p0|={len_c1}, expected ~1.243"
+            );
+            assert!(
+                (len_c2 - 1.2427).abs() < 0.01,
+                "{label}: |c2-p1|={len_c2}, expected ~1.243"
+            );
+        }
+    }
+
+    #[test]
+    fn quarter_arc_endpoints_are_exact() {
+        // For a quarter arc with the layout we use for rounded brick
+        // corners, both endpoints must land on (p0, p1) bit-exact so
+        // that the surrounding straight edges meet without a sub-pixel
+        // gap. Top-left corner: from (1.08, 4.65) up-and-right to
+        // (3.33, 2.4) with rx=ry=2.25.
+        let p0 = Point { x: 1.08, y: 4.65 };
+        let p1 = Point { x: 3.33, y: 2.4 };
+        let beziers = arc_to_beziers(p0, p1, 2.25, 2.25, 0.0, false, true);
+        assert_eq!(beziers.len(), 1);
+        let (_, _, end) = beziers[0];
+        assert_eq!(end.x, p1.x);
+        assert_eq!(end.y, p1.y);
     }
 }

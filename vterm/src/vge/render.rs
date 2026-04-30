@@ -118,39 +118,6 @@ fn build_path(segments: &[PathSegment], ox: f32, oy: f32, cell_w: f32, cell_h: f
                     cur_x = x;
                     cur_y = y;
                 }
-                PathNode::ArcCircleTo {
-                    large,
-                    sweep,
-                    radius,
-                    dst,
-                } => {
-                    let p0 = super::codec::Point {
-                        x: cur_x,
-                        y: cur_y,
-                    };
-                    let (dx, dy) = to_px(*dst, ox, oy, cell_w, cell_h);
-                    // For ArcCircleTo we keep the radius in cell units and
-                    // approximate using the average cell dimension. Cells
-                    // are anisotropic, so the rendered "circle" is slightly
-                    // elliptical — clients that need exact circles should
-                    // use ArcEllipseTo with rx/ry compensated for cell ratio
-                    // (see §5.1). The average is a reasonable middle.
-                    let r_px = radius * (cell_w + cell_h) * 0.5;
-                    let beziers = arc_to_beziers(
-                        p0,
-                        super::codec::Point { x: dx, y: dy },
-                        r_px,
-                        r_px,
-                        0.0,
-                        *large,
-                        *sweep,
-                    );
-                    for (c1, c2, end) in beziers {
-                        path.bezier_to(c1.x, c1.y, c2.x, c2.y, end.x, end.y);
-                    }
-                    cur_x = dx;
-                    cur_y = dy;
-                }
                 PathNode::ArcEllipseTo {
                     large,
                     sweep,

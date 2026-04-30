@@ -175,24 +175,6 @@ fn write_path_node(w: &mut Writer, n: &PathNode) {
             write_point(w, *c1);
             write_point(w, *dst);
         }
-        PathNode::ArcCircleTo {
-            large,
-            sweep,
-            radius,
-            dst,
-        } => {
-            w.u8(4);
-            let mut flags: u8 = 0;
-            if *large {
-                flags |= 0x01;
-            }
-            if *sweep {
-                flags |= 0x02;
-            }
-            w.u8(flags);
-            w.f32(*radius);
-            write_point(w, *dst);
-        }
         PathNode::ArcEllipseTo {
             large,
             sweep,
@@ -201,7 +183,7 @@ fn write_path_node(w: &mut Writer, n: &PathNode) {
             rotation,
             dst,
         } => {
-            w.u8(5);
+            w.u8(4);
             let mut flags: u8 = 0;
             if *large {
                 flags |= 0x01;
@@ -216,10 +198,10 @@ fn write_path_node(w: &mut Writer, n: &PathNode) {
             write_point(w, *dst);
         }
         PathNode::ClosePath => {
-            w.u8(6);
+            w.u8(5);
         }
         PathNode::QuadraticBezierTo { c, dst } => {
-            w.u8(7);
+            w.u8(6);
             write_point(w, *c);
             write_point(w, *dst);
         }

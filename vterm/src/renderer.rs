@@ -9,14 +9,15 @@ use crate::vge;
 use imgref::{Img, ImgRef};
 use parley::{
     layout::{Alignment, Layout, PositionedLayoutItem},
-    style::{FontStack, StyleProperty},
+    style::{FontFamily, FontStack, GenericFamily, StyleProperty},
     AlignmentOptions, FontContext, LayoutContext,
 };
 use rgb::RGBA8;
+use std::borrow::Cow;
 use swash::{
     scale::{image::Content, Render, ScaleContext, Source, StrikeWith},
     zeno::Format,
-    FontRef,
+    FontRef, StringId,
 };
 
 const TEXTURE_SIZE: usize = 512;
@@ -419,6 +420,11 @@ pub struct TerminalRenderer {
     // Primary font
     font_data: Vec<u8>,
     font_index: usize,
+    /// Family name as advertised in the primary font's `name` table.
+    /// Used as the FontStack base for VGE styled text so that
+    /// bold/italic resolve from the same family the unstyled cell
+    /// renderer uses.
+    font_family: String,
 
     // Font fallback (separate fields for disjoint borrowing)
     font_cx: FontContext,
@@ -450,6 +456,7 @@ impl TerminalRenderer {
 
         let mut font_data = Vec::new();
         let mut font_index = 0usize;
+        let mut font_family = String::new();
         let mut cell_width = (font_size * 0.6).ceil();
         let mut cell_height = (font_size * 1.2).ceil();
         let mut ascent = font_size;
@@ -474,16 +481,24 @@ impl TerminalRenderer {
             let charmap = font_ref.charmap();
             let m_glyph = charmap.map('M');
             cell_width = glyph_metrics.advance_width(m_glyph).ceil();
+
+            if let Some(name) = font_ref
+                .localized_strings()
+                .find_by_id(StringId::Family, None)
+            {
+                font_family = name.to_string();
+            }
         }
 
         eprintln!(
-            "Font: cell={}x{}, ascent={}, size={}",
-            cell_width, cell_height, ascent, font_size
+            "Font: family={:?} cell={}x{}, ascent={}, size={}",
+            font_family, cell_width, cell_height, ascent, font_size
         );
 
         Self {
             font_data,
             font_index,
+            font_family,
             font_cx,
             layout_cx,
             fallback_fonts: Vec::new(),
@@ -705,7 +720,15 @@ impl TerminalRenderer {
             .layout_cx
             .ranged_builder(&mut self.font_cx, text, 1.0, false);
         builder.push_default(StyleProperty::Brush(Color::white()));
-        builder.push_default(FontStack::from("monospace"));
+        let stack: FontStack<'_> = if self.font_family.is_empty() {
+            FontStack::from(GenericFamily::Monospace)
+        } else {
+            FontStack::List(Cow::Owned(vec![
+                FontFamily::Named(Cow::Borrowed(self.font_family.as_str())),
+                FontFamily::Generic(GenericFamily::Monospace),
+            ]))
+        };
+        builder.push_default(stack);
         builder.push_default(StyleProperty::FontSize(self.font_size));
         builder.push_default(StyleProperty::FontWeight(weight));
         builder.push_default(StyleProperty::FontStyle(pstyle));
@@ -750,14 +773,23 @@ impl TerminalRenderer {
                         }
                     };
 
-                    let run_x = run_layout.offset();
+                    // Parley's `glyphs()` returns un-positioned glyphs
+                    // — each `glyph.x` is a per-glyph offset (kerning
+                    // / cluster nudge), `glyph.advance` is the step to
+                    // the next glyph, and `glyph.y` is the offset from
+                    // the run's baseline. We accumulate the pen
+                    // ourselves so the position we hand to the renderer
+                    // is in baseline coordinates (matches how the
+                    // per-char plain path computes positions).
+                    let mut pen_x = run_layout.offset();
                     for glyph in run_layout.glyphs() {
                         glyphs.push(G {
-                            x: run_x + glyph.x,
+                            x: pen_x + glyph.x,
                             y: glyph.y,
                             glyph_id: glyph.id as u16,
                             font_id,
                         });
+                        pen_x += glyph.advance;
                     }
                 }
             }
