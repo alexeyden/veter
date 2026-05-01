@@ -265,6 +265,29 @@ clear the entire VGE state: all elements (both screens), the global
 style table, and the image table. The client must re-probe and re-upload
 afterwards.
 
+### 5.7 Erase Display
+
+`ESC [ 2 J` (erase visible screen) and `ESC [ 3 J` (xterm "Erase Saved
+Lines" — erase scrollback) wipe the text grid in place. vt-style
+terminals don't push the cleared cells into scrollback, so VGE
+elements anchored to those rows would otherwise stay rendered on top
+of now-blank text.
+
+- `ESC [ 2 J` drops every top-level element whose `anchor_line` is
+  in the live region (`anchor_line >= top_of_live_screen`).
+- `ESC [ 3 J` drops every top-level element whose `anchor_line` is
+  in the scrollback region (`anchor_line < top_of_live_screen`).
+
+`clear(1)` (ncurses ≥ 6.0) emits `ESC [ H ESC [ 2 J ESC [ 3 J`, so the
+two events together wipe every top-level element on the current
+screen. The terminal's underlying text grid + scrollback go with them
+(the host terminal must implement `3J` for the text side; see the
+notes for vterm's vendored vt100 fork in `vt100/src/screen.rs`).
+
+The shared image and style tables are not affected; only the element
+table. Partial erases (`ESC [ J` / `ESC [ 0 J` / `ESC [ 1 J`) are
+cursor-relative and do not trigger this cleanup.
+
 ## 6. Elements
 
 ### 6.1 CreateElement (0x03)

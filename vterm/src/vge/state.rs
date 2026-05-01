@@ -472,6 +472,35 @@ impl VgeEngine {
                 // the cursor position reflects post-chunk state.
                 self.pending_cursor_queries += 1;
             }
+            EraseDisplay => {
+                // vt100 wipes the cells in place but doesn't push them
+                // to scrollback, so top_of_live_screen is unchanged.
+                // Drop every top-level element anchored at or after
+                // top_of_live_screen — those are the ones living in
+                // the now-blank live region.
+                self.drop_top_level_where(|el, top| el.anchor_line >= top);
+            }
+            EraseScrollback => {
+                // Wipe elements anchored above the live region. Pairs
+                // with `clear(1)` which emits `2J` followed by `3J`.
+                self.drop_top_level_where(|el, top| el.anchor_line < top);
+            }
+        }
+    }
+
+    /// Delete every top-level element on the current screen for which
+    /// `pred(el, top_of_live_screen)` returns true. Children cascade.
+    fn drop_top_level_where(&mut self, pred: impl Fn(&Element, i64) -> bool) {
+        let top = self.line_tracker.top_of_live_screen;
+        let to_delete: Vec<String> = self
+            .state
+            .elements()
+            .iter()
+            .filter(|(_, e)| e.parent.is_none() && pred(e, top))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in to_delete {
+            self.delete_subtree(&id);
         }
     }
 
@@ -1966,6 +1995,114 @@ mod tests {
 
         engine.process_pty_chunk(b"\x1b[!p");
         assert!(engine.state.elements().is_empty());
+    }
+
+    #[test]
+    fn ed_3_drops_scrollback_elements_keeps_live() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // Live element.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("live", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        // Forge a scrollback element.
+        let mut scroll_el =
+            engine.state.elements().get("live").cloned().unwrap();
+        scroll_el.id = Some("scroll".into());
+        scroll_el.anchor_line = -5;
+        engine
+            .state
+            .elements_mut()
+            .insert("scroll".into(), scroll_el);
+
+        // ESC[3J — erase scrollback only.
+        engine.process_pty_chunk(b"\x1b[3J");
+
+        assert!(engine.state.elements().contains_key("live"));
+        assert!(!engine.state.elements().contains_key("scroll"));
+    }
+
+    #[test]
+    fn vt100_3j_clears_text_scrollback() {
+        // Sanity check: the vendored vt100 fork actually drops its
+        // scrollback rows on `ESC[3J`. Without this fork the standard
+        // crate silently ignored mode 3.
+        let mut parser = vt100::Parser::new(3, 10, 100);
+        // Push enough rows to populate scrollback.
+        for _ in 0..10 {
+            parser.process(b"hello\r\n");
+        }
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert!(parser.screen().scrollback() > 0);
+        parser.process(b"\x1b[3J");
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn clear_sequence_drops_live_and_scrollback_elements() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("live", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let mut scroll_el =
+            engine.state.elements().get("live").cloned().unwrap();
+        scroll_el.id = Some("scroll".into());
+        scroll_el.anchor_line = -5;
+        engine
+            .state
+            .elements_mut()
+            .insert("scroll".into(), scroll_el);
+
+        // Full `clear` sequence.
+        engine.process_pty_chunk(b"\x1b[H\x1b[2J\x1b[3J");
+        assert!(engine.state.elements().is_empty());
+    }
+
+    #[test]
+    fn ed_drops_live_region_elements_keeps_scrollback() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // Create one element at the current cursor row (anchored at
+        // top_of_live_screen + 0). It lives in the live region.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("live", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert_eq!(engine.state.elements().len(), 1);
+
+        // Forge a second element anchored to a scrollback line by
+        // writing it directly into the table (no easy way to anchor to
+        // a negative line via the public API without scrolling first).
+        let scrollback_line: i64 = -5;
+        let mut scrollback_el =
+            engine.state.elements().get("live").cloned().unwrap();
+        scrollback_el.id = Some("scroll".into());
+        scrollback_el.anchor_line = scrollback_line;
+        engine
+            .state
+            .elements_mut()
+            .insert("scroll".into(), scrollback_el);
+
+        // ESC[2J — full screen erase.
+        engine.process_pty_chunk(b"\x1b[2J");
+
+        // Live element gone, scrollback element survives.
+        assert!(!engine.state.elements().contains_key("live"));
+        assert!(engine.state.elements().contains_key("scroll"));
     }
 
     #[test]

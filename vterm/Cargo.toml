@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 vge-protocol = { path = "../vge-protocol" }
-vt100 = "0.16"
+vt100 = { path = "../vt100" }
 femtovg = { version = "0.22", features = ["swash"] }
 parley = "0.7"
 swash = "0.2"

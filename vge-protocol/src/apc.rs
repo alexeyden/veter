@@ -32,6 +32,18 @@ pub enum TerminalEvent {
     /// reply, so the engine emits the response itself after vt100
     /// finishes processing the chunk.
     CursorPositionQuery,
+    /// `ESC [ 2 J` — erase entire visible screen. The text cells are
+    /// wiped in place; vt100 doesn't expose this as a scroll so VGE
+    /// elements anchored to the live region would otherwise stick
+    /// around. Engines drop top-level elements anchored at or below
+    /// `top_of_live_screen`. Scrollback elements are untouched.
+    EraseDisplay,
+    /// `ESC [ 3 J` — xterm "Erase Saved Lines"; wipes the scrollback
+    /// buffer above the live region, NOT the visible screen itself.
+    /// Engines drop top-level elements anchored above
+    /// `top_of_live_screen`. `clear(1)` typically emits `2J` followed
+    /// by `3J`, so the two together wipe all VGE elements.
+    EraseScrollback,
 }
 
 /// Cap on CSI body length we'll buffer for matching. Long sequences
@@ -244,6 +256,15 @@ impl ApcStream {
                     if buf.as_slice() == b"6" && b == b'n' {
                         out.events.push(TerminalEvent::CursorPositionQuery);
                     }
+                    // Erase In Display:
+                    //   `ESC [ 2 J` — wipe live region.
+                    //   `ESC [ 3 J` — wipe scrollback.
+                    if b == b'J' && buf.as_slice() == b"2" {
+                        out.events.push(TerminalEvent::EraseDisplay);
+                    }
+                    if b == b'J' && buf.as_slice() == b"3" {
+                        out.events.push(TerminalEvent::EraseScrollback);
+                    }
                     State::Idle
                 } else {
                     buf.push(b);
@@ -373,6 +394,47 @@ mod tests {
         assert_eq!(out.passthrough, b"\x1b[6n");
         assert_eq!(out.events, vec![TerminalEvent::CursorPositionQuery]);
         assert!(out.payloads.is_empty());
+    }
+
+    #[test]
+    fn ed_2_emits_erase_display_event_and_passes_through() {
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[2J");
+        assert_eq!(out.passthrough, b"\x1b[2J");
+        assert_eq!(out.events, vec![TerminalEvent::EraseDisplay]);
+    }
+
+    #[test]
+    fn ed_3_emits_erase_scrollback_event() {
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[3J");
+        assert_eq!(out.events, vec![TerminalEvent::EraseScrollback]);
+    }
+
+    #[test]
+    fn clear_command_sequence_emits_both_events() {
+        // ncurses `clear` sends ESC[H ESC[2J ESC[3J — the engine
+        // should see both EraseDisplay and EraseScrollback so it can
+        // wipe live and scrollback elements together.
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        assert_eq!(
+            out.events,
+            vec![
+                TerminalEvent::EraseDisplay,
+                TerminalEvent::EraseScrollback
+            ]
+        );
+    }
+
+    #[test]
+    fn ed_partial_does_not_emit_erase_display() {
+        // ESC[J / ESC[0J / ESC[1J are partial erases (cursor-relative)
+        // — they don't wipe the whole screen so we don't react to them.
+        let mut s = ApcStream::new();
+        assert!(s.feed(b"\x1b[J").events.is_empty());
+        assert!(s.feed(b"\x1b[0J").events.is_empty());
+        assert!(s.feed(b"\x1b[1J").events.is_empty());
     }
 
     #[test]
