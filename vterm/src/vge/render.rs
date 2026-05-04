@@ -171,6 +171,11 @@ fn stroke_paint(base: Paint, line_width_px: f32) -> Paint {
 /// element in (draw_order, creation_seq) order; for each element, its
 /// children render first (recursively), then the element's own
 /// commands ON TOP, all inside the element's clip rect (if any).
+///
+/// Kept as a VGE-only convenience entry point. With PRT also active,
+/// `prt::render::render_layers` is used instead so VGE elements and
+/// portals can interleave by `(draw_order, creation_seq)` (§10).
+#[allow(dead_code)]
 pub fn render_elements<T: Renderer>(
     canvas: &mut Canvas<T>,
     renderer: &mut TerminalRenderer,
@@ -180,35 +185,57 @@ pub fn render_elements<T: Renderer>(
     _screen_cols: u16,
     scrollback: usize,
 ) {
+    for el in state.top_level_sorted() {
+        render_one_top_level(
+            canvas,
+            renderer,
+            state,
+            el,
+            top_of_live_screen,
+            screen_rows,
+            scrollback,
+        );
+    }
+}
+
+/// Render a single top-level element. Used by the §10 unified layer
+/// walker in `prt::render` to interleave VGE elements and portals by
+/// `(draw_order, creation_seq)`.
+pub fn render_one_top_level<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    renderer: &mut TerminalRenderer,
+    state: &VgeState,
+    el: &super::state::Element,
+    top_of_live_screen: i64,
+    screen_rows: u16,
+    scrollback: usize,
+) {
+    if !el.is_visible {
+        return;
+    }
     let cell_w = renderer.cell_width;
     let cell_h = renderer.cell_height;
     let stroke_scale = (cell_w + cell_h) * 0.5;
     let visible_top = top_of_live_screen - scrollback as i64;
     let max_row = screen_rows as f32;
 
-    for el in state.top_level_sorted() {
-        if !el.is_visible {
-            continue;
-        }
-        let row_f = (el.anchor_line - visible_top) as f32 + el.sub_row;
-        // Quick reject for far-off-screen top-level subtrees.
-        if row_f < -1024.0 || row_f > max_row + 1024.0 {
-            continue;
-        }
-        let ox = el.origin_x * cell_w;
-        let oy = row_f * cell_h;
-        render_element(
-            canvas,
-            renderer,
-            state,
-            el,
-            ox,
-            oy,
-            cell_w,
-            cell_h,
-            stroke_scale,
-        );
+    let row_f = (el.anchor_line - visible_top) as f32 + el.sub_row;
+    if row_f < -1024.0 || row_f > max_row + 1024.0 {
+        return;
     }
+    let ox = el.origin_x * cell_w;
+    let oy = row_f * cell_h;
+    render_element(
+        canvas,
+        renderer,
+        state,
+        el,
+        ox,
+        oy,
+        cell_w,
+        cell_h,
+        stroke_scale,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -184,6 +184,7 @@ be tolerated by skipping unknown trailing bytes.
 | 0x09 | WritePortal        | §7.1         |
 | 0x0A | SetFocus           | §9.1         |
 | 0x0B | SetCursorStyle     | §9.2         |
+| 0x0C | SetPortalScrollback| §9.3         |
 
 All other frame_type values in the command range (0x01..0x7F) are
 reserved and MUST be rejected with `err_unknown_command`. Frame types
@@ -804,6 +805,51 @@ supported in v1; this is a host-wide policy.
 
 Response: empty Ok.
 
+### 9.3 SetPortalScrollback (0x0C)
+
+Body:
+
+```
+string id
+u32    lines       ; offset, in rows, from the top of the live screen
+                   ; into scrollback. 0 = live region (no offset).
+```
+
+Drives the portal's vt100 scrollback offset. While `lines > 0` the host
+renders that portion of the portal's history instead of the live
+region; new bytes still flow into the inner vt100 normally and accrue
+in scrollback. The value is silently capped at the portal's current
+history depth — the response carries the post-clamp offset so the
+client can show the actual scroll position even when its request
+exceeded the available history.
+
+`lines = 0` returns the portal to live view. Clients SHOULD send this
+when the user exits scroll/copy mode.
+
+Errors:
+
+- Unknown ID → `err_unknown_portal`.
+
+Response: Ok with body
+
+```
+u32 applied_lines  ; the offset actually in effect after clamping
+u32 history_depth  ; rows currently held in the portal's scrollback ring
+                   ; (grows with inner-program output, capped at
+                   ;  scrollback_lines from CreatePortal)
+```
+
+The body length is the source of truth, as in §2.1 — clients reading a
+shorter body MUST treat missing trailing fields as zero, so a host that
+only echoes `applied_lines` is still spec-compliant.
+
+Multiplexer-style clients typically issue `SetPortalScrollback` while
+in a "copy mode" UI driven by arrow keys / PgUp / PgDn / vim-style
+`j`/`k`. The applied-offset echo lets the indicator stop incrementing
+once the user reaches the top of the captured history;
+`history_depth` lets the client draw a scrollbar thumb sized to the
+actual history available.
+
 ## 10. Integration with VGE
 
 This section is **optional**: a host that does not implement the
@@ -1098,10 +1144,6 @@ These are intentionally deferred and are not part of v1:
 - **Server-side selection / copy.** A `ReadCells(portal_id, rect)`
   op for clients that want to copy text rendered inside a portal
   without keeping a parallel client-side mirror.
-- **Server-side scrollback navigation.** Today scrolling within a
-  portal is not exposed; the inner vt100's scrollback exists but the
-  client cannot drive it. A `SetPortalScrollback(id, lines)` would
-  fix this once a real client needs it.
 - **Per-portal cursor style override.** The host cursor-style policy
   is global (§9.2). Useful but easy to add later without breaking the
   wire.

@@ -1639,6 +1639,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prt-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix 0.29.0",
+ "prt-protocol",
+]
+
+[[package]]
+name = "prt-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "pxfm"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,6 +2351,17 @@ name = "vge-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "vmux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix 0.29.0",
+ "prt-protocol",
+ "vge-protocol",
+]
+
+[[package]]
 name = "vt100"
 version = "0.16.2"
 dependencies = [
@@ -2373,6 +2398,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "parley",
+ "prt-protocol",
  "raw-window-handle",
  "rgb",
  "swash",

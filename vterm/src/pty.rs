@@ -26,8 +26,16 @@ impl Pty {
         match result {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
-                let shell = CString::new("bash").unwrap();
-                let err = execvp(&shell, &[&shell]).unwrap_err();
+                // Honor `$SHELL` (the user's login shell) and fall back
+                // to `/bin/sh` if it's unset or unusable, mirroring the
+                // convention tmux/screen/alacritty all follow. The
+                // CString conversions can fail only on interior NULs,
+                // which `$SHELL` won't have in any sane setup.
+                let shell_path = std::env::var("SHELL")
+                    .ok()
+                    .and_then(|s| CString::new(s).ok())
+                    .unwrap_or_else(|| CString::new("/bin/sh").unwrap());
+                let err = execvp(&shell_path, &[&shell_path]).unwrap_err();
                 panic!("exec failed: {err}");
             }
             ForkptyResult::Parent { child, master } => Ok(Pty { master, child }),

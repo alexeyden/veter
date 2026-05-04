@@ -276,7 +276,7 @@ impl LineTracker {
         }
     }
 
-    fn update(&mut self, parser: &mut vt100::Parser) {
+    fn update<CB: vt100::Callbacks>(&mut self, parser: &mut vt100::Parser<CB>) {
         let (history_size, top_hash) = probe_history(parser);
 
         if !self.initialized {
@@ -316,7 +316,7 @@ impl LineTracker {
 
 /// Probe the parser for (history_size, hash_of_topmost_history_row).
 /// Restores the user's scrollback offset before returning.
-fn probe_history(parser: &mut vt100::Parser) -> (usize, u64) {
+fn probe_history<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> (usize, u64) {
     let saved = parser.screen().scrollback();
     parser.screen_mut().set_scrollback(usize::MAX);
     let history_size = parser.screen().scrollback();
@@ -398,6 +398,13 @@ pub struct VgeEngine {
     /// until vt100 has processed the chunk so the reply reflects
     /// post-process cursor state.
     pending_cursor_queries: u32,
+    /// When `false`, `\x1b[6n` queries observed in the byte stream are
+    /// not counted into `pending_cursor_queries` and so produce no
+    /// auto-reply. PRT in v1 uses this for per-portal VGE engines so
+    /// that PRT remains the sole DSR responder inside a portal —
+    /// otherwise both PRT and the per-portal VGE would synthesise a
+    /// reply for the same query and the inner program would see two.
+    auto_reply_dsr: bool,
 }
 
 impl VgeEngine {
@@ -412,7 +419,14 @@ impl VgeEngine {
             pending_response_bytes: Vec::new(),
             pending_image_deletes: Vec::new(),
             pending_cursor_queries: 0,
+            auto_reply_dsr: true,
         }
+    }
+
+    /// Disable DSR cursor-query auto-replies. See the field doc on
+    /// `auto_reply_dsr` — used by per-portal VGE engines.
+    pub fn set_auto_reply_dsr(&mut self, enabled: bool) {
+        self.auto_reply_dsr = enabled;
     }
 
     /// Hand off any image GPU handles whose owners have been dropped.
@@ -470,7 +484,9 @@ impl VgeEngine {
             CursorPositionQuery => {
                 // Queue; we reply after vt100 processes the chunk so
                 // the cursor position reflects post-chunk state.
-                self.pending_cursor_queries += 1;
+                if self.auto_reply_dsr {
+                    self.pending_cursor_queries += 1;
+                }
             }
             EraseDisplay => {
                 // vt100 wipes the cells in place but doesn't push them
@@ -515,7 +531,10 @@ impl VgeEngine {
     /// 1-indexed. The bytes are queued in `pending_response_bytes`,
     /// which the host writes to the PTY master alongside VGE
     /// response envelopes.
-    fn answer_pending_cursor_queries(&mut self, parser: &vt100::Parser) {
+    fn answer_pending_cursor_queries<CB: vt100::Callbacks>(
+        &mut self,
+        parser: &vt100::Parser<CB>,
+    ) {
         if self.pending_cursor_queries == 0 {
             return;
         }
@@ -531,7 +550,10 @@ impl VgeEngine {
     /// transitions. Call after every `parser.process(...)`. Also evicts
     /// elements whose anchor_line has fallen off the bottom of
     /// scrollback (main screen only — alt screen has no scrollback).
-    pub fn after_vt100_process(&mut self, parser: &mut vt100::Parser) {
+    pub fn after_vt100_process<CB: vt100::Callbacks>(
+        &mut self,
+        parser: &mut vt100::Parser<CB>,
+    ) {
         // §5.4 — detect screen transitions by polling vt100.
         let now_alt = parser.screen().alternate_screen();
         if now_alt && !self.state.on_alt() {

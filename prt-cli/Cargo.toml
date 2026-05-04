@@ -1,0 +1,11 @@
+[package]
+name = "prt-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line tool to emit PRT protocol envelopes for manual testing."
+
+[dependencies]
+prt-protocol = { path = "../prt-protocol" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+nix = { version = "0.29", features = ["term", "poll"] }

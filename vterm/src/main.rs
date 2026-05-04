@@ -1,3 +1,4 @@
+mod prt;
 mod pty;
 mod renderer;
 mod vge;
@@ -27,6 +28,7 @@ struct App {
     term_renderer: Option<renderer::TerminalRenderer>,
     rx: Option<mpsc::Receiver<Vec<u8>>>,
     vge: Option<vge::VgeEngine>,
+    prt: Option<prt::PrtEngine>,
 
     // GL state (dropped in reverse-creation order so the EGL surface
     // is destroyed while the Wayland window still exists)
@@ -52,6 +54,7 @@ impl App {
             term_renderer: None,
             rx: None,
             vge: None,
+            prt: None,
             proxy,
             modifiers: ModifiersState::empty(),
         }
@@ -191,6 +194,10 @@ impl App {
             Some(e) => e,
             None => return false,
         };
+        let prt = match &mut self.prt {
+            Some(p) => p,
+            None => return false,
+        };
         let pty = match &self.pty {
             Some(p) => p,
             None => return false,
@@ -199,11 +206,29 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(data) => {
-                    let passthrough = engine.process_pty_chunk(&data);
-                    if !passthrough.is_empty() {
-                        parser.process(&passthrough);
+                    // Pipeline: PRT extracts ESC_PRT envelopes and observes
+                    // RIS/DECSTR/2J/3J events; VGE then extracts ESC_VGE
+                    // envelopes from PRT's passthrough; the rest goes to
+                    // the host vt100. Each engine's apc passes the other
+                    // extension's marker through verbatim, so order is
+                    // independent of correctness.
+                    let prt_chunk = prt.process_pty_chunk_full(&data);
+                    let vge_passthrough = engine.process_pty_chunk(&prt_chunk.passthrough);
+                    if !vge_passthrough.is_empty() {
+                        parser.process(&vge_passthrough);
                     }
+                    // PRT host-screen reactions: scope_reset / cull on
+                    // observed RIS/DECSTR/2J/3J, then alt-screen swap +
+                    // line tracker + scrollback eviction.
+                    prt.handle_terminal_events(&prt_chunk.terminal_events);
+                    prt.after_vt100_process(parser);
+                    prt.flush_pending_events();
                     engine.after_vt100_process(parser);
+
+                    let prt_resp = prt.take_responses();
+                    if !prt_resp.is_empty() {
+                        let _ = pty.write_all(&prt_resp);
+                    }
                     let resp = engine.take_responses();
                     if !resp.is_empty() {
                         let _ = pty.write_all(&resp);
@@ -268,7 +293,15 @@ impl ApplicationHandler for App {
             term_renderer.cell_width.round() as u16,
             term_renderer.cell_height.round() as u16,
         );
-        let vge_engine = vge::VgeEngine::new(cell_px, window.scale_factor() as f32);
+        let scale = window.scale_factor() as f32;
+        let vge_engine = vge::VgeEngine::new(cell_px, scale);
+        // PRT engine: top-level scope (depth 0). Limits default to the
+        // recommended caps from §12 (64 portals, 1024×512, 100k
+        // scrollback, 1MiB writes, depth 8) and feature bits for every
+        // event category Phase 3 wires (bell/title/icon/cwd/clipboard/
+        // mouse mode + alt-screen-in-portal). Cell metrics are passed
+        // through so per-portal VGE engines (§10) inherit them.
+        let prt_engine = prt::PrtEngine::with_metrics(cell_px, scale);
 
         // Create PTY and parser
         let parser = vt100::Parser::new(term_rows, term_cols, 10000);
@@ -309,6 +342,7 @@ impl ApplicationHandler for App {
         self.term_renderer = Some(term_renderer);
         self.rx = Some(rx);
         self.vge = Some(vge_engine);
+        self.prt = Some(prt_engine);
 
         self.window.as_ref().unwrap().request_redraw();
     }
@@ -375,12 +409,23 @@ impl ApplicationHandler for App {
                 canvas.set_size(size.width, size.height, 1.0);
                 canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(30, 30, 30));
 
-                if let (Some(parser), Some(tr), Some(engine)) =
-                    (&mut self.parser, &mut self.term_renderer, &mut self.vge)
-                {
+                if let (Some(parser), Some(tr), Some(engine), Some(prt)) = (
+                    &mut self.parser,
+                    &mut self.term_renderer,
+                    &mut self.vge,
+                    &mut self.prt,
+                ) {
                     // Drop GPU resources for any images that were
-                    // dropped since the last frame.
+                    // dropped since the last frame — both the host
+                    // VGE engine's queue and every per-portal VGE
+                    // engine's queue, plus anything the PRT engine
+                    // accumulated when portals were torn down (delete
+                    // / clear / scope_reset / 2J / 3J / scrollback
+                    // eviction / alt-swap leave).
                     for gpu_id in engine.take_pending_image_deletes() {
+                        canvas.delete_image(gpu_id);
+                    }
+                    for gpu_id in prt.take_all_pending_image_deletes() {
                         canvas.delete_image(gpu_id);
                     }
 
@@ -396,6 +441,7 @@ impl ApplicationHandler for App {
                         max_scrollback,
                         &engine.state,
                         engine.top_of_live_screen(),
+                        &prt.state,
                     );
                 }
 

@@ -5,6 +5,7 @@ use femtovg::{
     Quad, Renderer,
 };
 
+use crate::prt;
 use crate::vge;
 use imgref::{Img, ImgRef};
 use parley::{
@@ -826,21 +827,28 @@ impl TerminalRenderer {
         (start_x, total_width)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn render<T: Renderer>(
+    /// Draw the cells of `screen` into the canvas at the given pixel
+    /// origin. `focused_cursor` names the cell that should render with
+    /// inverted foreground/background (the focused cursor look); if
+    /// `None`, no cell is inverted.
+    ///
+    /// The host render path passes `Some(host_cursor_pos)` when the
+    /// cursor is visible and the user isn't scrolled back; portal
+    /// rendering passes `None` because portal cursors are drawn
+    /// separately by `prt::render` (so the unfocused-style policy
+    /// from §9.2 can apply).
+    pub fn draw_screen_at<T: Renderer>(
         &mut self,
         canvas: &mut Canvas<T>,
         screen: &vt100::Screen,
-        max_scrollback: usize,
-        vge_state: &vge::VgeState,
-        top_of_live_screen: i64,
+        ox_px: f32,
+        oy_px: f32,
+        focused_cursor: Option<(u16, u16)>,
     ) {
         let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
         let default_bg = Color::rgb(30, 30, 30);
 
-        // Draw cell backgrounds
+        // Cell backgrounds.
         for row in 0..rows {
             for col in 0..cols {
                 let cell = match screen.cell(row, col) {
@@ -850,14 +858,12 @@ impl TerminalRenderer {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-
-                let is_cursor = show_cursor && row == cursor_row && col == cursor_col;
+                let is_cursor = focused_cursor == Some((row, col));
                 let (_, bg) = resolve_cell_colors(cell, is_cursor);
                 let w = if cell.is_wide() { 2.0 } else { 1.0 };
-
                 if bg != default_bg {
-                    let x = col as f32 * self.cell_width;
-                    let y = row as f32 * self.cell_height;
+                    let x = ox_px + col as f32 * self.cell_width;
+                    let y = oy_px + row as f32 * self.cell_height;
                     let mut path = Path::new();
                     path.rect(x, y, self.cell_width * w, self.cell_height);
                     canvas.fill_path(&path, &Paint::color(bg));
@@ -865,11 +871,9 @@ impl TerminalRenderer {
             }
         }
 
-        // Draw glyphs
+        // Glyphs.
         let primary_ref = FontRef::from_index(&self.font_data, self.font_index).unwrap();
         let primary_charmap = primary_ref.charmap();
-
-        // Batch quads by (fg_color, texture_index) for alpha glyphs
         let mut alpha_batches: HashMap<u32, HashMap<usize, Vec<Quad>>> = HashMap::new();
         let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
 
@@ -882,19 +886,16 @@ impl TerminalRenderer {
                 if cell.is_wide_continuation() || !cell.has_contents() {
                     continue;
                 }
-
                 let ch = match cell.contents().chars().next() {
                     Some(c) if c > ' ' => c,
                     _ => continue,
                 };
 
-                // Resolve font: try primary, then fallback
                 let (glyph_id, font_id) = {
                     let gid = primary_charmap.map(ch);
                     if gid != 0 {
                         (gid, 0u16)
                     } else {
-                        // Fallback resolution uses disjoint fields from font_data
                         match resolve_fallback(
                             &mut self.font_cx,
                             &mut self.layout_cx,
@@ -909,13 +910,12 @@ impl TerminalRenderer {
                     }
                 };
 
-                let is_cursor = show_cursor && row == cursor_row && col == cursor_col;
+                let is_cursor = focused_cursor == Some((row, col));
                 let (fg, _) = resolve_cell_colors(cell, is_cursor);
 
-                let x = col as f32 * self.cell_width;
-                let y = row as f32 * self.cell_height + self.ascent;
+                let x = ox_px + col as f32 * self.cell_width;
+                let y = oy_px + row as f32 * self.cell_height + self.ascent;
 
-                // Get font ref for rendering (primary or fallback)
                 let rendered = if font_id == 0 {
                     let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
                     self.glyph_cache.get_or_render(
@@ -938,7 +938,6 @@ impl TerminalRenderer {
                         font_id,
                     )
                 };
-
                 let rendered = match rendered {
                     Some(r) => r,
                     None => continue,
@@ -971,7 +970,6 @@ impl TerminalRenderer {
             }
         }
 
-        // Draw alpha glyphs grouped by color
         for (ck, tex_quads) in alpha_batches {
             let color = key_to_color(ck);
             let cmds: Vec<DrawCommand> = tex_quads
@@ -990,7 +988,6 @@ impl TerminalRenderer {
             );
         }
 
-        // Draw color glyphs (emoji etc.)
         if !color_batches.is_empty() {
             let cmds: Vec<DrawCommand> = color_batches
                 .into_iter()
@@ -1007,12 +1004,43 @@ impl TerminalRenderer {
                 &Paint::color(Color::white()),
             );
         }
+    }
 
-        // VGE elements render above text but below the scrollbar (§9).
-        vge::render::render_elements(
+    #[allow(clippy::too_many_arguments)]
+    pub fn render<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        screen: &vt100::Screen,
+        max_scrollback: usize,
+        vge_state: &vge::VgeState,
+        top_of_live_screen: i64,
+        prt_state: &prt::PrtState,
+    ) {
+        let (rows, cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
+        // §9.1 — the host's text-grid cursor renders only when host
+        // focus is on the host itself; if focus has been routed into a
+        // portal, the host cursor is suppressed and the focused-leaf
+        // portal renders the focused look instead.
+        let host_has_focus = matches!(prt_state.focus, prt::FocusKind::Host);
+
+        // Host text grid.
+        let focused_cursor = if show_cursor && host_has_focus {
+            Some((cursor_row, cursor_col))
+        } else {
+            None
+        };
+        self.draw_screen_at(canvas, screen, 0.0, 0.0, focused_cursor);
+
+        // Unified §10 layer walk: top-level VGE elements + host portals
+        // sorted by (draw_order, creation_seq), each rendered in turn.
+        // Per-portal sub-portals recurse from inside.
+        prt::render::render_layers(
             canvas,
             self,
             vge_state,
+            prt_state,
             top_of_live_screen,
             rows,
             cols,

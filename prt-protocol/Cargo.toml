@@ -1,0 +1,7 @@
+[package]
+name = "prt-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "PRT (Portal Extension) wire format: APC envelope, codec, command parser/encoder."
+
+[dependencies]
