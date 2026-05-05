@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
@@ -27,12 +28,25 @@ impl Pty {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 unsafe { std::env::set_var("COLORTERM", "truecolor") };
-                // Prefer vmux when available so vterm sessions get the
-                // multiplexer transparently. execvp searches $PATH and
-                // only returns on failure, so a missing/unrunnable vmux
-                // simply falls through to the user's login shell.
-                let vmux = CString::new("vmux").unwrap();
-                let _ = execvp(&vmux, &[&vmux]);
+                // Prefer vmux when available so vterm sessions get
+                // the multiplexer transparently. install.sh ships
+                // vmux alongside vterm in the same bindir, so look
+                // there first — desktop launchers often start vterm
+                // with a PATH that omits ~/.local/bin. Fall back to
+                // a normal $PATH search, then to the user's shell.
+                // execvp only returns on failure.
+                let argv0 = CString::new("vmux").unwrap();
+                let neighbor = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("vmux")))
+                    .filter(|p| p.is_file())
+                    .and_then(|p| {
+                        CString::new(p.as_os_str().as_bytes()).ok()
+                    });
+                if let Some(abs) = neighbor {
+                    let _ = execvp(&abs, &[&argv0]);
+                }
+                let _ = execvp(&argv0, &[&argv0]);
                 // Honor `$SHELL` (the user's login shell) and fall back
                 // to `/bin/sh` if it's unset or unusable, mirroring the
                 // convention tmux/screen/alacritty all follow. The
