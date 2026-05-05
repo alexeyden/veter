@@ -141,6 +141,30 @@ impl App {
             return;
         }
 
+        // DECCKM (application cursor mode): if the focused vt100 has
+        // it set, send SS3 form (`\eOA`/etc) instead of CSI form.
+        // vim/less/etc. enable DECCKM via terminfo's `smkx` and won't
+        // recognise the CSI form. The "focused vt" is the host's parser
+        // unless a portal owns focus, in which case it's that portal's
+        // vt — that's how a vmux child keeps its inner DECCKM separate
+        // from the host's.
+        let app_cursor = self
+            .prt
+            .as_ref()
+            .and_then(|p| {
+                p.state
+                    .focus_chain()
+                    .first()
+                    .and_then(|id| p.state.current().portals.get(*id))
+                    .map(|portal| portal.vt.screen().application_cursor())
+            })
+            .unwrap_or_else(|| {
+                self.parser
+                    .as_ref()
+                    .map(|p| p.screen().application_cursor())
+                    .unwrap_or(false)
+            });
+
         // Named keys
         let bytes: Option<&[u8]> = match &event.logical_key {
             Key::Named(named) => match named {
@@ -148,12 +172,12 @@ impl App {
                 NamedKey::Backspace => Some(b"\x7f"),
                 NamedKey::Tab => Some(b"\t"),
                 NamedKey::Escape => Some(b"\x1b"),
-                NamedKey::ArrowUp => Some(b"\x1b[A"),
-                NamedKey::ArrowDown => Some(b"\x1b[B"),
-                NamedKey::ArrowRight => Some(b"\x1b[C"),
-                NamedKey::ArrowLeft => Some(b"\x1b[D"),
-                NamedKey::Home => Some(b"\x1b[H"),
-                NamedKey::End => Some(b"\x1b[F"),
+                NamedKey::ArrowUp => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }),
+                NamedKey::ArrowDown => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
+                NamedKey::ArrowRight => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }),
+                NamedKey::ArrowLeft => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
+                NamedKey::Home => Some(if app_cursor { b"\x1bOH" } else { b"\x1b[H" }),
+                NamedKey::End => Some(if app_cursor { b"\x1bOF" } else { b"\x1b[F" }),
                 NamedKey::Delete => Some(b"\x1b[3~"),
                 NamedKey::PageUp => Some(b"\x1b[5~"),
                 NamedKey::PageDown => Some(b"\x1b[6~"),
