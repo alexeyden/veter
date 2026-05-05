@@ -2357,12 +2357,21 @@ fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
 ///   - any other case → forward the event to the matching pane's PTY
 ///     in SGR encoding, with coords translated to portal-relative.
 fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
-    // Find the pane whose `last_rect` contains the event cell. SGR
+    // Find the pane whose `last_rect` contains the event cell. Only
+    // panes in the active tab are eligible — panes from inactive tabs
+    // keep their `last_rect` from when they were last visible, so a
+    // global scan over `state.panes` would land mouse events on hidden
+    // panes whose rects overlap the active layout (and HashMap
+    // iteration order would make the choice nondeterministic). SGR
     // coords are 1-indexed; PaneRect is 0-indexed.
     let host_col = ev.col.saturating_sub(1) as i32;
     let host_row = ev.row.saturating_sub(1) as i32;
+    let active = state.active_pane_ids();
     let mut target: Option<String> = None;
     for (id, pane) in &state.panes {
+        if !active.contains(id) {
+            continue;
+        }
         if let Some(rect) = pane.last_rect {
             if host_col >= rect.x
                 && host_col < rect.x + rect.w as i32
