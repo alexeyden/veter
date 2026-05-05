@@ -40,7 +40,8 @@ use prt_protocol::command::{
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
-    EVT_RAW_REPLY, MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
+    EVT_MOUSE_MODE_CHANGE, EVT_RAW_REPLY, MARKER_T2C as PRT_MARKER_T2C,
+    RSP_PROBE as PRT_RSP_PROBE,
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
@@ -359,6 +360,12 @@ struct Pane {
     /// `last_rect`, but tracked separately because the inner size is
     /// `outer_rect_size minus chrome`.
     last_inner: Option<(u32, u32)>,
+    /// Mouse-protocol mode the inner program last opted into, as
+    /// reported by PRT `MouseModeChange` events (§8.9). 0 = off, 1
+    /// = X10, 2 = normal, 3 = button, 4 = any. Used by the wheel
+    /// dispatcher to decide whether wheel events drive vmux's
+    /// per-pane scrollback or get forwarded to the inner program.
+    inner_mouse_protocol: u8,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -629,10 +636,11 @@ fn build_chrome_commands(
         let portal_rows = (ph - 2.0).max(1.0);
         let total = portal_rows + s.history_depth as f32;
         // Track spans almost the full pane height with a small inset
-        // matching the outline. Same x-position trick as the outline:
-        // the scrollbar visually replaces the right border.
-        let track_x = pw - 0.85;
-        let track_w = 0.30;
+        // matching the outline. Sit a bit clear of the right border
+        // (which is the outline stroke at x = pw-0.5) so the thumb
+        // doesn't visually merge with it.
+        let track_x = pw - 1.30;
+        let track_w = 0.35;
         let track_y0 = 0.5;
         let track_y1 = ph - 0.5;
         let track_h = (track_y1 - track_y0).max(1.0);
@@ -970,6 +978,7 @@ impl State {
                 // bash with `checkwinsize`) to redraw their PS1 and leak an
                 // empty line into the pane.
                 last_inner: Some((cols, rows)),
+                inner_mouse_protocol: 0,
             },
         );
         Ok(s)
@@ -1047,6 +1056,7 @@ impl State {
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
+                inner_mouse_protocol: 0,
             },
         );
         // New pane gets focus.
@@ -1178,6 +1188,7 @@ impl State {
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
+                inner_mouse_protocol: 0,
             },
         );
         self.relayout_and_render()
@@ -1746,7 +1757,14 @@ impl TtyGuard {
     }
 
     fn enter_alt_screen(&mut self) -> Result<()> {
-        write_all_stdout(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        // Alt screen + hide cursor + clear. Then enable SGR-encoded
+        // mouse reporting (DECSET 1000 + 1006) so vterm forwards every
+        // wheel/click/drag to us; we hit-test against pane bounds in
+        // `handle_mouse_event` and either drive scrollback or
+        // re-encode and forward to the inner program's PTY.
+        write_all_stdout(
+            b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h",
+        )?;
         self.in_alt = true;
         Ok(())
     }
@@ -1755,10 +1773,12 @@ impl TtyGuard {
 impl Drop for TtyGuard {
     fn drop(&mut self) {
         if self.in_alt {
-            // Leave alt screen first (so the main screen comes back),
-            // then explicitly re-show the cursor — order matters because
-            // some terminals re-evaluate `?25` on screen swap.
-            let _ = write_all_stdout(b"\x1b[?1049l\x1b[?25h");
+            // Disable mouse reporting first so leftover wheel events
+            // don't leak into the outer shell, then leave alt screen
+            // and re-show the cursor.
+            let _ = write_all_stdout(
+                b"\x1b[?1006l\x1b[?1000l\x1b[?1049l\x1b[?25h",
+            );
         }
         if let Some(saved) = self.saved.take() {
             use nix::sys::termios::{tcsetattr, SetArg};
@@ -2198,6 +2218,16 @@ fn handle_stdin_chunk(
                         let _ = p.pty.write_all(&data);
                     }
                 }
+            } else if ft == EVT_MOUSE_MODE_CHANGE {
+                // §8.9: id, protocol, encoding, focus_events. We only
+                // need protocol — encoding/focus is handled per-event
+                // when we re-encode forwarded mouse bytes.
+                let mut br = PrtReader::new(body);
+                let id = br.string().unwrap_or("").to_string();
+                let protocol = br.u8().unwrap_or(0);
+                if let Some(p) = state.panes.get_mut(&id) {
+                    p.inner_mouse_protocol = protocol;
+                }
             } else if ft == prt_protocol::frame::RSP_OK
                 && rid == SCROLL_REQUEST_ID
                 && body.len() >= 4
@@ -2237,13 +2267,217 @@ fn handle_stdin_chunk(
         }
     }
 
-    // Strip VGE envelopes from the residual passthrough — what's left is
-    // user keystrokes the host forwarded.
+    // Strip VGE envelopes from the residual passthrough — what's left
+    // is user keystrokes plus host-emitted mouse events (because we
+    // enabled SGR mouse reporting on entry to alt screen).
     let vge_out = vge_apc.feed(&prt_out.passthrough);
     let _ = vge_out.payloads;
 
-    if !vge_out.passthrough.is_empty() {
-        process_user_input(state, &vge_out.passthrough)?;
+    // Split mouse events out of the keystroke stream, dispatch each,
+    // and forward only non-mouse bytes to the input state machine.
+    let (regular, mouse_events) = extract_mouse_events(&vge_out.passthrough);
+    for ev in mouse_events {
+        handle_mouse_event(state, ev)?;
+    }
+    if !regular.is_empty() {
+        process_user_input(state, &regular)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseEvent {
+    /// xterm-style button code: bits 0..1 = button (0=left, 1=middle,
+    /// 2=right, 3=release), bit 2 = shift, bit 3 = meta, bit 4 = ctrl,
+    /// bit 5 = motion, bit 6 = wheel (64=up, 65=down).
+    button: u32,
+    /// 1-indexed host cell coords as reported by SGR mouse encoding.
+    col: u32,
+    row: u32,
+    /// `true` for press / motion events (`M`), `false` for release (`m`).
+    press: bool,
+}
+
+/// Walk `bytes` and pull out SGR mouse sequences (`\e[<b;c;rM/m`).
+/// Returns the bytes that were NOT part of any mouse sequence (suitable
+/// for forwarding to the focused pane) plus the parsed events.
+fn extract_mouse_events(bytes: &[u8]) -> (Vec<u8>, Vec<MouseEvent>) {
+    let mut out_bytes = Vec::with_capacity(bytes.len());
+    let mut events = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Try to recognise `\e[<…M/m` as a mouse event. Anything else
+        // (including non-mouse CSI sequences) goes through verbatim.
+        if bytes[i] == 0x1B
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'['
+            && bytes[i + 2] == b'<'
+        {
+            // Scan ahead for the terminating M/m, capping the lookahead
+            // so a malformed sequence doesn't swallow the rest of the
+            // chunk.
+            let start = i + 3;
+            let cap = (start + 32).min(bytes.len());
+            if let Some(end) = (start..cap)
+                .find(|&j| bytes[j] == b'M' || bytes[j] == b'm')
+            {
+                let press = bytes[end] == b'M';
+                let body = &bytes[start..end];
+                if let Some(ev) = parse_sgr_body(body, press) {
+                    events.push(ev);
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out_bytes.push(bytes[i]);
+        i += 1;
+    }
+    (out_bytes, events)
+}
+
+fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
+    let s = std::str::from_utf8(body).ok()?;
+    let mut parts = s.splitn(3, ';');
+    let button: u32 = parts.next()?.parse().ok()?;
+    let col: u32 = parts.next()?.parse().ok()?;
+    let row: u32 = parts.next()?.parse().ok()?;
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        press,
+    })
+}
+
+/// Hit-test a mouse event against pane bounds and dispatch:
+///   - wheel + inner program doesn't want mouse → drive vmux's
+///     scrollback for that pane (auto-enter Mode::Scroll, auto-exit at
+///     offset 0);
+///   - any other case → forward the event to the matching pane's PTY
+///     in SGR encoding, with coords translated to portal-relative.
+fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
+    // Find the pane whose `last_rect` contains the event cell. SGR
+    // coords are 1-indexed; PaneRect is 0-indexed.
+    let host_col = ev.col.saturating_sub(1) as i32;
+    let host_row = ev.row.saturating_sub(1) as i32;
+    let mut target: Option<String> = None;
+    for (id, pane) in &state.panes {
+        if let Some(rect) = pane.last_rect {
+            if host_col >= rect.x
+                && host_col < rect.x + rect.w as i32
+                && host_row >= rect.y
+                && host_row < rect.y + rect.h as i32
+            {
+                target = Some(id.clone());
+                break;
+            }
+        }
+    }
+    let Some(pane_id) = target else {
+        return Ok(());
+    };
+
+    let is_wheel = matches!(ev.button & 0xFF, 64 | 65);
+    let inner_wants_mouse = state
+        .panes
+        .get(&pane_id)
+        .map(|p| p.inner_mouse_protocol != 0)
+        .unwrap_or(false);
+
+    if is_wheel && !inner_wants_mouse {
+        // Drive vmux's per-pane scrollback. Wheel-up enters scroll
+        // mode; wheel-down at offset 0 is a no-op; reaching offset 0
+        // exits scroll mode.
+        if !ev.press {
+            return Ok(()); // wheel only emits "press" events
+        }
+        let dir: i64 = if ev.button == 64 { 3 } else { -3 };
+        wheel_scroll(state, &pane_id, dir)?;
+        return Ok(());
+    }
+
+    // Forward to the inner program. Translate host cells to
+    // portal-relative cells (the inner expects coords inside its own
+    // grid). If the click is on the chrome (border / title row),
+    // ignore it rather than feed an out-of-range coordinate.
+    let Some(rect) = state.panes.get(&pane_id).and_then(|p| p.last_rect) else {
+        return Ok(());
+    };
+    let (rows, cols) = inner_grid_for(rect);
+    let (origin_x, origin_y) = inner_origin_for(rect);
+    let portal_col = host_col - origin_x;
+    let portal_row = host_row - origin_y;
+    if portal_col < 0
+        || portal_col >= cols as i32
+        || portal_row < 0
+        || portal_row >= rows as i32
+    {
+        return Ok(());
+    }
+    let final_byte = if ev.press { b'M' } else { b'm' };
+    let payload = format!(
+        "\x1b[<{};{};{}{}",
+        ev.button,
+        portal_col + 1,
+        portal_row + 1,
+        final_byte as char,
+    );
+    if let Some(p) = state.panes.get(&pane_id) {
+        let _ = p.pty.write_all(payload.as_bytes());
+    }
+    Ok(())
+}
+
+/// Wheel-driven scroll for `pane_id`: enter/exit `Mode::Scroll` as
+/// needed and adjust the offset by `delta`. Used when the inner
+/// program hasn't enabled mouse reporting, so wheel naturally drives
+/// vmux's scrollback for the pane under the cursor.
+fn wheel_scroll(state: &mut State, pane_id: &str, delta: i64) -> Result<()> {
+    // If we're scrolling a different pane, exit that one first.
+    let scrolling_other = matches!(
+        &state.mode,
+        Mode::Scroll { pane_id: cur, .. } if cur != pane_id
+    );
+    if scrolling_other {
+        let env = state.exit_scroll()?;
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
+
+    // Wheeling down on a pane that isn't currently being scrolled
+    // means "stay at live" — ignore.
+    if !matches!(&state.mode, Mode::Scroll { .. }) && delta < 0 {
+        return Ok(());
+    }
+
+    if !matches!(&state.mode, Mode::Scroll { .. }) {
+        // Enter scroll mode for this pane. enter_scroll() uses the
+        // current focus, so retarget focus briefly to the wheeled
+        // pane, enter, then leave focus where it was — wheel-driven
+        // scroll shouldn't steal keyboard focus.
+        let saved_focus = state.focus().to_string();
+        state.set_focus(pane_id.to_string());
+        let env = state.enter_scroll()?;
+        state.set_focus(saved_focus);
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
+
+    let env = state.scroll_delta(delta)?;
+    if !env.is_empty() {
+        write_all_stdout(&env)?;
+    }
+
+    // If we just landed back at live, drop scroll mode so the
+    // scrollbar / `[scroll: 0]` indicator clear.
+    if matches!(&state.mode, Mode::Scroll { offset: 0, .. }) {
+        let env = state.exit_scroll()?;
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
     }
     Ok(())
 }

@@ -40,6 +40,11 @@ struct App {
     // Input
     proxy: EventLoopProxy<()>,
     modifiers: ModifiersState,
+    /// Last seen pointer position in physical pixels. Set by
+    /// `WindowEvent::CursorMoved`, read by the `MouseWheel` handler so
+    /// it can convert to `(col, row)` cells when forwarding wheel
+    /// events to the PTY.
+    cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 impl App {
@@ -57,6 +62,7 @@ impl App {
             prt: None,
             proxy,
             modifiers: ModifiersState::empty(),
+            cursor_pos: None,
         }
     }
 
@@ -373,25 +379,89 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some(position);
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                        let ch = self
-                            .term_renderer
-                            .as_ref()
-                            .map(|t| t.cell_height)
-                            .unwrap_or(20.0);
-                        (pos.y as f32 / ch) as isize
+                // Decide whether to forward the wheel as a mouse-button
+                // event to the PTY (when the inner program has enabled
+                // mouse reporting in SGR encoding) or use it for the
+                // host's own scrollback.
+                let (mode, encoding) = self
+                    .parser
+                    .as_ref()
+                    .map(|p| {
+                        let s = p.screen();
+                        (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                    })
+                    .unwrap_or((
+                        vt100::MouseProtocolMode::None,
+                        vt100::MouseProtocolEncoding::Default,
+                    ));
+                let forward = mode != vt100::MouseProtocolMode::None
+                    && matches!(encoding, vt100::MouseProtocolEncoding::Sgr);
+
+                if forward {
+                    // Convert pointer position + delta into wheel ticks
+                    // (1 line = 1 tick). LineDelta is platform-native;
+                    // PixelDelta (touchpads) gets binned by cell height.
+                    let cell_h = self
+                        .term_renderer
+                        .as_ref()
+                        .map(|t| t.cell_height)
+                        .unwrap_or(20.0);
+                    let cell_w = self
+                        .term_renderer
+                        .as_ref()
+                        .map(|t| t.cell_width)
+                        .unwrap_or(9.0);
+                    let ticks = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            (pos.y / cell_h as f64).round() as i32
+                        }
+                    };
+                    if ticks != 0 {
+                        let (col, row) = self
+                            .cursor_pos
+                            .map(|p| {
+                                let c = (p.x / cell_w as f64).floor().max(0.0) as u32 + 1;
+                                let r = (p.y / cell_h as f64).floor().max(0.0) as u32 + 1;
+                                (c, r)
+                            })
+                            .unwrap_or((1, 1));
+                        let button = if ticks > 0 { 64 } else { 65 };
+                        let mut payload = Vec::with_capacity(16 * ticks.unsigned_abs() as usize);
+                        for _ in 0..ticks.unsigned_abs() {
+                            payload.extend_from_slice(
+                                format!("\x1b[<{button};{col};{row}M").as_bytes(),
+                            );
+                        }
+                        if let Some(pty) = &self.pty {
+                            let _ = pty.write_all(&payload);
+                        }
                     }
-                };
-                if let Some(parser) = &mut self.parser {
-                    let screen = parser.screen_mut();
-                    let current = screen.scrollback() as isize;
-                    screen.set_scrollback((current + lines).max(0) as usize);
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                } else {
+                    let lines = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            let ch = self
+                                .term_renderer
+                                .as_ref()
+                                .map(|t| t.cell_height)
+                                .unwrap_or(20.0);
+                            (pos.y as f32 / ch) as isize
+                        }
+                    };
+                    if let Some(parser) = &mut self.parser {
+                        let screen = parser.screen_mut();
+                        let current = screen.scrollback() as isize;
+                        screen.set_scrollback((current + lines).max(0) as usize);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
 
