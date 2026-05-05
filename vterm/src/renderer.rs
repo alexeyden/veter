@@ -93,6 +93,102 @@ fn color_key(c: Color) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
 }
 
+/// Draw a Unicode block element (U+2580..U+259F) directly with cell-sized
+/// rectangles instead of using the font glyph. Most monospace fonts ship
+/// block glyphs that fall short of the cell box (especially the cell
+/// height when leading is non-zero), which leaves visible gaps when these
+/// characters are tiled — see e.g. ASCII art that uses U+2588 FULL BLOCK.
+/// Konsole, kitty, alacritty, wezterm all do the same thing.
+///
+/// Returns `true` if `ch` was a block element and the cell was filled.
+fn try_draw_block_element<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    ch: char,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fg: Color,
+) -> bool {
+    let code = ch as u32;
+    if !(0x2580..=0x259F).contains(&code) {
+        return false;
+    }
+
+    let fill = |canvas: &mut Canvas<T>, rx: f32, ry: f32, rw: f32, rh: f32, color: Color| {
+        let mut p = Path::new();
+        p.rect(rx, ry, rw, rh);
+        canvas.fill_path(&p, &Paint::color(color));
+    };
+    let shaded = |alpha: u8| Color::rgba((fg.r * 255.0) as u8, (fg.g * 255.0) as u8, (fg.b * 255.0) as u8, alpha);
+
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.5;
+    let half_w = w * 0.5;
+    let half_h = h * 0.5;
+
+    match code {
+        // U+2580 UPPER HALF BLOCK
+        0x2580 => fill(canvas, x, y, w, half_h, fg),
+        // U+2581..U+2587 LOWER N/8 BLOCK (1/8 .. 7/8 from bottom)
+        0x2581..=0x2587 => {
+            let n = (code - 0x2580) as f32; // 1..=7
+            let bh = h * n / 8.0;
+            fill(canvas, x, y + h - bh, w, bh, fg);
+        }
+        // U+2588 FULL BLOCK
+        0x2588 => fill(canvas, x, y, w, h, fg),
+        // U+2589..U+258F LEFT N/8 BLOCK (7/8 .. 1/8 from left)
+        0x2589..=0x258F => {
+            let n = (0x2590 - code) as f32; // 7..=1
+            fill(canvas, x, y, w * n / 8.0, h, fg);
+        }
+        // U+2590 RIGHT HALF BLOCK
+        0x2590 => fill(canvas, cx, y, half_w, h, fg),
+        // U+2591 LIGHT SHADE
+        0x2591 => fill(canvas, x, y, w, h, shaded(64)),
+        // U+2592 MEDIUM SHADE
+        0x2592 => fill(canvas, x, y, w, h, shaded(128)),
+        // U+2593 DARK SHADE
+        0x2593 => fill(canvas, x, y, w, h, shaded(192)),
+        // U+2594 UPPER ONE EIGHTH BLOCK
+        0x2594 => fill(canvas, x, y, w, h / 8.0, fg),
+        // U+2595 RIGHT ONE EIGHTH BLOCK
+        0x2595 => fill(canvas, x + w * 7.0 / 8.0, y, w / 8.0, h, fg),
+        // U+2596..U+259F QUADRANT BLOCKS
+        0x2596..=0x259F => {
+            // Bitfield: bit0=UL, bit1=UR, bit2=LL, bit3=LR.
+            let mask: u8 = match code {
+                0x2596 => 0b0100, // ▖ LL
+                0x2597 => 0b1000, // ▗ LR
+                0x2598 => 0b0001, // ▘ UL
+                0x2599 => 0b1101, // ▙ UL+LL+LR
+                0x259A => 0b1001, // ▚ UL+LR
+                0x259B => 0b0111, // ▛ UL+UR+LL
+                0x259C => 0b1011, // ▜ UL+UR+LR
+                0x259D => 0b0010, // ▝ UR
+                0x259E => 0b0110, // ▞ UR+LL
+                0x259F => 0b1110, // ▟ UR+LL+LR
+                _ => unreachable!(),
+            };
+            if mask & 0b0001 != 0 {
+                fill(canvas, x, y, half_w, half_h, fg);
+            }
+            if mask & 0b0010 != 0 {
+                fill(canvas, cx, y, half_w, half_h, fg);
+            }
+            if mask & 0b0100 != 0 {
+                fill(canvas, x, cy, half_w, half_h, fg);
+            }
+            if mask & 0b1000 != 0 {
+                fill(canvas, cx, cy, half_w, half_h, fg);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn key_to_color(key: u32) -> Color {
     Color::rgba(
         ((key >> 16) & 0xFF) as u8,
@@ -891,6 +987,26 @@ impl TerminalRenderer {
                     _ => continue,
                 };
 
+                // Block elements (U+2580..U+259F) tile seamlessly only
+                // when drawn as primitives; the font glyphs leave gaps
+                // because the cell box includes leading. Short-circuit
+                // before the font lookup.
+                let is_cursor = focused_cursor == Some((row, col));
+                let (fg, _) = resolve_cell_colors(cell, is_cursor);
+                let cx = ox_px + col as f32 * self.cell_width;
+                let cy = oy_px + row as f32 * self.cell_height;
+                if try_draw_block_element(
+                    canvas,
+                    ch,
+                    cx,
+                    cy,
+                    self.cell_width,
+                    self.cell_height,
+                    fg,
+                ) {
+                    continue;
+                }
+
                 let (glyph_id, font_id) = {
                     let gid = primary_charmap.map(ch);
                     if gid != 0 {
@@ -910,11 +1026,8 @@ impl TerminalRenderer {
                     }
                 };
 
-                let is_cursor = focused_cursor == Some((row, col));
-                let (fg, _) = resolve_cell_colors(cell, is_cursor);
-
-                let x = ox_px + col as f32 * self.cell_width;
-                let y = oy_px + row as f32 * self.cell_height + self.ascent;
+                let x = cx;
+                let y = cy + self.ascent;
 
                 let rendered = if font_id == 0 {
                     let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
