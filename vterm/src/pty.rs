@@ -27,6 +27,12 @@ impl Pty {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 unsafe { std::env::set_var("COLORTERM", "truecolor") };
+                // Prefer vmux when available so vterm sessions get the
+                // multiplexer transparently. execvp searches $PATH and
+                // only returns on failure, so a missing/unrunnable vmux
+                // simply falls through to the user's login shell.
+                let vmux = CString::new("vmux").unwrap();
+                let _ = execvp(&vmux, &[&vmux]);
                 // Honor `$SHELL` (the user's login shell) and fall back
                 // to `/bin/sh` if it's unset or unusable, mirroring the
                 // convention tmux/screen/alacritty all follow. The
