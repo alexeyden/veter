@@ -26,6 +26,7 @@ impl Pty {
         match result {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
+                unsafe { std::env::set_var("COLORTERM", "truecolor") };
                 // Honor `$SHELL` (the user's login shell) and fall back
                 // to `/bin/sh` if it's unset or unusable, mirroring the
                 // convention tmux/screen/alacritty all follow. The
