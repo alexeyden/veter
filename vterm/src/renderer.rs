@@ -572,7 +572,10 @@ impl TerminalRenderer {
             let font_ref = FontRef::from_index(&font_data, font_index).unwrap();
             let metrics = font_ref.metrics(&[]).scale(font_size);
             ascent = metrics.ascent;
-            cell_height = (metrics.ascent + metrics.descent + metrics.leading).ceil();
+            // Match Konsole / kitty / alacritty: cell height excludes
+            // font-supplied leading. Including leading widens line
+            // spacing visibly versus what users expect from a terminal.
+            cell_height = (metrics.ascent + metrics.descent).ceil();
 
             let glyph_metrics = font_ref.glyph_metrics(&[]).scale(font_size);
             let charmap = font_ref.charmap();
