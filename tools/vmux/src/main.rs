@@ -2378,6 +2378,17 @@ fn main() -> Result<()> {
             Err(e) => return Err(anyhow!("poll: {e}")),
         };
         if n == 0 {
+            // Poll idle: nothing arrived for the full 50ms window, so any
+            // ESC byte still buffered in the APC parsers' EscPending state
+            // is unambiguously a lone keystroke (e.g. dismiss-modal). Push
+            // it through so the input handler can act on it without
+            // waiting for a follow-up byte that's never coming.
+            let prt_flushed = prt_apc.flush_pending_esc();
+            let mut pending = vge_apc.feed(&prt_flushed).passthrough;
+            pending.extend(vge_apc.flush_pending_esc());
+            if !pending.is_empty() {
+                process_user_input(&mut state, &pending)?;
+            }
             continue;
         }
 

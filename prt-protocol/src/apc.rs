@@ -132,6 +132,25 @@ impl ApcStream {
         out
     }
 
+    /// Drain a deferred lone ESC (state `EscPending`) and return it as a
+    /// single-byte `Vec`. Other states — mid-envelope, mid-CSI, etc. —
+    /// are left alone because their bodies must arrive in full.
+    ///
+    /// Callers should invoke this when the input source has been idle
+    /// long enough that a buffered ESC is unambiguously a lone keystroke
+    /// rather than the leading byte of an in-flight ESC-sequence. With
+    /// no flush, a lone ESC sits in `EscPending` until the next byte
+    /// arrives — which, for an interactive terminal, can mean a modal
+    /// dismiss key apparently does nothing.
+    pub fn flush_pending_esc(&mut self) -> Vec<u8> {
+        if matches!(self.state, State::EscPending) {
+            self.state = State::Idle;
+            vec![ESC]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn step(&mut self, b: u8, out: &mut Output) {
         // Move out the current state so we can rebuild it without fighting
         // the borrow checker on owned `Vec<u8>` body buffers.
@@ -351,6 +370,31 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(&[ESC, b'A']);
         assert_eq!(out.passthrough, vec![ESC, b'A']);
+    }
+
+    #[test]
+    fn flush_pending_esc_emits_deferred_lone_esc() {
+        let mut s = ApcStream::new();
+        let out = s.feed(&[ESC]);
+        assert!(out.passthrough.is_empty());
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+        // Idempotent — second flush has nothing to drain.
+        assert!(s.flush_pending_esc().is_empty());
+        // After flush, parser is back to Idle and accepts a fresh envelope.
+        let out = s.feed(&envelope(b"x"));
+        assert_eq!(out.payloads, vec![b"x".to_vec()]);
+    }
+
+    #[test]
+    fn flush_pending_esc_leaves_mid_envelope_alone() {
+        // If we're mid-PRT-envelope, flushing must not corrupt the body.
+        let mut s = ApcStream::new();
+        let env = envelope(b"abc");
+        let out = s.feed(&env[..env.len() - 1]); // everything but ST_CLOSE
+        assert!(out.payloads.is_empty());
+        assert!(s.flush_pending_esc().is_empty());
+        let out = s.feed(&env[env.len() - 1..]);
+        assert_eq!(out.payloads, vec![b"abc".to_vec()]);
     }
 
     #[test]
