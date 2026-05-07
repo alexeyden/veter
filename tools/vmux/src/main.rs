@@ -798,13 +798,13 @@ fn build_modal_commands(
     title: &str,
     prompt: &str,
     buffer: &str,
-    cell_pw: f32,
-    cell_ph: f32,
+    _cell_pw: f32,
+    _cell_ph: f32,
 ) -> CreateElementBody {
     // Center a fixed-size modal box on the host grid. The 4-cell box
-    // is (top pad)(title)(buffer)(bottom pad) — no inline hint row,
-    // since the buffer width drives the box width and any hint long
-    // enough to be useful would overflow on short prompts.
+    // is (title strip)(body top pad)(buffer)(body bottom pad) — title
+    // row is filled with brand color, the rest with the modal bg, and
+    // the whole box gets a straight-edge brand outline.
     let line = format!("{prompt}{buffer}_");
     let chars = line.chars().count() as f32;
     let inner_w = chars.max(20.0);
@@ -814,20 +814,39 @@ fn build_modal_commands(
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
 
-    let rx = 0.6_f32.min(box_w * 0.4);
-    let ry = (0.6_f32 * cell_pw / cell_ph).min(box_h * 0.4);
-
     let cmds = vec![
-        DrawCmd::OutlineFillPath {
+        DrawCmd::FillRectangles {
             fill: Style::Flat(COLOR_MODAL_BG),
+            rects: vec![Rect {
+                x: 0.0,
+                y: 1.0,
+                w: box_w,
+                h: box_h - 1.0,
+            }],
+        },
+        DrawCmd::FillRectangles {
+            fill: Style::Flat(COLOR_BRAND),
+            rects: vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                w: box_w,
+                h: 1.0,
+            }],
+        },
+        DrawCmd::DrawLineLoop {
             stroke: Style::Flat(COLOR_MODAL_OUTLINE),
             line_width: 0.1,
-            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
+            points: vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: box_w, y: 0.0 },
+                Point { x: box_w, y: box_h },
+                Point { x: 0.0, y: box_h },
+            ],
         },
         DrawCmd::DrawText {
             origin: Point {
                 x: box_w * 0.5,
-                y: 0.5,
+                y: 0.0,
             },
             align: Align::Center,
             fill: Style::Flat(COLOR_MODAL_TEXT),
@@ -898,8 +917,8 @@ const HELP_LINES: &[&str] = &[
 fn build_help_modal_body(
     host_w: u32,
     host_h: u32,
-    cell_pw: f32,
-    cell_ph: f32,
+    _cell_pw: f32,
+    _cell_ph: f32,
 ) -> CreateElementBody {
     // Box sized to the longest line + comfortable padding, clamped to
     // the host so it doesn't overflow on very small terminals.
@@ -916,25 +935,46 @@ fn build_help_modal_body(
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
 
-    let rx = 0.6_f32.min(box_w * 0.4);
-    let ry = (0.6_f32 * cell_pw / cell_ph).min(box_h * 0.4);
+    let mut cmds = vec![
+        DrawCmd::FillRectangles {
+            fill: Style::Flat(COLOR_MODAL_BG),
+            rects: vec![Rect {
+                x: 0.0,
+                y: 1.0,
+                w: box_w,
+                h: box_h - 1.0,
+            }],
+        },
+        DrawCmd::FillRectangles {
+            fill: Style::Flat(COLOR_BRAND),
+            rects: vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                w: box_w,
+                h: 1.0,
+            }],
+        },
+        DrawCmd::DrawLineLoop {
+            stroke: Style::Flat(COLOR_MODAL_OUTLINE),
+            line_width: 0.1,
+            points: vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: box_w, y: 0.0 },
+                Point { x: box_w, y: box_h },
+                Point { x: 0.0, y: box_h },
+            ],
+        },
+    ];
 
-    let mut cmds = vec![DrawCmd::OutlineFillPath {
-        fill: Style::Flat(COLOR_MODAL_BG),
-        stroke: Style::Flat(COLOR_MODAL_OUTLINE),
-        line_width: 0.1,
-        segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-    }];
-
-    // First line is the title (bold + centered); subsequent lines are
-    // left-aligned with monospace alignment.
+    // First line is the title — drawn into the brand title strip on
+    // row 0. Subsequent lines are left-aligned body content; the row
+    // immediately below the title strip stays empty as breathing room.
     for (i, line) in HELP_LINES.iter().enumerate() {
-        let row_y = 1.0 + i as f32;
         if i == 0 {
             cmds.push(DrawCmd::DrawText {
                 origin: Point {
                     x: box_w * 0.5,
-                    y: row_y,
+                    y: 0.0,
                 },
                 align: Align::Center,
                 fill: Style::Flat(COLOR_MODAL_TEXT),
@@ -946,7 +986,10 @@ fn build_help_modal_body(
             // body lines stay normal.
             let bold = !line.is_empty() && !line.starts_with(' ');
             cmds.push(DrawCmd::DrawText {
-                origin: Point { x: 3.0, y: row_y },
+                origin: Point {
+                    x: 3.0,
+                    y: 1.0 + i as f32,
+                },
                 align: Align::Left,
                 fill: Style::Flat(COLOR_MODAL_TEXT),
                 font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
@@ -1638,15 +1681,15 @@ impl State {
     fn build_rename_modal_body(&self) -> Option<CreateElementBody> {
         match &self.mode {
             Mode::Rename { target, buffer } => {
-                let (title, prompt) = match target {
-                    RenameTarget::Pane(id) => ("Rename pane", format!("{id}: ")),
-                    RenameTarget::Tab(idx) => ("Rename tab", format!("{}: ", idx + 1)),
+                let title = match target {
+                    RenameTarget::Pane(_) => "Rename pane",
+                    RenameTarget::Tab(_) => "Rename tab",
                 };
                 Some(build_modal_commands(
                     self.host_w,
                     self.host_h,
                     title,
-                    &prompt,
+                    "",
                     buffer,
                     self.cell_pw,
                     self.cell_ph,
