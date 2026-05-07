@@ -21,7 +21,21 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Icon, Window, WindowAttributes, WindowId};
+
+/// PNG-encoded window icon, rasterised from `assets/veter.svg`.
+/// Decoded once at window creation; failure is non-fatal (the platform
+/// just falls back to its default icon). Also note that on Wayland the
+/// per-window icon protocol doesn't exist — the compositor resolves the
+/// title-bar icon from the window's app_id matching `veter.desktop`,
+/// which is set via the platform-Wayland `with_name` extension below.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/128x128/veter.png");
+
+fn load_window_icon() -> Option<Icon> {
+    let img = image::load_from_memory(WINDOW_ICON_PNG).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).ok()
+}
 
 /// Which vt100 grid a selection belongs to. The host's vt100 is one
 /// option; the rest are portals identified by their full path of IDs
@@ -827,7 +841,18 @@ impl ApplicationHandler for App {
 
         let window_attrs = WindowAttributes::default()
             .with_title("Veter")
+            .with_window_icon(load_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(800u32, 600u32));
+
+        // On Wayland (and X11 fallback) the title-bar icon is resolved
+        // from the window's app_id / WM_CLASS matching a .desktop file
+        // — `with_window_icon` is a no-op there. Set the name to
+        // "veter" so the compositor finds `veter.desktop`.
+        #[cfg(target_os = "linux")]
+        let window_attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            window_attrs.with_name("veter", "veter")
+        };
 
         let template = ConfigTemplateBuilder::new().with_alpha_size(8);
         let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));

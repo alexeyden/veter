@@ -9,9 +9,16 @@
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
+ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
 PACKAGES := veter vcat vmux
 DESKTOP_FILE := $(APPDIR)/veter.desktop
+ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
+ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
+
+# Raster sizes installed for desktop menus that don't pick up the
+# scalable SVG (KDE Plasma's menu cache, GTK older versions, etc).
+ICON_PNG_SIZES := 16 32 48 64 128 256
 
 CARGO ?= cargo
 INSTALL ?= install
@@ -31,7 +38,7 @@ endif
 RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
-.PHONY: all build install uninstall clean help install-desktop
+.PHONY: all build install uninstall clean help install-desktop install-icon
 
 all: install
 
@@ -55,7 +62,7 @@ build:
 # is missing after the build.
 $(BINS): build
 
-install: $(BINS) install-desktop
+install: $(BINS) install-desktop install-icon
 	@$(INSTALL) -d $(BINDIR)
 	@for pkg in $(PACKAGES); do \
 	    src="$(RELEASE_DIR)/$$pkg"; \
@@ -84,7 +91,7 @@ install-desktop:
 	    'Comment=Veter — VGE/PRT-aware terminal emulator' \
 	    'Exec=$(BINDIR)/veter' \
 	    'TryExec=$(BINDIR)/veter' \
-	    'Icon=utilities-terminal' \
+	    'Icon=veter' \
 	    'Terminal=false' \
 	    'Categories=System;TerminalEmulator;' \
 	    'Keywords=shell;prompt;command;commandline;cmd;' \
@@ -96,13 +103,40 @@ install-desktop:
 	    update-desktop-database "$(APPDIR)" >/dev/null 2>&1 || true; \
 	fi
 
+# Install the SVG into the freedesktop hicolor scalable apps path plus
+# raster PNGs at standard sizes; the .desktop file's `Icon=veter` then
+# resolves on any compliant desktop env. Refresh the icon-theme cache
+# at the end so KDE Plasma's menu picks the new icon up immediately.
+install-icon:
+	@$(INSTALL) -d $(ICONROOT)/scalable/apps
+	@$(INSTALL) -m 0644 $(ICON_SVG_SRC) $(ICON_SVG_DST)
+	@echo "    veter.svg -> $(ICON_SVG_DST)"
+	@for sz in $(ICON_PNG_SIZES); do \
+	    src="$(CURDIR)/assets/icons/$${sz}x$${sz}/veter.png"; \
+	    dst="$(ICONROOT)/$${sz}x$${sz}/apps/veter.png"; \
+	    $(INSTALL) -d "$(ICONROOT)/$${sz}x$${sz}/apps"; \
+	    $(INSTALL) -m 0644 "$$src" "$$dst"; \
+	    echo "    veter.png ($${sz}px) -> $$dst"; \
+	done
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+	    gtk-update-icon-cache -q -f -t "$(ICONROOT)" >/dev/null 2>&1 || true; \
+	fi
+
 uninstall:
 	@for pkg in $(PACKAGES); do \
 	    rm -f "$(BINDIR)/$$pkg" && echo "    removed $(BINDIR)/$$pkg"; \
 	done
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
+	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
+	@for sz in $(ICON_PNG_SIZES); do \
+	    rm -f "$(ICONROOT)/$${sz}x$${sz}/apps/veter.png" && \
+	    echo "    removed $(ICONROOT)/$${sz}x$${sz}/apps/veter.png"; \
+	done
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database "$(APPDIR)" >/dev/null 2>&1 || true; \
+	fi
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+	    gtk-update-icon-cache -q -f -t "$(ICONROOT)" >/dev/null 2>&1 || true; \
 	fi
 
 clean:
