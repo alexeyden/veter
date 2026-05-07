@@ -226,6 +226,11 @@ pub struct PrtEngine {
     /// `take_all_pending_image_deletes` so femtovg's GPU cache stays
     /// in sync with the CPU side.
     pending_image_deletes: Vec<femtovg::ImageId>,
+    /// Decoded OSC 52 set payloads observed in any portal's vt100 in
+    /// this engine's subtree. Buffered alongside the regular
+    /// `EVT_CLIPBOARD_OP` emission so the host (`App`) can apply them
+    /// to the system clipboard. Drained by `take_pending_clipboard_writes`.
+    pending_clipboard_writes: Vec<String>,
 }
 
 impl PrtEngine {
@@ -262,6 +267,7 @@ impl PrtEngine {
             cell_px,
             scale_factor,
             pending_image_deletes: Vec::new(),
+            pending_clipboard_writes: Vec::new(),
         }
     }
 
@@ -327,6 +333,14 @@ impl PrtEngine {
     /// write to the PTY master.
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response_bytes)
+    }
+
+    /// Drain decoded OSC 52 set payloads observed in any portal under
+    /// this engine since the last call. The host (`App`) feeds these to
+    /// the system clipboard; the corresponding `EVT_CLIPBOARD_OP` PRT
+    /// frames are still emitted to the engine's client.
+    pub fn take_pending_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_clipboard_writes)
     }
 
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that
@@ -1041,6 +1055,12 @@ impl PrtEngine {
                 // multi-char selectors (e.g. "cp"); take the first.
                 let sel = selection.first().copied().unwrap_or(b'c');
                 let decoded = b64_decode(&data).unwrap_or_default();
+                // Surface the text to the host (App) so it can update
+                // the system clipboard. We still emit the PRT event
+                // unchanged — clients (e.g. nested vmux) may also care.
+                if let Ok(text) = std::str::from_utf8(&decoded) {
+                    self.pending_clipboard_writes.push(text.to_owned());
+                }
                 self.emit_event(
                     EVT_CLIPBOARD_OP,
                     clipboard_op_body(id, sel, CLIPBOARD_SET, &decoded),

@@ -2,7 +2,7 @@
 //! Vector Graphics Extension (VGE) for chrome.
 //!
 //! Run inside a vterm session that advertises both extensions. Default
-//! prefix key is **Ctrl+B**. After pressing it once:
+//! prefix key is **Ctrl+Space**. After pressing it once:
 //!
 //!   v  split the focused pane vertically (new pane to the right)
 //!   h  split horizontally (new pane below)
@@ -218,19 +218,131 @@ struct PaneRect {
 }
 
 /// Walk the layout tree and lay every leaf out within `bounds`.
-/// Inner grid of a portal placed at `rect`. One cell on each side is
-/// eaten by the outline border. The title text overlays the bottom-right
-/// portal cell rather than reserving a row of its own. Returns `(rows,
-/// cols)`.
+/// Inner grid of a portal placed at `rect`. The portal fills the entire
+/// rect — separators sit on the cell edges *between* panes, not inside
+/// them, so we don't reserve a chrome border. The title text overlays
+/// the bottom-right portal cell rather than reserving a row. Returns
+/// `(rows, cols)`.
 fn inner_grid_for(rect: PaneRect) -> (u32, u32) {
-    let cols = rect.w.saturating_sub(2).max(1);
-    let rows = rect.h.saturating_sub(2).max(1);
-    (rows, cols)
+    (rect.h.max(1), rect.w.max(1))
 }
 
 /// Inner-portal origin within the host grid for `rect`.
 fn inner_origin_for(rect: PaneRect) -> (i32, i32) {
-    (rect.x + 1, rect.y + 1)
+    (rect.x, rect.y)
+}
+
+/// A thin line drawn between two adjacent panes. Coordinates are in
+/// host-cell units; the line lies on a cell edge.
+#[derive(Debug, Clone, Copy)]
+enum Separator {
+    /// Vertical line at `x`, spanning `y0..y1`.
+    Vertical { x: f32, y0: f32, y1: f32 },
+    /// Horizontal line at `y`, spanning `x0..x1`.
+    Horizontal { y: f32, x0: f32, x1: f32 },
+}
+
+/// Walk the layout tree and emit one separator at each split boundary.
+/// Each separator stops 1 cell short of the split's bounds on both ends
+/// so adjacent separators (in nested splits) and pane corners get a
+/// little visual breathing room.
+fn collect_separators(node: &Layout, bounds: PaneRect, out: &mut Vec<Separator>) {
+    if let Layout::Split { dir, ratio, a, b } = node {
+        match dir {
+            SplitDir::Vertical => {
+                let w_a = ((bounds.w as f32 * ratio).round() as u32).max(1);
+                let w_a = w_a.min(bounds.w.saturating_sub(1));
+                let w_b = bounds.w - w_a;
+                let rect_a = PaneRect {
+                    x: bounds.x,
+                    y: bounds.y,
+                    w: w_a,
+                    h: bounds.h,
+                };
+                let rect_b = PaneRect {
+                    x: bounds.x + w_a as i32,
+                    y: bounds.y,
+                    w: w_b,
+                    h: bounds.h,
+                };
+                let y0 = bounds.y as f32 + 1.0;
+                let y1 = bounds.y as f32 + bounds.h as f32 - 1.0;
+                if y1 > y0 {
+                    out.push(Separator::Vertical {
+                        x: bounds.x as f32 + w_a as f32,
+                        y0,
+                        y1,
+                    });
+                }
+                collect_separators(a, rect_a, out);
+                collect_separators(b, rect_b, out);
+            }
+            SplitDir::Horizontal => {
+                let h_a = ((bounds.h as f32 * ratio).round() as u32).max(1);
+                let h_a = h_a.min(bounds.h.saturating_sub(1));
+                let h_b = bounds.h - h_a;
+                let rect_a = PaneRect {
+                    x: bounds.x,
+                    y: bounds.y,
+                    w: bounds.w,
+                    h: h_a,
+                };
+                let rect_b = PaneRect {
+                    x: bounds.x,
+                    y: bounds.y + h_a as i32,
+                    w: bounds.w,
+                    h: h_b,
+                };
+                let x0 = bounds.x as f32 + 1.0;
+                let x1 = bounds.x as f32 + bounds.w as f32 - 1.0;
+                if x1 > x0 {
+                    out.push(Separator::Horizontal {
+                        y: bounds.y as f32 + h_a as f32,
+                        x0,
+                        x1,
+                    });
+                }
+                collect_separators(a, rect_a, out);
+                collect_separators(b, rect_b, out);
+            }
+        }
+    }
+}
+
+/// Build the VGE element body that draws between-pane separators for
+/// the active tab's layout. With a single pane, `commands` is empty —
+/// we still emit the element so visibility tracking is uniform.
+fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
+    let mut seps = Vec::new();
+    collect_separators(layout, full, &mut seps);
+    let mut cmds: Vec<DrawCmd> = Vec::new();
+    if !seps.is_empty() {
+        let lines: Vec<(Point, Point)> = seps
+            .into_iter()
+            .map(|s| match s {
+                Separator::Vertical { x, y0, y1 } => {
+                    (Point { x, y: y0 }, Point { x, y: y1 })
+                }
+                Separator::Horizontal { y, x0, x1 } => {
+                    (Point { x: x0, y }, Point { x: x1, y })
+                }
+            })
+            .collect();
+        cmds.push(DrawCmd::DrawLines {
+            stroke: Style::Flat(COLOR_BRAND),
+            line_width: 0.06,
+            lines,
+        });
+    }
+    CreateElementBody {
+        id: SEPARATORS_ELEMENT_ID.to_string(),
+        commands: cmds,
+        origin: Point { x: 0.0, y: 0.0 },
+        is_visible: true,
+        draw_order: CHROME_DRAW_ORDER,
+        parent: None,
+        size: None,
+    }
 }
 
 fn layout_rects(node: &Layout, bounds: PaneRect, out: &mut HashMap<String, PaneRect>) {
@@ -391,34 +503,28 @@ const PORTAL_SCROLLBACK_LINES: u32 = 5_000;
 /// 4-byte body) can be picked out of the response stream.
 const SCROLL_REQUEST_ID: u32 = 0x5C_5C_5C_5C;
 
-const COLOR_OUTLINE: Color = Color {
-    r: 0.40,
-    g: 0.45,
-    b: 0.55,
+/// Brand color (#3e3b73) shared by separators, the title thumb, the
+/// active-tab gradient, and the modal outline. Muted purple — calm
+/// enough to recede into chrome but distinctive against the terminal
+/// background.
+const COLOR_BRAND: Color = Color {
+    r: 0x3e as f32 / 255.0,
+    g: 0x3b as f32 / 255.0,
+    b: 0x73 as f32 / 255.0,
     a: 1.0,
 };
-const COLOR_OUTLINE_FOCUS: Color = Color {
-    r: 0.95,
-    g: 0.75,
-    b: 0.25,
-    a: 1.0,
-};
-const COLOR_TABBAR_BG: Color = Color {
-    r: 0.10,
-    g: 0.12,
-    b: 0.16,
-    a: 1.0,
+/// Same hue as COLOR_BRAND but semi-transparent — used to fill the thumb
+/// behind a pane's title text.
+const COLOR_TITLE_THUMB: Color = Color {
+    r: COLOR_BRAND.r,
+    g: COLOR_BRAND.g,
+    b: COLOR_BRAND.b,
+    a: 0.35,
 };
 const COLOR_TAB_INACTIVE_TEXT: Color = Color {
     r: 0.55,
     g: 0.58,
     b: 0.65,
-    a: 1.0,
-};
-const COLOR_TAB_ACTIVE_BG: Color = Color {
-    r: 0.30,
-    g: 0.25,
-    b: 0.10,
     a: 1.0,
 };
 const COLOR_TAB_ACTIVE_TEXT: Color = Color {
@@ -439,18 +545,20 @@ const COLOR_SCROLLBAR: Color = Color {
     b: 1.0,
     a: 0.35,
 };
+/// Modal background: a dark, mostly-opaque base for legibility — the
+/// modal can sit over arbitrary shell text. Tinted slightly toward
+/// COLOR_BRAND so it reads as part of the same palette as the brand
+/// accents (separators, title thumb, active tab) instead of looking
+/// like a leftover from another design.
 const COLOR_MODAL_BG: Color = Color {
-    r: 0.10,
-    g: 0.12,
-    b: 0.18,
+    r: 0.09,
+    g: 0.06,
+    b: 0.16,
     a: 0.96,
 };
-const COLOR_MODAL_OUTLINE: Color = Color {
-    r: 0.95,
-    g: 0.75,
-    b: 0.25,
-    a: 1.0,
-};
+/// Modal outline uses COLOR_BRAND so the dialog edge picks up the same
+/// accent the rest of the chrome uses.
+const COLOR_MODAL_OUTLINE: Color = COLOR_BRAND;
 const COLOR_MODAL_TEXT: Color = Color {
     r: 0.96,
     g: 0.96,
@@ -493,28 +601,42 @@ fn rounded_rect_path(
     }]
 }
 
-/// VGE element ID used for a pane's chrome (outline + title strip).
+/// VGE element ID used for a pane's chrome (title thumb + scroll thumb).
 fn chrome_element_id(pane_id: &str) -> String {
     format!("vmux-chrome-{pane_id}")
 }
 
 const MODAL_ELEMENT_ID: &str = "vmux-modal";
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
+/// Single VGE element holding all between-pane separator strokes for the
+/// active tab. Recreated on every relayout — the layout tree determines
+/// which split boundaries to draw.
+const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 
 /// Build the VGE element body that renders the host's top-row tab bar.
-/// One label per tab, active tab highlighted with a bg fill + bold.
-fn build_tabbar_commands(tabs: &[Tab], active: usize, host_w: u32) -> CreateElementBody {
+/// One label per tab, active tab highlighted with a solid brand-color
+/// thumb and bold text. A rule along row 1 separates the bar from the
+/// pane area below.
+fn build_tabbar_commands(
+    tabs: &[Tab],
+    active: usize,
+    host_w: u32,
+) -> CreateElementBody {
+    // No bar background — row 0 of the host vt100 is left untouched
+    // (vmux never writes there) so the terminal's default cell color
+    // shows through, matching whatever theme the user runs vterm in.
     let mut cmds: Vec<DrawCmd> = Vec::new();
 
-    // Background bar across the whole row.
-    cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(COLOR_TABBAR_BG),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 0.0,
-            w: host_w as f32,
-            h: 1.0,
-        }],
+    // Solid rule along the bottom edge of the tab row, separating the
+    // bar from the pane area at row 1. Drawn before tab fills so an
+    // active tab sits flush on top of it.
+    cmds.push(DrawCmd::DrawLines {
+        stroke: Style::Flat(COLOR_BRAND),
+        line_width: 0.06,
+        lines: vec![(
+            Point { x: 0.0, y: 1.0 },
+            Point { x: host_w as f32, y: 1.0 },
+        )],
     });
 
     let mut x: f32 = 0.0;
@@ -526,8 +648,9 @@ fn build_tabbar_commands(tabs: &[Tab], active: usize, host_w: u32) -> CreateElem
         }
         let is_active = i == active;
         if is_active {
+            // Solid brand-color thumb spanning the full label cell.
             cmds.push(DrawCmd::FillRectangles {
-                fill: Style::Flat(COLOR_TAB_ACTIVE_BG),
+                fill: Style::Flat(COLOR_BRAND),
                 rects: vec![Rect {
                     x,
                     y: 0.0,
@@ -576,73 +699,72 @@ struct ScrollIndicator {
 
 /// Build chrome draw-commands for one pane. Element origin is the
 /// pane's top-left in host cells; commands are pane-relative.
+///
+/// `show_title` is false for the only pane in a tab — there's nothing to
+/// disambiguate, so we hide the label. Scroll-indicator titles still
+/// show because they convey active state, not just identity.
 fn build_chrome_commands(
     rect: PaneRect,
     title: &str,
     focused: bool,
+    show_title: bool,
     cell_pw: f32,
     cell_ph: f32,
     scroll: Option<ScrollIndicator>,
 ) -> Vec<DrawCmd> {
-    // Outline rounded rect spans the entire pane. The half-cell inset
-    // keeps the stroke off the very edge so it doesn't get clipped by
-    // neighbouring panes.
     let pw = rect.w as f32;
     let ph = rect.h as f32;
+    let mut cmds: Vec<DrawCmd> = Vec::new();
 
-    let outline_x0 = 0.5;
-    let outline_y0 = 0.5;
-    let outline_x1 = pw - 0.5;
-    let outline_y1 = ph - 0.5;
+    // Title text in the bottom-right portal cell, right-aligned, with
+    // a semi-transparent rounded "thumb" behind it (no stroke). Drawn
+    // at higher draw_order than the portal so it overlays shell text.
+    // 0.5-cell inset from the right edge keeps the thumb clear of any
+    // separator on the pane boundary. Both thumb and text are nudged
+    // up by 1/4 of a cell so the thumb doesn't visually fuse with the
+    // bottom edge of the pane.
+    if show_title && !title.is_empty() {
+        let text_w = title.chars().count() as f32;
+        let lift = 0.25;
+        let text_origin_x = pw - 1.0;
+        let text_origin_y = ph - 1.0 - lift;
+        let pad_x = 0.5;
+        let thumb_x0 = text_origin_x - text_w - pad_x;
+        let thumb_x1 = text_origin_x + pad_x;
+        let thumb_y0 = text_origin_y;
+        let thumb_y1 = text_origin_y + 1.0;
+        // Rounded with corner radii compensated for anisotropic cells.
+        let ry: f32 = 0.45;
+        let rx = (ry * cell_ph / cell_pw).min((thumb_x1 - thumb_x0) * 0.4);
+        let ry = ry.min((thumb_y1 - thumb_y0) * 0.4);
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(COLOR_TITLE_THUMB),
+            segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
+        });
+        cmds.push(DrawCmd::DrawText {
+            origin: Point {
+                x: text_origin_x,
+                y: text_origin_y,
+            },
+            align: Align::Right,
+            fill: Style::Flat(COLOR_TITLE_TEXT),
+            font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
+            text: title.to_string(),
+        });
+    }
 
-    // Compensate the corner radius so the corners look visually circular
-    // on anisotropic cell grids (see tools/breakout for the trick).
-    let r_cells: f32 = 0.45;
-    let rx = r_cells.min((outline_x1 - outline_x0) * 0.4);
-    let ry = (r_cells * cell_pw / cell_ph).min((outline_y1 - outline_y0) * 0.4);
-
-    let outline_color = if focused {
-        COLOR_OUTLINE_FOCUS
-    } else {
-        COLOR_OUTLINE
-    };
-    let mut cmds = vec![DrawCmd::DrawLinePath {
-        stroke: Style::Flat(outline_color),
-        line_width: 0.06,
-        segments: rounded_rect_path(outline_x0, outline_y0, outline_x1, outline_y1, rx, ry),
-    }];
-
-    // Title text: the bare label, right-aligned in the bottom-right
-    // portal cell with 1 cell of padding from the right border. Drawn at
-    // higher draw_order than the portal so it overlays whatever the
-    // shell put in that corner.
-    let display_title = if title.is_empty() { " " } else { title };
-    cmds.push(DrawCmd::DrawText {
-        origin: Point {
-            x: pw - 2.0,
-            y: ph - 2.0,
-        },
-        align: Align::Right,
-        fill: Style::Flat(COLOR_TITLE_TEXT),
-        font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
-        text: display_title.to_string(),
-    });
-
-    // Scrollbar thumb on the right border, vterm-style. Drawn in cell
-    // units across the full pane height; sized by visible_rows /
-    // (visible_rows + history_depth) and positioned by offset.
+    // Scrollbar thumb at the right edge of the pane. Drawn in cell
+    // units; sized by visible_rows / (visible_rows + history_depth)
+    // and positioned by offset. Track stops above the lifted title
+    // row so the thumb never collides with the scroll-indicator title
+    // that sits in the bottom-right cell while we're scrolling.
     if let Some(s) = scroll {
-        // Visible rows = portal interior height (matches inner_grid_for).
-        let portal_rows = (ph - 2.0).max(1.0);
+        let portal_rows = ph.max(1.0);
         let total = portal_rows + s.history_depth as f32;
-        // Track spans almost the full pane height with a small inset
-        // matching the outline. Sit a bit clear of the right border
-        // (which is the outline stroke at x = pw-0.5) so the thumb
-        // doesn't visually merge with it.
         let track_x = pw - 1.30;
         let track_w = 0.35;
         let track_y0 = 0.5;
-        let track_y1 = ph - 0.5;
+        let track_y1 = (ph - 1.25).max(track_y0 + 1.0);
         let track_h = (track_y1 - track_y0).max(1.0);
 
         let thumb_h_norm = (portal_rows / total).clamp(0.05, 1.0);
@@ -673,17 +795,21 @@ fn build_chrome_commands(
 fn build_modal_commands(
     host_w: u32,
     host_h: u32,
+    title: &str,
     prompt: &str,
     buffer: &str,
     cell_pw: f32,
     cell_ph: f32,
 ) -> CreateElementBody {
-    // Center a fixed-size modal box on the host grid.
+    // Center a fixed-size modal box on the host grid. The 4-cell box
+    // is (top pad)(title)(buffer)(bottom pad) — no inline hint row,
+    // since the buffer width drives the box width and any hint long
+    // enough to be useful would overflow on short prompts.
     let line = format!("{prompt}{buffer}_");
     let chars = line.chars().count() as f32;
     let inner_w = chars.max(20.0);
     let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
-    let box_h = 5.0_f32.min(host_h.saturating_sub(2) as f32);
+    let box_h = 4.0_f32.min(host_h.saturating_sub(2) as f32);
 
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
@@ -701,32 +827,22 @@ fn build_modal_commands(
         DrawCmd::DrawText {
             origin: Point {
                 x: box_w * 0.5,
-                y: 1.6,
+                y: 0.5,
             },
             align: Align::Center,
             fill: Style::Flat(COLOR_MODAL_TEXT),
             font_style: FontStyle(0x01),
-            text: "Rename pane".into(),
+            text: title.into(),
         },
         DrawCmd::DrawText {
             origin: Point {
                 x: box_w * 0.5,
-                y: 3.2,
+                y: 2.0,
             },
             align: Align::Center,
             fill: Style::Flat(COLOR_MODAL_TEXT),
             font_style: FontStyle(0x00),
             text: line,
-        },
-        DrawCmd::DrawText {
-            origin: Point {
-                x: box_w * 0.5,
-                y: 4.5,
-            },
-            align: Align::Center,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(0x00),
-            text: "Enter to confirm  ·  Esc to cancel".into(),
         },
     ];
 
@@ -747,7 +863,7 @@ fn build_modal_commands(
 /// Help-modal contents: list of every prefix keybinding. Activated via
 /// `prefix-?`, dismissed by any keystroke.
 const HELP_LINES: &[&str] = &[
-    "vmux keybindings  —  prefix is Ctrl+B",
+    "vmux keybindings  —  prefix is Ctrl+Space",
     "",
     "Pane",
     "  v        split focused pane vertically",
@@ -758,8 +874,8 @@ const HELP_LINES: &[&str] = &[
     "",
     "Tab",
     "  c        new tab",
-    "  n        next tab",
-    "  p        previous tab",
+    "  n / →    next tab",
+    "  p / ←    previous tab",
     "  1..9     jump to tab N",
     "  R        rename current tab",
     "",
@@ -772,9 +888,9 @@ const HELP_LINES: &[&str] = &[
     "  0 / End       jump back to live",
     "",
     "Misc",
-    "  ?        show this help",
-    "  q        quit vmux",
-    "  Ctrl+B   send a literal Ctrl+B",
+    "  ?           show this help",
+    "  q           quit vmux",
+    "  Ctrl+Space  send a literal Ctrl+Space",
     "",
     "press any key to dismiss",
 ];
@@ -866,7 +982,7 @@ enum RenameTarget {
 #[derive(Debug)]
 enum Mode {
     Normal,
-    /// Prefix key (Ctrl+B) was pressed — next byte is interpreted as a
+    /// Prefix key (Ctrl+Space) was pressed — next byte is interpreted as a
     /// vmux command.
     Prefix,
     /// Modal text editor for `prefix-r` (pane) or `prefix-R` (tab).
@@ -897,7 +1013,7 @@ enum Mode {
     },
 }
 
-const PREFIX_BYTE: u8 = 0x02; // Ctrl+B
+const PREFIX_BYTE: u8 = 0x00; // Ctrl+Space
 
 // ─────────────────────────────────────────────────────────────────────────
 // Multiplexer state
@@ -936,6 +1052,11 @@ struct State {
     visible_panes: HashSet<String>,
     /// True once the tab bar VGE element has been created on the host.
     tabbar_created: bool,
+    /// True once the separators VGE element has been created on the
+    /// host. Tracked so the first relayout emits a CreateElement (not a
+    /// stale-DeleteElement-then-Create) and subsequent passes can
+    /// idempotently replace the element.
+    separators_created: bool,
 }
 
 impl State {
@@ -963,6 +1084,7 @@ impl State {
             last_focus_sent: None,
             visible_panes: HashSet::new(),
             tabbar_created: false,
+            separators_created: false,
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let pty = PanePty::spawn(rows as u16, cols as u16)?;
@@ -1245,6 +1367,10 @@ impl State {
         // Stable iteration order so the wire trace is deterministic.
         let mut ordered: Vec<String> = rects.keys().cloned().collect();
         ordered.sort();
+        // Hide the per-pane title when the active tab has only one pane
+        // (there's nothing to disambiguate). A scroll indicator still
+        // surfaces because `display_title != raw_title` in that case.
+        let single_pane = ordered.len() <= 1;
 
         for pane_id in &ordered {
             let rect = rects[pane_id];
@@ -1259,6 +1385,7 @@ impl State {
                 .map(|p| p.title.clone())
                 .unwrap_or_default();
             let display_title = self.display_title_for(pane_id, &pane_title_raw);
+            let show_title = !single_pane || display_title != pane_title_raw;
             let scroll_ind = self.scroll_indicator_for(pane_id);
             let pane = self.panes.get_mut(pane_id).expect("layout/panes mismatch");
 
@@ -1336,6 +1463,7 @@ impl State {
                 rect,
                 &display_title,
                 pane_id == &focus,
+                show_title,
                 self.cell_pw,
                 self.cell_ph,
                 scroll_ind,
@@ -1413,6 +1541,21 @@ impl State {
             ));
             self.last_focus_sent = Some(focus.clone());
         }
+
+        // Between-pane separators for the active tab. Rebuilt every
+        // relayout — the layout tree determines which split boundaries
+        // need a stroke.
+        let sep_body = build_separators_body(self.active_layout(), self.full_bounds());
+        if self.separators_created {
+            vge_cmds.push((
+                VgeCommand::DeleteElement {
+                    id: SEPARATORS_ELEMENT_ID.into(),
+                },
+                0,
+            ));
+        }
+        vge_cmds.push((VgeCommand::CreateElement(sep_body), 0));
+        self.separators_created = true;
 
         // Tab bar: re-create on every relayout so tab adds/removes,
         // active-tab changes, and renames all show up. Cheap — single
@@ -1495,13 +1638,14 @@ impl State {
     fn build_rename_modal_body(&self) -> Option<CreateElementBody> {
         match &self.mode {
             Mode::Rename { target, buffer } => {
-                let prompt = match target {
-                    RenameTarget::Pane(id) => format!("rename pane {id}: "),
-                    RenameTarget::Tab(idx) => format!("rename tab {}: ", idx + 1),
+                let (title, prompt) = match target {
+                    RenameTarget::Pane(id) => ("Rename pane", format!("{id}: ")),
+                    RenameTarget::Tab(idx) => ("Rename tab", format!("{}: ", idx + 1)),
                 };
                 Some(build_modal_commands(
                     self.host_w,
                     self.host_h,
+                    title,
                     &prompt,
                     buffer,
                     self.cell_pw,
@@ -1668,10 +1812,18 @@ impl State {
         };
         let display_title = self.display_title_for(pane_id, &title_raw);
         let scroll_ind = self.scroll_indicator_for(pane_id);
+        // Match the same single-pane suppression as the relayout path:
+        // a one-pane tab hides the title unless display_title is in
+        // scroll-indicator form (different from the raw label).
+        let mut leaves = Vec::new();
+        self.tabs[self.active_tab].layout.collect_leaves(&mut leaves);
+        let single_pane = leaves.len() <= 1;
+        let show_title = !single_pane || display_title != title_raw;
         let cmds = build_chrome_commands(
             rect,
             &display_title,
             pane_id == self.focus(),
+            show_title,
             self.cell_pw,
             self.cell_ph,
             scroll_ind,
@@ -2519,6 +2671,26 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 idx = stop;
             }
             Mode::Prefix => {
+                // Arrow keys arrive as 3-byte sequences (`ESC [ X` in
+                // normal cursor mode, `ESC O X` in DECCKM application
+                // mode), so peek ahead and consume the whole sequence
+                // when prefix-arrow is in flight. If the trailing
+                // bytes haven't landed in this read yet, fall through
+                // to the single-byte path — the lone ESC is silently
+                // dropped, which is preferable to leaking partial
+                // CSI bytes to the focused pane.
+                if b == 0x1b
+                    && idx + 2 < bytes.len()
+                    && (bytes[idx + 1] == b'[' || bytes[idx + 1] == b'O')
+                {
+                    let env = handle_prefix_arrow(state, bytes[idx + 2])?;
+                    state.mode = Mode::Normal;
+                    if !env.is_empty() {
+                        write_all_stdout(&env)?;
+                    }
+                    idx += 3;
+                    continue;
+                }
                 let env = handle_prefix_command(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
@@ -2611,13 +2783,25 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         // scroll mode
         b'[' => state.enter_scroll(),
         PREFIX_BYTE => {
-            // Double-tap: forward a literal Ctrl+B to the focused pane.
+            // Double-tap: forward a literal Ctrl+Space to the focused pane.
             let focus_id = state.focus().to_string();
             if let Some(pane) = state.panes.get(&focus_id) {
                 pane.pty.write_all(&[PREFIX_BYTE])?;
             }
             Ok(Vec::new())
         }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Final-byte dispatch for `prefix + <arrow>`. Right (`C`) cycles to
+/// the next tab, left (`D`) to the previous one. Up/down are reserved
+/// for future use and silently consumed. Caller has already reset the
+/// mode to `Mode::Normal` and consumed the whole CSI/SS3 sequence.
+fn handle_prefix_arrow(state: &mut State, final_byte: u8) -> Result<Vec<u8>> {
+    match final_byte {
+        b'C' => state.next_tab(),
+        b'D' => state.prev_tab(),
         _ => Ok(Vec::new()),
     }
 }

@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around two custom protocols: PRT (portals / multiplexing) and VGE (vector graphics in the grid). All shipped tools and library crates use the `v`-prefix family (`vterm`, `vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`).
+
 ## Build & run
 
 Cargo workspace; edition 2024 (the vendored `vt100` fork stays on 2021).
@@ -9,7 +11,7 @@ Cargo workspace; edition 2024 (the vendored `vt100` fork stays on 2021).
 - Build everything: `cargo build` (release: `cargo build --release`)
 - Build one crate: `cargo build -p vterm` (or `vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `breakout`)
 - Run the GUI terminal: `cargo run -p vterm`
-- Install `vterm`/`vcat`/`vmux` to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `./install.sh`
+- Install `vterm`/`vcat`/`vmux` to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them)
 
 ## Tests
 
@@ -36,7 +38,7 @@ Each extension is split into a wire-format crate and host-side state lives only 
 | `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`). The screen model the host and every portal use. |
 | `vterm` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host vt100, the host-side PRT engine (`src/prt/`), and the host-side VGE engine (`src/vge/`). |
 | `vge-cli`, `prt-cli` | Emit raw envelopes for manual protocol testing. |
-| `tools/vmux` | Terminal multiplexer that runs *inside* vterm, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+B`. |
+| `tools/vmux` | Terminal multiplexer that runs *inside* vterm, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
 | `tools/vcat` | Display images inside a VGE-aware terminal. |
 | `tools/breakout` | VGE demo. |
 

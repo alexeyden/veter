@@ -23,6 +23,73 @@ use swash::{
 
 const TEXTURE_SIZE: usize = 512;
 
+/// Selection range expressed in visible-row coords (i.e. as the
+/// renderer sees them after the user's current scrollback offset is
+/// applied). `start_row` may be negative when the selection extends
+/// above the viewport (anchor in scrollback that's now off-screen);
+/// `end_row` may exceed `rows` for the same reason at the bottom.
+/// Half-open: `[start, end)` in lexicographic (row, col) order.
+#[derive(Copy, Clone, Debug)]
+pub struct SelectionRange {
+    pub start_row: i32,
+    pub start_col: u16,
+    pub end_row: i32,
+    pub end_col: u16,
+}
+
+impl SelectionRange {
+    fn contains(&self, row: u16, col: u16) -> bool {
+        let pos = (row as i32, col);
+        let start = (self.start_row, self.start_col);
+        let end = (self.end_row, self.end_col);
+        pos >= start && pos < end
+    }
+}
+
+/// Resolve an absolute-line selection (anchor + head in some vt100's
+/// scrollback line coords) into a half-open `SelectionRange` in that
+/// vt100's currently-visible row coords. Used by both the host call
+/// site and per-portal render to avoid duplicating the math.
+/// Returns `None` for empty or fully off-screen selections.
+#[allow(clippy::too_many_arguments)]
+pub fn selection_range_from_abs(
+    anchor_line: i64,
+    anchor_col: u16,
+    head_line: i64,
+    head_col: u16,
+    top_of_live_screen: i64,
+    scrollback: usize,
+    rows: u16,
+    cols: u16,
+) -> Option<SelectionRange> {
+    if (anchor_line, anchor_col) == (head_line, head_col) {
+        return None;
+    }
+    let ((s_line, s_col), (e_line, e_col)) =
+        if (anchor_line, anchor_col) <= (head_line, head_col) {
+            ((anchor_line, anchor_col), (head_line, head_col))
+        } else {
+            ((head_line, head_col), (anchor_line, anchor_col))
+        };
+    let viewport_top = top_of_live_screen - scrollback as i64;
+    let s_row = (s_line - viewport_top) as i32;
+    let mut e_row = (e_line - viewport_top) as i32;
+    let mut e_col_open = e_col.saturating_add(1);
+    if e_col_open > cols {
+        e_row += 1;
+        e_col_open = 0;
+    }
+    if e_row < 0 || s_row >= rows as i32 {
+        return None;
+    }
+    Some(SelectionRange {
+        start_row: s_row,
+        start_col: s_col,
+        end_row: e_row,
+        end_col: e_col_open,
+    })
+}
+
 // ANSI 256-color palette
 fn ansi_color(idx: u8) -> Color {
     match idx {
@@ -59,7 +126,7 @@ fn ansi_color(idx: u8) -> Color {
     }
 }
 
-fn resolve_cell_colors(cell: &vt100::Cell, is_cursor: bool) -> (Color, Color) {
+fn resolve_cell_colors(cell: &vt100::Cell, is_cursor: bool, is_selected: bool) -> (Color, Color) {
     let default_fg = Color::rgb(204, 204, 204);
     let default_bg = Color::rgb(30, 30, 30);
 
@@ -78,7 +145,7 @@ fn resolve_cell_colors(cell: &vt100::Cell, is_cursor: bool) -> (Color, Color) {
         vt100::Color::Rgb(r, g, b) => Color::rgb(r, g, b),
     };
 
-    if cell.inverse() ^ is_cursor {
+    if cell.inverse() ^ is_cursor ^ is_selected {
         std::mem::swap(&mut fg, &mut bg);
     }
 
@@ -943,9 +1010,11 @@ impl TerminalRenderer {
         ox_px: f32,
         oy_px: f32,
         focused_cursor: Option<(u16, u16)>,
+        selection: Option<&SelectionRange>,
     ) {
         let (rows, cols) = screen.size();
         let default_bg = Color::rgb(30, 30, 30);
+        let selected = |r, c| selection.map(|s| s.contains(r, c)).unwrap_or(false);
 
         // Cell backgrounds.
         for row in 0..rows {
@@ -958,9 +1027,12 @@ impl TerminalRenderer {
                     continue;
                 }
                 let is_cursor = focused_cursor == Some((row, col));
-                let (_, bg) = resolve_cell_colors(cell, is_cursor);
+                let sel = selected(row, col);
+                let (_, bg) = resolve_cell_colors(cell, is_cursor, sel);
                 let w = if cell.is_wide() { 2.0 } else { 1.0 };
-                if bg != default_bg {
+                // Selected cells need a bg fill even when the underlying
+                // cell uses the default bg, so the highlight is visible.
+                if bg != default_bg || sel {
                     let x = ox_px + col as f32 * self.cell_width;
                     let y = oy_px + row as f32 * self.cell_height;
                     let mut path = Path::new();
@@ -995,7 +1067,7 @@ impl TerminalRenderer {
                 // because the cell box includes leading. Short-circuit
                 // before the font lookup.
                 let is_cursor = focused_cursor == Some((row, col));
-                let (fg, _) = resolve_cell_colors(cell, is_cursor);
+                let (fg, _) = resolve_cell_colors(cell, is_cursor, selected(row, col));
                 let cx = ox_px + col as f32 * self.cell_width;
                 let cy = oy_px + row as f32 * self.cell_height;
                 if try_draw_block_element(
@@ -1131,6 +1203,8 @@ impl TerminalRenderer {
         vge_state: &vge::VgeState,
         top_of_live_screen: i64,
         prt_state: &prt::PrtState,
+        selection: Option<&SelectionRange>,
+        portal_selection: Option<&prt::render::PortalSelectionCtx>,
     ) {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
@@ -1147,7 +1221,7 @@ impl TerminalRenderer {
         } else {
             None
         };
-        self.draw_screen_at(canvas, screen, 0.0, 0.0, focused_cursor);
+        self.draw_screen_at(canvas, screen, 0.0, 0.0, focused_cursor, selection);
 
         // Unified §10 layer walk: top-level VGE elements + host portals
         // sorted by (draw_order, creation_seq), each rendered in turn.
@@ -1161,6 +1235,7 @@ impl TerminalRenderer {
             rows,
             cols,
             screen.scrollback(),
+            portal_selection,
         );
 
         // Draw scrollbar when scrolled back

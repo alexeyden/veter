@@ -19,3 +19,4 @@ libc = "0.2"
 rgb = "0.8"
 imgref = "1"
 image = { version = "0.25", default-features = false, features = ["webp"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }

@@ -20,6 +20,20 @@ use super::state::PrtState;
 use crate::renderer::TerminalRenderer;
 use crate::vge;
 
+/// Drives portal-targeted selection rendering. Carries the absolute
+/// (target-vt100) selection coords plus the path of portal IDs from
+/// here down to the leaf where the highlight should actually paint.
+/// At each render frame the path shrinks by one element until it's
+/// empty, at which point the current portal *is* the target and a
+/// `SelectionRange` is computed against its visible viewport.
+pub struct PortalSelectionCtx<'a> {
+    pub remaining_path: &'a [String],
+    pub anchor_line: i64,
+    pub anchor_col: u16,
+    pub head_line: i64,
+    pub head_col: u16,
+}
+
 /// One top-level layer in the unified render order: either a host VGE
 /// element or a host portal.
 enum Layer<'a> {
@@ -40,6 +54,7 @@ pub fn render_layers<T: Renderer>(
     screen_rows: u16,
     _screen_cols: u16,
     scrollback: usize,
+    portal_selection: Option<&PortalSelectionCtx>,
 ) {
     let mut layers: Vec<(i32, u64, Layer)> = Vec::new();
     for el in vge_state.top_level_sorted() {
@@ -72,6 +87,19 @@ pub fn render_layers<T: Renderer>(
                 );
             }
             Layer::Portal(portal) => {
+                let sub_sel = portal_selection.and_then(|s| {
+                    let first = s.remaining_path.first().map(|s| s.as_str())?;
+                    if first != portal.id.as_str() {
+                        return None;
+                    }
+                    Some(PortalSelectionCtx {
+                        remaining_path: &s.remaining_path[1..],
+                        anchor_line: s.anchor_line,
+                        anchor_col: s.anchor_col,
+                        head_line: s.head_line,
+                        head_col: s.head_col,
+                    })
+                });
                 render_portal_at(
                     canvas,
                     term_renderer,
@@ -84,6 +112,7 @@ pub fn render_layers<T: Renderer>(
                     cell_h,
                     prt_state.cursor_style,
                     &focus_chain,
+                    sub_sel.as_ref(),
                 );
             }
         }
@@ -109,6 +138,7 @@ fn render_portal_at<T: Renderer>(
     cell_h: f32,
     unfocused_style: CursorStyle,
     focus_chain: &[&str],
+    portal_selection: Option<&PortalSelectionCtx>,
 ) {
     if !portal.is_visible {
         return;
@@ -159,7 +189,33 @@ fn render_portal_at<T: Renderer>(
     } else {
         None
     };
-    term_renderer.draw_screen_at(canvas, portal.vt.screen(), ox_px, oy_px, focused_cursor);
+    // Selection only renders when this portal *is* the target — i.e.
+    // the remaining path is empty. Otherwise we keep walking down.
+    let portal_sel_range = portal_selection.and_then(|s| {
+        if !s.remaining_path.is_empty() {
+            return None;
+        }
+        let portal_top = portal.children.top_of_live_screen();
+        let portal_scrollback = portal.vt.screen().scrollback();
+        crate::renderer::selection_range_from_abs(
+            s.anchor_line,
+            s.anchor_col,
+            s.head_line,
+            s.head_col,
+            portal_top,
+            portal_scrollback,
+            portal.size_h as u16,
+            portal.size_w as u16,
+        )
+    });
+    term_renderer.draw_screen_at(
+        canvas,
+        portal.vt.screen(),
+        ox_px,
+        oy_px,
+        focused_cursor,
+        portal_sel_range.as_ref(),
+    );
 
     // 2. §10 — per-portal VGE elements. They render *inside* the
     //    portal's clip rect, on top of the portal's text grid, in the
@@ -216,6 +272,19 @@ fn render_portal_at<T: Renderer>(
         .collect();
     subs.sort_by_key(|p| (p.draw_order, p.creation_seq));
     for sub in subs {
+        let next_sel = portal_selection.and_then(|s| {
+            let first = s.remaining_path.first().map(|s| s.as_str())?;
+            if first != sub.id.as_str() {
+                return None;
+            }
+            Some(PortalSelectionCtx {
+                remaining_path: &s.remaining_path[1..],
+                anchor_line: s.anchor_line,
+                anchor_col: s.anchor_col,
+                head_line: s.head_line,
+                head_col: s.head_col,
+            })
+        });
         render_portal_at(
             canvas,
             term_renderer,
@@ -228,6 +297,7 @@ fn render_portal_at<T: Renderer>(
             cell_h,
             unfocused_style,
             sub_focus_chain,
+            next_sel.as_ref(),
         );
     }
 
