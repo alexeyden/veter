@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use femtovg::{
     Atlas, Canvas, Color, DrawCommand, GlyphDrawCommands, ImageFlags, ImageSource, Paint, Path,
-    Quad, Renderer,
+    Quad, Renderer, Solidity,
 };
 
 use crate::prt;
@@ -253,6 +253,309 @@ fn try_draw_block_element<T: Renderer>(
         }
         _ => return false,
     }
+    true
+}
+
+// Box-drawing range (U+2500..U+257F): same rationale as the block
+// elements above. Box-drawing glyphs in most fonts don't tile cleanly
+// (visible gaps at cell joints, weight inconsistencies between Light
+// and Heavy variants), so terminals draw these as primitives.
+//
+// Each cell is modelled as four directional stubs (N/E/S/W) at one of
+// {None, Light, Heavy, Double}, plus a small set of specials for
+// dashes (12 chars), arcs (4), and diagonals (3). 109 chars are pure
+// stub combinations; 19 are specials.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Stub {
+    None,
+    Light,
+    Heavy,
+    Double,
+}
+
+#[derive(Copy, Clone)]
+enum BoxSpecial {
+    None,
+    /// Horizontal dashed rule across full cell width. (heavy, count).
+    DashH(bool, u8),
+    /// Vertical dashed rule across full cell height. (heavy, count).
+    DashV(bool, u8),
+    /// Light arc joining two adjacent edges. Booleans pick which two:
+    /// (right, down) — true means the arc reaches that edge.
+    /// ╭=(t,t) ╮=(f,t) ╯=(f,f) ╰=(t,f).
+    Arc(bool, bool),
+    /// Diagonals. (nw_se, ne_sw): ╲=(t,f) ╱=(f,t) ╳=(t,t).
+    Diag(bool, bool),
+}
+
+#[derive(Copy, Clone)]
+struct BoxDef {
+    n: Stub,
+    e: Stub,
+    s: Stub,
+    w: Stub,
+    special: BoxSpecial,
+}
+
+const fn b(n: Stub, e: Stub, s: Stub, w: Stub) -> BoxDef {
+    BoxDef { n, e, s, w, special: BoxSpecial::None }
+}
+const fn bs(special: BoxSpecial) -> BoxDef {
+    BoxDef { n: Stub::None, e: Stub::None, s: Stub::None, w: Stub::None, special }
+}
+
+// Indexed by (codepoint - 0x2500). Comments give the codepoint and
+// glyph; stubs are listed N/E/S/W.
+#[rustfmt::skip]
+static BOX_DRAWING: [BoxDef; 128] = {
+    use Stub::{Double as D, Heavy as H, Light as L, None as O};
+    use BoxSpecial::{Arc, DashH, DashV, Diag};
+    [
+        // 2500 ─  2501 ━  2502 │  2503 ┃
+        b(O, L, O, L), b(O, H, O, H), b(L, O, L, O), b(H, O, H, O),
+        // 2504 ┄ 2505 ┅  2506 ┆  2507 ┇  (triple dash)
+        bs(DashH(false, 3)), bs(DashH(true, 3)), bs(DashV(false, 3)), bs(DashV(true, 3)),
+        // 2508 ┈ 2509 ┉  250A ┊  250B ┋  (quad dash)
+        bs(DashH(false, 4)), bs(DashH(true, 4)), bs(DashV(false, 4)), bs(DashV(true, 4)),
+        // 250C ┌  250D ┍  250E ┎  250F ┏
+        b(O, L, L, O), b(O, H, L, O), b(O, L, H, O), b(O, H, H, O),
+        // 2510 ┐  2511 ┑  2512 ┒  2513 ┓
+        b(O, O, L, L), b(O, O, L, H), b(O, O, H, L), b(O, O, H, H),
+        // 2514 └  2515 ┕  2516 ┖  2517 ┗
+        b(L, L, O, O), b(L, H, O, O), b(H, L, O, O), b(H, H, O, O),
+        // 2518 ┘  2519 ┙  251A ┚  251B ┛
+        b(L, O, O, L), b(L, O, O, H), b(H, O, O, L), b(H, O, O, H),
+        // 251C ├  251D ┝  251E ┞  251F ┟
+        b(L, L, L, O), b(L, H, L, O), b(H, L, L, O), b(L, L, H, O),
+        // 2520 ┠  2521 ┡  2522 ┢  2523 ┣
+        b(H, L, H, O), b(H, H, L, O), b(L, H, H, O), b(H, H, H, O),
+        // 2524 ┤  2525 ┥  2526 ┦  2527 ┧
+        b(L, O, L, L), b(L, O, L, H), b(H, O, L, L), b(L, O, H, L),
+        // 2528 ┨  2529 ┩  252A ┪  252B ┫
+        b(H, O, H, L), b(H, O, L, H), b(L, O, H, H), b(H, O, H, H),
+        // 252C ┬  252D ┭  252E ┮  252F ┯
+        b(O, L, L, L), b(O, L, L, H), b(O, H, L, L), b(O, H, L, H),
+        // 2530 ┰  2531 ┱  2532 ┲  2533 ┳
+        b(O, L, H, L), b(O, L, H, H), b(O, H, H, L), b(O, H, H, H),
+        // 2534 ┴  2535 ┵  2536 ┶  2537 ┷
+        b(L, L, O, L), b(L, L, O, H), b(L, H, O, L), b(L, H, O, H),
+        // 2538 ┸  2539 ┹  253A ┺  253B ┻
+        b(H, L, O, L), b(H, L, O, H), b(H, H, O, L), b(H, H, O, H),
+        // 253C ┼  253D ┽  253E ┾  253F ┿
+        b(L, L, L, L), b(L, L, L, H), b(L, H, L, L), b(L, H, L, H),
+        // 2540 ╀  2541 ╁  2542 ╂  2543 ╃
+        b(H, L, L, L), b(L, L, H, L), b(H, L, H, L), b(H, L, L, H),
+        // 2544 ╄  2545 ╅  2546 ╆  2547 ╇
+        b(H, H, L, L), b(L, L, H, H), b(L, H, H, L), b(H, H, L, H),
+        // 2548 ╈  2549 ╉  254A ╊  254B ╋
+        b(L, H, H, H), b(H, L, H, H), b(H, H, H, L), b(H, H, H, H),
+        // 254C ╌  254D ╍  254E ╎  254F ╏  (double dash)
+        bs(DashH(false, 2)), bs(DashH(true, 2)), bs(DashV(false, 2)), bs(DashV(true, 2)),
+        // 2550 ═  2551 ║  2552 ╒  2553 ╓
+        b(O, D, O, D), b(D, O, D, O), b(O, D, L, O), b(O, L, D, O),
+        // 2554 ╔  2555 ╕  2556 ╖  2557 ╗
+        b(O, D, D, O), b(O, O, L, D), b(O, O, D, L), b(O, O, D, D),
+        // 2558 ╘  2559 ╙  255A ╚  255B ╛
+        b(L, D, O, O), b(D, L, O, O), b(D, D, O, O), b(L, O, O, D),
+        // 255C ╜  255D ╝  255E ╞  255F ╟
+        b(D, O, O, L), b(D, O, O, D), b(L, D, L, O), b(D, L, D, O),
+        // 2560 ╠  2561 ╡  2562 ╢  2563 ╣
+        b(D, D, D, O), b(L, O, L, D), b(D, O, D, L), b(D, O, D, D),
+        // 2564 ╤  2565 ╥  2566 ╦  2567 ╧
+        b(O, L, D, L), b(O, D, L, D), b(O, D, D, D), b(D, L, O, L),
+        // 2568 ╨  2569 ╩  256A ╪  256B ╫
+        b(L, D, O, D), b(D, D, O, D), b(L, D, L, D), b(D, L, D, L),
+        // 256C ╬  256D ╭  256E ╮  256F ╯
+        b(D, D, D, D), bs(Arc(true, true)), bs(Arc(false, true)), bs(Arc(false, false)),
+        // 2570 ╰  2571 ╱  2572 ╲  2573 ╳
+        bs(Arc(true, false)), bs(Diag(false, true)), bs(Diag(true, false)), bs(Diag(true, true)),
+        // 2574 ╴  2575 ╵  2576 ╶  2577 ╷
+        b(O, O, O, L), b(L, O, O, O), b(O, L, O, O), b(O, O, L, O),
+        // 2578 ╸  2579 ╹  257A ╺  257B ╻
+        b(O, O, O, H), b(H, O, O, O), b(O, H, O, O), b(O, O, H, O),
+        // 257C ╼  257D ╽  257E ╾  257F ╿
+        b(O, H, O, L), b(L, O, H, O), b(O, L, O, H), b(H, O, L, O),
+    ]
+};
+
+/// Draw a Unicode box-drawing element (U+2500..U+257F) directly with
+/// stub-based primitives. Returns `true` if `ch` was recognised and
+/// the cell was filled.
+fn try_draw_box_drawing<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    ch: char,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fg: Color,
+) -> bool {
+    let code = ch as u32;
+    if !(0x2500..=0x257F).contains(&code) {
+        return false;
+    }
+    let def = BOX_DRAWING[(code - 0x2500) as usize];
+
+    // Light = 1 unit, Heavy ≈ 2 units. Double = two light rules with a
+    // light-sized gap (3 light units span). Tuned so a 24px cell gives
+    // light=2, heavy=4 — visually consistent with what fonts ship.
+    let light = (h / 14.0).round().max(1.0);
+    let heavy = (light * 2.0).max(2.0);
+
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.5;
+
+    let fill = |canvas: &mut Canvas<T>, rx: f32, ry: f32, rw: f32, rh: f32| {
+        if rw <= 0.0 || rh <= 0.0 {
+            return;
+        }
+        let mut p = Path::new();
+        p.rect(rx, ry, rw, rh);
+        canvas.fill_path(&p, &Paint::color(fg));
+    };
+
+    // Specials short-circuit before stub rendering — they don't combine
+    // with stubs in the box-drawing range.
+    match def.special {
+        BoxSpecial::None => {}
+        BoxSpecial::DashH(heavy_w, n) => {
+            let thick = if heavy_w { heavy } else { light };
+            let gap = w / (3.0 * n as f32 - 1.0);
+            let dash = gap * 2.0;
+            for i in 0..n as usize {
+                fill(canvas, x + i as f32 * (dash + gap), cy - thick * 0.5, dash, thick);
+            }
+            return true;
+        }
+        BoxSpecial::DashV(heavy_w, n) => {
+            let thick = if heavy_w { heavy } else { light };
+            let gap = h / (3.0 * n as f32 - 1.0);
+            let dash = gap * 2.0;
+            for i in 0..n as usize {
+                fill(canvas, cx - thick * 0.5, y + i as f32 * (dash + gap), thick, dash);
+            }
+            return true;
+        }
+        BoxSpecial::Arc(right, down) => {
+            // True quarter-circle of radius `r = min(w/2, h/2)`, with
+            // straight bridge segments from each cell-edge midpoint to
+            // the arc tangent point. A quadratic with control at the
+            // cell center stretches with the cell's aspect ratio, so
+            // tall cells produce a vertically-elongated curve; this
+            // formulation keeps the curvature symmetric and snaps the
+            // straight legs onto adjacent cells' lines at cx / cy.
+            let r = (w * 0.5).min(h * 0.5);
+            let sign_r = if right { 1.0 } else { -1.0 };
+            let sign_d = if down { 1.0 } else { -1.0 };
+            let center_x = cx + sign_r * r;
+            let center_y = cy + sign_d * r;
+            // Arc endpoints (in screen-y-down polar): the v-side end is
+            // due-east or due-west of the center; the h-side end is
+            // due-south or due-north. Sweep direction follows the
+            // sign(right) × sign(down) parity.
+            let pi = std::f32::consts::PI;
+            let theta_v = if right { pi } else { 0.0 };
+            let theta_h = if down { 1.5 * pi } else { 0.5 * pi };
+            let solidity = if right == down {
+                Solidity::Hole
+            } else {
+                Solidity::Solid
+            };
+            let v_edge_y = if down { y + h } else { y };
+            let h_edge_x = if right { x + w } else { x };
+            let mut p = Path::new();
+            p.move_to(cx, v_edge_y);
+            p.line_to(cx, center_y);
+            p.arc(center_x, center_y, r, theta_v, theta_h, solidity);
+            p.line_to(h_edge_x, cy);
+            canvas.stroke_path(&p, &Paint::color(fg).with_line_width(light));
+            return true;
+        }
+        BoxSpecial::Diag(nw_se, ne_sw) => {
+            let mut p = Path::new();
+            if nw_se {
+                p.move_to(x, y);
+                p.line_to(x + w, y + h);
+            }
+            if ne_sw {
+                p.move_to(x + w, y);
+                p.line_to(x, y + h);
+            }
+            canvas.stroke_path(&p, &Paint::color(fg).with_line_width(light));
+            return true;
+        }
+    }
+
+    // Pure-double corners (exactly two stubs, both Double, perpendicular).
+    // Naïve stub-by-stub leaves the outer-corner pixel empty because each
+    // double rule stops at center; extend the relevant rule past center
+    // to close it.
+    let (n_d, e_d, s_d, w_d) = (
+        def.n == Stub::Double,
+        def.e == Stub::Double,
+        def.s == Stub::Double,
+        def.w == Stub::Double,
+    );
+    let (n_any, e_any, s_any, w_any) = (
+        def.n != Stub::None,
+        def.e != Stub::None,
+        def.s != Stub::None,
+        def.w != Stub::None,
+    );
+    let dr = e_d && s_d && !n_any && !w_any; // ╔
+    let dl = w_d && s_d && !n_any && !e_any; // ╗
+    let ur = n_d && e_d && !s_any && !w_any; // ╚
+    let ul = n_d && w_d && !s_any && !e_any; // ╝
+
+    // East stub.
+    match def.e {
+        Stub::None => {}
+        Stub::Light => fill(canvas, cx, cy - light * 0.5, x + w - cx, light),
+        Stub::Heavy => fill(canvas, cx, cy - heavy * 0.5, x + w - cx, heavy),
+        Stub::Double => {
+            let top_x = if dr { cx - 1.5 * light } else { cx };
+            let bot_x = if ur { cx - 1.5 * light } else { cx };
+            fill(canvas, top_x, cy - 1.5 * light, x + w - top_x, light);
+            fill(canvas, bot_x, cy + 0.5 * light, x + w - bot_x, light);
+        }
+    }
+    // West stub.
+    match def.w {
+        Stub::None => {}
+        Stub::Light => fill(canvas, x, cy - light * 0.5, cx - x, light),
+        Stub::Heavy => fill(canvas, x, cy - heavy * 0.5, cx - x, heavy),
+        Stub::Double => {
+            let top_w = if dl { cx + 1.5 * light - x } else { cx - x };
+            let bot_w = if ul { cx + 1.5 * light - x } else { cx - x };
+            fill(canvas, x, cy - 1.5 * light, top_w, light);
+            fill(canvas, x, cy + 0.5 * light, bot_w, light);
+        }
+    }
+    // North stub.
+    match def.n {
+        Stub::None => {}
+        Stub::Light => fill(canvas, cx - light * 0.5, y, light, cy - y),
+        Stub::Heavy => fill(canvas, cx - heavy * 0.5, y, heavy, cy - y),
+        Stub::Double => {
+            let left_h = if ul { cy + 1.5 * light - y } else { cy - y };
+            let right_h = if ur { cy + 1.5 * light - y } else { cy - y };
+            fill(canvas, cx - 1.5 * light, y, light, left_h);
+            fill(canvas, cx + 0.5 * light, y, light, right_h);
+        }
+    }
+    // South stub.
+    match def.s {
+        Stub::None => {}
+        Stub::Light => fill(canvas, cx - light * 0.5, cy, light, y + h - cy),
+        Stub::Heavy => fill(canvas, cx - heavy * 0.5, cy, heavy, y + h - cy),
+        Stub::Double => {
+            let left_y = if dl { cy - 1.5 * light } else { cy };
+            let right_y = if dr { cy - 1.5 * light } else { cy };
+            fill(canvas, cx - 1.5 * light, left_y, light, y + h - left_y);
+            fill(canvas, cx + 0.5 * light, right_y, light, y + h - right_y);
+        }
+    }
+
     true
 }
 
@@ -1062,23 +1365,28 @@ impl TerminalRenderer {
                     _ => continue,
                 };
 
-                // Block elements (U+2580..U+259F) tile seamlessly only
-                // when drawn as primitives; the font glyphs leave gaps
-                // because the cell box includes leading. Short-circuit
-                // before the font lookup.
+                // Box-drawing (U+2500..U+257F) and block elements
+                // (U+2580..U+259F) tile seamlessly only when drawn as
+                // primitives; the font glyphs leave gaps because the
+                // cell box includes leading and weights are inconsistent.
+                // Short-circuit before the font lookup.
                 let is_cursor = focused_cursor == Some((row, col));
                 let (fg, _) = resolve_cell_colors(cell, is_cursor, selected(row, col));
                 let cx = ox_px + col as f32 * self.cell_width;
                 let cy = oy_px + row as f32 * self.cell_height;
-                if try_draw_block_element(
-                    canvas,
-                    ch,
-                    cx,
-                    cy,
-                    self.cell_width,
-                    self.cell_height,
-                    fg,
-                ) {
+                let code = ch as u32;
+                let drawn = if (0x2500..=0x257F).contains(&code) {
+                    try_draw_box_drawing(
+                        canvas, ch, cx, cy, self.cell_width, self.cell_height, fg,
+                    )
+                } else if (0x2580..=0x259F).contains(&code) {
+                    try_draw_block_element(
+                        canvas, ch, cx, cy, self.cell_width, self.cell_height, fg,
+                    )
+                } else {
+                    false
+                };
+                if drawn {
                     continue;
                 }
 
