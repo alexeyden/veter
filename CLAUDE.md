@@ -2,16 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around two custom protocols: PRT (portals / multiplexing) and VGE (vector graphics in the grid). All shipped tools and library crates use the `v`-prefix family (`vterm`, `vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`).
+The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around two custom protocols: PRT (portals / multiplexing) and VGE (vector graphics in the grid). The terminal binary itself is `veter`; the supporting tools and library crates keep their `v`-prefix names (`vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`).
 
 ## Build & run
 
 Cargo workspace; edition 2024 (the vendored `vt100` fork stays on 2021).
 
 - Build everything: `cargo build` (release: `cargo build --release`)
-- Build one crate: `cargo build -p vterm` (or `vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `breakout`)
-- Run the GUI terminal: `cargo run -p vterm`
-- Install `vterm`/`vcat`/`vmux` to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them)
+- Build one crate: `cargo build -p veter` (or `vmux`, `vcat`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `breakout`)
+- Run the GUI terminal: `cargo run -p veter`
+- Install `veter`/`vcat`/`vmux` to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them)
 
 ## Tests
 
@@ -30,21 +30,21 @@ Two custom terminal protocols live under `doc/` and drive the entire codebase. R
 - `doc/portal-extension.md` — PRT, an APC-framed protocol (`ESC _ PRT … ESC \`) for carving the host grid into per-portal sub-terminals (multiplexer panes, PiP log views, scrollback-anchored snapshots).
 - `doc/vector-graphics-extension.md` — VGE, an APC-framed protocol (`ESC _ VGE … ESC \`) for vector/raster graphics inside the grid.
 
-Each extension is split into a wire-format crate and host-side state lives only in `vterm`:
+Each extension is split into a wire-format crate and host-side state lives only in `veter`:
 
 | Crate | Role |
 |---|---|
 | `vge-protocol`, `prt-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Both host and clients depend on these. |
 | `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`). The screen model the host and every portal use. |
-| `vterm` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host vt100, the host-side PRT engine (`src/prt/`), and the host-side VGE engine (`src/vge/`). |
+| `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host vt100, the host-side PRT engine (`src/prt/`), and the host-side VGE engine (`src/vge/`). |
 | `vge-cli`, `prt-cli` | Emit raw envelopes for manual protocol testing. |
-| `tools/vmux` | Terminal multiplexer that runs *inside* vterm, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
+| `tools/vmux` | Terminal multiplexer that runs *inside* veter, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
 | `tools/vcat` | Display images inside a VGE-aware terminal. |
 | `tools/breakout` | VGE demo. |
 
-## Host-side byte pipeline (vterm)
+## Host-side byte pipeline (veter)
 
-`vterm/src/main.rs::App::process_pty_output` is the load-bearing path. Output from the child PTY is fed through, in order:
+`veter/src/main.rs::App::process_pty_output` is the load-bearing path. Output from the child PTY is fed through, in order:
 
 1. **PRT engine** (`src/prt/state.rs`) — extracts `ESC _ PRT …` envelopes, dispatches portal commands, observes RIS / DECSTR / `2J` / `3J` for portal scope cleanup, and returns the leftover bytes as `passthrough`.
 2. **VGE engine** (`src/vge/state.rs`) — extracts `ESC _ VGE …` envelopes from PRT's passthrough.
@@ -60,9 +60,9 @@ A portal owns a private vt100 instance and its own PRT/VGE state. Portals nest b
 
 PRT carries display direction only. Keystrokes/mouse go from the host's PTY straight to the inner program's PTY master FD — `WritePortal` is not an input channel. `SetFocus` is purely a rendering hint. This is the contract every multiplexer client (including `vmux`) is built on; do not invent input-over-PRT shortcuts.
 
-## vterm spawns vmux by default
+## veter spawns vmux by default
 
-`vterm/src/pty.rs` execs `vmux` (first the binary next to `vterm`, then `$PATH`) before falling back to `$SHELL` / `/bin/sh`. So launching `vterm` normally drops you into `vmux` — bypass with e.g. `SHELL=/bin/bash` and a `vmux`-free `PATH`, or run a different binary. Tests and headless work should run individual crates with `cargo run -p …` rather than going through `vterm`.
+`veter/src/pty.rs` execs `vmux` (first the binary next to `veter`, then `$PATH`) before falling back to `$SHELL` / `/bin/sh`. So launching `veter` normally drops you into `vmux` — bypass with e.g. `SHELL=/bin/bash` and a `vmux`-free `PATH`, or run a different binary. Tests and headless work should run individual crates with `cargo run -p …` rather than going through `veter`.
 
 ## Conventions
 

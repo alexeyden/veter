@@ -1,11 +1,11 @@
 //! Breakout demo over VGE.
 //!
-//! Run inside vterm. Controls: A / Left = paddle left, D / Right =
+//! Run inside veter. Controls: A / Left = paddle left, D / Right =
 //! paddle right, Space = restart after game-over, Q or Ctrl-C = quit.
 //!
 //! The game wraps itself in the alternate screen (DECSET 1049) so the
 //! user's shell history is restored on exit. Each frame's render-state
-//! delta is shipped as a single VGE envelope; vterm's response is
+//! delta is shipped as a single VGE envelope; veter's response is
 //! drained inline to keep the PTY buffer from filling.
 
 use std::io::Write;

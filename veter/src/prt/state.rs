@@ -1167,7 +1167,7 @@ impl Default for PrtEngine {
 /// vt100's first live-screen row) by probing the parser before/after
 /// `parser.process(...)` calls.
 ///
-/// Same algorithm as VGE's tracker (see `vterm/src/vge/state.rs`):
+/// Same algorithm as VGE's tracker (see `veter/src/vge/state.rs`):
 /// pre-saturation growth advances the line count by added history rows;
 /// at-cap growth detects eviction by hashing vt100's topmost history
 /// row and comparing across probes.

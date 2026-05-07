@@ -83,7 +83,7 @@ pub fn wrap_t2c_envelope(frames_buf: &[u8]) -> Vec<u8> {
 
 /// Wrap a frame buffer as a client→terminal envelope (uppercase `VGE`
 /// marker). Used by the test CLI and any client that wants to feed
-/// commands into a vterm session.
+/// commands into a veter session.
 pub fn wrap_c2t_envelope(frames_buf: &[u8]) -> Vec<u8> {
     wrap(frames_buf, MARKER_C2T)
 }

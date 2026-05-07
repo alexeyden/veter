@@ -1,8 +1,8 @@
 //! prt-cli — emit PRT (Portal Extension) envelopes to stdout for manual
 //! testing.
 //!
-//! Usage examples (run inside a vterm session — stdout IS the PTY,
-//! vterm reads it through its APC parser):
+//! Usage examples (run inside a veter session — stdout IS the PTY,
+//! veter reads it through its APC parser):
 //!
 //!   prt-cli probe
 //!   prt-cli create-portal left  --size 80x24 --origin 0,0

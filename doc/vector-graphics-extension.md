@@ -282,7 +282,7 @@ of now-blank text.
 two events together wipe every top-level element on the current
 screen. The terminal's underlying text grid + scrollback go with them
 (the host terminal must implement `3J` for the text side; see the
-notes for vterm's vendored vt100 fork in `vt100/src/screen.rs`).
+notes for veter's vendored vt100 fork in `vt100/src/screen.rs`).
 
 The shared image and style tables are not affected; only the element
 table. Partial erases (`ESC [ J` / `ESC [ 0 J` / `ESC [ 1 J`) are

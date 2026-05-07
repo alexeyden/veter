@@ -1,7 +1,7 @@
 //! vmux — terminal multiplexer over the Portal Extension (PRT) plus
 //! Vector Graphics Extension (VGE) for chrome.
 //!
-//! Run inside a vterm session that advertises both extensions. Default
+//! Run inside a veter session that advertises both extensions. Default
 //! prefix key is **Ctrl+Space**. After pressing it once:
 //!
 //!   v  split the focused pane vertically (new pane to the right)
@@ -624,7 +624,7 @@ fn build_tabbar_commands(
 ) -> CreateElementBody {
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
-    // shows through, matching whatever theme the user runs vterm in.
+    // shows through, matching whatever theme the user runs veter in.
     let mut cmds: Vec<DrawCmd> = Vec::new();
 
     // Solid rule along the bottom edge of the tab row, separating the
@@ -996,7 +996,7 @@ enum Mode {
     /// Scrollback navigation for one pane via `prefix-[`. Drives the
     /// portal's vt100 scrollback offset through PRT
     /// `SetPortalScrollback`. Active pane's chrome shows a status
-    /// indicator instead of its title plus a vterm-style scrollbar.
+    /// indicator instead of its title plus a veter-style scrollbar.
     Scroll {
         pane_id: String,
         offset: u32,
@@ -1910,7 +1910,7 @@ impl TtyGuard {
 
     fn enter_alt_screen(&mut self) -> Result<()> {
         // Alt screen + hide cursor + clear. Then enable SGR-encoded
-        // mouse reporting (DECSET 1000 + 1006) so vterm forwards every
+        // mouse reporting (DECSET 1000 + 1006) so veter forwards every
         // wheel/click/drag to us; we hit-test against pane bounds in
         // `handle_mouse_event` and either drive scrollback or
         // re-encode and forward to the inner program's PTY.

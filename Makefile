@@ -1,4 +1,4 @@
-# Build and install vterm, vcat, and vmux. Mirrors what install.sh used
+# Build and install veter, vcat, and vmux. Mirrors what install.sh used
 # to do — `make install` builds the three binaries in release mode and
 # drops them into $(BINDIR), plus a desktop entry into $(APPDIR).
 #
@@ -10,8 +10,8 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 
-PACKAGES := vterm vcat vmux
-DESKTOP_FILE := $(APPDIR)/vterm.desktop
+PACKAGES := veter vcat vmux
+DESKTOP_FILE := $(APPDIR)/veter.desktop
 
 CARGO ?= cargo
 INSTALL ?= install
@@ -79,11 +79,11 @@ install-desktop:
 	@printf '%s\n' \
 	    '[Desktop Entry]' \
 	    'Type=Application' \
-	    'Name=vterm' \
+	    'Name=Veter' \
 	    'GenericName=Terminal' \
-	    'Comment=vterm — VGE/PRT-aware terminal emulator' \
-	    'Exec=$(BINDIR)/vterm' \
-	    'TryExec=$(BINDIR)/vterm' \
+	    'Comment=Veter — VGE/PRT-aware terminal emulator' \
+	    'Exec=$(BINDIR)/veter' \
+	    'TryExec=$(BINDIR)/veter' \
 	    'Icon=utilities-terminal' \
 	    'Terminal=false' \
 	    'Categories=System;TerminalEmulator;' \
@@ -91,7 +91,7 @@ install-desktop:
 	    'StartupNotify=true' \
 	    > $(DESKTOP_FILE)
 	@chmod 0644 $(DESKTOP_FILE)
-	@echo "    vterm.desktop -> $(DESKTOP_FILE)"
+	@echo "    veter.desktop -> $(DESKTOP_FILE)"
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database "$(APPDIR)" >/dev/null 2>&1 || true; \
 	fi

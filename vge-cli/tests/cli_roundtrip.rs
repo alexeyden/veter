@@ -1,6 +1,6 @@
 // Spawn the vge-cli binary, capture stdout, feed it back through the
 // vge-protocol parser, and assert we recover the typed Command. This is
-// the closest we can get to "actual user runs vge-cli inside vterm" in
+// the closest we can get to "actual user runs vge-cli inside veter" in
 // CI.
 
 use std::io::Read;

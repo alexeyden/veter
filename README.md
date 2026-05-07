@@ -11,8 +11,8 @@ Both protocols are framed as APC envelopes (`ESC _ … ESC \`) so they pass clea
 
 | Crate | Purpose |
 |---|---|
-| `vterm` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host-side PRT and VGE engines. |
-| `vmux` | Terminal multiplexer that runs *inside* `vterm`, using PRT for panes and VGE for chrome. Default prefix `Ctrl+Space`. |
+| `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host-side PRT and VGE engines. |
+| `vmux` | Terminal multiplexer that runs *inside* `veter`, using PRT for panes and VGE for chrome. Default prefix `Ctrl+Space`. |
 | `vcat` | Display images inside a VGE-aware terminal. |
 | `vge-cli`, `prt-cli` | Emit raw protocol envelopes for manual testing. |
 | `vge-protocol`, `prt-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
@@ -25,7 +25,7 @@ Cargo workspace, edition 2024 (the vendored `vt100` fork stays on 2021).
 
 ```sh
 cargo build --release
-cargo run -p vterm
+cargo run -p veter
 ```
 
 ## Install

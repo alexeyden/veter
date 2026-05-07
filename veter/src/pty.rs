@@ -28,11 +28,11 @@ impl Pty {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 unsafe { std::env::set_var("COLORTERM", "truecolor") };
-                // Prefer vmux when available so vterm sessions get
+                // Prefer vmux when available so veter sessions get
                 // the multiplexer transparently. `make install`
-                // ships vmux alongside vterm in the same bindir, so
+                // ships vmux alongside veter in the same bindir, so
                 // look there first — desktop launchers often start
-                // vterm with a PATH that omits ~/.local/bin. Fall
+                // veter with a PATH that omits ~/.local/bin. Fall
                 // back to a normal $PATH search, then to the user's
                 // shell. execvp only returns on failure.
                 let argv0 = CString::new("vmux").unwrap();

@@ -826,7 +826,7 @@ impl ApplicationHandler for App {
         }
 
         let window_attrs = WindowAttributes::default()
-            .with_title("vterm")
+            .with_title("Veter")
             .with_inner_size(winit::dpi::LogicalSize::new(800u32, 600u32));
 
         let template = ConfigTemplateBuilder::new().with_alpha_size(8);

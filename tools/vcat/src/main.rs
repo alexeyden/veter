@@ -11,7 +11,7 @@
 //!      (Lanczos), upload as a Raw RGBA8 VGE image, and create an
 //!      element placed where the next prompt would have been.
 //!
-//! Run inside vterm:
+//! Run inside veter:
 //!     vcat ~/Downloads/photo.jpg
 //!     vcat --width 40 logo.png
 

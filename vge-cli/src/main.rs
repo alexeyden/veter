@@ -1,7 +1,7 @@
 //! vge-cli — emit VGE protocol envelopes to stdout for manual testing.
 //!
-//! Usage examples (run inside a vterm session — stdout IS the PTY,
-//! vterm reads it through its APC parser):
+//! Usage examples (run inside a veter session — stdout IS the PTY,
+//! veter reads it through its APC parser):
 //!
 //!   vge-cli probe
 //!   vge-cli create-rect myrect --at 5,3 --size 10,5 --color ff0000ff
