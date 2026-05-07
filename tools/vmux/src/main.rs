@@ -3199,6 +3199,7 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
         SetTop,
         SetLive,
         Exit,
+        ToPrefix,
     }
 
     // Decide the action under a single mutable borrow scope so we can
@@ -3219,6 +3220,13 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
                     csi_buf.push(b);
                     Action::Nothing
                 }
+                // Prefix byte: drop scroll state and yield to Mode::Prefix
+                // so any prefix command (tab switching, splits, help, …)
+                // is reachable while scrolling. Tab switching already
+                // exits scroll on its own; doing it up front means the
+                // same exit happens for every prefix command, which is
+                // consistent and saves a per-command carve-out.
+                PREFIX_BYTE => Action::ToPrefix,
                 b'q' | b'G' => Action::Exit,
                 b'k' => Action::Delta(1),
                 b'j' => Action::Delta(-1),
@@ -3270,5 +3278,10 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
         Action::SetTop => state.scroll_set(u32::MAX),
         Action::SetLive => state.scroll_set(0),
         Action::Exit => state.exit_scroll(),
+        Action::ToPrefix => {
+            let env = state.exit_scroll()?;
+            state.mode = Mode::Prefix;
+            Ok(env)
+        }
     }
 }
