@@ -607,6 +607,13 @@ fn chrome_element_id(pane_id: &str) -> String {
 }
 
 const MODAL_ELEMENT_ID: &str = "vmux-modal";
+/// Children of the help modal. Each scrolls or sits at a fixed offset
+/// relative to MODAL_ELEMENT_ID; deleting the parent cascades to all
+/// of them (§9.6).
+const MODAL_BODY_FILL_ID: &str = "vmux-modal-bg";
+const MODAL_BODY_LINES_ID: &str = "vmux-modal-body";
+const MODAL_TRACK_ID: &str = "vmux-modal-track";
+const MODAL_THUMB_ID: &str = "vmux-modal-thumb";
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
 /// Single VGE element holding all between-pane separator strokes for the
 /// active tab. Recreated on every relayout — the layout tree determines
@@ -911,17 +918,46 @@ const HELP_LINES: &[&str] = &[
     "  q           quit vmux",
     "  Ctrl+Space  send a literal Ctrl+Space",
     "",
-    "press any key to dismiss",
+    "j/k or ↑/↓ scroll · any other key dismisses",
 ];
 
-fn build_help_modal_body(
-    host_w: u32,
-    host_h: u32,
-    _cell_pw: f32,
-    _cell_ph: f32,
-) -> CreateElementBody {
-    // Box sized to the longest line + comfortable padding, clamped to
-    // the host so it doesn't overflow on very small terminals.
+/// Number of body lines a half-page jump moves through.
+const HELP_HALF_PAGE: i64 = 6;
+
+/// Returns (visible body rows, max scroll offset in body lines) given a
+/// modal box height. Body lines start at row 2 (after the title strip
+/// and a one-row gap) and stop at row `box_h - 1`, leaving a one-row
+/// bottom pad. When `box_h` is too small for the gap/pad, body content
+/// fills whatever is left.
+fn help_body_window(box_h: f32) -> (usize, u32) {
+    let body_rows = (box_h as i32 - 3).max(1) as usize;
+    let body_lines = HELP_LINES.len().saturating_sub(1);
+    let max_offset = body_lines.saturating_sub(body_rows) as u32;
+    (body_rows, max_offset)
+}
+
+/// Y-coordinate of the scrollbar thumb element's origin (parent-local)
+/// for a given scroll `offset`. Centralised so initial creation and
+/// `UpdateOrigin`-driven scroll updates compute identical values.
+fn help_thumb_origin_y(box_h: f32, offset: u32) -> f32 {
+    let (body_rows, max_offset) = help_body_window(box_h);
+    let body_lines = HELP_LINES.len().saturating_sub(1);
+    if body_lines <= body_rows || max_offset == 0 {
+        return 2.0;
+    }
+    let track_h = body_rows as f32;
+    let thumb_h = (track_h * body_rows as f32 / body_lines as f32).max(0.5);
+    let thumb_max_off = (track_h - thumb_h).max(0.0);
+    let off = offset.min(max_offset) as f32;
+    2.0 + thumb_max_off * off / max_offset as f32
+}
+
+/// Build the help modal as a parent element (chrome + clip rect) plus
+/// children for the body fill, the scrollable body lines, and — when
+/// content overflows — a scrollbar track and thumb. Scrolling is handled
+/// purely by shifting the body-lines and thumb children's origins, so
+/// the body's draw commands never need to be rebuilt.
+fn build_help_modal_elements(host_w: u32, host_h: u32, offset: u32) -> Vec<CreateElementBody> {
     let max_line = HELP_LINES
         .iter()
         .map(|l| l.chars().count())
@@ -935,43 +971,30 @@ fn build_help_modal_body(
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
 
-    let mut cmds = vec![
-        DrawCmd::FillRectangles {
-            fill: Style::Flat(COLOR_MODAL_BG),
-            rects: vec![Rect {
-                x: 0.0,
-                y: 1.0,
-                w: box_w,
-                h: box_h - 1.0,
-            }],
-        },
-        DrawCmd::FillRectangles {
-            fill: Style::Flat(COLOR_BRAND),
-            rects: vec![Rect {
-                x: 0.0,
-                y: 0.0,
-                w: box_w,
-                h: 1.0,
-            }],
-        },
-        DrawCmd::DrawLineLoop {
-            stroke: Style::Flat(COLOR_MODAL_OUTLINE),
-            line_width: 0.1,
-            points: vec![
-                Point { x: 0.0, y: 0.0 },
-                Point { x: box_w, y: 0.0 },
-                Point { x: box_w, y: box_h },
-                Point { x: 0.0, y: box_h },
-            ],
-        },
-    ];
+    let (body_rows, max_offset) = help_body_window(box_h);
+    let offset = offset.min(max_offset);
+    let body_lines = HELP_LINES.len().saturating_sub(1);
+    let scrollable = body_lines > body_rows;
 
-    // First line is the title — drawn into the brand title strip on
-    // row 0. Subsequent lines are left-aligned body content; the row
-    // immediately below the title strip stays empty as breathing room.
-    for (i, line) in HELP_LINES.iter().enumerate() {
-        if i == 0 {
-            cmds.push(DrawCmd::DrawText {
+    let mut elements: Vec<CreateElementBody> = Vec::new();
+
+    // Parent — its `size` clips every child to the modal's bounds, and
+    // its own `commands` (title strip, outline, title text) draw last,
+    // on top of every child, so the title strip cleanly masks any body
+    // line that scrolls into rows 0/1.
+    elements.push(CreateElementBody {
+        id: MODAL_ELEMENT_ID.into(),
+        commands: vec![
+            DrawCmd::FillRectangles {
+                fill: Style::Flat(COLOR_BRAND),
+                rects: vec![Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: box_w,
+                    h: 1.0,
+                }],
+            },
+            DrawCmd::DrawText {
                 origin: Point {
                     x: box_w * 0.5,
                     y: 0.0,
@@ -979,28 +1002,19 @@ fn build_help_modal_body(
                 align: Align::Center,
                 fill: Style::Flat(COLOR_MODAL_TEXT),
                 font_style: FontStyle(0x01),
-                text: (*line).to_string(),
-            });
-        } else {
-            // Section headers (no leading space) get bold; indented
-            // body lines stay normal.
-            let bold = !line.is_empty() && !line.starts_with(' ');
-            cmds.push(DrawCmd::DrawText {
-                origin: Point {
-                    x: 3.0,
-                    y: 1.0 + i as f32,
-                },
-                align: Align::Left,
-                fill: Style::Flat(COLOR_MODAL_TEXT),
-                font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
-                text: (*line).to_string(),
-            });
-        }
-    }
-
-    CreateElementBody {
-        id: MODAL_ELEMENT_ID.to_string(),
-        commands: cmds,
+                text: HELP_LINES[0].to_string(),
+            },
+            DrawCmd::DrawLineLoop {
+                stroke: Style::Flat(COLOR_MODAL_OUTLINE),
+                line_width: 0.1,
+                points: vec![
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: box_w, y: 0.0 },
+                    Point { x: box_w, y: box_h },
+                    Point { x: 0.0, y: box_h },
+                ],
+            },
+        ],
         origin: Point {
             x: origin_x,
             y: origin_y,
@@ -1008,8 +1022,110 @@ fn build_help_modal_body(
         is_visible: true,
         draw_order: MODAL_DRAW_ORDER,
         parent: None,
+        size: Some(Point {
+            x: box_w,
+            y: box_h,
+        }),
+    });
+
+    // Body fill — sits behind the scrolling body lines.
+    elements.push(CreateElementBody {
+        id: MODAL_BODY_FILL_ID.into(),
+        commands: vec![DrawCmd::FillRectangles {
+            fill: Style::Flat(COLOR_MODAL_BG),
+            rects: vec![Rect {
+                x: 0.0,
+                y: 1.0,
+                w: box_w,
+                h: box_h - 1.0,
+            }],
+        }],
+        origin: Point { x: 0.0, y: 0.0 },
+        is_visible: true,
+        draw_order: 0,
+        parent: Some(MODAL_ELEMENT_ID.into()),
         size: None,
+    });
+
+    // Body lines — every line drawn at its natural y position; the
+    // element's origin shifts the whole stack up to scroll, and the
+    // parent's clip rect hides what goes out of view.
+    let mut body_cmds = Vec::with_capacity(body_lines);
+    for i in 1..HELP_LINES.len() {
+        let line = HELP_LINES[i];
+        let bold = !line.is_empty() && !line.starts_with(' ');
+        body_cmds.push(DrawCmd::DrawText {
+            origin: Point {
+                x: 3.0,
+                y: 1.0 + i as f32,
+            },
+            align: Align::Left,
+            fill: Style::Flat(COLOR_MODAL_TEXT),
+            font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
+            text: line.to_string(),
+        });
     }
+    elements.push(CreateElementBody {
+        id: MODAL_BODY_LINES_ID.into(),
+        commands: body_cmds,
+        origin: Point {
+            x: 0.0,
+            y: -(offset as f32),
+        },
+        is_visible: true,
+        draw_order: 1,
+        parent: Some(MODAL_ELEMENT_ID.into()),
+        size: None,
+    });
+
+    if scrollable {
+        let track_h = body_rows as f32;
+        let thumb_h = (track_h * body_rows as f32 / body_lines as f32).max(0.5);
+
+        elements.push(CreateElementBody {
+            id: MODAL_TRACK_ID.into(),
+            commands: vec![DrawCmd::FillRectangles {
+                fill: Style::Flat(COLOR_SCROLLBAR),
+                rects: vec![Rect {
+                    x: box_w - 1.0,
+                    y: 2.0,
+                    w: 0.4,
+                    h: track_h,
+                }],
+            }],
+            origin: Point { x: 0.0, y: 0.0 },
+            is_visible: true,
+            draw_order: 2,
+            parent: Some(MODAL_ELEMENT_ID.into()),
+            size: None,
+        });
+
+        // Thumb command is anchored at local (box_w-1, 0); the
+        // element's origin places it at the right y, so scroll updates
+        // are a single `UpdateOrigin` away.
+        elements.push(CreateElementBody {
+            id: MODAL_THUMB_ID.into(),
+            commands: vec![DrawCmd::FillRectangles {
+                fill: Style::Flat(COLOR_BRAND),
+                rects: vec![Rect {
+                    x: box_w - 1.0,
+                    y: 0.0,
+                    w: 0.4,
+                    h: thumb_h,
+                }],
+            }],
+            origin: Point {
+                x: 0.0,
+                y: help_thumb_origin_y(box_h, offset),
+            },
+            is_visible: true,
+            draw_order: 3,
+            parent: Some(MODAL_ELEMENT_ID.into()),
+            size: None,
+        });
+    }
+
+    elements
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1034,8 +1150,16 @@ enum Mode {
         target: RenameTarget,
         buffer: String,
     },
-    /// Help-modal display via `prefix-?`. Any keystroke dismisses it.
-    Help,
+    /// Help-modal display via `prefix-?`. Recognised navigation keys
+    /// (`j`/`k`/Up/Down/PgUp/PgDn/`g`/`G`) scroll when the help text is
+    /// taller than the modal; any other keystroke dismisses it.
+    Help {
+        offset: u32,
+        /// Partial CSI sequence buffer, mirroring `Mode::Scroll` — lets
+        /// us recognise multi-byte arrow / PgUp / PgDn sequences without
+        /// the leading ESC dismissing the modal prematurely.
+        csi_buf: Vec<u8>,
+    },
     /// Scrollback navigation for one pane via `prefix-[`. Drives the
     /// portal's vt100 scrollback offset through PRT
     /// `SetPortalScrollback`. Active pane's chrome shows a status
@@ -1620,14 +1744,17 @@ impl State {
         self.tabbar_created = true;
 
         // Re-emit modal on top, if active.
-        if let Some(body) = self.build_rename_modal_body() {
+        let modal_elements = self.build_modal_elements();
+        if !modal_elements.is_empty() {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
                 },
                 0,
             ));
-            vge_cmds.push((VgeCommand::CreateElement(body), 0));
+            for el in modal_elements {
+                vge_cmds.push((VgeCommand::CreateElement(el), 0));
+            }
             self.modal_visible = true;
         } else if self.modal_visible {
             vge_cmds.push((
@@ -1651,14 +1778,19 @@ impl State {
 
     fn render_modal_overlay(&mut self) -> Vec<u8> {
         let mut vge_cmds: Vec<(VgeCommand, u32)> = Vec::new();
-        if let Some(body) = self.build_rename_modal_body() {
+        let elements = self.build_modal_elements();
+        if !elements.is_empty() {
+            // Deleting the parent cascades to every child (§9.6), so a
+            // single delete clears whatever modal was up before.
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
                 },
                 0,
             ));
-            vge_cmds.push((VgeCommand::CreateElement(body), 0));
+            for el in elements {
+                vge_cmds.push((VgeCommand::CreateElement(el), 0));
+            }
             self.modal_visible = true;
         } else if self.modal_visible {
             vge_cmds.push((
@@ -1676,16 +1808,58 @@ impl State {
         }
     }
 
-    /// Build the modal CreateElement body for whichever overlay the
-    /// current mode wants up — rename prompt or help — or `None`.
-    fn build_rename_modal_body(&self) -> Option<CreateElementBody> {
+    /// Scroll-only update for the help modal: shift the body-lines
+    /// child's origin and the thumb's origin in place. No element is
+    /// recreated, no draw commands are rebuilt — this is the showcase
+    /// for VGE's parent/clip + per-element origin features.
+    fn render_help_scroll(&self) -> Vec<u8> {
+        let Mode::Help { offset, .. } = &self.mode else {
+            return Vec::new();
+        };
+        let inner_h = HELP_LINES.len() as f32;
+        let box_h = (inner_h + 2.0).min(self.host_h.saturating_sub(2) as f32);
+        let (body_rows, max_offset) = help_body_window(box_h);
+        let body_lines = HELP_LINES.len().saturating_sub(1);
+        if body_lines <= body_rows {
+            return Vec::new();
+        }
+        let off = (*offset).min(max_offset);
+        let cmds = vec![
+            (
+                VgeCommand::UpdateOrigin {
+                    id: MODAL_BODY_LINES_ID.into(),
+                    origin: Point {
+                        x: 0.0,
+                        y: -(off as f32),
+                    },
+                },
+                0,
+            ),
+            (
+                VgeCommand::UpdateOrigin {
+                    id: MODAL_THUMB_ID.into(),
+                    origin: Point {
+                        x: 0.0,
+                        y: help_thumb_origin_y(box_h, off),
+                    },
+                },
+                0,
+            ),
+        ];
+        build_vge_envelope(&cmds)
+    }
+
+    /// Build the modal as a list of elements (parent first, children
+    /// after) for whichever overlay the current mode wants up — rename
+    /// prompt or help — or empty if no modal should be visible.
+    fn build_modal_elements(&self) -> Vec<CreateElementBody> {
         match &self.mode {
             Mode::Rename { target, buffer } => {
                 let title = match target {
                     RenameTarget::Pane(_) => "Rename pane",
                     RenameTarget::Tab(_) => "Rename tab",
                 };
-                Some(build_modal_commands(
+                vec![build_modal_commands(
                     self.host_w,
                     self.host_h,
                     title,
@@ -1693,15 +1867,12 @@ impl State {
                     buffer,
                     self.cell_pw,
                     self.cell_ph,
-                ))
+                )]
             }
-            Mode::Help => Some(build_help_modal_body(
-                self.host_w,
-                self.host_h,
-                self.cell_pw,
-                self.cell_ph,
-            )),
-            Mode::Normal | Mode::Prefix | Mode::Scroll { .. } => None,
+            Mode::Help { offset, .. } => {
+                build_help_modal_elements(self.host_w, self.host_h, *offset)
+            }
+            Mode::Normal | Mode::Prefix | Mode::Scroll { .. } => Vec::new(),
         }
     }
 
@@ -2747,13 +2918,8 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 }
                 idx += 1;
             }
-            Mode::Help => {
-                // Any keystroke dismisses the help modal. The byte is
-                // consumed (not forwarded to the focused pane) so a
-                // multi-byte sequence pressed by accident doesn't leak
-                // through.
-                state.mode = Mode::Normal;
-                let env = state.render_modal_overlay();
+            Mode::Help { .. } => {
+                let env = handle_help_byte(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
@@ -2820,7 +2986,10 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         }
         // help
         b'?' => {
-            state.mode = Mode::Help;
+            state.mode = Mode::Help {
+                offset: 0,
+                csi_buf: Vec::new(),
+            };
             Ok(state.render_modal_overlay())
         }
         // scroll mode
@@ -2905,6 +3074,101 @@ fn handle_rename_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
             Ok(state.render_modal_overlay())
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Process one byte while the help modal is up. Navigation keys scroll
+/// the body; any unrecognised byte dismisses. CSI sequences for arrow
+/// keys / PgUp / PgDn are buffered so the leading ESC doesn't dismiss
+/// before we know what they are.
+fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
+    enum Action {
+        Nothing,
+        Delta(i64),
+        Top,
+        Bottom,
+        Dismiss,
+    }
+
+    let max_offset = {
+        let inner_h = HELP_LINES.len() as f32;
+        let box_h = (inner_h + 2.0).min(state.host_h.saturating_sub(2) as f32);
+        help_body_window(box_h).1
+    };
+
+    let action = {
+        let Mode::Help { csi_buf, .. } = &mut state.mode else {
+            return Ok(Vec::new());
+        };
+        if csi_buf.is_empty() {
+            match b {
+                0x1B => {
+                    csi_buf.push(b);
+                    Action::Nothing
+                }
+                b'j' => Action::Delta(1),
+                b'k' => Action::Delta(-1),
+                b'd' | b' ' => Action::Delta(HELP_HALF_PAGE),
+                b'u' => Action::Delta(-HELP_HALF_PAGE),
+                b'g' => Action::Top,
+                b'G' => Action::Bottom,
+                _ => Action::Dismiss,
+            }
+        } else if csi_buf.len() == 1 {
+            // After ESC: '[' (CSI) or 'O' (SS3, sent by terminals in
+            // application cursor mode) continues an arrow / function
+            // sequence; anything else means the ESC was a standalone
+            // keystroke → dismiss.
+            if b == b'[' || b == b'O' {
+                csi_buf.push(b);
+                Action::Nothing
+            } else {
+                csi_buf.clear();
+                Action::Dismiss
+            }
+        } else {
+            csi_buf.push(b);
+            if (0x40..=0x7E).contains(&b) {
+                let act = match csi_buf.as_slice() {
+                    [0x1B, b'[', b'A'] | [0x1B, b'O', b'A'] => Action::Delta(-1),
+                    [0x1B, b'[', b'B'] | [0x1B, b'O', b'B'] => Action::Delta(1),
+                    [0x1B, b'[', b'5', b'~'] => Action::Delta(-HELP_HALF_PAGE * 2),
+                    [0x1B, b'[', b'6', b'~'] => Action::Delta(HELP_HALF_PAGE * 2),
+                    [0x1B, b'[', b'H'] | [0x1B, b'O', b'H'] => Action::Top,
+                    [0x1B, b'[', b'F'] | [0x1B, b'O', b'F'] => Action::Bottom,
+                    _ => Action::Dismiss,
+                };
+                csi_buf.clear();
+                act
+            } else {
+                Action::Nothing
+            }
+        }
+    };
+
+    match action {
+        Action::Nothing => Ok(Vec::new()),
+        Action::Dismiss => {
+            state.mode = Mode::Normal;
+            Ok(state.render_modal_overlay())
+        }
+        other => {
+            if let Mode::Help { offset, .. } = &mut state.mode {
+                let new_off = match other {
+                    Action::Delta(d) => (*offset as i64 + d)
+                        .max(0)
+                        .min(max_offset as i64) as u32,
+                    Action::Top => 0,
+                    Action::Bottom => max_offset,
+                    _ => *offset,
+                };
+                if new_off != *offset {
+                    *offset = new_off;
+                    return Ok(state.render_help_scroll());
+                }
+            }
+            Ok(Vec::new())
+        }
     }
 }
 
