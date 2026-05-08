@@ -59,6 +59,9 @@ pub struct Screen {
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
 
+    charset: crate::charset::CharsetState,
+    saved_charset: crate::charset::CharsetState,
+
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
@@ -77,6 +80,9 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+
+            charset: crate::charset::CharsetState::default(),
+            saved_charset: crate::charset::CharsetState::default(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -661,11 +667,13 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs = self.attrs;
+        self.saved_charset = self.charset;
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs;
+        self.charset = self.saved_charset;
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -703,6 +711,7 @@ impl Screen {
 
 impl Screen {
     pub(crate) fn text(&mut self, c: char) {
+        let c = self.charset.translate(c);
         let pos = self.grid().pos();
         let size = self.grid().size();
         let attrs = self.attrs;
@@ -992,6 +1001,20 @@ impl Screen {
     // ESC M
     pub(crate) fn ri(&mut self) {
         self.grid_mut().row_dec_scroll(1);
+    }
+
+    // SO (0x0E) / SI (0x0F): swap GL between G1 and G0.
+    pub(crate) fn shift_out(&mut self) {
+        self.charset.shift_out();
+    }
+
+    pub(crate) fn shift_in(&mut self) {
+        self.charset.shift_in();
+    }
+
+    // ESC ( <c> / ESC ) <c> / ESC * <c> / ESC + <c> — designate G0..G3.
+    pub(crate) fn designate_charset(&mut self, selector: u8, code: u8) {
+        self.charset.designate(selector, code);
     }
 
     // ESC c
@@ -1355,5 +1378,79 @@ fn u16_to_u8(i: u16) -> Option<u8> {
     } else {
         // safe because we just ensured that the value fits in a u8
         Some(i.try_into().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod scs_tests {
+    use crate::Parser;
+
+    fn cell_at(p: &Parser, row: u16, col: u16) -> &str {
+        p.screen().cell(row, col).unwrap().contents()
+    }
+
+    #[test]
+    fn esc_paren_zero_then_back() {
+        let mut p = Parser::new(2, 10, 0);
+        // Switch G0 to DEC Special Graphics, draw `lqqk`, then back to ASCII
+        // and draw `AB`.
+        p.process(b"\x1b(0lqqk\x1b(BAB");
+        assert_eq!(cell_at(&p, 0, 0), "┌");
+        assert_eq!(cell_at(&p, 0, 1), "─");
+        assert_eq!(cell_at(&p, 0, 2), "─");
+        assert_eq!(cell_at(&p, 0, 3), "┐");
+        assert_eq!(cell_at(&p, 0, 4), "A");
+        assert_eq!(cell_at(&p, 0, 5), "B");
+    }
+
+    #[test]
+    fn so_si_swap_between_g0_and_g1() {
+        let mut p = Parser::new(2, 10, 0);
+        // Designate G1 as DEC Special Graphics, leave G0 ASCII. SO selects
+        // G1, SI returns to G0.
+        p.process(b"\x1b)0A\x0eq\x0fB");
+        assert_eq!(cell_at(&p, 0, 0), "A"); // G0 ASCII
+        assert_eq!(cell_at(&p, 0, 1), "─"); // after SO, GL=G1=DEC
+        assert_eq!(cell_at(&p, 0, 2), "B"); // after SI, GL=G0=ASCII
+    }
+
+    #[test]
+    fn ris_resets_charset() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b(0");
+        // RIS should drop us back to ASCII.
+        p.process(b"\x1bc");
+        p.process(b"q");
+        assert_eq!(cell_at(&p, 0, 0), "q");
+    }
+
+    #[test]
+    fn decsc_decrc_save_and_restore_charset() {
+        let mut p = Parser::new(2, 10, 0);
+        // Save while ASCII, switch to DEC, restore — must be back to ASCII.
+        p.process(b"\x1b7\x1b(0\x1b8q");
+        assert_eq!(cell_at(&p, 0, 0), "q");
+    }
+
+    #[test]
+    fn alt_screen_1049_preserves_charset() {
+        let mut p = Parser::new(2, 10, 0);
+        // Establish DEC on G0, enter alt screen via 1049, switch back to
+        // ASCII inside, leave alt screen — main charset must still be DEC.
+        p.process(b"\x1b(0");
+        p.process(b"\x1b[?1049h");
+        p.process(b"\x1b(B");
+        p.process(b"\x1b[?1049l");
+        p.process(b"q");
+        assert_eq!(cell_at(&p, 0, 0), "─");
+    }
+
+    #[test]
+    fn unicode_is_not_corrupted_by_dec_set() {
+        // `é` is outside the 0x21..=0x7E range, so even with DEC active it
+        // must pass through unchanged.
+        let mut p = Parser::new(2, 10, 0);
+        p.process("\x1b(0é".as_bytes());
+        assert_eq!(cell_at(&p, 0, 0), "é");
     }
 }

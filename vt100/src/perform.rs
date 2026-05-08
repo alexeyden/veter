@@ -48,15 +48,33 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             11 => self.screen.vt(),
             12 => self.screen.ff(),
             13 => self.screen.cr(),
-            // we don't implement shift in/out alternate character sets, but
-            // it shouldn't count as an "error"
-            14 | 15 => {}
+            // SO (0x0E) / SI (0x0F) — flip GL between G1 and G0 so DEC
+            // line-drawing programs (jtop, dialog, ncurses TUIs) render
+            // box characters instead of leaking raw `qx j k l m` ASCII.
+            14 => self.screen.shift_out(),
+            15 => self.screen.shift_in(),
             _ => self.callbacks.unhandled_control(&mut self.screen, b),
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
         if let Some(i) = intermediates.first() {
+            // ESC ( <c> / ESC ) <c> / ESC * <c> / ESC + <c> — SCS, designate
+            // G0..G3. Followups with a second intermediate (96-char sets,
+            // DOCS, etc.) are still left to the unhandled callback.
+            if intermediates.len() == 1 {
+                let selector = match *i {
+                    b'(' => Some(0),
+                    b')' => Some(1),
+                    b'*' => Some(2),
+                    b'+' => Some(3),
+                    _ => None,
+                };
+                if let Some(sel) = selector {
+                    self.screen.designate_charset(sel, b);
+                    return;
+                }
+            }
             self.callbacks.unhandled_escape(
                 &mut self.screen,
                 Some(*i),

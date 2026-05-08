@@ -50,6 +50,7 @@
 mod attrs;
 mod callbacks;
 mod cell;
+mod charset;
 mod grid;
 mod parser;
 mod perform;
