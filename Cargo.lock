@@ -2510,6 +2510,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vft-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "vge-cli"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,7 @@
+[package]
+name = "vft-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "VFT (File Transfer Extension) wire format: APC envelope, codec, command parser/encoder."
+
+[dependencies]
