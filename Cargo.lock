@@ -2504,6 +2504,7 @@ dependencies = [
  "raw-window-handle",
  "rgb",
  "swash",
+ "vft-protocol",
  "vge-protocol",
  "vt100",
  "winit",

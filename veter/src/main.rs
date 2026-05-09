@@ -2,6 +2,7 @@ mod clipboard;
 mod prt;
 mod pty;
 mod renderer;
+mod vft;
 mod vge;
 
 use std::io::Read;
@@ -235,6 +236,7 @@ struct App {
     rx: Option<mpsc::Receiver<Vec<u8>>>,
     vge: Option<vge::VgeEngine>,
     prt: Option<prt::PrtEngine>,
+    vft: Option<vft::VftEngine>,
     clipboard: clipboard::ClipboardManager,
 
     // GL state (dropped in reverse-creation order so the EGL surface
@@ -274,6 +276,7 @@ impl App {
             rx: None,
             vge: None,
             prt: None,
+            vft: None,
             proxy,
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
@@ -790,32 +793,53 @@ impl App {
             Some(p) => p,
             None => return false,
         };
+        let vft = match &mut self.vft {
+            Some(v) => v,
+            None => return false,
+        };
         let pty = match &self.pty {
             Some(p) => p,
             None => return false,
         };
+
+        // Drain VFT worker channels first so async events (download
+        // chunks, finalisation responses, aborts) join the next
+        // outgoing envelope even when no PTY input arrived this tick.
+        vft.drive();
 
         loop {
             match rx.try_recv() {
                 Ok(data) => {
                     // Pipeline: PRT extracts ESC_PRT envelopes and observes
                     // RIS/DECSTR/2J/3J events; VGE then extracts ESC_VGE
-                    // envelopes from PRT's passthrough; the rest goes to
-                    // the host vt100. Each engine's apc passes the other
-                    // extension's marker through verbatim, so order is
-                    // independent of correctness.
+                    // envelopes from PRT's passthrough; VFT does the same
+                    // for ESC_VFT; the rest goes to the host vt100. Each
+                    // engine's apc passes the others' markers through
+                    // verbatim, so order is independent of correctness.
                     let prt_chunk = prt.process_pty_chunk_full(&data);
                     let vge_passthrough = engine.process_pty_chunk(&prt_chunk.passthrough);
-                    if !vge_passthrough.is_empty() {
-                        parser.process(&vge_passthrough);
+                    let vft_passthrough = vft.process_pty_chunk(&vge_passthrough);
+                    if !vft_passthrough.is_empty() {
+                        parser.process(&vft_passthrough);
                     }
                     // PRT host-screen reactions: scope_reset / cull on
                     // observed RIS/DECSTR/2J/3J, then alt-screen swap +
                     // line tracker + scrollback eviction.
                     prt.handle_terminal_events(&prt_chunk.terminal_events);
+                    // §5.6 — VFT has no apc-side observation of resets,
+                    // so it relies on PRT's terminal event stream.
+                    for ev in &prt_chunk.terminal_events {
+                        match ev {
+                            prt::TerminalEvent::HardReset | prt::TerminalEvent::SoftReset => {
+                                vft.abort_all(vft_protocol::frame::ABORT_HOST_RESET, "");
+                            }
+                            _ => {}
+                        }
+                    }
                     prt.after_vt100_process(parser);
                     prt.flush_pending_events();
                     engine.after_vt100_process(parser);
+                    vft.drive();
 
                     let prt_resp = prt.take_responses();
                     if !prt_resp.is_empty() {
@@ -825,8 +849,21 @@ impl App {
                     if !resp.is_empty() {
                         let _ = pty.write_all(&resp);
                     }
+                    let vft_resp = vft.take_responses();
+                    if !vft_resp.is_empty() {
+                        let _ = pty.write_all(&vft_resp);
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => return true,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Even with no incoming bytes, the VFT engine may
+                    // have produced events (download chunks, etc.) via
+                    // the `vft.drive()` call above; flush those out.
+                    let vft_resp = vft.take_responses();
+                    if !vft_resp.is_empty() {
+                        let _ = pty.write_all(&vft_resp);
+                    }
+                    return true;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => return false,
             }
         }
@@ -906,6 +943,14 @@ impl ApplicationHandler for App {
         // through so per-portal VGE engines (§10) inherit them.
         let prt_engine = prt::PrtEngine::with_metrics(cell_px, scale);
 
+        // VFT engine: takes a wakeup closure so worker threads can
+        // tick the event loop after pushing chunk events. Without
+        // this, downloads would only stream while the user is typing.
+        let wakeup_proxy = self.proxy.clone();
+        let vft_engine = vft::VftEngine::new(move || {
+            let _ = wakeup_proxy.send_event(());
+        });
+
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a
         // Callbacks impl that catches OSC 52 set requests for the
@@ -954,6 +999,7 @@ impl ApplicationHandler for App {
         self.rx = Some(rx);
         self.vge = Some(vge_engine);
         self.prt = Some(prt_engine);
+        self.vft = Some(vft_engine);
 
         self.window.as_ref().unwrap().request_redraw();
     }
