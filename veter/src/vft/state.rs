@@ -38,7 +38,8 @@ use vft_protocol::envelope::{
 use vft_protocol::frame::*;
 
 use super::path;
-use super::worker::{self, Wakeup, WorkerCmd, WorkerEvt};
+use super::worker::{self, WorkerCmd, WorkerEvt};
+pub use super::worker::Wakeup;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -116,14 +117,29 @@ pub struct VftEngine {
 }
 
 impl VftEngine {
+    /// Convenience wrapper for tests and ad-hoc usage that takes a
+    /// closure rather than a pre-wrapped `Arc`. Production paths use
+    /// `with_wakeup` so a single `Arc<dyn Fn>` is shared with every
+    /// per-portal engine; under cargo's bin-only build this method is
+    /// only reachable from `cargo test`, hence the lint allow.
+    #[allow(dead_code)]
     pub fn new<F: Fn() + Send + Sync + 'static>(wakeup: F) -> Self {
+        Self::with_wakeup(Arc::new(wakeup))
+    }
+
+    /// Construct an engine that shares an existing wakeup `Arc`.
+    /// Used by the PRT engine when it spawns a per-portal VFT engine
+    /// for §10: the host's wakeup is cloned once at engine
+    /// construction and re-used for every portal so a worker in any
+    /// scope ultimately ticks the same main loop.
+    pub fn with_wakeup(wakeup: Wakeup) -> Self {
         Self {
             apc: ApcStream::new(),
             response_queue: VecDeque::new(),
             ready_frames: Vec::new(),
             transfers: HashMap::new(),
             limits: Limits::default(),
-            wakeup: Arc::new(wakeup),
+            wakeup,
         }
     }
 

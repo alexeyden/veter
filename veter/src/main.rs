@@ -840,6 +840,10 @@ impl App {
                     prt.flush_pending_events();
                     engine.after_vt100_process(parser);
                     vft.drive();
+                    // Drive every per-portal VFT engine and surface
+                    // their async events as RawReply on each portal's
+                    // wire (§10 vft-in-portal).
+                    prt.drive_and_flush_vft();
 
                     let prt_resp = prt.take_responses();
                     if !prt_resp.is_empty() {
@@ -855,12 +859,18 @@ impl App {
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    // Even with no incoming bytes, the VFT engine may
-                    // have produced events (download chunks, etc.) via
-                    // the `vft.drive()` call above; flush those out.
+                    // Even with no incoming bytes, the host VFT engine
+                    // and per-portal engines may have produced events
+                    // since the `vft.drive()` call above. Drive the
+                    // portal tree once more and flush any new bytes.
+                    prt.drive_and_flush_vft();
                     let vft_resp = vft.take_responses();
                     if !vft_resp.is_empty() {
                         let _ = pty.write_all(&vft_resp);
+                    }
+                    let prt_resp = prt.take_responses();
+                    if !prt_resp.is_empty() {
+                        let _ = pty.write_all(&prt_resp);
                     }
                     return true;
                 }
@@ -941,15 +951,18 @@ impl ApplicationHandler for App {
         // event category Phase 3 wires (bell/title/icon/cwd/clipboard/
         // mouse mode + alt-screen-in-portal). Cell metrics are passed
         // through so per-portal VGE engines (§10) inherit them.
-        let prt_engine = prt::PrtEngine::with_metrics(cell_px, scale);
-
-        // VFT engine: takes a wakeup closure so worker threads can
-        // tick the event loop after pushing chunk events. Without
-        // this, downloads would only stream while the user is typing.
+        // VFT wakeup: shared between the host's top-level VFT engine
+        // and every per-portal VFT engine spawned via PRT, so worker
+        // threads at any nesting depth tick the event loop after
+        // pushing chunk events.
         let wakeup_proxy = self.proxy.clone();
-        let vft_engine = vft::VftEngine::new(move || {
+        let vft_wakeup: vft::Wakeup = std::sync::Arc::new(move || {
             let _ = wakeup_proxy.send_event(());
         });
+        let vft_engine = vft::VftEngine::with_wakeup(vft_wakeup.clone());
+
+        let prt_engine =
+            prt::PrtEngine::with_metrics_and_wakeup(cell_px, scale, vft_wakeup);
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a

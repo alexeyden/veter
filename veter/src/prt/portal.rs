@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Parser, Screen};
 
 use super::state::PrtEngine;
+use crate::vft::VftEngine;
 use crate::vge::VgeEngine;
 
 /// A portal's vertical anchor.
@@ -150,6 +151,11 @@ pub struct Portal {
     /// the portal's cell coordinate space. `auto_reply_dsr` is forced
     /// off so PRT remains the sole DSR responder inside the portal.
     pub vge: VgeEngine,
+    /// §10 (vft-in-portal) — every portal owns its own VFT engine
+    /// scoped to that portal's transfer table. Workers act on the
+    /// host's filesystem with the host's user permissions; isolation
+    /// is OS-level (containers, user accounts), not VFT-level.
+    pub vft: VftEngine,
     pub state_cache: PolledStateCache,
     /// DSR cursor-position queries observed on inbound bytes that
     /// haven't yet been answered. Drained after `vt.process` so the

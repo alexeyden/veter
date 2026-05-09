@@ -231,31 +231,56 @@ pub struct PrtEngine {
     /// `EVT_CLIPBOARD_OP` emission so the host (`App`) can apply them
     /// to the system clipboard. Drained by `take_pending_clipboard_writes`.
     pending_clipboard_writes: Vec<String>,
+    /// Wakeup closure cloned into every per-portal VFT engine spawned
+    /// in this scope (and inherited by sub-engines). When a per-portal
+    /// VFT worker emits an event during an idle phase, it pings this
+    /// to tick the host's main loop so `drive_and_flush_vft` runs and
+    /// the event surfaces as a RawReply.
+    vft_wakeup: crate::vft::Wakeup,
 }
 
 impl PrtEngine {
     /// Construct the host's top-level PRT engine with default cell
     /// metrics (suitable for unit tests; `main.rs` should use
-    /// `with_metrics`).
+    /// `with_metrics_and_wakeup` so per-portal VFT engines can wake
+    /// the event loop).
     pub fn new() -> Self {
-        Self::with_all(Limits::default(), 0, (8, 16), 1.0)
+        Self::with_all(
+            Limits::default(),
+            0,
+            (8, 16),
+            1.0,
+            std::sync::Arc::new(|| {}),
+        )
     }
 
-    /// Construct the host's top-level PRT engine with the host's
-    /// actual cell metrics. Per-portal VGE engines created in this
-    /// scope inherit these metrics.
-    pub fn with_metrics(cell_px: (u16, u16), scale_factor: f32) -> Self {
-        Self::with_all(Limits::default(), 0, cell_px, scale_factor)
+    /// Production constructor for the host's top-level engine. The
+    /// supplied wakeup is shared with every per-portal VFT engine
+    /// spawned in this scope (and inherited by sub-engines), so a
+    /// download chunk emitted by a worker inside a deeply nested
+    /// portal still ticks the same main loop that drives the host.
+    pub fn with_metrics_and_wakeup(
+        cell_px: (u16, u16),
+        scale_factor: f32,
+        vft_wakeup: crate::vft::Wakeup,
+    ) -> Self {
+        Self::with_all(Limits::default(), 0, cell_px, scale_factor, vft_wakeup)
     }
 
     /// Construct with explicit limits. Used by tests that need to pin
     /// caps; metrics default to the test-friendly values.
     #[allow(dead_code)] // tests-only
     pub fn with_limits(limits: Limits, depth: u32) -> Self {
-        Self::with_all(limits, depth, (8, 16), 1.0)
+        Self::with_all(limits, depth, (8, 16), 1.0, std::sync::Arc::new(|| {}))
     }
 
-    fn with_all(limits: Limits, depth: u32, cell_px: (u16, u16), scale_factor: f32) -> Self {
+    fn with_all(
+        limits: Limits,
+        depth: u32,
+        cell_px: (u16, u16),
+        scale_factor: f32,
+        vft_wakeup: crate::vft::Wakeup,
+    ) -> Self {
         Self {
             apc: ApcStream::new(),
             state: PrtState::new(),
@@ -268,6 +293,7 @@ impl PrtEngine {
             scale_factor,
             pending_image_deletes: Vec::new(),
             pending_clipboard_writes: Vec::new(),
+            vft_wakeup,
         }
     }
 
@@ -391,6 +417,40 @@ impl PrtEngine {
             append_frame(&mut frames, frame_type, 0, &body);
         }
         self.queue_envelope(frames);
+    }
+
+    /// Drive every per-portal VFT engine in this scope's active
+    /// portal set, recursively, and emit any responses they produced
+    /// as RawReply events for their containing portal (§10
+    /// vft-in-portal). Suspended sets (e.g. main while on alt) are
+    /// not driven in v1; their workers buffer events and drain on
+    /// the next screen swap. Calls `flush_pending_events` at the end
+    /// so the resulting envelopes ride out via the next
+    /// `take_responses`.
+    pub fn drive_and_flush_vft(&mut self) {
+        let portal_ids: Vec<String> = self
+            .state
+            .current()
+            .portals
+            .keys()
+            .cloned()
+            .collect();
+        for id in portal_ids {
+            let bundle = {
+                let Some(portal) = self.state.current_mut().portals.get_mut(&id) else {
+                    continue;
+                };
+                portal.vft.drive();
+                portal.children.drive_and_flush_vft();
+                let mut b = portal.vft.take_responses();
+                b.extend_from_slice(&portal.children.take_responses());
+                b
+            };
+            if !bundle.is_empty() {
+                self.emit_event(EVT_RAW_REPLY, raw_reply_body(&id, &bundle));
+            }
+        }
+        self.flush_pending_events();
     }
 
     /// React to a slice of `TerminalEvent`s observed by an apc stream
@@ -755,11 +815,17 @@ impl PrtEngine {
             self.depth + 1,
             self.cell_px,
             self.scale_factor,
+            self.vft_wakeup.clone(),
         );
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
         // §10 + §13.4 — leave PRT as the sole DSR responder inside the
         // portal so an inner `\x1b[6n` produces exactly one reply.
         portal_vge.set_auto_reply_dsr(false);
+
+        // §10 (vft-in-portal) — every portal owns its own VFT engine.
+        // Workers share the host's wakeup so async events from any
+        // depth tick the host's main loop.
+        let portal_vft = crate::vft::VftEngine::with_wakeup(self.vft_wakeup.clone());
 
         let set = self.state.current_mut();
         let creation_seq = set.next_seq();
@@ -776,6 +842,7 @@ impl PrtEngine {
             vt,
             children: child_engine,
             vge: portal_vge,
+            vft: portal_vft,
             state_cache: initial_cache,
             pending_cursor_queries: 0,
         };
@@ -942,6 +1009,18 @@ impl PrtEngine {
             // also resets / erases its own grid.
             portal.children.handle_terminal_events(&chunk.terminal_events);
 
+            // §10 (vft-in-portal) — RIS / DECSTR inside the portal
+            // also abort every transfer in this portal's VFT engine.
+            // EraseDisplay / EraseScrollback do not affect VFT (file
+            // transfer carries no on-screen state).
+            for ev in &chunk.terminal_events {
+                if matches!(ev, TerminalEvent::HardReset | TerminalEvent::SoftReset) {
+                    portal
+                        .vft
+                        .abort_all(vft_protocol::frame::ABORT_HOST_RESET, "");
+                }
+            }
+
             // 2. §10 — per-portal VGE. Extract any ESC_VGE envelopes
             //    from the bytes and apply them against the portal's
             //    private VGE state. The engine internally handles its
@@ -950,10 +1029,21 @@ impl PrtEngine {
             //    way it does for sub-portals.
             let vge_passthrough = portal.vge.process_pty_chunk(&chunk.passthrough);
 
+            // 2b. §10 (vft-in-portal) — extract any ESC_VFT envelopes
+            //     from the post-VGE passthrough. VFT has no on-screen
+            //     state so it does not observe terminal events on its
+            //     own apc; the abort_all call above covers RIS/DECSTR.
+            let vft_passthrough = portal.vft.process_pty_chunk(&vge_passthrough);
+
+            // Drain any worker events that arrived synchronously
+            // during this command (e.g. a Finalised reply for an
+            // EndUpload that fsync'd very fast on local SSD).
+            portal.vft.drive();
+
             // 3. Feed the remaining bytes into the portal's vt100. The
             //    `PortalCallbacks` instance accumulates Bell / Title /
             //    Icon / Clipboard / OSC events.
-            portal.vt.process(&vge_passthrough);
+            portal.vt.process(&vft_passthrough);
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
             // 4. Update the children engine's line tracker against the
@@ -985,6 +1075,7 @@ impl PrtEngine {
             //    All surface to the parent client as a single RawReply.
             let mut reverse = portal.children.take_responses();
             reverse.extend_from_slice(&portal.vge.take_responses());
+            reverse.extend_from_slice(&portal.vft.take_responses());
             if portal.pending_cursor_queries > 0 {
                 let (row, col) = portal.vt.screen().cursor_position();
                 let reply = format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
@@ -2638,6 +2729,139 @@ mod tests {
         let data = r.bytes().unwrap();
         // Exactly one DSR reply, not two.
         assert_eq!(data, b"\x1b[1;4R");
+    }
+
+    // ---- §10 (vft-in-portal): per-portal VFT plumbing ----------------
+
+    #[test]
+    fn per_portal_vft_probe_surfaces_as_raw_reply() {
+        // A program inside a portal sends an ESC_VFT Probe envelope.
+        // The host's per-portal VFT engine processes it and the
+        // ProbeResponse comes back as part of the portal's RawReply.
+        use vft_protocol::frame::{
+            CMD_PROBE as VFT_CMD_PROBE, MARKER_H2C as VFT_MARKER_H2C,
+            RSP_PROBE as VFT_RSP_PROBE,
+        };
+
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 80, 24),
+        );
+
+        let mut vft_frames = Vec::new();
+        vft_protocol::envelope::append_frame(&mut vft_frames, VFT_CMD_PROBE, 77, &[]);
+        let vft_envelope = vft_protocol::envelope::wrap_c2h_envelope(&vft_frames);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: vft_envelope,
+        });
+
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        assert_eq!(frames[0].frame_type, RSP_OK);
+        let raw = first_event(&frames, EVT_RAW_REPLY)
+            .expect("expected RawReply containing the VFT response");
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "p");
+        let inner_h2c = r.bytes().unwrap();
+
+        let mut s = vft_protocol::apc::ApcStream::with_marker(*VFT_MARKER_H2C);
+        let out = s.feed(inner_h2c);
+        assert_eq!(
+            out.payloads.len(),
+            1,
+            "expected one VFT response envelope"
+        );
+        let payload = &out.payloads[0];
+        let mut r = Reader::new(payload);
+        let _version = r.u8().unwrap();
+        let _payload_len = r.u32().unwrap();
+        let frame_type = r.u8().unwrap();
+        let request_id = r.u32().unwrap();
+        assert_eq!(frame_type, VFT_RSP_PROBE);
+        assert_eq!(request_id, 77);
+    }
+
+    #[test]
+    fn inside_portal_ris_aborts_per_portal_vft_transfers() {
+        // Bring up a per-portal VFT upload, then send `ESC c` inside
+        // the portal. The portal's VFT engine should abort the
+        // transfer and emit a TransferAborted event in the portal's
+        // RawReply stream.
+        use vft_protocol::command::{BeginUploadBody, Command as VftCommand};
+        use vft_protocol::encode::build_envelope as vft_build_envelope;
+        use vft_protocol::frame::{ABORT_HOST_RESET, EVT_TRANSFER_ABORTED, MARKER_H2C as VFT_MARKER_H2C};
+
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 80, 24),
+        );
+
+        // Use a temp path so the portal's VFT engine can actually
+        // open the upload destination. We never fill it; the test
+        // immediately resets.
+        let tmp_path = std::env::temp_dir()
+            .join(format!("vft-prt-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp_path);
+        let begin = VftCommand::BeginUpload(BeginUploadBody {
+            transfer_id: "t".into(),
+            host_path: tmp_path.to_string_lossy().into_owned(),
+            basename: "".into(),
+            total_bytes: 100,
+            flags: 0,
+            mode: 0,
+            mtime: 0,
+        });
+        let begin_env = vft_build_envelope(&[(begin, 1)]);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: begin_env,
+        });
+        let _ = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        // Now send `\x1b c` (RIS) inside the portal. Per spec §10
+        // this aborts every transfer in the portal's VFT engine.
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"\x1bc".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+
+        let raw = first_event(&frames, EVT_RAW_REPLY)
+            .expect("expected RawReply with TransferAborted");
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "p");
+        let inner_h2c = r.bytes().unwrap();
+        let mut s = vft_protocol::apc::ApcStream::with_marker(*VFT_MARKER_H2C);
+        let out = s.feed(inner_h2c);
+        assert!(!out.payloads.is_empty(), "expected at least one VFT envelope");
+
+        // Find the TransferAborted frame and verify its reason byte.
+        let payload = &out.payloads[0];
+        let mut r = Reader::new(payload);
+        let _v = r.u8().unwrap();
+        let _len = r.u32().unwrap();
+        let mut saw_abort = false;
+        while !r.at_end() {
+            let frame_type = r.u8().unwrap();
+            let _rid = r.u32().unwrap();
+            let body_len = r.u32().unwrap() as usize;
+            let body = r.take(body_len).unwrap();
+            if frame_type == EVT_TRANSFER_ABORTED {
+                let mut br = Reader::new(body);
+                assert_eq!(br.string().unwrap(), "t");
+                assert_eq!(br.u8().unwrap(), ABORT_HOST_RESET);
+                saw_abort = true;
+            }
+        }
+        assert!(saw_abort, "expected TransferAborted in the response");
+        let _ = std::fs::remove_file(&tmp_path);
     }
 
     #[test]

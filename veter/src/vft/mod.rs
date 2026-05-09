@@ -12,5 +12,6 @@ pub mod state;
 pub mod worker;
 
 pub use state::{Limits, VftEngine};
+pub use worker::Wakeup;
 
 pub use vft_protocol::*;
