@@ -1,0 +1,13 @@
+[package]
+name = "vrecv"
+version = "0.1.0"
+edition = "2024"
+description = "Pull a host-side file back to the local filesystem from a VFT-aware terminal."
+
+[dependencies]
+vft-protocol = { path = "../../vft-protocol" }
+vft-client = { path = "../vft-client" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+nix = { version = "0.29", features = ["term", "poll"] }
+libc = "0.2"

@@ -2511,6 +2511,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vft-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix 0.29.0",
+ "vft-protocol",
+ "vge-protocol",
+]
+
+[[package]]
 name = "vft-protocol"
 version = "0.1.0"
 
@@ -2538,6 +2549,30 @@ dependencies = [
  "nix 0.29.0",
  "prt-protocol",
  "vge-protocol",
+]
+
+[[package]]
+name = "vrecv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "nix 0.29.0",
+ "vft-client",
+ "vft-protocol",
+]
+
+[[package]]
+name = "vsend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "nix 0.29.0",
+ "vft-client",
+ "vft-protocol",
 ]
 
 [[package]]
