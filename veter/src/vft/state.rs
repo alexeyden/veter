@@ -38,7 +38,7 @@ use vft_protocol::envelope::{
 use vft_protocol::frame::*;
 
 use super::path;
-use super::worker::{self, WorkerCmd, WorkerEvt};
+use super::worker::{self, PickerResult, WorkerCmd, WorkerEvt};
 pub use super::worker::Wakeup;
 
 #[derive(Debug, Clone, Copy)]
@@ -116,8 +116,20 @@ pub struct VftEngine {
     /// the next `take_responses()` will wrap into a single envelope.
     ready_frames: Vec<u8>,
     transfers: HashMap<String, TransferHandle>,
+    /// Deferred-form BeginDownload (§7.1) reservations awaiting the
+    /// user's file-picker decision. `drain_pickers` (called from
+    /// `drive`) promotes Selected entries into real transfers and
+    /// surfaces Cancelled as `err_cancelled`.
+    pending_pickers: Vec<PendingPicker>,
     limits: Limits,
     wakeup: Wakeup,
+}
+
+struct PendingPicker {
+    transfer_id: String,
+    request_id: u32,
+    chunk_size_hint: u32,
+    rx: std::sync::mpsc::Receiver<PickerResult>,
 }
 
 impl VftEngine {
@@ -142,6 +154,7 @@ impl VftEngine {
             response_queue: VecDeque::new(),
             ready_frames: Vec::new(),
             transfers: HashMap::new(),
+            pending_pickers: Vec::new(),
             limits: Limits::default(),
             wakeup,
         }
@@ -184,10 +197,45 @@ impl VftEngine {
     /// downloads can stream chunks without waiting for further client
     /// input on the PTY.
     pub fn drive(&mut self) {
+        self.drain_pickers();
         let ids: Vec<String> = self.transfers.keys().cloned().collect();
         for id in ids {
             self.drain_worker(&id);
         }
+    }
+
+    /// Promote resolved file-picker results into real downloads, or
+    /// surface cancellations as `err_cancelled`. Called by `drive`.
+    fn drain_pickers(&mut self) {
+        let mut keep = Vec::new();
+        for p in std::mem::take(&mut self.pending_pickers) {
+            match p.rx.try_recv() {
+                Ok(PickerResult::Selected(path)) => {
+                    self.start_download(
+                        p.request_id,
+                        p.transfer_id,
+                        path,
+                        p.chunk_size_hint,
+                    );
+                }
+                Ok(PickerResult::Cancelled) => {
+                    self.fill_slot(
+                        p.request_id,
+                        RSP_ERR,
+                        err_body(ERR_CANCELLED, "user cancelled picker"),
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => keep.push(p),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.fill_slot(
+                        p.request_id,
+                        RSP_ERR,
+                        err_body(ERR_INTERNAL, "picker thread vanished"),
+                    );
+                }
+            }
+        }
+        self.pending_pickers = keep;
     }
 
     /// Take queued response/event bytes ready to write to the PTY
@@ -215,6 +263,14 @@ impl VftEngine {
                     transfer_aborted_body(&id, reason, message),
                 );
             }
+        }
+        // Pending pickers never became active transfers, so they
+        // surface as `err_cancelled` on their reserved slot instead
+        // of a TransferAborted event. The picker thread continues to
+        // run until the user dismisses the dialog; its eventual send
+        // hits a dropped receiver and is silently discarded.
+        for p in std::mem::take(&mut self.pending_pickers) {
+            self.fill_slot(p.request_id, RSP_ERR, err_body(ERR_CANCELLED, message));
         }
     }
 
@@ -293,11 +349,11 @@ impl VftEngine {
     }
 
     fn handle_begin_upload(&mut self, rid: u32, b: BeginUploadBody) {
-        if self.transfers.contains_key(&b.transfer_id) {
+        if self.transfer_id_in_use(&b.transfer_id) {
             self.push_err(rid, ERR_DUPLICATE_TRANSFER, "id in use");
             return;
         }
-        if self.transfers.len() as u32 >= self.limits.max_concurrent_transfers {
+        if self.total_active() >= self.limits.max_concurrent_transfers as usize {
             self.push_err(rid, ERR_TOO_MANY_TRANSFERS, "transfer budget exhausted");
             return;
         }
@@ -433,11 +489,11 @@ impl VftEngine {
     }
 
     fn handle_begin_download(&mut self, rid: u32, b: BeginDownloadBody) {
-        if self.transfers.contains_key(&b.transfer_id) {
+        if self.transfer_id_in_use(&b.transfer_id) {
             self.push_err(rid, ERR_DUPLICATE_TRANSFER, "id in use");
             return;
         }
-        if self.transfers.len() as u32 >= self.limits.max_concurrent_transfers {
+        if self.total_active() >= self.limits.max_concurrent_transfers as usize {
             self.push_err(rid, ERR_TOO_MANY_TRANSFERS, "transfer budget exhausted");
             return;
         }
@@ -445,13 +501,27 @@ impl VftEngine {
             self.push_err(rid, ERR_PATH_TOO_LONG, "host_path too long");
             return;
         }
+
         if b.host_path.is_empty() {
-            // Deferred form (file picker) is deferred to a follow-up
-            // PR; the spec lets the host return err_picker_unavailable
-            // when it cannot satisfy the request (§7.1).
-            self.push_err(rid, ERR_PICKER_UNAVAILABLE, "file picker not implemented");
+            // Deferred form: spawn a native file-picker on a worker
+            // thread. The response is deferred until the picker
+            // resolves (drain_pickers, called from drive()).
+            let (tx, rx) = mpsc::channel();
+            let wakeup = self.wakeup.clone();
+            let title = "Choose a file to send".to_string();
+            std::thread::spawn(move || {
+                worker::run_picker(title, tx, wakeup);
+            });
+            self.pending_pickers.push(PendingPicker {
+                transfer_id: b.transfer_id.clone(),
+                request_id: rid,
+                chunk_size_hint: b.chunk_size_hint,
+                rx,
+            });
+            self.push_pending(rid);
             return;
         }
+
         let resolved_path = match path::resolve(&b.host_path) {
             Ok(p) => p,
             Err(e) => {
@@ -459,6 +529,20 @@ impl VftEngine {
                 return;
             }
         };
+        self.start_download(rid, b.transfer_id, resolved_path, b.chunk_size_hint);
+    }
+
+    /// Open the file at `resolved_path`, spawn a download worker,
+    /// register the transfer, and queue the response Ok body. Shared
+    /// between explicit-form BeginDownload and the picker-deferred
+    /// path (`drain_pickers`).
+    fn start_download(
+        &mut self,
+        rid: u32,
+        transfer_id: String,
+        resolved_path: PathBuf,
+        chunk_size_hint: u32,
+    ) {
         let file = match File::open(&resolved_path) {
             Ok(f) => f,
             Err(e) => {
@@ -467,28 +551,28 @@ impl VftEngine {
                     std::io::ErrorKind::PermissionDenied => ERR_PATH_DENIED,
                     _ => ERR_IO,
                 };
-                self.push_err(rid, code, &e.to_string());
+                self.fail(rid, code, &e.to_string());
                 return;
             }
         };
         let meta = match file.metadata() {
             Ok(m) => m,
             Err(e) => {
-                self.push_err(rid, ERR_IO, &e.to_string());
+                self.fail(rid, ERR_IO, &e.to_string());
                 return;
             }
         };
         let total_bytes = meta.len();
         if self.limits.max_file_bytes != 0 && total_bytes > self.limits.max_file_bytes {
-            self.push_err(rid, ERR_TOO_MANY_BYTES, "exceeds max_file_bytes");
+            self.fail(rid, ERR_TOO_MANY_BYTES, "exceeds max_file_bytes");
             return;
         }
         let (mode, mtime) = file_meta_unix(&meta);
 
-        let chunk_size = if b.chunk_size_hint == 0 {
+        let chunk_size = if chunk_size_hint == 0 {
             std::cmp::min(256 * 1024, self.limits.max_chunk_bytes)
         } else {
-            std::cmp::min(b.chunk_size_hint, self.limits.max_chunk_bytes)
+            std::cmp::min(chunk_size_hint, self.limits.max_chunk_bytes)
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -500,7 +584,7 @@ impl VftEngine {
 
         let resolved_str = resolved_path.to_string_lossy().into_owned();
         self.transfers.insert(
-            b.transfer_id.clone(),
+            transfer_id,
             TransferHandle {
                 direction: Direction::Download,
                 bytes_received: 0,
@@ -515,11 +599,38 @@ impl VftEngine {
                 open_after_finalize: false,
             },
         );
-        self.push_ready(
-            rid,
-            RSP_OK,
-            ok_begin_download_body(&resolved_str, total_bytes, mode, mtime),
-        );
+        let body = ok_begin_download_body(&resolved_str, total_bytes, mode, mtime);
+        self.deliver(rid, RSP_OK, body);
+    }
+
+    fn transfer_id_in_use(&self, id: &str) -> bool {
+        self.transfers.contains_key(id)
+            || self.pending_pickers.iter().any(|p| p.transfer_id == id)
+    }
+
+    fn total_active(&self) -> usize {
+        self.transfers.len() + self.pending_pickers.len()
+    }
+
+    /// Deliver a response body to `rid`, either by filling a pre-
+    /// reserved Pending slot (picker case) or by enqueuing a new
+    /// Ready slot. Use this from code paths that may be invoked
+    /// either synchronously (where the slot doesn't exist yet) or
+    /// asynchronously after a Pending slot is sitting in the queue.
+    fn deliver(&mut self, rid: u32, frame_type: u8, body: Vec<u8>) {
+        if self
+            .response_queue
+            .iter()
+            .any(|s| matches!(s, ResponseSlot::Pending { request_id } if *request_id == rid))
+        {
+            self.fill_slot(rid, frame_type, body);
+        } else {
+            self.push_ready(rid, frame_type, body);
+        }
+    }
+
+    fn fail(&mut self, rid: u32, code: u16, msg: &str) {
+        self.deliver(rid, RSP_ERR, err_body(code, msg));
     }
 
     fn handle_report_download_ack(&mut self, rid: u32, b: ReportDownloadAckBody) {
@@ -1125,7 +1236,12 @@ mod tests {
     }
 
     #[test]
-    fn begin_download_picker_unavailable_for_empty_path() {
+    fn begin_download_deferred_form_defers_response_then_cancels() {
+        // Empty host_path triggers the picker path. Under cfg(test)
+        // the picker is a no-op that immediately yields Cancelled, so
+        // after drive() picks it up the slot fills with
+        // err_cancelled. Before drive(), no frame has been emitted
+        // (the response slot is still Pending).
         let mut e = VftEngine::new(|| {});
         feed(
             &mut e,
@@ -1138,10 +1254,113 @@ mod tests {
                 1,
             )],
         );
+        assert!(
+            e.ready_frames.is_empty(),
+            "BeginDownload deferred form must not emit a synchronous response"
+        );
+
+        let ok = drive_until(
+            &mut e,
+            |eng| !eng.ready_frames.is_empty(),
+            std::time::Duration::from_secs(3),
+        );
+        assert!(ok, "drive() should have picked up the cancelled picker");
         let frames = explicit_frames(&mut e);
-        assert_eq!(frames[0].0, RSP_ERR);
-        let mut r = Reader::new(&frames[0].2);
-        assert_eq!(r.u16().unwrap(), ERR_PICKER_UNAVAILABLE);
+        let (ft, _rid, body) = &frames[0];
+        assert_eq!(*ft, RSP_ERR);
+        let mut r = Reader::new(body);
+        assert_eq!(r.u16().unwrap(), ERR_CANCELLED);
+    }
+
+    #[test]
+    fn deferred_download_reserves_transfer_id_against_concurrent_uses() {
+        // A pending picker holds the transfer_id; a follow-up
+        // BeginUpload with the same id is rejected with
+        // err_duplicate_transfer. Its response sits behind the
+        // picker's Pending slot until drive() drains the picker
+        // (strict response ordering, spec §1.2), at which point
+        // both frames flush in order.
+        let mut e = VftEngine::new(|| {});
+        feed(
+            &mut e,
+            &[(
+                Command::BeginDownload(DLBody {
+                    transfer_id: "t".into(),
+                    host_path: "".into(),
+                    chunk_size_hint: 0,
+                }),
+                1,
+            )],
+        );
+        let path = std::env::temp_dir().join(format!("vft-dup-pick-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        feed(
+            &mut e,
+            &[(
+                Command::BeginUpload(ULBody {
+                    transfer_id: "t".into(),
+                    host_path: path.to_string_lossy().into_owned(),
+                    basename: "".into(),
+                    total_bytes: 0,
+                    flags: FLAG_OVERWRITE,
+                    mode: 0,
+                    mtime: 0,
+                }),
+                2,
+            )],
+        );
+        // Both responses are queued — rid=1 is Pending, rid=2 is
+        // Ready(err_dup), so the queue is "Pending, Ready" and
+        // flush emits nothing until the picker resolves.
+        assert!(e.ready_frames.is_empty());
+
+        let ok = drive_until(
+            &mut e,
+            |eng| eng.pending_pickers.is_empty(),
+            std::time::Duration::from_secs(3),
+        );
+        assert!(ok);
+        let frames = explicit_frames(&mut e);
+        let pick = frames
+            .iter()
+            .find(|(_, rid, _)| *rid == 1)
+            .expect("expected response for request_id=1");
+        assert_eq!(pick.0, RSP_ERR);
+        assert_eq!(Reader::new(&pick.2).u16().unwrap(), ERR_CANCELLED);
+        let dup = frames
+            .iter()
+            .find(|(_, rid, _)| *rid == 2)
+            .expect("expected response for request_id=2");
+        assert_eq!(dup.0, RSP_ERR);
+        assert_eq!(
+            Reader::new(&dup.2).u16().unwrap(),
+            ERR_DUPLICATE_TRANSFER
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn abort_all_cancels_pending_pickers() {
+        let mut e = VftEngine::new(|| {});
+        feed(
+            &mut e,
+            &[(
+                Command::BeginDownload(DLBody {
+                    transfer_id: "t".into(),
+                    host_path: "".into(),
+                    chunk_size_hint: 0,
+                }),
+                1,
+            )],
+        );
+        // Before drive() drains the picker, fire a host reset.
+        e.abort_all(ABORT_HOST_RESET, "RIS");
+        let frames = explicit_frames(&mut e);
+        let (ft, _rid, body) = &frames[0];
+        assert_eq!(*ft, RSP_ERR);
+        let mut r = Reader::new(body);
+        assert_eq!(r.u16().unwrap(), ERR_CANCELLED);
+        assert!(e.pending_pickers.is_empty());
     }
 
     #[test]

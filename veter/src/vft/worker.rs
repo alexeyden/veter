@@ -12,6 +12,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vft_protocol::frame::*;
 
+/// Result of a native file-picker dialog spawned for a deferred-form
+/// BeginDownload (§7.1).
+pub enum PickerResult {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+/// Open a native file dialog (sync, blocking), post the result onto
+/// `tx`, and tick the engine via `wakeup` so `drive()` consumes the
+/// outcome on the next main-loop pass. Errors from the dialog
+/// backend (e.g. no display, GTK init failure) surface as
+/// `Cancelled` — the engine then returns `err_cancelled` to the
+/// client, which is the same code the user-cancel path uses.
+///
+/// Under `cfg(test)` the GTK dialog is suppressed and an immediate
+/// `Cancelled` is sent, so unit tests can exercise the spawn /
+/// drain / response-slot plumbing without blocking on a real UI.
+pub fn run_picker(title: String, tx: Sender<PickerResult>, wakeup: Wakeup) {
+    #[cfg(test)]
+    {
+        let _ = title;
+        let _ = tx.send(PickerResult::Cancelled);
+        wakeup();
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let result = std::panic::catch_unwind(move || {
+            rfd::FileDialog::new().set_title(title).pick_file()
+        });
+        let outcome = match result {
+            Ok(Some(p)) => PickerResult::Selected(p),
+            _ => PickerResult::Cancelled,
+        };
+        let _ = tx.send(outcome);
+        wakeup();
+    }
+}
+
 /// Closure called by a worker after pushing an event. The host wires
 /// this to the winit event-loop proxy so the main thread ticks even
 /// when the PTY is silent (§ "drive cycles" in the engine).

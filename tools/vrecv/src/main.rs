@@ -3,9 +3,11 @@
 //!
 //! Usage:
 //!   $ vrecv :/var/log/syslog ./syslog.txt
-//!   $ vrecv ./from-host.bin                # picker form (v1: host
-//!                                          #   returns
-//!                                          #   err_picker_unavailable)
+//!   $ vrecv ./from-host.bin                # picker form: the host
+//!                                          #   pops a native file
+//!                                          #   dialog; user cancel
+//!                                          #   surfaces as
+//!                                          #   err_cancelled
 //!
 //! Pipeline:
 //!   1. Resolve the host path (prefix `:`) and local destination from
