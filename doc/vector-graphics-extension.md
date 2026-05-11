@@ -105,11 +105,14 @@ f32  scale_factor              // device pixels per logical pixel (HiDPI)
 u32  max_elements              // soft cap; over-limit creates fail
 u32  max_commands_per_element
 u32  max_text_bytes            // per DrawText / UpdateText
-u32  max_image_bytes           // per UploadImage
-u32  max_images                // concurrent uploaded images
+u32  max_image_bytes           // per UploadImage / UploadImageBegin
+u32  max_images                // concurrent uploaded images; includes
+                               // in-progress chunked uploads (§8.3)
 u8   supported_image_encodings // bitmask: bit0=Raw, bit1=WebP
 u8   max_nesting_depth         // parent-child nesting cap (§9); 0
                                // means parenting not supported
+u32  max_chunk_bytes           // upper bound on a single
+                               // UploadImageChunk payload (§8.3)
 ```
 
 If the terminal does not support the extension, no response is emitted; the
@@ -147,6 +150,8 @@ later sections.
 | 0x0D | DropImage          | §8.2         |
 | 0x0E | ClearAll           | §6.7         |
 | 0x0F | UpdateSize         | §9.5         |
+| 0x10 | UploadImageBegin   | §8.3         |
+| 0x11 | UploadImageChunk   | §8.3         |
 
 All other frame_type values are reserved and MUST be rejected with
 `err_unknown_command`.
@@ -180,6 +185,9 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x0032 | err_image_decode        | Image bytes failed to decode (e.g. bad WebP)     |
 | 0x0033 | err_duplicate_image_id  | image ID already in use (UploadImage)            |
 | 0x0034 | err_too_many_images     | Image budget exhausted                           |
+| 0x0035 | err_chunk_overflow      | UploadImageChunk would push cumulative > total_bytes |
+| 0x0036 | err_chunk_no_upload     | UploadImageChunk targets an id with no in-progress upload |
+| 0x0037 | err_chunk_too_large     | Single chunk exceeds advertised max_chunk_bytes  |
 | 0x0040 | err_max_nesting_depth   | parenting would exceed advertised cap            |
 | 0x00FF | err_internal            | Terminal-side failure                            |
 
@@ -393,22 +401,49 @@ If `command_index` does not point to a `DrawText` command → `err_bad_payload`.
 
 ### 6.5 UpdateImage (0x08)
 
-Swaps the image referenced by a `DrawImage` command for a different
-already-uploaded image. Intended for animation cycling: pre-upload N
-frames once, then issue tight `UpdateImage` calls to advance.
+Patches a `DrawImage` command in place. Any combination of
+`image_id`, source ROI, and `target_rect` can be replaced atomically;
+unset fields keep their previous values. Intended both for animation
+(swap `image_id` between pre-uploaded frames, or advance a sprite-atlas
+ROI on a fixed image) and for dynamic zoom/pan (move/scale source and
+target rects without re-uploading pixels).
 
 Body:
 
 ```
 string id                       ; element ID
 varu   command_index            ; index into element.commands
+u8     update_flags             ; bit0 = set_image_id
+                                ; bit1 = set_source_rect
+                                ; bit2 = set_target_rect
+                                ; bits 3..7 reserved (must be 0)
+; if bit0 (set_image_id):
 string new_image_id             ; must reference an uploaded image (§8.2)
+; if bit1 (set_source_rect):
+u8     source_mode              ; 0 = clear ROI (sample full image)
+                                ; 1 = explicit pixel rect
+; if bit1 AND source_mode == 1:
+rect   new_source_rect_px       ; f32 x,y,w,h in source image pixels (§7.5)
+; if bit2 (set_target_rect):
+rect   new_target_rect          ; cell units, relative to element.origin
 ```
 
-If `command_index` does not point to a `DrawImage` command →
-`err_bad_payload`. If `new_image_id` is not a known image →
-`err_unknown_image`. The `target_rect` of the underlying `DrawImage` is
-unchanged.
+Validation is atomic across all fields:
+
+- If `command_index` does not point to a `DrawImage` command →
+  `err_bad_payload`.
+- `update_flags == 0` (no-op) or any reserved bit set →
+  `err_bad_payload`.
+- If bit0 set and `new_image_id` is not a known image →
+  `err_unknown_image`.
+- If bit1 set, `new_source_rect_px` (when present) is validated per
+  §7.5 against the image that will be in effect after this update
+  (the new image if bit0 is also set, otherwise the current one).
+  Out-of-bounds, non-finite, or negative w/h → `err_bad_payload`.
+- If bit2 set, `new_target_rect` must be finite. There is no further
+  cell-space bound (drawing off-grid is silently clipped — §5.5).
+
+On any error the underlying `DrawImage` is unchanged.
 
 ### 6.6 UpdateOrigin (0x09) / UpdateVisibility (0x0A) / UpdateDrawOrder (0x0B)
 
@@ -641,24 +676,58 @@ ascent of the primary font).
 ### 7.5 DrawImage (0x21)
 
 ```
-rect    target_rect       ; cell units, relative to element.origin
-string  image_id          ; references an uploaded image (§8.2)
+rect    target_rect           ; cell units, relative to element.origin
+string  image_id              ; references an uploaded image (§8.2 / §8.3)
+u8      flags                 ; bit0 = has_source_rect
+                              ; bits 1..7 reserved (must be 0)
+; if bit0 (has_source_rect):
+rect    source_rect_px        ; f32 x,y,w,h in source image pixels
 ```
 
-The image must have been uploaded with `UploadImage` (§8.2) prior to the
-command being processed. Unknown ID → `err_unknown_image` and the
-enclosing `CreateElement` / `UpdateCommands` / `UpdateCommand` fails
-atomically.
+The image must have been fully uploaded with `UploadImage` (§8.2) or
+finalized via `UploadImageBegin` / `UploadImageChunk` (§8.3) prior to
+the command being processed. An in-progress chunked upload is not yet
+visible; referencing its id → `err_unknown_image`. Unknown ID →
+`err_unknown_image` and the enclosing `CreateElement` /
+`UpdateCommands` / `UpdateCommand` fails atomically.
 
-If the referenced image is later dropped (`DropImage`) while the element
-remains live, rendering of the affected `DrawImage` falls back to a
-magenta debug fill (same treatment as missing styles, §7.3). The element
-itself stays — only its image rendering is degraded — and a fresh
-`UpdateImage` to a valid ID restores normal rendering.
+`flags` is mandatory. Any reserved bit set → `err_bad_payload`.
 
-The image is stretched to fit `target_rect`. Interpolation is
-implementation-defined (the femtovg-based renderer in this repo will use
-linear filtering).
+If `has_source_rect` is unset (`flags == 0`), the whole image is
+sampled. If set, `source_rect_px` selects a sub-region of the source
+image in its native pixel coordinates (top-left origin, +x rightward,
++y downward). The selected region is stretched to fit `target_rect`
+exactly as in the no-ROI case — only the *source* sampling changes.
+
+`source_rect_px` validation, at command-processing time:
+
+- Components must be finite.
+- `w >= 0` and `h >= 0`. A region with `w == 0` or `h == 0` is legal
+  and renders nothing (matches the "collapse without delete" pattern
+  in §9.4).
+- The region must fall fully within `[0, image.width] × [0, image.height]`.
+
+Any violation → `err_bad_payload`, atomic.
+
+Common patterns:
+
+- **Sprite-sheet animation**: upload the atlas once; advance frames
+  with tight `UpdateImage` calls that set only `source_rect_px`
+  (§6.5).
+- **Dynamic zoom/pan**: keep `image_id` fixed and update
+  `source_rect_px` (zoom = scale, pan = translate) and/or
+  `target_rect`.
+
+If the referenced image is later dropped (`DropImage`) while the
+element remains live, rendering of the affected `DrawImage` falls
+back to a magenta debug fill (same treatment as missing styles, §7.3)
+regardless of any ROI. The element itself stays — only its image
+rendering is degraded — and a fresh `UpdateImage` to a valid ID
+restores normal rendering.
+
+The selected source region is stretched to fit `target_rect`.
+Interpolation is implementation-defined (the femtovg-based renderer
+in this repo will use linear filtering).
 
 ## 8. Image table
 
@@ -672,6 +741,11 @@ This separation between upload and draw exists for two reasons: clients
 can hold large images once and reference them cheaply, and animations
 can cycle through pre-uploaded frames via `UpdateImage` without
 re-transmitting pixel data.
+
+Small images are uploaded in a single envelope (§8.2). Large images
+may be split across many envelopes using the chunked upload commands
+(§8.3) so the sender can pace its writes, surface byte-level progress
+to the user (e.g. over SSH), and stay within `max_chunk_bytes`.
 
 ### 8.1 ImageData encoding
 
@@ -716,6 +790,85 @@ do not collide.
 Image data is held verbatim by the terminal (Raw stays Raw, WebP stays
 WebP); decoding to a renderable representation is implementation-defined
 and may be lazy or eager.
+
+### 8.3 Chunked upload: UploadImageBegin (0x10) / UploadImageChunk (0x11)
+
+A chunked upload streams a single image across many frames. The
+intended use cases are oversized images that would not fit in one
+envelope comfortably, and progress reporting on the sender side (the
+sender knows how many bytes it has flushed of `total_bytes`).
+
+```
+UploadImageBegin:
+  string id                ; non-empty, ≤ 64 UTF-8 bytes
+  u8     encoding          ; 0x01 = Raw RGBA8, 0x02 = WebP (§8.1)
+  u32    width
+  u32    height
+  u32    total_bytes       ; size of the pixel/file payload that will
+                           ; arrive across subsequent UploadImageChunk
+                           ; frames, summed; matches the `data` field
+                           ; of the equivalent single-shot UploadImage
+
+UploadImageChunk:
+  string id
+  bytes  chunk             ; raw payload bytes (varu length prefix)
+```
+
+Lifecycle:
+
+1. `UploadImageBegin` reserves `id` in the image table as an
+   **in-progress** slot, locks in the metadata, and counts against
+   `max_images` exactly like a finalized image. Pre-flight checks:
+   - `id` already in use (in-progress or finalized) →
+     `err_duplicate_image_id`.
+   - `encoding` bit not set in advertised `supported_image_encodings`
+     → `err_bad_payload`.
+   - `total_bytes > max_image_bytes` → `err_image_too_large`.
+   - Image table full → `err_too_many_images`.
+
+   On any error the slot is never created and `id` stays free.
+   Response: empty Ok.
+
+2. Each `UploadImageChunk` appends `chunk` bytes to the slot in
+   arrival order. Chunks within an envelope are processed
+   sequentially, and the spec defines no offset / out-of-order
+   semantics. Checks per chunk:
+   - No in-progress slot with this `id` (never begun, already
+     finalized, or aborted) → `err_chunk_no_upload`.
+   - `chunk.length > max_chunk_bytes` → `err_chunk_too_large`.
+   - `bytes_received + chunk.length > total_bytes` →
+     `err_chunk_overflow`.
+
+   On any error the slot is dropped and the `id` released; the
+   client must restart from `UploadImageBegin` to retry. Successful
+   chunks respond empty Ok unless the chunk triggers finalize (next
+   step).
+
+3. The chunk whose arrival brings `bytes_received` up to
+   `total_bytes` triggers **implicit finalize**: the encoding-specific
+   validation from §8.1 runs (Raw size must equal
+   `width * height * 4`; WebP file is decoded and the decoded
+   dimensions must match `width`/`height`). If finalize succeeds, the
+   image moves from in-progress to finalized and that chunk's
+   response is empty Ok. If finalize fails (Raw size mismatch, WebP
+   decode error, decoded WebP dimensions disagree) the slot is
+   dropped, `id` is released, and the chunk's response carries
+   `err_image_decode`.
+
+`DropImage` on an in-progress `id` aborts the upload: the slot is
+dropped and `id` is released. Drawing against an in-progress `id`
+yields `err_unknown_image` until finalize — the image is not
+addressable for rendering before that point.
+
+Multiple chunked uploads can be in progress concurrently against
+distinct `id`s, bounded only by `max_images`. Clients interleaving
+chunks for different ids are responsible for ordering them
+correctly; the terminal does not buffer or reorder.
+
+Reset (`RIS` / `DECSTR`, §5.6) wipes the image table and so drops
+every in-progress slot too; the screen-buffer switch (§5.4) does
+not — chunked uploads continue across an alt-screen swap exactly
+like finalized images survive it.
 
 ## 9. Element parenting and clipping
 
@@ -991,16 +1144,19 @@ with the relevant error code. A non-exhaustive list:
   `UpdateCommands`.
 - `max_text_bytes`: per `DrawText` text field after any `UpdateText`.
 - `max_image_bytes`: byte size of a single `ImageData` payload at
-  `UploadImage`.
-- `max_images`: number of concurrently-uploaded images in the session
-  image table (§8).
+  `UploadImage`, or `total_bytes` at `UploadImageBegin`.
+- `max_images`: number of concurrently-allocated entries in the
+  session image table (§8). In-progress chunked uploads (§8.3) count
+  toward this budget exactly like finalized images.
+- `max_chunk_bytes`: byte size of a single `UploadImageChunk` payload
+  (§8.3).
 - `max_nesting_depth`: parent-child tree depth (§9.7). 0 means
   parenting unsupported.
 
 The reference implementation in this repo SHOULD start with: 4096
 elements, 4096 commands per element, 1 MiB text per command, 32 MiB per
-image, 1024 concurrent images, 16 levels of parent nesting. These
-numbers can be tuned without breaking the protocol.
+image, 1024 concurrent images, 64 KiB per chunk, 16 levels of parent
+nesting. These numbers can be tuned without breaking the protocol.
 
 ## 12. Interaction with existing terminal state
 
@@ -1024,9 +1180,10 @@ These are intentionally deferred and are not part of v1:
 - A query-element-existence command (clients track lifetimes themselves).
 - Compression on the wire (the byte-stuffed APC envelope is already
   binary; image-level compression via WebP is what we have for now).
-- ROI image updates (overwriting a region of an uploaded image without
-  re-uploading the whole thing). Useful for video / streaming workloads;
-  not justified for v1's animation-via-cycling use case.
+- Partial image *writes* — overwriting a region of an uploaded image
+  in place without re-uploading the whole thing. Useful for video /
+  streaming workloads. (Read-side ROI sampling on `DrawImage` is in
+  v1; see §7.5.)
 - Cross-session / persistent image cache (browser-style content-addressed
   store shared across terminal restarts). Removed from v1 due to identity
   / partitioning questions that were not resolvable without protocol-level
