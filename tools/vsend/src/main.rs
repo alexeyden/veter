@@ -30,7 +30,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use vft_client::probe::{read_cursor_row, run_vft_probe, run_vge_probe};
-use vft_client::progress::{AsciiProgress, ProgressUI, VgeProgress};
+use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
 use vft_client::tty::{drain_stale_stdin, winsize_cols, RawTty};
 
@@ -53,6 +53,13 @@ struct Cli {
     /// Disable the progress display entirely.
     #[arg(long)]
     no_progress: bool,
+
+    /// Defer the progress display by this many milliseconds. Quick
+    /// transfers (localhost VM, fast LAN, small files) finish before
+    /// the threshold and never spawn a bar; only longer-running ones
+    /// reveal it. `0` shows the bar immediately.
+    #[arg(long, default_value_t = 2000)]
+    progress_delay_ms: u64,
 
     /// Bytes per UploadChunk frame. Default 256 KiB.
     #[arg(long, default_value_t = 256 * 1024)]
@@ -142,17 +149,24 @@ fn main() -> Result<()> {
     })?;
 
     // Progress UI
+    let delay = Duration::from_millis(cli.progress_delay_ms);
     let mut ui: Box<dyn ProgressUI> = if cli.no_progress {
         Box::new(NoopProgress)
     } else if vge_probe.is_some() {
-        Box::new(VgeProgress::new(
-            format!("vsend-progress-{}", std::process::id()),
-            format!("vsend: {basename}"),
-            cursor_row,
-            term_cols,
+        Box::new(DelayedProgress::new(
+            VgeProgress::new(
+                format!("vsend-progress-{}", std::process::id()),
+                format!("vsend: {basename}"),
+                cursor_row,
+                term_cols,
+            ),
+            delay,
         ))
     } else {
-        Box::new(AsciiProgress::new(format!("vsend: {basename}"), term_cols))
+        Box::new(DelayedProgress::new(
+            AsciiProgress::new(format!("vsend: {basename}"), term_cols),
+            delay,
+        ))
     };
     ui.start()?;
     let _ = ui.update(0, total_bytes, 0.0);

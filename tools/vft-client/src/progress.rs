@@ -61,6 +61,68 @@ pub trait ProgressUI {
     fn finish(&mut self, final_line: &str) -> Result<()>;
 }
 
+/// Adapter that suppresses an inner `ProgressUI` until the transfer
+/// has been running for at least `delay`. Instant transfers
+/// (localhost VMs, fast LANs, small files) never spawn a bar at
+/// all; longer ones fall through to the inner UI as soon as the
+/// threshold is crossed.
+///
+/// `start()` only records the timestamp; the actual `inner.start()`
+/// runs lazily on the first `update()` past the threshold.
+/// `finish()` prints just the final line when the bar never
+/// materialised, or forwards to `inner.finish()` otherwise.
+pub struct DelayedProgress<P: ProgressUI> {
+    inner: P,
+    delay: std::time::Duration,
+    started_at: Option<Instant>,
+    showing: bool,
+}
+
+impl<P: ProgressUI> DelayedProgress<P> {
+    pub fn new(inner: P, delay: std::time::Duration) -> Self {
+        Self {
+            inner,
+            delay,
+            started_at: None,
+            showing: false,
+        }
+    }
+}
+
+impl<P: ProgressUI> ProgressUI for DelayedProgress<P> {
+    fn start(&mut self) -> Result<()> {
+        self.started_at = Some(Instant::now());
+        Ok(())
+    }
+
+    fn update(&mut self, current: u64, total: u64, rate_bps: f64) -> Result<()> {
+        if !self.showing {
+            let Some(t0) = self.started_at else {
+                return Ok(());
+            };
+            if t0.elapsed() < self.delay {
+                return Ok(());
+            }
+            self.inner.start()?;
+            self.showing = true;
+        }
+        self.inner.update(current, total, rate_bps)
+    }
+
+    fn finish(&mut self, final_line: &str) -> Result<()> {
+        if self.showing {
+            self.inner.finish(final_line)
+        } else {
+            // Bar never materialised; just emit the final line so the
+            // caller's wrapper output sequence remains uniform.
+            let mut out = std::io::stdout().lock();
+            write!(out, "{final_line}\r\n")?;
+            out.flush()?;
+            Ok(())
+        }
+    }
+}
+
 // ---- VGE progress ----------------------------------------------------
 
 pub struct VgeProgress {
@@ -401,5 +463,63 @@ mod tests {
     #[test]
     fn bar_width_clamps_to_maximum() {
         assert_eq!(bar_width_cells(500), 80);
+    }
+
+    /// In-memory ProgressUI for DelayedProgress tests: records every
+    /// start/update/finish call so we can assert what flowed through.
+    #[derive(Default)]
+    struct Recorder {
+        starts: u32,
+        updates: Vec<(u64, u64, f64)>,
+        finishes: Vec<String>,
+    }
+
+    impl ProgressUI for Recorder {
+        fn start(&mut self) -> Result<()> {
+            self.starts += 1;
+            Ok(())
+        }
+        fn update(&mut self, c: u64, t: u64, r: f64) -> Result<()> {
+            self.updates.push((c, t, r));
+            Ok(())
+        }
+        fn finish(&mut self, line: &str) -> Result<()> {
+            self.finishes.push(line.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_progress_suppresses_inner_when_under_threshold() {
+        use std::time::Duration;
+        let mut d = DelayedProgress::new(Recorder::default(), Duration::from_secs(10));
+        d.start().unwrap();
+        d.update(50, 100, 1024.0).unwrap();
+        d.update(100, 100, 1024.0).unwrap();
+        d.finish("done").unwrap();
+        assert_eq!(d.inner.starts, 0, "inner.start should not run for fast transfers");
+        assert!(d.inner.updates.is_empty());
+        assert!(
+            d.inner.finishes.is_empty(),
+            "inner.finish should not run if the bar never materialised"
+        );
+    }
+
+    #[test]
+    fn delayed_progress_falls_through_after_threshold() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let mut d = DelayedProgress::new(Recorder::default(), Duration::from_millis(20));
+        d.start().unwrap();
+        d.update(10, 100, 0.0).unwrap();
+        assert_eq!(d.inner.starts, 0, "still under the threshold");
+        sleep(Duration::from_millis(30));
+        d.update(50, 100, 0.0).unwrap();
+        assert_eq!(d.inner.starts, 1, "threshold crossed; inner.start should run");
+        assert_eq!(d.inner.updates.len(), 1, "first post-threshold update forwarded");
+        d.update(100, 100, 0.0).unwrap();
+        d.finish("done").unwrap();
+        assert_eq!(d.inner.updates.len(), 2);
+        assert_eq!(d.inner.finishes, vec!["done".to_string()]);
     }
 }
