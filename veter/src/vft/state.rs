@@ -89,6 +89,10 @@ struct TransferHandle {
     /// for uploads.
     upload_mode: u32,
     upload_mtime: i64,
+    /// Set on deferred-form uploads (§6.1): after finalisation the
+    /// worker calls `opener::open(final_path)` so the user's default
+    /// app pops up for the just-uploaded file.
+    open_after_finalize: bool,
 }
 
 enum ResponseSlot {
@@ -306,7 +310,8 @@ impl VftEngine {
             return;
         }
 
-        let resolved_path = if b.host_path.is_empty() {
+        let deferred = b.host_path.is_empty();
+        let resolved_path = if deferred {
             path::deferred_upload_destination(&b.basename)
         } else {
             match path::resolve(&b.host_path) {
@@ -363,6 +368,7 @@ impl VftEngine {
                 closing: false,
                 upload_mode: b.mode,
                 upload_mtime: b.mtime,
+                open_after_finalize: deferred,
             },
         );
         self.push_ready(rid, RSP_OK, ok_begin_upload_body(&resolved_str));
@@ -415,6 +421,7 @@ impl VftEngine {
             request_id: rid,
             mode: h.upload_mode,
             mtime: h.upload_mtime,
+            open_after: h.open_after_finalize,
         };
         if h.cmd_tx.send(cmd).is_err() {
             self.push_err(rid, ERR_INTERNAL, "worker gone");
@@ -505,6 +512,7 @@ impl VftEngine {
                 closing: false,
                 upload_mode: 0,
                 upload_mtime: 0,
+                open_after_finalize: false,
             },
         );
         self.push_ready(
@@ -1390,5 +1398,88 @@ mod tests {
         assert!(ok);
         assert_eq!(std::fs::read(&resolved).unwrap(), b"abcd");
         let _ = std::fs::remove_file(&resolved);
+    }
+
+    #[test]
+    fn deferred_form_upload_sets_open_after_finalize_flag() {
+        // The actual `opener::open` call is suppressed under cfg(test),
+        // so this test just inspects the engine's bookkeeping to
+        // confirm the deferred form opts in.
+        let path = std::env::temp_dir().join(format!("vft-open-flag-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut e = VftEngine::new(|| {});
+        feed(
+            &mut e,
+            &[(
+                Command::BeginUpload(ULBody {
+                    transfer_id: "t".into(),
+                    host_path: "".into(),
+                    basename: "open-flag.bin".into(),
+                    total_bytes: 0,
+                    flags: FLAG_OVERWRITE,
+                    mode: 0,
+                    mtime: 0,
+                }),
+                1,
+            )],
+        );
+        let _ = explicit_frames(&mut e);
+        assert!(
+            e.transfers.get("t").unwrap().open_after_finalize,
+            "deferred-form uploads should request open-after-finalize"
+        );
+
+        feed(
+            &mut e,
+            &[(
+                Command::CancelTransfer(CTBody {
+                    transfer_id: "t".into(),
+                }),
+                2,
+            )],
+        );
+        let _ = explicit_frames(&mut e);
+    }
+
+    #[test]
+    fn explicit_form_upload_does_not_set_open_after_finalize_flag() {
+        let path = std::env::temp_dir()
+            .join(format!("vft-no-open-flag-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut e = VftEngine::new(|| {});
+        feed(
+            &mut e,
+            &[(
+                Command::BeginUpload(ULBody {
+                    transfer_id: "t".into(),
+                    host_path: path.to_string_lossy().into_owned(),
+                    basename: "".into(),
+                    total_bytes: 0,
+                    flags: FLAG_OVERWRITE,
+                    mode: 0,
+                    mtime: 0,
+                }),
+                1,
+            )],
+        );
+        let _ = explicit_frames(&mut e);
+        assert!(
+            !e.transfers.get("t").unwrap().open_after_finalize,
+            "explicit-form uploads should NOT request open-after-finalize"
+        );
+
+        feed(
+            &mut e,
+            &[(
+                Command::CancelTransfer(CTBody {
+                    transfer_id: "t".into(),
+                }),
+                2,
+            )],
+        );
+        let _ = explicit_frames(&mut e);
+        let _ = std::fs::remove_file(&path);
     }
 }

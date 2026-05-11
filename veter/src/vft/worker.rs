@@ -27,13 +27,18 @@ pub enum WorkerCmd {
     /// Stop reading new chunks and exit. The download worker yields
     /// `Aborted { reason = client_cancel }` before exiting.
     Cancel,
-    /// Finalise the upload: flush, fsync, set permissions / mtime, and
-    /// reply with `Finalised`. `request_id` is echoed in the reply so
-    /// the engine can match it to the originating EndUpload.
+    /// Finalise the upload: flush, fsync, set permissions / mtime,
+    /// optionally launch the user's default app for the result, and
+    /// reply with `Finalised`. `request_id` is echoed in the reply
+    /// so the engine can match it to the originating EndUpload.
+    /// `open_after` triggers `opener::open(final_path)` after the
+    /// file is durable; used by deferred-form uploads (§6.1) to
+    /// hand the result to the user's default viewer.
     Finalize {
         request_id: u32,
         mode: u32,
         mtime: i64,
+        open_after: bool,
     },
 }
 
@@ -89,7 +94,12 @@ pub fn run_upload(
                 }
                 bytes_processed.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
-            Ok(WorkerCmd::Finalize { request_id, mode, mtime }) => {
+            Ok(WorkerCmd::Finalize {
+                request_id,
+                mode,
+                mtime,
+                open_after,
+            }) => {
                 if let Err(e) = file.flush() {
                     send(WorkerEvt::Aborted {
                         reason: ABORT_IO_ERROR,
@@ -106,11 +116,15 @@ pub fn run_upload(
                     });
                     return;
                 }
+                drop(file);
                 if mode != 0 {
                     apply_mode(&final_path, mode);
                 }
                 if mtime != 0 {
                     apply_mtime(&final_path, mtime);
+                }
+                if open_after {
+                    maybe_open_default(&final_path);
                 }
                 let bytes_written = bytes_processed.load(Ordering::Relaxed);
                 send(WorkerEvt::Finalised {
@@ -218,6 +232,24 @@ fn classify_io_error(e: &std::io::Error) -> u8 {
             ABORT_IO_ERROR
         }
     }
+}
+
+/// Hand the finalised file to the user's default application. Used
+/// by deferred-form uploads (§6.1) so a `vsend ./screenshot.png` lands
+/// in `$TMPDIR` and then immediately pops up in the user's image
+/// viewer. Errors are swallowed — failing to launch the app does not
+/// abort the transfer; the file is already durable.
+///
+/// Disabled under `cfg(test)` so unit tests don't spawn the user's
+/// real applications.
+#[cfg(not(test))]
+fn maybe_open_default(path: &PathBuf) {
+    let _ = opener::open(path);
+}
+
+#[cfg(test)]
+fn maybe_open_default(_path: &PathBuf) {
+    // intentional no-op in test builds
 }
 
 #[cfg(unix)]
