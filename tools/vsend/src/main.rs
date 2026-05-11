@@ -201,6 +201,11 @@ fn main() -> Result<()> {
 
     let _ = ui.update(total_bytes, total_bytes, bytes_per_sec(offset, started));
     ui.finish(&format!("uploaded -> {final_path}"))?;
+    // Absorb any in-flight VGE Ok responses for the trailing
+    // progress-bar envelopes; otherwise they land on the shell's
+    // stdin after we exit and readline prints them as caret
+    // notation.
+    stream.drain_idle(Duration::from_millis(100));
     let _ = resolved; // silence warning when --no-progress / non-vge
     Ok(())
 }

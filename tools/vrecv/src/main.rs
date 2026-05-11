@@ -207,6 +207,11 @@ fn main() -> Result<()> {
         resolved_path,
         local_path.display()
     ))?;
+    // Absorb any in-flight VGE Ok responses for the trailing
+    // progress-bar envelopes; otherwise they land on the shell's
+    // stdin after we exit and readline prints them as caret
+    // notation.
+    stream.drain_idle(Duration::from_millis(100));
     Ok(())
 }
 

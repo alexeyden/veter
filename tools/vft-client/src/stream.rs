@@ -64,6 +64,16 @@ impl ResponseStream {
     pub fn at_eof(&self) -> bool {
         self.eof.load(Ordering::Relaxed)
     }
+
+    /// Block until the stream has been idle for `idle_timeout`,
+    /// discarding any frames that arrive in the meantime. Used at
+    /// exit time so that VGE Ok responses (for the trailing
+    /// UpdateCommand / DeleteElement envelopes the progress UI
+    /// emits) don't leak into the shell's stdin where readline
+    /// would echo them as `^[_vge…^[\` caret notation.
+    pub fn drain_idle(&self, idle_timeout: Duration) {
+        while self.recv_timeout(idle_timeout).is_some() {}
+    }
 }
 
 fn run_reader(tx: Sender<HostFrame>, eof: Arc<AtomicBool>) {
