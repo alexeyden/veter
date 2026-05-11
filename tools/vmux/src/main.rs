@@ -40,8 +40,8 @@ use prt_protocol::command::{
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
-    EVT_MOUSE_MODE_CHANGE, EVT_RAW_REPLY, MARKER_T2C as PRT_MARKER_T2C,
-    RSP_PROBE as PRT_RSP_PROBE,
+    EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_RAW_REPLY, EVT_TITLE_CHANGE,
+    MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
@@ -265,8 +265,8 @@ fn collect_separators(node: &Layout, bounds: PaneRect, out: &mut Vec<Separator>)
                     w: w_b,
                     h: bounds.h,
                 };
-                let y0 = bounds.y as f32 + 1.0;
-                let y1 = bounds.y as f32 + bounds.h as f32 - 1.0;
+                let y0 = bounds.y as f32;
+                let y1 = bounds.y as f32 + bounds.h as f32;
                 if y1 > y0 {
                     out.push(Separator::Vertical {
                         x: bounds.x as f32 + w_a as f32,
@@ -293,8 +293,8 @@ fn collect_separators(node: &Layout, bounds: PaneRect, out: &mut Vec<Separator>)
                     w: bounds.w,
                     h: h_b,
                 };
-                let x0 = bounds.x as f32 + 1.0;
-                let x1 = bounds.x as f32 + bounds.w as f32 - 1.0;
+                let x0 = bounds.x as f32;
+                let x1 = bounds.x as f32 + bounds.w as f32;
                 if x1 > x0 {
                     out.push(Separator::Horizontal {
                         y: bounds.y as f32 + h_a as f32,
@@ -461,8 +461,43 @@ impl Drop for PanePty {
     }
 }
 
+/// Per-pane scrollback navigation state. Each pane scrolls
+/// independently — the user can leave one pane scrolled back, switch
+/// tabs or focus another pane, and the original pane keeps its offset
+/// (host-side) and indicator (client-side). Cleared on exit / when the
+/// offset hits live.
+#[derive(Debug)]
+struct PaneScroll {
+    offset: u32,
+    /// Latest history-depth reported by the host in the
+    /// `SetPortalScrollback` ack (§9.3). Used to size the scrollbar
+    /// thumb. 0 until the first ack arrives.
+    history_depth: u32,
+    /// Half the pane's portal-row count, cached on entry. Used for
+    /// PgUp/PgDn / d / u "half-page" jumps.
+    half_page: u32,
+    /// Partial CSI sequence buffer (`\e`, `\e[`, `\e[5`, …). Lets us
+    /// recognise multi-byte arrow / PgUp / PgDn sequences while
+    /// scroll-mode keys are dispatched to this pane.
+    csi_buf: Vec<u8>,
+}
+
 struct Pane {
+    /// Stable default label, equal to the portal id (`p1`, `p2`, …).
+    /// Never mutated after construction; renames live in `manual_title`
+    /// and OSC 0/1/2 in `osc_title` so the portal id stays usable as
+    /// both the wire id and the chrome fallback.
     title: String,
+    /// User rename via `prefix-r`. Wins over `osc_title`. Cleared by
+    /// renaming to an empty string, which falls back to OSC / default.
+    manual_title: Option<String>,
+    /// Most recent OSC 0/2 (window title) the inner program emitted,
+    /// delivered via `EVT_TITLE_CHANGE`. Empty payloads clear it.
+    osc_title: Option<String>,
+    /// Most recent OSC 1 (icon name). Used as a tertiary fallback in
+    /// case the program only sets the icon name (rare, but mutt and a
+    /// couple of others do it).
+    osc_icon: Option<String>,
     pty: PanePty,
     /// Most recent host-cell rect this pane was laid out in. Used to
     /// detect "actually changed" and skip redundant PRT updates.
@@ -478,6 +513,21 @@ struct Pane {
     /// dispatcher to decide whether wheel events drive vmux's
     /// per-pane scrollback or get forwarded to the inner program.
     inner_mouse_protocol: u8,
+    /// `Some` while this pane is navigating its scrollback. Independent
+    /// per-pane so two panes can sit at different offsets at the same
+    /// time and tab switches don't clobber state.
+    scroll: Option<PaneScroll>,
+}
+
+impl Pane {
+    /// Effective display title, highest precedence first.
+    fn effective_title(&self) -> &str {
+        self.manual_title
+            .as_deref()
+            .or(self.osc_title.as_deref())
+            .or(self.osc_icon.as_deref())
+            .unwrap_or(&self.title)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -498,10 +548,13 @@ const MODAL_DRAW_ORDER: i32 = 100;
 /// memory on dozens of panes.
 const PORTAL_SCROLLBACK_LINES: u32 = 5_000;
 
-/// Magic request id we tag every `SetPortalScrollback` with so the
-/// matching `Ok` response (which carries the host-applied offset in its
-/// 4-byte body) can be picked out of the response stream.
-const SCROLL_REQUEST_ID: u32 = 0x5C_5C_5C_5C;
+/// Reserved high half of the request-id space used for our
+/// `SetPortalScrollback` requests. We allocate one fresh id per request
+/// (counting up from this base) and remember which pane it belongs to
+/// in `State.pending_scrolls`, so two panes can have outstanding scroll
+/// acks at the same time and the response handler routes each ack to
+/// the right pane.
+const SCROLL_REQUEST_ID_BASE: u32 = 0x5C_00_00_00;
 
 /// Brand color (#3e3b73) shared by separators, the title thumb, the
 /// active-tab gradient, and the modal outline. Muted purple — calm
@@ -566,16 +619,40 @@ const COLOR_MODAL_TEXT: Color = Color {
     a: 1.0,
 };
 
-/// Build a closed rounded-rectangle path in cell-units, traversed CCW
-/// (matches femtovg's tessellator preference — see brick_drawcmd in
-/// tools/breakout).
-fn rounded_rect_path(
+/// Slight corner rounding applied uniformly across vmux chrome (active
+/// tab top edges, modal corners, pane title pills). One value so all
+/// chrome reads as part of the same visual language; conservative on
+/// purpose — too aggressive and the chrome turns into a button.
+/// Y units only; the matching `rx` is computed per call site so
+/// anisotropic cells don't produce visually elliptical corners.
+const CHROME_CORNER_RY: f32 = 0.175;
+
+/// Compute an `rx` in cell units that yields a visually-circular arc
+/// for `ry` given the host's pixel-per-cell ratios. Clamps so the corner
+/// never exceeds 40% of the rect's smaller dimension (prevents arcs
+/// from collapsing into each other on narrow shapes).
+fn chrome_corner_radii(width: f32, height: f32, cell_pw: f32, cell_ph: f32) -> (f32, f32) {
+    let ry = CHROME_CORNER_RY.min(height * 0.4);
+    let rx = (CHROME_CORNER_RY * cell_ph / cell_pw).min(width * 0.4);
+    (rx, ry)
+}
+
+/// Build a closed rectangle path with selectable rounded corners.
+/// Corner toggles are `(top_left, top_right, bottom_right, bottom_left)`
+/// — `false` produces a square corner. Traversal is CCW in y-down
+/// coords (matches femtovg's tessellator preference — see `brick_drawcmd`
+/// in tools/breakout).
+fn rounded_rect_path_corners(
     x0: f32,
     y0: f32,
     x1: f32,
     y1: f32,
     rx: f32,
     ry: f32,
+    tl: bool,
+    tr: bool,
+    br: bool,
+    bl: bool,
 ) -> Vec<PathSegment> {
     let arc = |dst: Point| PathNode::ArcEllipseTo {
         large: false,
@@ -585,20 +662,53 @@ fn rounded_rect_path(
         rotation: 0.0,
         dst,
     };
+    let start_y = if tl { y0 + ry } else { y0 };
+    let mut nodes: Vec<PathNode> = Vec::new();
+    // Down the left edge.
+    nodes.push(PathNode::VerticalLineTo {
+        y: if bl { y1 - ry } else { y1 },
+    });
+    if bl {
+        nodes.push(arc(Point { x: x0 + rx, y: y1 }));
+    }
+    // Across the bottom.
+    nodes.push(PathNode::HorizontalLineTo {
+        x: if br { x1 - rx } else { x1 },
+    });
+    if br {
+        nodes.push(arc(Point { x: x1, y: y1 - ry }));
+    }
+    // Up the right edge.
+    nodes.push(PathNode::VerticalLineTo {
+        y: if tr { y0 + ry } else { y0 },
+    });
+    if tr {
+        nodes.push(arc(Point { x: x1 - rx, y: y0 }));
+    }
+    // Across the top.
+    nodes.push(PathNode::HorizontalLineTo {
+        x: if tl { x0 + rx } else { x0 },
+    });
+    if tl {
+        nodes.push(arc(Point { x: x0, y: y0 + ry }));
+    }
+    nodes.push(PathNode::ClosePath);
     vec![PathSegment {
-        start: Point { x: x0, y: y0 + ry },
-        nodes: vec![
-            PathNode::VerticalLineTo { y: y1 - ry },
-            arc(Point { x: x0 + rx, y: y1 }),
-            PathNode::HorizontalLineTo { x: x1 - rx },
-            arc(Point { x: x1, y: y1 - ry }),
-            PathNode::VerticalLineTo { y: y0 + ry },
-            arc(Point { x: x1 - rx, y: y0 }),
-            PathNode::HorizontalLineTo { x: x0 + rx },
-            arc(Point { x: x0, y: y0 + ry }),
-            PathNode::ClosePath,
-        ],
+        start: Point { x: x0, y: start_y },
+        nodes,
     }]
+}
+
+/// Build a closed rounded-rectangle path with all four corners rounded.
+fn rounded_rect_path(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    rx: f32,
+    ry: f32,
+) -> Vec<PathSegment> {
+    rounded_rect_path_corners(x0, y0, x1, y1, rx, ry, true, true, true, true)
 }
 
 /// VGE element ID used for a pane's chrome (title thumb + scroll thumb).
@@ -621,13 +731,22 @@ const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
 const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 
 /// Build the VGE element body that renders the host's top-row tab bar.
-/// One label per tab, active tab highlighted with a solid brand-color
-/// thumb and bold text. A rule along row 1 separates the bar from the
-/// pane area below.
+/// Each tab is split into two adjacent sub-rects:
+///   - **number rect** (always present, dim modal-background fill, top-
+///     left corner rounded) showing the 1-based tab index. Color is
+///     fixed regardless of selection so the index reads as a stable
+///     anchor.
+///   - **name rect** (filled with brand color only when active, top-
+///     right corner rounded) showing the tab title.
+///
+/// The rule along row 1 separates the bar from the pane area below;
+/// active tab fills sit flush on top of it.
 fn build_tabbar_commands(
-    tabs: &[Tab],
+    labels: &[String],
     active: usize,
     host_w: u32,
+    cell_pw: f32,
+    cell_ph: f32,
 ) -> CreateElementBody {
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
@@ -647,27 +766,68 @@ fn build_tabbar_commands(
     });
 
     let mut x: f32 = 0.0;
-    for (i, tab) in tabs.iter().enumerate() {
-        let label = format!(" {}: {} ", i + 1, tab.title);
-        let label_w = label.chars().count() as f32;
-        if x + label_w > host_w as f32 {
+    for (i, raw) in labels.iter().enumerate() {
+        let num_text = format!(" {} ", i + 1);
+        let name_text = format!(" {} ", raw);
+        let num_w = num_text.chars().count() as f32;
+        let name_w = name_text.chars().count() as f32;
+        let total_w = num_w + name_w;
+        if x + total_w > host_w as f32 {
             break;
         }
         let is_active = i == active;
+
+        // Number sub-rect: always filled with the dim modal background,
+        // top-left corner rounded.
+        let (num_rx, num_ry) = chrome_corner_radii(num_w, 1.0, cell_pw, cell_ph);
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(COLOR_MODAL_BG),
+            segments: rounded_rect_path_corners(
+                x,
+                0.0,
+                x + num_w,
+                1.0,
+                num_rx,
+                num_ry,
+                true,  // TL rounded
+                false, // TR (meets the name rect, kept square)
+                false, // BR
+                false, // BL (sits on the row-1 rule)
+            ),
+        });
+        cmds.push(DrawCmd::DrawText {
+            origin: Point { x, y: 0.0 },
+            align: Align::Left,
+            // Number text is light regardless of selection so it stays
+            // legible on the fixed dim background.
+            fill: Style::Flat(COLOR_TAB_ACTIVE_TEXT),
+            font_style: FontStyle(0x00),
+            text: num_text,
+        });
+
+        // Name sub-rect: brand-color fill only on the active tab; top-
+        // right corner rounded so the tab silhouette has a tab shape.
+        let name_x0 = x + num_w;
         if is_active {
-            // Solid brand-color thumb spanning the full label cell.
-            cmds.push(DrawCmd::FillRectangles {
+            let (name_rx, name_ry) = chrome_corner_radii(name_w, 1.0, cell_pw, cell_ph);
+            cmds.push(DrawCmd::FillPath {
                 fill: Style::Flat(COLOR_BRAND),
-                rects: vec![Rect {
-                    x,
-                    y: 0.0,
-                    w: label_w,
-                    h: 1.0,
-                }],
+                segments: rounded_rect_path_corners(
+                    name_x0,
+                    0.0,
+                    name_x0 + name_w,
+                    1.0,
+                    name_rx,
+                    name_ry,
+                    false, // TL (meets the number rect)
+                    true,  // TR rounded
+                    false, // BR (sits on the row-1 rule)
+                    false, // BL
+                ),
             });
         }
         cmds.push(DrawCmd::DrawText {
-            origin: Point { x, y: 0.0 },
+            origin: Point { x: name_x0, y: 0.0 },
             align: Align::Left,
             fill: Style::Flat(if is_active {
                 COLOR_TAB_ACTIVE_TEXT
@@ -675,9 +835,9 @@ fn build_tabbar_commands(
                 COLOR_TAB_INACTIVE_TEXT
             }),
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
-            text: label,
+            text: name_text,
         });
-        x += label_w;
+        x += total_w;
     }
 
     CreateElementBody {
@@ -740,10 +900,10 @@ fn build_chrome_commands(
         let thumb_x1 = text_origin_x + pad_x;
         let thumb_y0 = text_origin_y;
         let thumb_y1 = text_origin_y + 1.0;
-        // Rounded with corner radii compensated for anisotropic cells.
-        let ry: f32 = 0.45;
-        let rx = (ry * cell_ph / cell_pw).min((thumb_x1 - thumb_x0) * 0.4);
-        let ry = ry.min((thumb_y1 - thumb_y0) * 0.4);
+        // Same slight rounding as the modal/tab chrome, with rx
+        // compensated for anisotropic cells.
+        let (rx, ry) =
+            chrome_corner_radii(thumb_x1 - thumb_x0, thumb_y1 - thumb_y0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
             fill: Style::Flat(COLOR_TITLE_THUMB),
             segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
@@ -805,13 +965,14 @@ fn build_modal_commands(
     title: &str,
     prompt: &str,
     buffer: &str,
-    _cell_pw: f32,
-    _cell_ph: f32,
+    cell_pw: f32,
+    cell_ph: f32,
 ) -> CreateElementBody {
     // Center a fixed-size modal box on the host grid. The 4-cell box
     // is (title strip)(body top pad)(buffer)(body bottom pad) — title
     // row is filled with brand color, the rest with the modal bg, and
-    // the whole box gets a straight-edge brand outline.
+    // the whole box gets a rounded-edge brand outline that matches the
+    // tab and pill styling.
     let line = format!("{prompt}{buffer}_");
     let chars = line.chars().count() as f32;
     let inner_w = chars.max(20.0);
@@ -821,34 +982,26 @@ fn build_modal_commands(
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
 
+    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
     let cmds = vec![
-        DrawCmd::FillRectangles {
+        // Body fill — full rounded rect; the title strip is drawn over
+        // its top region.
+        DrawCmd::FillPath {
             fill: Style::Flat(COLOR_MODAL_BG),
-            rects: vec![Rect {
-                x: 0.0,
-                y: 1.0,
-                w: box_w,
-                h: box_h - 1.0,
-            }],
+            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         },
-        DrawCmd::FillRectangles {
+        // Title strip — rounded only on the top corners so the seam
+        // with the body fill below is straight.
+        DrawCmd::FillPath {
             fill: Style::Flat(COLOR_BRAND),
-            rects: vec![Rect {
-                x: 0.0,
-                y: 0.0,
-                w: box_w,
-                h: 1.0,
-            }],
+            segments: rounded_rect_path_corners(
+                0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
+            ),
         },
-        DrawCmd::DrawLineLoop {
+        DrawCmd::DrawLinePath {
             stroke: Style::Flat(COLOR_MODAL_OUTLINE),
             line_width: 0.1,
-            points: vec![
-                Point { x: 0.0, y: 0.0 },
-                Point { x: box_w, y: 0.0 },
-                Point { x: box_w, y: box_h },
-                Point { x: 0.0, y: box_h },
-            ],
+            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         },
         DrawCmd::DrawText {
             origin: Point {
@@ -957,7 +1110,13 @@ fn help_thumb_origin_y(box_h: f32, offset: u32) -> f32 {
 /// content overflows — a scrollbar track and thumb. Scrolling is handled
 /// purely by shifting the body-lines and thumb children's origins, so
 /// the body's draw commands never need to be rebuilt.
-fn build_help_modal_elements(host_w: u32, host_h: u32, offset: u32) -> Vec<CreateElementBody> {
+fn build_help_modal_elements(
+    host_w: u32,
+    host_h: u32,
+    offset: u32,
+    cell_pw: f32,
+    cell_ph: f32,
+) -> Vec<CreateElementBody> {
     let max_line = HELP_LINES
         .iter()
         .map(|l| l.chars().count())
@@ -978,21 +1137,21 @@ fn build_help_modal_elements(host_w: u32, host_h: u32, offset: u32) -> Vec<Creat
 
     let mut elements: Vec<CreateElementBody> = Vec::new();
 
+    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
+
     // Parent — its `size` clips every child to the modal's bounds, and
     // its own `commands` (title strip, outline, title text) draw last,
     // on top of every child, so the title strip cleanly masks any body
-    // line that scrolls into rows 0/1.
+    // line that scrolls into rows 0/1. Title strip rounds only its top
+    // corners; the bottom seam meets the body fill cleanly.
     elements.push(CreateElementBody {
         id: MODAL_ELEMENT_ID.into(),
         commands: vec![
-            DrawCmd::FillRectangles {
+            DrawCmd::FillPath {
                 fill: Style::Flat(COLOR_BRAND),
-                rects: vec![Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: box_w,
-                    h: 1.0,
-                }],
+                segments: rounded_rect_path_corners(
+                    0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
+                ),
             },
             DrawCmd::DrawText {
                 origin: Point {
@@ -1004,15 +1163,10 @@ fn build_help_modal_elements(host_w: u32, host_h: u32, offset: u32) -> Vec<Creat
                 font_style: FontStyle(0x01),
                 text: HELP_LINES[0].to_string(),
             },
-            DrawCmd::DrawLineLoop {
+            DrawCmd::DrawLinePath {
                 stroke: Style::Flat(COLOR_MODAL_OUTLINE),
                 line_width: 0.1,
-                points: vec![
-                    Point { x: 0.0, y: 0.0 },
-                    Point { x: box_w, y: 0.0 },
-                    Point { x: box_w, y: box_h },
-                    Point { x: 0.0, y: box_h },
-                ],
+                segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
             },
         ],
         origin: Point {
@@ -1028,17 +1182,14 @@ fn build_help_modal_elements(host_w: u32, host_h: u32, offset: u32) -> Vec<Creat
         }),
     });
 
-    // Body fill — sits behind the scrolling body lines.
+    // Body fill — full rounded rect underneath the scrolling body lines.
+    // The title strip drawn by the parent (above) covers its top region;
+    // we rely on draw order rather than masking the body fill itself.
     elements.push(CreateElementBody {
         id: MODAL_BODY_FILL_ID.into(),
-        commands: vec![DrawCmd::FillRectangles {
+        commands: vec![DrawCmd::FillPath {
             fill: Style::Flat(COLOR_MODAL_BG),
-            rects: vec![Rect {
-                x: 0.0,
-                y: 1.0,
-                w: box_w,
-                h: box_h - 1.0,
-            }],
+            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         }],
         origin: Point { x: 0.0, y: 0.0 },
         is_visible: true,
@@ -1155,27 +1306,9 @@ enum Mode {
     /// taller than the modal; any other keystroke dismisses it.
     Help {
         offset: u32,
-        /// Partial CSI sequence buffer, mirroring `Mode::Scroll` — lets
-        /// us recognise multi-byte arrow / PgUp / PgDn sequences without
-        /// the leading ESC dismissing the modal prematurely.
-        csi_buf: Vec<u8>,
-    },
-    /// Scrollback navigation for one pane via `prefix-[`. Drives the
-    /// portal's vt100 scrollback offset through PRT
-    /// `SetPortalScrollback`. Active pane's chrome shows a status
-    /// indicator instead of its title plus a veter-style scrollbar.
-    Scroll {
-        pane_id: String,
-        offset: u32,
-        /// Latest history-depth reported by the host in the
-        /// `SetPortalScrollback` ack (§9.3). Used to size the scrollbar
-        /// thumb. 0 until the first ack arrives.
-        history_depth: u32,
-        /// Half the pane's portal-row count, cached on entry. Used for
-        /// PgUp/PgDn / d / u "half-page" jumps.
-        half_page: u32,
-        /// Partial CSI sequence buffer (`\e`, `\e[`, `\e[5`, …). Lets
-        /// us recognise multi-byte arrow / PgUp / PgDn sequences.
+        /// Partial CSI sequence buffer — lets us recognise multi-byte
+        /// arrow / PgUp / PgDn sequences without the leading ESC
+        /// dismissing the modal prematurely.
         csi_buf: Vec<u8>,
     },
 }
@@ -1191,7 +1324,12 @@ const PREFIX_BYTE: u8 = 0x00; // Ctrl+Space
 /// themselves are shared in `State.panes` and persist across tabs (their
 /// inner shells keep running while the tab is hidden, per spec §6.5).
 struct Tab {
+    /// Numeric default ("1", "2", …). Never overwritten by renames or
+    /// auto-titling; falls through as the last resort.
     title: String,
+    /// Set by `prefix-R`. Wins over the active pane's effective title.
+    /// Empty rename clears it.
+    manual_title: Option<String>,
     layout: Layout,
     focus: String,
 }
@@ -1224,6 +1362,14 @@ struct State {
     /// stale-DeleteElement-then-Create) and subsequent passes can
     /// idempotently replace the element.
     separators_created: bool,
+    /// Outstanding `SetPortalScrollback` requests, keyed by request id
+    /// → pane id. Lets the ack handler route the host's reply (which
+    /// only carries `applied_lines` + `history_depth`, no pane id) back
+    /// to the right pane's scroll state.
+    pending_scrolls: HashMap<u32, String>,
+    /// Monotonic counter for allocating scroll request ids. Starts at
+    /// `SCROLL_REQUEST_ID_BASE` and increments per request.
+    next_scroll_req_id: u32,
 }
 
 impl State {
@@ -1231,6 +1377,7 @@ impl State {
         let id = "p1".to_string();
         let initial_tab = Tab {
             title: "1".to_string(),
+            manual_title: None,
             layout: Layout::Leaf(id.clone()),
             focus: id.clone(),
         };
@@ -1252,6 +1399,8 @@ impl State {
             visible_panes: HashSet::new(),
             tabbar_created: false,
             separators_created: false,
+            pending_scrolls: HashMap::new(),
+            next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let pty = PanePty::spawn(rows as u16, cols as u16)?;
@@ -1259,6 +1408,9 @@ impl State {
             id.clone(),
             Pane {
                 title: id,
+                manual_title: None,
+                osc_title: None,
+                osc_icon: None,
                 pty,
                 last_rect: None,
                 // Pre-record the inner size so the first `relayout_and_render`
@@ -1268,6 +1420,7 @@ impl State {
                 // empty line into the pane.
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
+                scroll: None,
             },
         );
         Ok(s)
@@ -1342,10 +1495,14 @@ impl State {
             new_id.clone(),
             Pane {
                 title: new_id.clone(),
+                manual_title: None,
+                osc_title: None,
+                osc_icon: None,
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
+                scroll: None,
             },
         );
         // New pane gets focus.
@@ -1363,14 +1520,11 @@ impl State {
     /// relayout. If the tab becomes empty, the tab is removed too; if
     /// the last tab goes, vmux quits.
     fn close_pane(&mut self, target: &str) -> Result<Vec<u8>> {
-        // If we're scrolling the pane that's about to go away, drop
-        // scroll state silently — there's no portal left to render the
-        // indicator over and the host will tear it down anyway.
-        if let Mode::Scroll { pane_id, .. } = &self.mode {
-            if pane_id == target {
-                self.mode = Mode::Normal;
-            }
-        }
+        // Drop any in-flight scroll acks for the pane we're tearing
+        // down — once `DeletePortal` lands the host can't deliver them
+        // anyway, and we don't want a stale ack to resurrect state on
+        // a freshly-allocated pane id (unlikely but cheap to defend).
+        self.pending_scrolls.retain(|_, pid| pid != target);
         let mut tab_idx: Option<usize> = None;
         for (i, tab) in self.tabs.iter().enumerate() {
             let mut leaves = Vec::new();
@@ -1459,6 +1613,7 @@ impl State {
         let tab_title = self.allocate_tab_id();
         let new_tab = Tab {
             title: tab_title,
+            manual_title: None,
             layout: Layout::Leaf(pane_id.clone()),
             focus: pane_id.clone(),
         };
@@ -1474,10 +1629,14 @@ impl State {
             pane_id.clone(),
             Pane {
                 title: pane_id,
+                manual_title: None,
+                osc_title: None,
+                osc_icon: None,
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
+                scroll: None,
             },
         );
         self.relayout_and_render()
@@ -1487,15 +1646,11 @@ impl State {
         if index >= self.tabs.len() || index == self.active_tab {
             return Ok(Vec::new());
         }
-        // Switching tabs implicitly exits scroll mode — the scrolled
-        // pane is about to be hidden anyway.
-        let mut out = Vec::new();
-        if matches!(self.mode, Mode::Scroll { .. }) {
-            out.extend(self.exit_scroll()?);
-        }
+        // Per-pane scroll state survives tab switches: scrolled panes
+        // stay scrolled in the background and the chrome indicator
+        // returns when the user tabs back to that tab.
         self.active_tab = index;
-        out.extend(self.relayout_and_render()?);
-        Ok(out)
+        self.relayout_and_render()
     }
 
     fn next_tab(&mut self) -> Result<Vec<u8>> {
@@ -1549,7 +1704,7 @@ impl State {
             let pane_title_raw = self
                 .panes
                 .get(pane_id)
-                .map(|p| p.title.clone())
+                .map(|p| p.effective_title().to_string())
                 .unwrap_or_default();
             let display_title = self.display_title_for(pane_id, &pane_title_raw);
             let show_title = !single_pane || display_title != pane_title_raw;
@@ -1727,10 +1882,15 @@ impl State {
         // Tab bar: re-create on every relayout so tab adds/removes,
         // active-tab changes, and renames all show up. Cheap — single
         // small VGE element.
+        let tabbar_labels: Vec<String> = (0..self.tabs.len())
+            .map(|i| self.tab_effective_title(i))
+            .collect();
         let tabbar_body = build_tabbar_commands(
-            &self.tabs,
+            &tabbar_labels,
             self.active_tab,
             self.host_w,
+            self.cell_pw,
+            self.cell_ph,
         );
         if self.tabbar_created {
             vge_cmds.push((
@@ -1869,10 +2029,14 @@ impl State {
                     self.cell_ph,
                 )]
             }
-            Mode::Help { offset, .. } => {
-                build_help_modal_elements(self.host_w, self.host_h, *offset)
-            }
-            Mode::Normal | Mode::Prefix | Mode::Scroll { .. } => Vec::new(),
+            Mode::Help { offset, .. } => build_help_modal_elements(
+                self.host_w,
+                self.host_h,
+                *offset,
+                self.cell_pw,
+                self.cell_ph,
+            ),
+            Mode::Normal | Mode::Prefix => Vec::new(),
         }
     }
 
@@ -1880,15 +2044,8 @@ impl State {
     /// label, but a `[scroll: N]` indicator while that pane is being
     /// scrolled.
     fn display_title_for(&self, pane_id: &str, raw_title: &str) -> String {
-        if let Mode::Scroll {
-            pane_id: scrolled,
-            offset,
-            ..
-        } = &self.mode
-        {
-            if scrolled == pane_id {
-                return format!("[scroll: {offset}]");
-            }
+        if let Some(s) = self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
+            return format!("[scroll: {}]", s.offset);
         }
         raw_title.to_string()
     }
@@ -1896,122 +2053,125 @@ impl State {
     /// Scroll-indicator state to draw a thumb in `pane_id`'s chrome,
     /// or `None` if we're not currently scrolling that pane.
     fn scroll_indicator_for(&self, pane_id: &str) -> Option<ScrollIndicator> {
-        if let Mode::Scroll {
-            pane_id: scrolled,
-            offset,
-            history_depth,
-            ..
-        } = &self.mode
-        {
-            if scrolled == pane_id {
-                return Some(ScrollIndicator {
-                    offset: *offset,
-                    history_depth: *history_depth,
-                });
-            }
-        }
-        None
+        let s = self.panes.get(pane_id)?.scroll.as_ref()?;
+        Some(ScrollIndicator {
+            offset: s.offset,
+            history_depth: s.history_depth,
+        })
     }
 
-    /// Enter scroll mode for the focused pane. Caches the half-page
-    /// step from the pane's portal row count and re-emits the chrome so
-    /// the title turns into the scroll indicator.
-    fn enter_scroll(&mut self) -> Result<Vec<u8>> {
-        let pane_id = self.focus().to_string();
-        let rows = self
-            .panes
-            .get(&pane_id)
-            .and_then(|p| p.last_inner)
-            .map(|(_cols, rows)| rows)
-            .unwrap_or(10);
+    /// Allocate a fresh request id for a `SetPortalScrollback` command
+    /// targeting `pane_id`, register it in `pending_scrolls`, and
+    /// return the id. The ack handler uses the registration to route
+    /// the response back to the right pane.
+    fn alloc_scroll_request(&mut self, pane_id: &str) -> u32 {
+        let id = self.next_scroll_req_id;
+        self.next_scroll_req_id = self.next_scroll_req_id.wrapping_add(1);
+        // Wrap around back into the reserved high half — we never need
+        // to overlap with rid=0 (used for fire-and-forget commands)
+        // and we want the ack handler's filter to keep working.
+        if self.next_scroll_req_id < SCROLL_REQUEST_ID_BASE {
+            self.next_scroll_req_id = SCROLL_REQUEST_ID_BASE;
+        }
+        self.pending_scrolls.insert(id, pane_id.to_string());
+        id
+    }
+
+    /// Begin scrollback navigation for `pane_id`. No-op if that pane is
+    /// already scrolling (so re-pressing `prefix-[` is harmless). Caches
+    /// the half-page step and re-emits chrome so the title turns into
+    /// the scroll indicator.
+    fn enter_scroll(&mut self, pane_id: &str) -> Result<Vec<u8>> {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return Ok(Vec::new());
+        };
+        if pane.scroll.is_some() {
+            return Ok(Vec::new());
+        }
+        let rows = pane.last_inner.map(|(_c, r)| r).unwrap_or(10);
         let half_page = (rows / 2).max(1);
-        self.mode = Mode::Scroll {
-            pane_id: pane_id.clone(),
+        pane.scroll = Some(PaneScroll {
             offset: 0,
             history_depth: 0,
             half_page,
             csi_buf: Vec::new(),
-        };
+        });
         // Probe the host once for the current history depth so the
         // scrollbar shows up right away (offset stays 0).
+        let req_id = self.alloc_scroll_request(pane_id);
         let mut out = build_prt_envelope(&[(
             PrtCommand::SetPortalScrollback {
-                id: pane_id.clone(),
+                id: pane_id.to_string(),
                 lines: 0,
             },
-            SCROLL_REQUEST_ID,
+            req_id,
         )]);
-        out.extend(self.render_one_chrome(&pane_id));
+        out.extend(self.render_one_chrome(pane_id));
         Ok(out)
     }
 
-    /// Leave scroll mode: clear scrollback offset on the host, restore
-    /// the pane's normal title, return to Normal mode.
-    fn exit_scroll(&mut self) -> Result<Vec<u8>> {
-        let Mode::Scroll { pane_id, .. } = &self.mode else {
+    /// End scrollback navigation for `pane_id`: reset the host-side
+    /// offset to live and clear the pane's local scroll state.
+    fn exit_scroll(&mut self, pane_id: &str) -> Result<Vec<u8>> {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
             return Ok(Vec::new());
         };
-        let pane_id = pane_id.clone();
-        let mut out = Vec::new();
-        if self.panes.contains_key(&pane_id) {
-            out.extend(build_prt_envelope(&[(
-                PrtCommand::SetPortalScrollback {
-                    id: pane_id.clone(),
-                    lines: 0,
-                },
-                SCROLL_REQUEST_ID,
-            )]));
+        if pane.scroll.is_none() {
+            return Ok(Vec::new());
         }
-        self.mode = Mode::Normal;
-        out.extend(self.render_one_chrome(&pane_id));
+        pane.scroll = None;
+        let req_id = self.alloc_scroll_request(pane_id);
+        let mut out = build_prt_envelope(&[(
+            PrtCommand::SetPortalScrollback {
+                id: pane_id.to_string(),
+                lines: 0,
+            },
+            req_id,
+        )]);
+        out.extend(self.render_one_chrome(pane_id));
         Ok(out)
     }
 
-    /// Apply a delta to the current scroll offset (positive = scroll
+    /// Apply a delta to `pane_id`'s scroll offset (positive = scroll
     /// further back, negative = closer to live). Clamped to
-    /// `[0, PORTAL_SCROLLBACK_LINES]`.
-    fn scroll_delta(&mut self, delta: i64) -> Result<Vec<u8>> {
-        let new_offset = match &self.mode {
-            Mode::Scroll { offset, .. } => {
-                let cur = *offset as i64;
+    /// `[0, PORTAL_SCROLLBACK_LINES]`. Silent no-op if the pane isn't
+    /// in scroll mode.
+    fn scroll_delta(&mut self, pane_id: &str, delta: i64) -> Result<Vec<u8>> {
+        let new_offset = match self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
+            Some(s) => {
+                let cur = s.offset as i64;
                 let next = (cur + delta).max(0);
                 (next.min(PORTAL_SCROLLBACK_LINES as i64)) as u32
             }
-            _ => return Ok(Vec::new()),
+            None => return Ok(Vec::new()),
         };
-        self.scroll_set(new_offset)
+        self.scroll_set(pane_id, new_offset)
     }
 
-    /// Jump to an absolute scroll offset.
-    fn scroll_set(&mut self, mut offset: u32) -> Result<Vec<u8>> {
+    /// Jump `pane_id` to an absolute scroll offset.
+    fn scroll_set(&mut self, pane_id: &str, mut offset: u32) -> Result<Vec<u8>> {
         if offset > PORTAL_SCROLLBACK_LINES {
             offset = PORTAL_SCROLLBACK_LINES;
         }
-        let pane_id = match &mut self.mode {
-            Mode::Scroll {
-                pane_id,
-                offset: cur,
-                ..
-            } => {
-                if *cur == offset {
-                    return Ok(Vec::new());
-                }
-                *cur = offset;
-                pane_id.clone()
-            }
-            _ => return Ok(Vec::new()),
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return Ok(Vec::new());
         };
-        let mut out = Vec::new();
-        if self.panes.contains_key(&pane_id) {
-            out.extend(build_prt_envelope(&[(
-                PrtCommand::SetPortalScrollback {
-                    id: pane_id.clone(),
-                    lines: offset,
-                },
-                SCROLL_REQUEST_ID,
-            )]));
+        let Some(s) = pane.scroll.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if s.offset == offset {
+            return Ok(Vec::new());
         }
-        out.extend(self.render_one_chrome(&pane_id));
+        s.offset = offset;
+        let req_id = self.alloc_scroll_request(pane_id);
+        let mut out = build_prt_envelope(&[(
+            PrtCommand::SetPortalScrollback {
+                id: pane_id.to_string(),
+                lines: offset,
+            },
+            req_id,
+        )]);
+        out.extend(self.render_one_chrome(pane_id));
         Ok(out)
     }
 
@@ -2019,7 +2179,7 @@ impl State {
     fn render_one_chrome(&mut self, pane_id: &str) -> Vec<u8> {
         let (rect, title_raw) = match self.panes.get(pane_id) {
             Some(pane) => match pane.last_rect {
-                Some(rect) => (rect, pane.title.clone()),
+                Some(rect) => (rect, pane.effective_title().to_string()),
                 None => return Vec::new(),
             },
             None => return Vec::new(),
@@ -2067,6 +2227,57 @@ impl State {
             ),
         ];
         build_vge_envelope(&vge_cmds)
+    }
+
+    /// Effective tab title: manual rename wins; otherwise the active
+    /// pane's effective title; otherwise the numeric default ("1", …).
+    fn tab_effective_title(&self, tab_idx: usize) -> String {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return String::new();
+        };
+        if let Some(name) = &tab.manual_title {
+            return name.clone();
+        }
+        if let Some(pane) = self.panes.get(&tab.focus) {
+            // Only use the pane's title when it's been customised
+            // (manual rename or OSC). The default `pN` label would
+            // bubble up as e.g. "p3" which is meaningless on a tab.
+            if pane.manual_title.is_some()
+                || pane.osc_title.is_some()
+                || pane.osc_icon.is_some()
+            {
+                return pane.effective_title().to_string();
+            }
+        }
+        tab.title.clone()
+    }
+
+    /// Re-emit just the tab bar element. Used when an OSC title or a
+    /// rename changes the active pane's effective title without
+    /// otherwise affecting layout.
+    fn render_tabbar(&mut self) -> Vec<u8> {
+        let labels: Vec<String> = (0..self.tabs.len())
+            .map(|i| self.tab_effective_title(i))
+            .collect();
+        let body = build_tabbar_commands(
+            &labels,
+            self.active_tab,
+            self.host_w,
+            self.cell_pw,
+            self.cell_ph,
+        );
+        let mut cmds = Vec::new();
+        if self.tabbar_created {
+            cmds.push((
+                VgeCommand::DeleteElement {
+                    id: TABBAR_ELEMENT_ID.into(),
+                },
+                0,
+            ));
+        }
+        cmds.push((VgeCommand::CreateElement(body), 0));
+        self.tabbar_created = true;
+        build_vge_envelope(&cmds)
     }
 }
 
@@ -2570,7 +2781,13 @@ fn handle_stdin_chunk(
     // pane's PTY) and Ok responses to our scroll commands (carry the
     // host-applied offset so we can show the real scroll position even
     // when the request exceeded the available history).
-    let mut latest_ack: Option<(u32, u32)> = None;
+    // Most recent (applied_lines, history_depth) ack received per
+    // pane in this chunk. Coalesced so a burst of scroll commands
+    // results in a single chrome re-render per pane.
+    let mut latest_acks: HashMap<String, (u32, u32)> = HashMap::new();
+    // Pane ids whose effective title may have changed in this chunk.
+    // Used after the loop to re-emit chrome and the tab bar in one go.
+    let mut titles_dirty: HashSet<String> = HashSet::new();
     for payload in prt_out.payloads {
         let mut r = PrtReader::new(&payload);
         let _version = r.u8();
@@ -2595,6 +2812,26 @@ fn handle_stdin_chunk(
                         let _ = p.pty.write_all(&data);
                     }
                 }
+            } else if ft == EVT_TITLE_CHANGE || ft == EVT_ICON_NAME_CHANGE {
+                // §8.2: string id, string title. Empty title clears the
+                // override and lets the next-precedence label show.
+                let mut br = PrtReader::new(body);
+                let id = br.string().unwrap_or("").to_string();
+                let title = br.string().unwrap_or("").to_string();
+                if !id.is_empty() {
+                    if let Some(p) = state.panes.get_mut(&id) {
+                        let slot = if ft == EVT_TITLE_CHANGE {
+                            &mut p.osc_title
+                        } else {
+                            &mut p.osc_icon
+                        };
+                        let new_value = if title.is_empty() { None } else { Some(title) };
+                        if *slot != new_value {
+                            *slot = new_value;
+                            titles_dirty.insert(id);
+                        }
+                    }
+                }
             } else if ft == EVT_MOUSE_MODE_CHANGE {
                 // §8.9: id, protocol, encoding, focus_events. We only
                 // need protocol — encoding/focus is handled per-event
@@ -2606,40 +2843,58 @@ fn handle_stdin_chunk(
                     p.inner_mouse_protocol = protocol;
                 }
             } else if ft == prt_protocol::frame::RSP_OK
-                && rid == SCROLL_REQUEST_ID
                 && body.len() >= 4
             {
-                // §9.3 ack: u32 applied_lines, u32 history_depth (the
-                // second field is optional per the spec — older hosts
-                // can omit it). We hold the most recent values and
-                // apply once after the loop to avoid per-frame redraws.
-                let applied = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-                let history = if body.len() >= 8 {
-                    u32::from_le_bytes([body[4], body[5], body[6], body[7]])
-                } else {
-                    0
-                };
-                latest_ack = Some((applied, history));
+                // §9.3 `SetPortalScrollback` ack: u32 applied_lines,
+                // u32 history_depth (history_depth is optional per the
+                // spec — older hosts may omit it). The frame doesn't
+                // carry the pane id, so we route it via
+                // `pending_scrolls` (rid → pane id) which we populated
+                // when sending the request.
+                if let Some(pane_id) = state.pending_scrolls.remove(&rid) {
+                    let applied = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                    let history = if body.len() >= 8 {
+                        u32::from_le_bytes([body[4], body[5], body[6], body[7]])
+                    } else {
+                        0
+                    };
+                    latest_acks.insert(pane_id, (applied, history));
+                }
             }
         }
     }
-    if let Some((applied, history)) = latest_ack {
-        if let Mode::Scroll {
-            pane_id,
-            offset,
-            history_depth,
-            ..
-        } = &mut state.mode
-        {
-            let changed = *offset != applied || *history_depth != history;
-            *offset = applied;
-            *history_depth = history;
-            if changed {
-                let pane_id = pane_id.clone();
-                let env = state.render_one_chrome(&pane_id);
-                if !env.is_empty() {
-                    write_all_stdout(&env)?;
-                }
+    // Flush title changes: re-emit each affected pane's chrome and the
+    // tab bar (because the active pane's effective title can drive the
+    // auto-tab-title). Cheap — small per-pane VGE elements.
+    if !titles_dirty.is_empty() {
+        let mut env = Vec::new();
+        for id in &titles_dirty {
+            env.extend(state.render_one_chrome(id));
+        }
+        env.extend(state.render_tabbar());
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
+
+    // Apply each pane's most recent scroll ack and re-render its chrome
+    // if anything actually changed. A pane that has already exited
+    // scroll mode (e.g. the user pressed `q` between the request and
+    // the ack) silently drops the update.
+    for (pane_id, (applied, history)) in &latest_acks {
+        let changed = match state.panes.get_mut(pane_id).and_then(|p| p.scroll.as_mut()) {
+            Some(s) => {
+                let dirty = s.offset != *applied || s.history_depth != *history;
+                s.offset = *applied;
+                s.history_depth = *history;
+                dirty
+            }
+            None => false,
+        };
+        if changed {
+            let env = state.render_one_chrome(pane_id);
+            if !env.is_empty() {
+                write_all_stdout(&env)?;
             }
         }
     }
@@ -2729,8 +2984,8 @@ fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
 
 /// Hit-test a mouse event against pane bounds and dispatch:
 ///   - wheel + inner program doesn't want mouse → drive vmux's
-///     scrollback for that pane (auto-enter Mode::Scroll, auto-exit at
-///     offset 0);
+///     scrollback for that pane (auto-enter the pane's scroll state,
+///     auto-exit at offset 0);
 ///   - any other case → forward the event to the matching pane's PTY
 ///     in SGR encoding, with coords translated to portal-relative.
 fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
@@ -2815,52 +3070,47 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     Ok(())
 }
 
-/// Wheel-driven scroll for `pane_id`: enter/exit `Mode::Scroll` as
-/// needed and adjust the offset by `delta`. Used when the inner
-/// program hasn't enabled mouse reporting, so wheel naturally drives
-/// vmux's scrollback for the pane under the cursor.
+/// Wheel-driven scroll for `pane_id`: enter or extend that pane's
+/// scrollback navigation by `delta`. Each pane's scroll state is
+/// independent, so wheeling pane B doesn't disturb pane A's scroll.
+/// Used when the inner program hasn't enabled mouse reporting, so
+/// wheel naturally drives vmux's scrollback for the pane under the
+/// cursor.
 fn wheel_scroll(state: &mut State, pane_id: &str, delta: i64) -> Result<()> {
-    // If we're scrolling a different pane, exit that one first.
-    let scrolling_other = matches!(
-        &state.mode,
-        Mode::Scroll { pane_id: cur, .. } if cur != pane_id
-    );
-    if scrolling_other {
-        let env = state.exit_scroll()?;
-        if !env.is_empty() {
-            write_all_stdout(&env)?;
-        }
-    }
+    let already_scrolling = state
+        .panes
+        .get(pane_id)
+        .map(|p| p.scroll.is_some())
+        .unwrap_or(false);
 
     // Wheeling down on a pane that isn't currently being scrolled
     // means "stay at live" — ignore.
-    if !matches!(&state.mode, Mode::Scroll { .. }) && delta < 0 {
+    if !already_scrolling && delta < 0 {
         return Ok(());
     }
 
-    if !matches!(&state.mode, Mode::Scroll { .. }) {
-        // Enter scroll mode for this pane. enter_scroll() uses the
-        // current focus, so retarget focus briefly to the wheeled
-        // pane, enter, then leave focus where it was — wheel-driven
-        // scroll shouldn't steal keyboard focus.
-        let saved_focus = state.focus().to_string();
-        state.set_focus(pane_id.to_string());
-        let env = state.enter_scroll()?;
-        state.set_focus(saved_focus);
+    if !already_scrolling {
+        let env = state.enter_scroll(pane_id)?;
         if !env.is_empty() {
             write_all_stdout(&env)?;
         }
     }
 
-    let env = state.scroll_delta(delta)?;
+    let env = state.scroll_delta(pane_id, delta)?;
     if !env.is_empty() {
         write_all_stdout(&env)?;
     }
 
-    // If we just landed back at live, drop scroll mode so the
+    // If we just landed back at live, drop scroll for this pane so the
     // scrollbar / `[scroll: 0]` indicator clear.
-    if matches!(&state.mode, Mode::Scroll { offset: 0, .. }) {
-        let env = state.exit_scroll()?;
+    let at_live = state
+        .panes
+        .get(pane_id)
+        .and_then(|p| p.scroll.as_ref())
+        .map(|s| s.offset == 0)
+        .unwrap_or(false);
+    if at_live {
+        let env = state.exit_scroll(pane_id)?;
         if !env.is_empty() {
             write_all_stdout(&env)?;
         }
@@ -2880,6 +3130,23 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     idx += 1;
                     continue;
                 }
+                // If the focused pane is in scroll mode, route keys to
+                // the scroll handler. Other panes (possibly also
+                // scrolling) are unaffected — focus drives input.
+                let focus_id = state.focus().to_string();
+                let focus_scrolling = state
+                    .panes
+                    .get(&focus_id)
+                    .map(|p| p.scroll.is_some())
+                    .unwrap_or(false);
+                if focus_scrolling {
+                    let env = handle_scroll_byte(state, &focus_id, b)?;
+                    if !env.is_empty() {
+                        write_all_stdout(&env)?;
+                    }
+                    idx += 1;
+                    continue;
+                }
                 // Forward the entire residual chunk to the focused pane
                 // up to the next prefix byte. This keeps multi-byte
                 // sequences (CSI, UTF-8) intact.
@@ -2888,7 +3155,6 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     .position(|c| *c == PREFIX_BYTE)
                     .map(|p| idx + p)
                     .unwrap_or(bytes.len());
-                let focus_id = state.focus().to_string();
                 if let Some(pane) = state.panes.get(&focus_id) {
                     dlog(&format!("key>{focus_id}"), &bytes[idx..stop]);
                     pane.pty.write_all(&bytes[idx..stop])?;
@@ -2936,13 +3202,6 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 }
                 idx += 1;
             }
-            Mode::Scroll { .. } => {
-                let env = handle_scroll_byte(state, b)?;
-                if !env.is_empty() {
-                    write_all_stdout(&env)?;
-                }
-                idx += 1;
-            }
         }
     }
     Ok(())
@@ -2963,10 +3222,12 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         }
         b'r' => {
             let pane_id = state.focus().to_string();
+            // Pre-fill with the current effective title so backspacing
+            // to empty cleanly drops the manual override.
             let buffer = state
                 .panes
                 .get(&pane_id)
-                .map(|p| p.title.clone())
+                .map(|p| p.effective_title().to_string())
                 .unwrap_or_default();
             state.mode = Mode::Rename {
                 target: RenameTarget::Pane(pane_id),
@@ -2980,11 +3241,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'p' => state.prev_tab(),
         b'R' => {
             let idx = state.active_tab;
-            let buffer = state
-                .tabs
-                .get(idx)
-                .map(|t| t.title.clone())
-                .unwrap_or_default();
+            let buffer = state.tab_effective_title(idx);
             state.mode = Mode::Rename {
                 target: RenameTarget::Tab(idx),
                 buffer,
@@ -3003,8 +3260,11 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
             };
             Ok(state.render_modal_overlay())
         }
-        // scroll mode
-        b'[' => state.enter_scroll(),
+        // scroll mode for focused pane
+        b'[' => {
+            let pane_id = state.focus().to_string();
+            state.enter_scroll(&pane_id)
+        }
         PREFIX_BYTE => {
             // Double-tap: forward a literal Ctrl+Space to the focused pane.
             let focus_id = state.focus().to_string();
@@ -3047,17 +3307,26 @@ fn handle_rename_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
             match target {
                 RenameTarget::Pane(pane_id) => {
                     if let Some(pane) = state.panes.get_mut(&pane_id) {
-                        if !new_title.is_empty() {
-                            pane.title = new_title;
-                        }
+                        // Empty rename clears the override so the OSC
+                        // title (or default `pN` label) takes over.
+                        pane.manual_title = if new_title.is_empty() {
+                            None
+                        } else {
+                            Some(new_title)
+                        };
                     }
                     env.extend(state.render_one_chrome(&pane_id));
+                    // Pane title is the auto-tab-title source, so the
+                    // tab bar may need to re-render too.
+                    env.extend(state.render_tabbar());
                 }
                 RenameTarget::Tab(idx) => {
                     if let Some(tab) = state.tabs.get_mut(idx) {
-                        if !new_title.is_empty() {
-                            tab.title = new_title;
-                        }
+                        tab.manual_title = if new_title.is_empty() {
+                            None
+                        } else {
+                            Some(new_title)
+                        };
                     }
                     // Tab bar gets re-emitted in the next relayout; do
                     // an idempotent one now so the new title shows.
@@ -3192,7 +3461,7 @@ fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
 /// "Up" means scroll *back* into history (offset +); "Down" means scroll
 /// toward live (offset −). Sends `SetPortalScrollback` to the host on
 /// any change.
-fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
+fn handle_scroll_byte(state: &mut State, pane_id: &str, b: u8) -> Result<Vec<u8>> {
     enum Action {
         Nothing,
         Delta(i64),
@@ -3202,17 +3471,17 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
         ToPrefix,
     }
 
-    // Decide the action under a single mutable borrow scope so we can
-    // call back into &mut self helpers afterwards.
-    let half = match &state.mode {
-        Mode::Scroll { half_page, .. } => *half_page as i64,
-        _ => return Ok(Vec::new()),
+    // Read half-page first under a shared borrow.
+    let half = match state.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
+        Some(s) => s.half_page as i64,
+        None => return Ok(Vec::new()),
     };
 
     let action = {
-        let Mode::Scroll { csi_buf, .. } = &mut state.mode else {
+        let Some(s) = state.panes.get_mut(pane_id).and_then(|p| p.scroll.as_mut()) else {
             return Ok(Vec::new());
         };
+        let csi_buf = &mut s.csi_buf;
         if csi_buf.is_empty() {
             // Plain key.
             match b {
@@ -3220,12 +3489,11 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
                     csi_buf.push(b);
                     Action::Nothing
                 }
-                // Prefix byte: drop scroll state and yield to Mode::Prefix
-                // so any prefix command (tab switching, splits, help, …)
-                // is reachable while scrolling. Tab switching already
-                // exits scroll on its own; doing it up front means the
-                // same exit happens for every prefix command, which is
-                // consistent and saves a per-command carve-out.
+                // Prefix byte: keep this pane's scroll state alive but
+                // yield to `Mode::Prefix` so prefix commands (tab
+                // switches, splits, help, …) are reachable while
+                // scrolling. Coming back to the focused pane resumes
+                // scroll-key dispatch automatically.
                 PREFIX_BYTE => Action::ToPrefix,
                 b'q' | b'G' => Action::Exit,
                 b'k' => Action::Delta(1),
@@ -3274,14 +3542,16 @@ fn handle_scroll_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
 
     match action {
         Action::Nothing => Ok(Vec::new()),
-        Action::Delta(d) => state.scroll_delta(d),
-        Action::SetTop => state.scroll_set(u32::MAX),
-        Action::SetLive => state.scroll_set(0),
-        Action::Exit => state.exit_scroll(),
+        Action::Delta(d) => state.scroll_delta(pane_id, d),
+        Action::SetTop => state.scroll_set(pane_id, u32::MAX),
+        Action::SetLive => state.scroll_set(pane_id, 0),
+        Action::Exit => state.exit_scroll(pane_id),
         Action::ToPrefix => {
-            let env = state.exit_scroll()?;
+            // Keep the pane's scroll state intact; just switch the
+            // global mode. Prefix commands run, and if focus returns
+            // to this pane, scroll-key dispatch resumes.
             state.mode = Mode::Prefix;
-            Ok(env)
+            Ok(Vec::new())
         }
     }
 }
