@@ -52,10 +52,11 @@ struct Cli {
     verbose: bool,
 
     /// Wire encoding for the uploaded image. `raw` sends straight
-    /// RGBA8 bytes (fastest to encode, biggest payload). `webp-lossless`
-    /// encodes via libwebp's lossless path (smaller, slower).
-    /// `webp-lossy` is JPEG-equivalent compression, controlled by
-    /// `--quality`.
+    /// RGBA8 bytes (fastest to encode, biggest payload).
+    /// `webp-lossless` and `webp-lossy` both ride the pure-Rust
+    /// `oxideav-webp` encoder so the workspace builds clean against
+    /// `aarch64-unknown-linux-musl` without a C cross-compiler.
+    /// Lossy quality is controlled by `--quality` (0..=100).
     #[arg(long, value_enum, default_value_t = Mode::Raw)]
     mode: Mode,
 
@@ -173,33 +174,46 @@ fn main() -> Result<()> {
     let (encoding, payload) = match cli.mode {
         Mode::Raw => (0x01u8, raw_rgba),
         Mode::WebpLossless => {
-            let enc = webp::Encoder::from_rgba(
-                &raw_rgba,
+            // oxideav-webp's lossless path expects packed ARGB u32s.
+            let argb: Vec<u32> = raw_rgba
+                .chunks_exact(4)
+                .map(|c| {
+                    ((c[3] as u32) << 24)
+                        | ((c[0] as u32) << 16)
+                        | ((c[1] as u32) << 8)
+                        | (c[2] as u32)
+                })
+                .collect();
+            let out = oxideav_webp::encode_vp8l_argb(
                 placement.target_px_w,
                 placement.target_px_h,
-            );
-            let mem = enc.encode_lossless();
-            trace!(v, "webp lossless: {} -> {} bytes", raw_rgba.len(), mem.len());
-            (0x02u8, mem.to_vec())
+                &argb,
+                /* has_alpha */ true,
+            )
+            .context("webp lossless encode")?;
+            trace!(v, "webp lossless: {} -> {} bytes", raw_rgba.len(), out.len());
+            (0x02u8, out)
         }
         Mode::WebpLossy => {
             if !cli.quality.is_finite() || !(0.0..=100.0).contains(&cli.quality) {
                 bail!("--quality must be in 0..=100, got {}", cli.quality);
             }
-            let enc = webp::Encoder::from_rgba(
-                &raw_rgba,
+            let out = oxideav_webp::encode_vp8_lossy_rgba(
                 placement.target_px_w,
                 placement.target_px_h,
-            );
-            let mem = enc.encode(cli.quality);
+                &raw_rgba,
+                cli.quality,
+                &oxideav_webp::WebpMetadata::default(),
+            )
+            .context("webp lossy encode")?;
             trace!(
                 v,
                 "webp lossy q={}: {} -> {} bytes",
                 cli.quality,
                 raw_rgba.len(),
-                mem.len()
+                out.len()
             );
-            (0x02u8, mem.to_vec())
+            (0x02u8, out)
         }
     };
     let upload = Command::UploadImage(UploadImageBody {

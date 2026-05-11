@@ -871,12 +871,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1236,16 +1230,6 @@ dependencies = [
  "libc",
  "plain",
  "redox_syscall 0.7.3",
-]
-
-[[package]]
-name = "libwebp-sys"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54cd30df7c7165ce74a456e4ca9732c603e8dc5e60784558c1c6dc047f876733"
-dependencies = [
- "cc",
- "glob",
 ]
 
 [[package]]
@@ -1763,6 +1747,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "oxideav-vp8"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f4c0f98d2900480f5c7ad040e5a8f62b88bd3bb0e5cab4f4d9210c1f848c142"
+
+[[package]]
+name = "oxideav-webp"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e550d0b676bc62f6132fe884ead2b00085476f283df42103508d8faa484059d5"
+dependencies = [
+ "oxideav-vp8",
 ]
 
 [[package]]
@@ -2732,8 +2731,8 @@ dependencies = [
  "image",
  "libc",
  "nix 0.29.0",
+ "oxideav-webp",
  "vge-protocol",
- "webp",
 ]
 
 [[package]]
@@ -3107,16 +3106,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "webp"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c071456adef4aca59bf6a583c46b90ff5eb0b4f758fc347cea81290288f37ce1"
-dependencies = [
- "image",
- "libwebp-sys",
 ]
 
 [[package]]
