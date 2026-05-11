@@ -5,10 +5,11 @@
 // owns stdin from that point on; the main thread must not call
 // `read_stdin` while the reader is running).
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tty::read_stdin;
 
@@ -65,14 +66,49 @@ impl ResponseStream {
         self.eof.load(Ordering::Relaxed)
     }
 
-    /// Block until the stream has been idle for `idle_timeout`,
-    /// discarding any frames that arrive in the meantime. Used at
-    /// exit time so that VGE Ok responses (for the trailing
-    /// UpdateCommand / DeleteElement envelopes the progress UI
-    /// emits) don't leak into the shell's stdin where readline
-    /// would echo them as `^[_vge…^[\` caret notation.
-    pub fn drain_idle(&self, idle_timeout: Duration) {
-        while self.recv_timeout(idle_timeout).is_some() {}
+    /// Round-trip a VGE `Probe` and drain any frames that arrive
+    /// before its response. Used at exit time to flush VGE Ok
+    /// responses for the trailing UpdateCommand / DeleteElement
+    /// envelopes the progress UI emitted; otherwise they leak into
+    /// the shell's stdin where zsh's zle binds `ESC _` to
+    /// `insert-last-word` and pastes the previous argv plus the
+    /// literal marker bytes (`<argv> vge <argv> vge …`).
+    ///
+    /// Since VGE guarantees one response per command in order
+    /// (spec §1.2), receiving the Probe's ProbeResponse proves
+    /// every prior command's Ok has already been read off the
+    /// wire. Returns `false` on timeout or if stdout fails.
+    pub fn vge_barrier(&self, request_id: u32, timeout: Duration) -> bool {
+        let env = vge_protocol::encode::build_envelope(&[(
+            vge_protocol::command::Command::Probe,
+            request_id,
+        )]);
+        {
+            let mut out = std::io::stdout().lock();
+            if out.write_all(&env).is_err() || out.flush().is_err() {
+                return false;
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Some(frame) = self.recv_timeout(remaining) else {
+                return false;
+            };
+            if let HostFrame::Vge {
+                frame_type,
+                request_id: rid,
+                ..
+            } = frame
+                && rid == request_id
+                && frame_type == vge_protocol::frame::RSP_PROBE
+            {
+                return true;
+            }
+        }
     }
 }
 

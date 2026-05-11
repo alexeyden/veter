@@ -218,11 +218,16 @@ fn main() -> Result<()> {
         resolved_path,
         local_path.display()
     ))?;
-    // Absorb any in-flight VGE Ok responses for the trailing
-    // progress-bar envelopes; otherwise they land on the shell's
-    // stdin after we exit and readline prints them as caret
-    // notation.
-    stream.drain_idle(Duration::from_millis(100));
+    // VGE responses for the trailing UpdateCommand / DeleteElement
+    // envelopes the progress UI emitted are still in flight; if
+    // they land on the shell's stdin after we exit, zsh's zle
+    // interprets `ESC _` as `insert-last-word` and pastes our argv
+    // back onto the next prompt. Round-trip a VGE Probe to flush
+    // them deterministically (VGE spec §1.2: one response per
+    // command, in order).
+    if !cli.no_progress && vge_probe.is_some() {
+        stream.vge_barrier(begin_rid.wrapping_add(1), Duration::from_secs(2));
+    }
     Ok(())
 }
 
