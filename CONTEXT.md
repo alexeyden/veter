@@ -6,9 +6,8 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: dirty (Commit D plus this doc update). Branch:
-`master`. The build is green and the full workspace test suite
-passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: clean. Branch: `master`. The build is green and the
+full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -41,7 +40,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `cf34bbf` | doc: CONTEXT.md: log Commit A and B |
 | `a832110` | feat: veterd: detach hotkey Ctrl+\\ then d |
 | `6c7dad7` | doc: CONTEXT.md: mark Commit C as landed |
-| *(uncommitted)* | feat: veterd: upstream VGE/PRT probe at attach (Commit D) |
+| `840adcf` | feat: veterd: upstream VGE/PRT probe + winsize at attach time |
 
 ### Snapshot serializers (the core)
 
@@ -217,7 +216,7 @@ and snapshot replay still contains the session's prior output.
 Configurability via env var is deferred — the architecture doc
 called this out as fine for v1.
 
-### Commit D — upstream VGE/PRT probe + winsize handover (uncommitted, working tree)
+### Commit D — upstream VGE/PRT probe + winsize handover (committed)
 
 Files added/changed:
 
