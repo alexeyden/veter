@@ -45,7 +45,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `6c7dad7` | doc: CONTEXT.md: mark Commit C as landed |
 | `840adcf` | feat: veterd: upstream VGE/PRT probe + winsize at attach time |
 | `fe9e657` | doc: CONTEXT.md: mark Commit D as landed |
-| *(uncommitted)* | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll (Commit E) |
+| `dc35a2a` | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll |
 
 ### Snapshot serializers (the core)
 
@@ -259,7 +259,7 @@ End-to-end smoke tests verified:
   forwarded to the inner PTY after the probe phase ends; an
   echoing bash session sees them and replies as usual.
 
-### Commit E — mid-attach SIGWINCH via TIOCGWINSZ poll (uncommitted, working tree)
+### Commit E — mid-attach SIGWINCH via TIOCGWINSZ poll (committed)
 
 The daemon doesn't share a controlling tty with the renderer's PTY
 slave, so the kernel never delivers `SIGWINCH` to us. Instead,
