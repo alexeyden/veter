@@ -488,7 +488,6 @@ impl VgeEngine {
     pub fn serialize_state(&self) -> Vec<u8> {
         let mut frames: Vec<(Command, u32)> = Vec::new();
         let state = &self.state;
-        let current = state.current();
 
         // 1. Image table — UploadImage per entry. We only have the
         //    decoded RGBA8 pixels, so emit as Raw.

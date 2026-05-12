@@ -1,9 +1,7 @@
-mod clipboard;
-mod prt;
-mod pty;
-mod renderer;
-mod vft;
-mod vge;
+// Modules live in the library face (see `src/lib.rs`); the binary
+// re-imports them for in-file references. veterd and other workspace
+// crates pull the same code through `veter::*`.
+use veter::{clipboard, prt, pty, renderer, vft, vge};
 
 use std::io::Read;
 use std::num::NonZeroU32;
