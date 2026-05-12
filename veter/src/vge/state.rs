@@ -453,6 +453,75 @@ impl VgeEngine {
         self.line_tracker.history_cap
     }
 
+    /// Serialize the engine's current state as a wire-ready APC
+    /// envelope (or chain of envelopes) of VGE commands. Feeding the
+    /// result into a fresh `VgeEngine` of matching probe capabilities
+    /// reproduces the image table, global style table, and currently-
+    /// active element set.
+    ///
+    /// Intended for veterd attach-time replay
+    /// (`doc/session-manager.md` §4). The caller is responsible for
+    /// having replayed the vt100 grid + scrollback first so the
+    /// receiver's `top_of_live_screen` matches the value captured
+    /// here at snapshot time — top-level element origins are
+    /// computed relative to that.
+    ///
+    /// v1 limitations (called out in the doc):
+    /// - Only the currently-active screen's element set is emitted.
+    ///   Suspended alt/main set state is dropped.
+    /// - Images are emitted as Raw RGBA8 regardless of how they were
+    ///   uploaded; the original encoded bytes (e.g. WebP) aren't
+    ///   retained on the engine. This inflates a 50 KiB WebP avatar
+    ///   to `width*height*4` bytes on every replay.
+    pub fn serialize_state(&self) -> Vec<u8> {
+        let mut frames: Vec<(Command, u32)> = Vec::new();
+        let state = &self.state;
+        let current = state.current();
+
+        // 1. Image table — UploadImage per entry. We only have the
+        //    decoded RGBA8 pixels, so emit as Raw.
+        for (id, img) in &state.shared.images {
+            let mut data = Vec::with_capacity(img.pixels.len() * 4);
+            for px in &img.pixels {
+                data.push(px.r);
+                data.push(px.g);
+                data.push(px.b);
+                data.push(px.a);
+            }
+            frames.push((
+                Command::UploadImage(UploadImageBody {
+                    id: id.clone(),
+                    encoding: 0x01,
+                    width: img.width,
+                    height: img.height,
+                    data,
+                }),
+                0,
+            ));
+        }
+
+        // 2. Global style table.
+        for (id, style) in &state.shared.styles {
+            frames.push((
+                Command::SetGlobalStyle {
+                    id: id.clone(),
+                    style: style.clone(),
+                },
+                0,
+            ));
+        }
+
+        // 3. Elements. Top-level in (draw_order, creation_seq) order,
+        //    each followed by its full subtree in the same order, so
+        //    every parent is created before its children.
+        let top_offset = self.line_tracker.top_of_live_screen;
+        for top in state.top_level_sorted() {
+            emit_element_subtree(top, state, top_offset, &mut frames);
+        }
+
+        vge_protocol::encode::build_envelope(&frames)
+    }
+
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that
     /// should be forwarded to vt100. Any complete VGE envelopes are
     /// processed and their responses queued in `take_responses()`.
@@ -1134,6 +1203,56 @@ impl VgeEngine {
     fn queue_envelope(&mut self, frames_buf: Vec<u8>) {
         let env = wrap_envelope(&frames_buf);
         self.pending_response_bytes.extend_from_slice(&env);
+    }
+}
+
+/// Walk `el`'s subtree and append `CreateElement` frames in
+/// (draw_order, creation_seq) order, parents before children. Used
+/// by [`VgeEngine::serialize_state`]. Top-level origins are
+/// reconstructed from the engine's `top_offset` so the receiver
+/// computes the same `anchor_line` when this stream replays into
+/// a vt100 with matching scrollback height.
+fn emit_element_subtree(
+    el: &Element,
+    state: &VgeState,
+    top_offset: i64,
+    frames: &mut Vec<(Command, u32)>,
+) {
+    let id_for_wire = el.id.clone().unwrap_or_default();
+    let origin = if el.parent.is_some() {
+        Point {
+            x: el.origin_x,
+            y: el.origin_y,
+        }
+    } else {
+        Point {
+            x: el.origin_x,
+            y: (el.anchor_line - top_offset) as f32 + el.sub_row,
+        }
+    };
+    frames.push((
+        Command::CreateElement(CreateElementBody {
+            id: id_for_wire,
+            commands: el.commands.clone(),
+            origin,
+            is_visible: el.is_visible,
+            draw_order: el.draw_order,
+            parent: el.parent.clone(),
+            size: el.clip_size,
+        }),
+        0,
+    ));
+
+    // Recurse into children, in (draw_order, creation_seq) order so
+    // the receiver's tie-breaks match ours.
+    let mut kids: Vec<&Element> = el
+        .children
+        .iter()
+        .filter_map(|k| state.current().elements.get(k))
+        .collect();
+    kids.sort_by_key(|c| (c.draw_order, c.creation_seq));
+    for child in kids {
+        emit_element_subtree(child, state, top_offset, frames);
     }
 }
 
@@ -2158,6 +2277,193 @@ mod tests {
         let reply = engine.take_responses();
         let s = std::str::from_utf8(&reply).unwrap();
         assert_eq!(s, "\x1b[5;12R");
+    }
+
+    // --- snapshot/replay roundtrip tests ------------------------------
+
+    /// Build a CreateElement body with a single FillRectangles command
+    /// using a flat RGBA color, no parent, no clip.
+    fn create_top_level_rect(
+        id: &str,
+        origin_x: f32,
+        origin_y: f32,
+        draw_order: i32,
+        color_g: u8,
+    ) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.varu(1); // n_commands
+        w.u8(OP_FILL_RECTANGLES);
+        // Style: Flat RGBA8888
+        w.u8(STYLE_FLAT);
+        w.u8(0x01); // RGBA8888
+        w.u8(0x00);
+        w.u8(color_g);
+        w.u8(0x00);
+        w.u8(0xFF);
+        w.varu(1); // n_rects
+        w.f32(0.0);
+        w.f32(0.0);
+        w.f32(2.0);
+        w.f32(1.0);
+        // origin
+        w.f32(origin_x);
+        w.f32(origin_y);
+        // is_visible
+        w.u8(1);
+        // draw_order
+        for b in draw_order.to_le_bytes() {
+            w.u8(b);
+        }
+        w.buf
+    }
+
+    /// Build a CreateElement for a child of `parent_id`.
+    fn create_child_rect(
+        id: &str,
+        parent_id: &str,
+        origin_x: f32,
+        origin_y: f32,
+        draw_order: i32,
+    ) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.varu(1);
+        w.u8(OP_FILL_RECTANGLES);
+        w.u8(STYLE_FLAT);
+        w.u8(0x01);
+        w.u8(0xFF);
+        w.u8(0xFF);
+        w.u8(0x00);
+        w.u8(0xFF);
+        w.varu(1);
+        w.f32(0.0);
+        w.f32(0.0);
+        w.f32(1.0);
+        w.f32(1.0);
+        w.f32(origin_x);
+        w.f32(origin_y);
+        w.u8(1);
+        for b in draw_order.to_le_bytes() {
+            w.u8(b);
+        }
+        // extra_flags: bit0 = has_parent
+        w.u8(0b0000_0001);
+        w.str(parent_id);
+        w.buf
+    }
+
+    /// Build a `SetGlobalStyle` body for a flat RGBA8 color.
+    fn set_global_style_flat(id: &str, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.u8(STYLE_FLAT);
+        w.u8(0x01); // RGBA8888
+        w.u8(r);
+        w.u8(g);
+        w.u8(b);
+        w.u8(a);
+        w.buf
+    }
+
+    /// Snapshot engine A, replay into a fresh engine B, and confirm
+    /// the relevant state has been reproduced.
+    #[test]
+    fn serialize_state_roundtrips_images_styles_and_top_level_elements() {
+        let mut a = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        append_command(
+            &mut frames,
+            CMD_SET_GLOBAL_STYLE,
+            2,
+            &set_global_style_flat("accent", 0, 200, 50, 255),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_top_level_rect("rectA", 1.0, 2.5, 5, 200),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            4,
+            &create_top_level_rect("rectB", 3.0, 4.0, 10, 100),
+        );
+        a.process_pty_chunk(&build_envelope(&frames));
+        let _ = a.take_responses();
+
+        let snapshot = a.serialize_state();
+
+        let mut b = VgeEngine::new((9, 20), 1.0);
+        let passthrough = b.process_pty_chunk(&snapshot);
+        assert!(passthrough.is_empty(), "snapshot must not leak to vt100");
+        let _ = b.take_responses();
+
+        // Image table copied.
+        assert_eq!(b.state.shared.images.len(), 1);
+        let img = b.state.shared.images.get("logo").unwrap();
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(img.pixels.len(), 4);
+        // Style table copied.
+        assert_eq!(b.state.shared.styles.len(), 1);
+        // Elements copied with correct order.
+        assert_eq!(b.state.elements().len(), 2);
+        let a_rect_a = a.state.elements().get("rectA").unwrap();
+        let b_rect_a = b.state.elements().get("rectA").unwrap();
+        assert_eq!(a_rect_a.draw_order, b_rect_a.draw_order);
+        assert_eq!(a_rect_a.anchor_line, b_rect_a.anchor_line);
+        assert!((a_rect_a.sub_row - b_rect_a.sub_row).abs() < 1e-3);
+        assert_eq!(a_rect_a.is_visible, b_rect_a.is_visible);
+    }
+
+    #[test]
+    fn serialize_state_roundtrips_parent_child_subtree() {
+        let mut a = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_top_level_rect("parent", 0.0, 0.0, 0, 100),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_child_rect("child", "parent", 1.5, 2.5, 3),
+        );
+        a.process_pty_chunk(&build_envelope(&frames));
+        let _ = a.take_responses();
+
+        let mut b = VgeEngine::new((9, 20), 1.0);
+        b.process_pty_chunk(&a.serialize_state());
+        let _ = b.take_responses();
+
+        // Both elements present, parent relationship preserved.
+        let parent = b.state.elements().get("parent").unwrap();
+        let child = b.state.elements().get("child").unwrap();
+        assert_eq!(child.parent.as_deref(), Some("parent"));
+        assert!(parent.children.iter().any(|k| k == "child"));
+        assert_eq!(child.draw_order, 3);
+        // Child origin is parent-relative; should round-trip verbatim.
+        assert!((child.origin_x - 1.5).abs() < 1e-3);
+        assert!((child.origin_y - 2.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn serialize_state_empty_engine_produces_no_op_replay() {
+        let a = VgeEngine::new((9, 20), 1.0);
+        let snapshot = a.serialize_state();
+
+        let mut b = VgeEngine::new((9, 20), 1.0);
+        b.process_pty_chunk(&snapshot);
+        let _ = b.take_responses();
+
+        assert!(b.state.elements().is_empty());
+        assert!(b.state.shared.images.is_empty());
+        assert!(b.state.shared.styles.is_empty());
     }
 }
 
