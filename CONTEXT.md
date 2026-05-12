@@ -6,14 +6,14 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: dirty (Commit C plus this doc update). Branch:
-`master`. The build is green and the full workspace test suite
-passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
-`kill` / `kill-server` over the Unix socket, plus `attach <name>`
-with `SCM_RIGHTS` stdio handover that replays a vt100 + VGE + PRT
-snapshot, live-forwards subsequent inner-program output to the
-renderer, and detaches cleanly on the `Ctrl+\` + `d` hotkey while
-leaving the session running for a later re-attach.
+Working tree: clean. Branch: `master`. The build is green and the
+full workspace test suite passes (`cargo test`). End-to-end
+smoke-tested: `new` / `list` / `kill` / `kill-server` over the Unix
+socket, plus `attach <name>` with `SCM_RIGHTS` stdio handover that
+replays a vt100 + VGE + PRT snapshot, live-forwards subsequent
+inner-program output to the renderer, and detaches cleanly on the
+`Ctrl+\` + `d` hotkey while leaving the session running for a
+later re-attach.
 
 ## What's done
 
@@ -34,7 +34,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `9855a75` | feat: veterd: per-session host engines + PTY worker thread |
 | `0564ee8` | feat: veterd: attach with snapshot replay over SCM_RIGHTS |
 | `cf34bbf` | doc: CONTEXT.md: log Commit A and B |
-| *(next)* | feat: veterd: detach hotkey Ctrl+\\ d (Commit C) |
+| `a832110` | feat: veterd: detach hotkey Ctrl+\\ then d |
 
 ### Snapshot serializers (the core)
 
@@ -188,7 +188,7 @@ list):
 - **No resize handling.** The daemon doesn't observe SIGWINCH on
   its inherited stdio; the inner PTY stays at 24×80.
 
-### Commit C — detach hotkey (uncommitted, working tree)
+### Commit C — detach hotkey (committed)
 
 Hardcoded `Ctrl+\` (`0x1C`) + `d` (`0x64`). Lives in
 `attach::DetachScanner` (state machine) and is plumbed into the
