@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vmux vsend vrecv
+PACKAGES := veter vcat vmux vsend vrecv veterd
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
