@@ -169,7 +169,7 @@ impl Portal {
     /// PRT engine right before removing the portal from its scope, so
     /// the renderer can `canvas.delete_image()` each ID and the
     /// femtovg cache doesn't leak when a portal goes away.
-    pub fn drain_for_destroy(&mut self) -> Vec<femtovg::ImageId> {
+    pub fn drain_for_destroy(&mut self) -> Vec<crate::vge::GpuImageId> {
         let mut deletes = Vec::new();
         // Already-scheduled deletes from in-flight DropImage commands.
         deletes.extend(self.vge.take_pending_image_deletes());

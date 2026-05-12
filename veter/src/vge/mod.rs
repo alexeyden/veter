@@ -5,7 +5,7 @@
 pub mod render;
 pub mod state;
 
-pub use state::{VgeEngine, VgeState};
+pub use state::{GpuImageId, VgeEngine, VgeState};
 
 // Re-export the wire-format crate so existing call sites don't need to
 // know about the split.

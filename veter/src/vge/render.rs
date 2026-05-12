@@ -514,6 +514,7 @@ fn render_cmd<T: Renderer>(
 
             let paint = ensure_image_paint(
                 canvas,
+                renderer,
                 images,
                 image_id,
                 target_x,
@@ -528,9 +529,12 @@ fn render_cmd<T: Renderer>(
 
 /// Resolve an image id to a femtovg `Paint::image(...)`. Lazy-creates
 /// the GPU texture on first use; falls back to magenta on missing or
-/// failed-to-create images.
+/// failed-to-create images. The renderer-side `GpuImageId` mapping
+/// is owned by `TerminalRenderer` so the engine state stays GUI-free
+/// (host engines store only the opaque `GpuImageId`).
 fn ensure_image_paint<T: Renderer>(
     canvas: &mut Canvas<T>,
+    renderer: &mut TerminalRenderer,
     images: &HashMap<String, UploadedImage>,
     image_id: &str,
     target_x: f32,
@@ -545,7 +549,7 @@ fn ensure_image_paint<T: Renderer>(
             return Paint::color(MAGENTA);
         }
     };
-    let id = match img.gpu.get() {
+    let femto_id = match img.gpu.get().and_then(|gpu| renderer.lookup_gpu_image(gpu)) {
         Some(id) => id,
         None => {
             let src = ImageSource::from(ImgRef::new(
@@ -554,9 +558,10 @@ fn ensure_image_paint<T: Renderer>(
                 img.height as usize,
             ));
             match canvas.create_image(src, ImageFlags::empty()) {
-                Ok(id) => {
-                    img.gpu.set(Some(id));
-                    id
+                Ok(femto_id) => {
+                    let gpu = renderer.register_gpu_image(femto_id);
+                    img.gpu.set(Some(gpu));
+                    femto_id
                 }
                 Err(e) => {
                     eprintln!("vge: create_image failed for `{image_id}`: {e}");
@@ -570,7 +575,7 @@ fn ensure_image_paint<T: Renderer>(
     // parameter names `cx`/`cy` are misleading), and (width, height)
     // is the size of one image tile. Anchor at the target rect's
     // top-left so the image fills the rect exactly.
-    Paint::image(id, target_x, target_y, target_w, target_h, 0.0, 1.0)
+    Paint::image(femto_id, target_x, target_y, target_w, target_h, 0.0, 1.0)
 }
 
 fn polygon_path(

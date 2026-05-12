@@ -225,7 +225,7 @@ pub struct PrtEngine {
     /// queued. Drained per frame by the renderer via
     /// `take_all_pending_image_deletes` so femtovg's GPU cache stays
     /// in sync with the CPU side.
-    pending_image_deletes: Vec<femtovg::ImageId>,
+    pending_image_deletes: Vec<crate::vge::GpuImageId>,
     /// Decoded OSC 52 set payloads observed in any portal's vt100 in
     /// this engine's subtree. Buffered alongside the regular
     /// `EVT_CLIPBOARD_OP` emission so the host (`App`) can apply them
@@ -304,8 +304,8 @@ impl PrtEngine {
     ///
     /// Caller (renderer) is responsible for `canvas.delete_image(id)`
     /// on each ID.
-    pub fn take_all_pending_image_deletes(&mut self) -> Vec<femtovg::ImageId> {
-        let mut deletes: Vec<femtovg::ImageId> =
+    pub fn take_all_pending_image_deletes(&mut self) -> Vec<crate::vge::GpuImageId> {
+        let mut deletes: Vec<crate::vge::GpuImageId> =
             std::mem::take(&mut self.pending_image_deletes);
         Self::collect_pending_from_set(&mut self.state.main, &mut deletes);
         if let Some(alt) = &mut self.state.alt {
@@ -316,7 +316,7 @@ impl PrtEngine {
 
     fn collect_pending_from_set(
         set: &mut PortalSet,
-        out: &mut Vec<femtovg::ImageId>,
+        out: &mut Vec<crate::vge::GpuImageId>,
     ) {
         for portal in set.portals.values_mut() {
             out.extend(portal.vge.take_pending_image_deletes());
@@ -329,8 +329,8 @@ impl PrtEngine {
     /// by `Portal::drain_for_destroy` when a parent portal is being
     /// torn down so all the per-portal VGE engines below it surrender
     /// their handles in one pass.
-    pub fn take_subtree_for_destroy(&mut self) -> Vec<femtovg::ImageId> {
-        let mut deletes: Vec<femtovg::ImageId> =
+    pub fn take_subtree_for_destroy(&mut self) -> Vec<crate::vge::GpuImageId> {
+        let mut deletes: Vec<crate::vge::GpuImageId> =
             std::mem::take(&mut self.pending_image_deletes);
         for portal in self.state.main.portals.values_mut() {
             deletes.extend(portal.drain_for_destroy());
@@ -2967,7 +2967,7 @@ mod tests {
         // Build host → outer "A" → sub-portal "X". DeletePortal("A")
         // must walk the subtree, drain GPU IDs, and route them through
         // PrtEngine::pending_image_deletes for the renderer to free.
-        // Without real GPU IDs (femtovg::ImageId is opaque), we can't
+        // Without real renderer-assigned GpuImageIds (the host engine
         // assert non-empty contents, but we CAN assert the machinery
         // runs without panicking and yields a Vec on the next drain.
         let mut engine = PrtEngine::new();

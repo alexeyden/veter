@@ -1219,10 +1219,10 @@ impl ApplicationHandler for App {
                     // / clear / scope_reset / 2J / 3J / scrollback
                     // eviction / alt-swap leave).
                     for gpu_id in engine.take_pending_image_deletes() {
-                        canvas.delete_image(gpu_id);
+                        tr.release_gpu_image(canvas, gpu_id);
                     }
                     for gpu_id in prt.take_all_pending_image_deletes() {
-                        canvas.delete_image(gpu_id);
+                        tr.release_gpu_image(canvas, gpu_id);
                     }
 
                     // Probe actual scrollback buffer size (no public accessor)

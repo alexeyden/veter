@@ -906,6 +906,13 @@ pub struct TerminalRenderer {
     ascent: f32,
     scale_cx: ScaleContext,
     glyph_cache: GlyphCache,
+
+    // VGE image bookkeeping. The host engines store `GpuImageId`
+    // (opaque, renderer-defined); the renderer maintains the
+    // mapping from those to its own GPU texture handles so the
+    // engine state stays GUI-free.
+    gpu_image_handles: HashMap<crate::vge::GpuImageId, femtovg::ImageId>,
+    next_gpu_image_id: u64,
 }
 
 impl TerminalRenderer {
@@ -979,6 +986,42 @@ impl TerminalRenderer {
             ascent,
             scale_cx: ScaleContext::new(),
             glyph_cache: GlyphCache::new(),
+            gpu_image_handles: HashMap::new(),
+            next_gpu_image_id: 0,
+        }
+    }
+
+    /// Allocate a fresh `GpuImageId` and record the renderer-side
+    /// femtovg handle it maps to.
+    pub fn register_gpu_image(
+        &mut self,
+        femto_id: femtovg::ImageId,
+    ) -> crate::vge::GpuImageId {
+        let gpu = crate::vge::GpuImageId(self.next_gpu_image_id);
+        self.next_gpu_image_id += 1;
+        self.gpu_image_handles.insert(gpu, femto_id);
+        gpu
+    }
+
+    /// Look up the femtovg handle for a `GpuImageId`, if registered.
+    pub fn lookup_gpu_image(
+        &self,
+        gpu: crate::vge::GpuImageId,
+    ) -> Option<femtovg::ImageId> {
+        self.gpu_image_handles.get(&gpu).copied()
+    }
+
+    /// Release a renderer-side image. The host engine drains its
+    /// `pending_image_deletes` queue and asks the renderer to free
+    /// each entry; the renderer translates back to its private
+    /// femtovg handle and calls `delete_image`.
+    pub fn release_gpu_image<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        gpu: crate::vge::GpuImageId,
+    ) {
+        if let Some(femto_id) = self.gpu_image_handles.remove(&gpu) {
+            canvas.delete_image(femto_id);
         }
     }
 

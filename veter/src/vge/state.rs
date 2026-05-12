@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use femtovg::ImageId;
 use rgb::RGBA8;
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::{Point, Reader};
@@ -44,19 +43,31 @@ impl Default for Limits {
     }
 }
 
+/// Opaque renderer-side image handle. The host engine assigns and
+/// stores these but never inspects them; the renderer maintains a
+/// private mapping from `GpuImageId` to its own GPU texture handle
+/// (e.g. `femtovg::ImageId`) and is responsible for creating /
+/// deleting the GPU resource on the engine's behalf.
+///
+/// Decoupling from any particular renderer type keeps the host
+/// engines GUI-free so the same code can run inside a headless
+/// `veterd` process (see `doc/session-manager.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GpuImageId(pub u64);
+
 /// An uploaded image, kept in CPU memory as straight-alpha RGBA8 plus a
-/// lazily-populated femtovg texture handle. The GPU side is created the
+/// lazily-populated renderer texture handle. The GPU side is created the
 /// first time the renderer encounters this image; `DropImage` queues
 /// `gpu` for deletion on the next frame.
 ///
-/// `gpu` is `Cell<Option<ImageId>>` so the renderer can populate it
+/// `gpu` is `Cell<Option<GpuImageId>>` so the renderer can populate it
 /// while only holding a `&VgeState` (the renderer doesn't need any
-/// other mutation, and `ImageId` is `Copy`).
+/// other mutation, and `GpuImageId` is `Copy`).
 pub struct UploadedImage {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<RGBA8>,
-    pub gpu: Cell<Option<ImageId>>,
+    pub gpu: Cell<Option<GpuImageId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +246,7 @@ impl VgeState {
     /// Wipe everything for §5.6 reset (RIS / DECSTR). Returns any GPU
     /// image handles whose CPU-side counterparts are now gone, so the
     /// caller can free them on the canvas.
-    pub fn reset(&mut self) -> Vec<femtovg::ImageId> {
+    pub fn reset(&mut self) -> Vec<GpuImageId> {
         let mut deletes = Vec::new();
         for (_, img) in self.shared.images.drain() {
             if let Some(gpu) = img.gpu.get() {
@@ -389,10 +400,11 @@ pub struct VgeEngine {
     scale_factor: f32,
     line_tracker: LineTracker,
     pending_response_bytes: Vec<u8>,
-    /// femtovg image handles for uploaded images that have been dropped
+    /// Renderer image handles for uploaded images that have been dropped
     /// but whose GPU resources still need releasing. The renderer drains
-    /// this on each frame.
-    pending_image_deletes: Vec<ImageId>,
+    /// this on each frame and translates each `GpuImageId` to its own
+    /// GPU texture handle to call `delete_image` (or equivalent).
+    pending_image_deletes: Vec<GpuImageId>,
     /// Number of `\x1b[6n` DSR cursor-position queries seen in the
     /// byte stream that haven't been answered yet. We need to wait
     /// until vt100 has processed the chunk so the reply reflects
@@ -431,7 +443,7 @@ impl VgeEngine {
 
     /// Hand off any image GPU handles whose owners have been dropped.
     /// The renderer should call `canvas.delete_image(id)` for each.
-    pub fn take_pending_image_deletes(&mut self) -> Vec<ImageId> {
+    pub fn take_pending_image_deletes(&mut self) -> Vec<GpuImageId> {
         std::mem::take(&mut self.pending_image_deletes)
     }
 
