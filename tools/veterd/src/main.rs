@@ -23,6 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 mod daemon;
+mod engines;
 mod ipc;
 mod session;
 

@@ -2,12 +2,13 @@
 //!
 //! A session owns the inner PTY and the child process running on its
 //! slave side (default `$SHELL`). The daemon keeps these alive across
-//! renderer attach/detach cycles. Future commits (task #6) extend
-//! this struct with the per-session host engines (vt100 / PRT / VGE)
-//! that parse the PTY output to keep an authoritative state model
-//! for snapshot replay.
+//! renderer attach/detach cycles. Per-session host engines (vt100 /
+//! PRT / VGE) parse the PTY output continuously via the worker thread
+//! in [`crate::engines`], so the attach path can replay an
+//! authoritative state snapshot when a renderer connects.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -17,12 +18,14 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, Pid};
 use std::ffi::CString;
 
+use crate::engines::{spawn_worker, EngineState};
+
 pub struct Session {
     pub name: String,
     /// Master side of the inner PTY. Used by task #6's attach path
-    /// to splice bytes between the daemon and the connected
-    /// renderer. The skeleton holds onto it so the slave doesn't
-    /// see EOF on its end.
+    /// to splice renderer-stdin bytes into the inner program. The
+    /// worker thread holds its own dup for reads and engine-response
+    /// writes; this fd stays around so closing it can drop the slave.
     #[allow(dead_code)]
     pub master: OwnedFd,
     pub child: Pid,
@@ -30,6 +33,11 @@ pub struct Session {
     /// Whether a renderer is currently attached. Reserved for task #6
     /// — the skeleton never flips this from `false`.
     pub attached: bool,
+    /// Authoritative host engine state. The worker thread holds the
+    /// other Arc and mutates this under the lock; the daemon's accept
+    /// loop will lock it on attach to serialize a snapshot.
+    #[allow(dead_code)]
+    pub engines: Arc<Mutex<EngineState>>,
 }
 
 impl Session {
@@ -53,13 +61,26 @@ impl Session {
         let fork = unsafe { forkpty(Some(&winsize), None) }
             .with_context(|| "forkpty failed")?;
         match fork {
-            ForkptyResult::Parent { child, master } => Ok(Self {
-                name,
-                master,
-                child,
-                created_at: Instant::now(),
-                attached: false,
-            }),
+            ForkptyResult::Parent { child, master } => {
+                let engines = match spawn_worker(&master) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // We've already forked; reap the child so it
+                        // doesn't leak into the daemon's process table.
+                        let _ = kill(child, Signal::SIGKILL);
+                        let _ = waitpid(child, None);
+                        return Err(e.context("spawning session worker thread"));
+                    }
+                };
+                Ok(Self {
+                    name,
+                    master,
+                    child,
+                    created_at: Instant::now(),
+                    attached: false,
+                    engines,
+                })
+            }
             ForkptyResult::Child => {
                 // Build the argv as C strings up front (allocations
                 // are non-signal-safe but we're past the fork point
