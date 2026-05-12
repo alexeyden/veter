@@ -1,0 +1,15 @@
+[package]
+name = "veterd"
+version = "0.1.0"
+edition = "2024"
+description = "Persistent veter session daemon — holds host vt100 / PRT / VGE state across renderer disconnects (see doc/session-manager.md)."
+
+[dependencies]
+veter = { path = "../../veter" }
+vt100 = { path = "../../vt100" }
+prt-protocol = { path = "../../prt-protocol" }
+vge-protocol = { path = "../../vge-protocol" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["term", "poll", "process", "signal", "fs", "socket", "user"] }
+libc = "0.2"

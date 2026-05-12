@@ -1283,7 +1283,7 @@ impl PrtEngine {
     /// silently capped.
     ///
     /// The Ok body echoes:
-    /// ```
+    /// ```text
     /// u32 applied_lines    ; offset actually in effect after clamping
     /// u32 history_depth    ; rows currently held in the portal's
     ///                      ; scrollback ring (sized by inner program
