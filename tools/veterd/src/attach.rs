@@ -150,21 +150,110 @@ fn handler_main(
     result
 }
 
+/// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 veterd
+/// owns the trigger, not local vmux; `Ctrl+\` is distinct from
+/// vmux's default `Ctrl+Space` so the two can never collide.
+const DETACH_PREFIX: u8 = 0x1C; // Ctrl+\
+const DETACH_SECOND: u8 = b'd';
+
+/// Outcome of feeding one chunk of renderer-stdin bytes through the
+/// detach-hotkey state machine.
+struct ScanOutput {
+    /// Bytes ready to be written to the inner PTY master.
+    forward: Vec<u8>,
+    /// True if the chunk contained the detach sequence; the caller
+    /// should write `forward` (the bytes that arrived before the
+    /// trigger) and then exit the splice loop cleanly.
+    detach: bool,
+}
+
+/// State carried between chunks of renderer-stdin so the prefix
+/// scan works even if the user types `Ctrl+\` and `d` arrive in
+/// separate reads.
+#[derive(Default)]
+struct DetachScanner {
+    /// True iff the *last* byte we saw was the detach prefix and we
+    /// haven't yet decided what to do with it — i.e. we owe the
+    /// inner PTY one prefix byte unless the next byte cancels it
+    /// (which only happens for `d`).
+    pending_prefix: bool,
+}
+
+impl DetachScanner {
+    /// Feed one chunk of renderer-stdin bytes and split them into
+    /// "forward to inner PTY" and "detach detected" outputs.
+    ///
+    /// Trade-off: a lone `Ctrl+\` does not reach the inner PTY
+    /// until the user types something afterwards. This is the same
+    /// shape as tmux/screen prefix keys; the follow-up byte is
+    /// usually right behind.
+    fn feed(&mut self, chunk: &[u8]) -> ScanOutput {
+        let mut out = Vec::with_capacity(chunk.len() + 1);
+        for &b in chunk {
+            if self.pending_prefix {
+                if b == DETACH_SECOND {
+                    self.pending_prefix = false;
+                    return ScanOutput { forward: out, detach: true };
+                }
+                // Not a detach — release the buffered prefix.
+                out.push(DETACH_PREFIX);
+                if b == DETACH_PREFIX {
+                    // Another prefix arrived immediately; stay
+                    // pending for the next byte.
+                    self.pending_prefix = true;
+                } else {
+                    out.push(b);
+                    self.pending_prefix = false;
+                }
+            } else if b == DETACH_PREFIX {
+                self.pending_prefix = true;
+            } else {
+                out.push(b);
+            }
+        }
+        ScanOutput { forward: out, detach: false }
+    }
+
+    /// On stdin EOF, flush any buffered prefix so the inner PTY
+    /// sees the byte the user typed (writes to a dying tty are
+    /// benign).
+    fn flush_on_eof(&mut self) -> Option<u8> {
+        if std::mem::take(&mut self.pending_prefix) {
+            Some(DETACH_PREFIX)
+        } else {
+            None
+        }
+    }
+}
+
 /// Renderer-stdin → inner-PTY-master forwarding loop. Returns on EOF
-/// of stdin (renderer disconnected cleanly) or on write error
-/// (inner program gone).
+/// of stdin (renderer disconnected cleanly), on write error (inner
+/// program gone), or when the [`DetachScanner`] fires.
 fn splice_input(stdin_fd: OwnedFd, master_writer_fd: OwnedFd) -> Result<()> {
     let mut reader = std::fs::File::from(stdin_fd);
     let writer_raw = master_writer_fd.as_raw_fd();
     let mut buf = [0u8; 4096];
+    let mut scanner = DetachScanner::default();
     loop {
         let n = match reader.read(&mut buf) {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                if let Some(b) = scanner.flush_on_eof() {
+                    let _ = write_all_raw(writer_raw, &[b]);
+                }
+                return Ok(());
+            }
             Ok(n) => n,
             Err(e) => return Err(anyhow!("renderer stdin read: {e}")),
         };
-        write_all_raw(writer_raw, &buf[..n])
-            .with_context(|| "writing renderer input to inner PTY")?;
+
+        let out = scanner.feed(&buf[..n]);
+        if !out.forward.is_empty() {
+            write_all_raw(writer_raw, &out.forward)
+                .with_context(|| "writing renderer input to inner PTY")?;
+        }
+        if out.detach {
+            return Ok(());
+        }
     }
 }
 
@@ -182,4 +271,92 @@ fn write_all_raw(raw: std::os::fd::RawFd, mut data: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_chunks(chunks: &[&[u8]]) -> (Vec<u8>, bool) {
+        let mut s = DetachScanner::default();
+        let mut forwarded = Vec::new();
+        for chunk in chunks {
+            let out = s.feed(chunk);
+            forwarded.extend_from_slice(&out.forward);
+            if out.detach {
+                return (forwarded, true);
+            }
+        }
+        if let Some(b) = s.flush_on_eof() {
+            forwarded.push(b);
+        }
+        (forwarded, false)
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        let (out, detached) = feed_chunks(&[b"hello world\n"]);
+        assert_eq!(out, b"hello world\n");
+        assert!(!detached);
+    }
+
+    #[test]
+    fn single_prefix_then_normal_byte_passes_both_through() {
+        let (out, detached) = feed_chunks(&[&[DETACH_PREFIX, b'x']]);
+        assert_eq!(out, &[DETACH_PREFIX, b'x']);
+        assert!(!detached);
+    }
+
+    #[test]
+    fn detach_in_one_chunk() {
+        let (out, detached) = feed_chunks(&[b"abc", &[DETACH_PREFIX, DETACH_SECOND], b"ignored"]);
+        // Bytes after the trigger are discarded along with the trigger.
+        assert_eq!(out, b"abc");
+        assert!(detached);
+    }
+
+    #[test]
+    fn detach_split_across_chunks() {
+        // Prefix arrives in chunk N, `d` in chunk N+1 — still detaches.
+        let (out, detached) = feed_chunks(&[&[DETACH_PREFIX], &[DETACH_SECOND]]);
+        assert_eq!(out, b"");
+        assert!(detached);
+    }
+
+    #[test]
+    fn prefix_then_prefix_then_letter() {
+        // First prefix has no follow-up other than another prefix —
+        // the first prefix is released, the second stays pending until
+        // resolved by `q`, which is not detach.
+        let (out, detached) = feed_chunks(&[&[DETACH_PREFIX, DETACH_PREFIX, b'q']]);
+        assert_eq!(out, &[DETACH_PREFIX, DETACH_PREFIX, b'q']);
+        assert!(!detached);
+    }
+
+    #[test]
+    fn prefix_then_prefix_then_detach_letter() {
+        // Two prefixes in a row, then `d`: first prefix releases as a
+        // normal byte, second forms the detach sequence with `d`.
+        let (out, detached) =
+            feed_chunks(&[&[DETACH_PREFIX, DETACH_PREFIX, DETACH_SECOND]]);
+        assert_eq!(out, &[DETACH_PREFIX]);
+        assert!(detached);
+    }
+
+    #[test]
+    fn dangling_prefix_flushes_on_eof() {
+        // No follow-up byte — EOF releases the buffered prefix.
+        let (out, detached) = feed_chunks(&[&[DETACH_PREFIX]]);
+        assert_eq!(out, &[DETACH_PREFIX]);
+        assert!(!detached);
+    }
+
+    #[test]
+    fn detach_consumes_letter_after_real_prefix_byte() {
+        // The bytes preceding the trigger are forwarded; the trigger
+        // itself is fully consumed.
+        let (out, detached) = feed_chunks(&[b"vim", &[DETACH_PREFIX], b"d after"]);
+        assert_eq!(out, b"vim");
+        assert!(detached);
+    }
 }

@@ -6,12 +6,14 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: clean. Branch: `master`. The build is green and the
-full workspace test suite passes (`cargo test`). End-to-end
-smoke-tested: `new` / `list` / `kill` / `kill-server` over the Unix
-socket, plus `attach <name>` with `SCM_RIGHTS` stdio handover that
-replays a vt100 + VGE + PRT snapshot and live-forwards subsequent
-inner-program output to the renderer.
+Working tree: dirty (Commit C plus this doc update). Branch:
+`master`. The build is green and the full workspace test suite
+passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+`kill` / `kill-server` over the Unix socket, plus `attach <name>`
+with `SCM_RIGHTS` stdio handover that replays a vt100 + VGE + PRT
+snapshot, live-forwards subsequent inner-program output to the
+renderer, and detaches cleanly on the `Ctrl+\` + `d` hotkey while
+leaving the session running for a later re-attach.
 
 ## What's done
 
@@ -31,6 +33,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `a212101` | chore: make: add veterd to install target |
 | `9855a75` | feat: veterd: per-session host engines + PTY worker thread |
 | `0564ee8` | feat: veterd: attach with snapshot replay over SCM_RIGHTS |
+| `cf34bbf` | doc: CONTEXT.md: log Commit A and B |
+| *(next)* | feat: veterd: detach hotkey Ctrl+\\ d (Commit C) |
 
 ### Snapshot serializers (the core)
 
@@ -184,27 +188,40 @@ list):
 - **No resize handling.** The daemon doesn't observe SIGWINCH on
   its inherited stdio; the inner PTY stays at 24×80.
 
-### Commit C — detach hotkey (todo)
+### Commit C — detach hotkey (uncommitted, working tree)
 
-Per `doc/session-manager.md` §6 the trigger is owned by veterd, not
-by local vmux. Decoder lives in the input-side splice path
-(`attach::splice_input`): scan bytes for the configured
-prefix-then-`d` sequence; on match, swallow the bytes (don't
-forward to inner PTY) and exit the splice loop cleanly. Default
-suggestion: `Ctrl+\` (`0x1C`) then `d`. Make it configurable via a
-daemon-side env var (e.g. `VETERD_DETACH_PREFIX`) or config file
-later.
+Hardcoded `Ctrl+\` (`0x1C`) + `d` (`0x64`). Lives in
+`attach::DetachScanner` (state machine) and is plumbed into the
+existing `splice_input` loop. State machine:
+
+- *Pass* — bytes flow verbatim. The prefix byte itself is not
+  forwarded yet; it transitions to *Pending*.
+- *Pending* — the next byte decides:
+    - `d` → detach (return cleanly, both prefix bytes consumed).
+    - prefix again → flush the buffered prefix, stay *Pending*.
+    - anything else → flush the buffered prefix, then the new byte,
+      return to *Pass*.
+- On stdin EOF with a buffered prefix → flush it.
+
+Eight unit tests in `attach::tests` cover the table:
+plain-text passthrough, lone prefix-then-letter, detach-in-one-chunk,
+detach-split-across-chunks, prefix-prefix-letter, prefix-prefix-d,
+EOF-flushes-prefix, prefix-followed-by-detach.
+
+End-to-end smoke test verified: attach with stdin ending in
+`\x1cd` detaches cleanly, session stays alive, re-attach succeeds
+and snapshot replay still contains the session's prior output.
+
+Configurability via env var is deferred — the architecture doc
+called this out as fine for v1.
 
 ## What's left
 
 ### #7 — Detach hotkey
 
-Now the obvious next commit (Commit C — see the staging plan
-above). The skeleton is in `attach::splice_input`; it just needs a
-small state machine that watches for the configured prefix-then-`d`
-sequence in the byte stream and cleanly exits the loop when it
-fires. Configurable via a daemon-side env var (suggest
-`VETERD_DETACH_PREFIX`); default `Ctrl+\` (`0x1C`) then `d`.
+Done (hardcoded `Ctrl+\` + `d` — see Commit C above). Making it
+configurable is the obvious follow-up; the architecture doc names a
+daemon-side env var (e.g. `VETERD_DETACH_PREFIX`).
 
 ### #8 — aarch64-musl packaging for veterd
 
