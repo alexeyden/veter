@@ -134,6 +134,64 @@ impl Row {
         }
     }
 
+    /// Stream-style serializer: emit this row's contents as bytes
+    /// without any cursor-positioning escapes. The receiver is
+    /// assumed to have its cursor at column 0 of an otherwise-blank
+    /// row of `cols` columns; the emitted bytes fill cells in order
+    /// (substituting spaces for empty cells with non-default
+    /// attributes, and trimming trailing default cells).
+    ///
+    /// `prev_attrs` is the SGR state the receiver currently has
+    /// active; this function emits diffs against it and updates it
+    /// in place so the caller can chain rows without redundant
+    /// escapes.
+    pub(crate) fn write_contents_inline(
+        &self,
+        contents: &mut Vec<u8>,
+        cols: u16,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        let default_cell = crate::Cell::new();
+        // Find the last column index that actually carries content
+        // or non-default attrs; everything past that is trimmed so
+        // we don't waste bytes on trailing blank cells.
+        let stop = match self
+            .cells
+            .iter()
+            .take(usize::from(cols))
+            .rposition(|c| c.has_contents() || c.attrs() != default_cell.attrs())
+        {
+            Some(i) => i as u16 + 1,
+            None => return,
+        };
+        let mut prev_was_wide = false;
+        for col in 0..stop {
+            let cell = &self.cells[usize::from(col)];
+            if prev_was_wide {
+                prev_was_wide = false;
+                continue;
+            }
+            // Wide-continuation cells (the right half of a wide
+            // glyph) carry no content and should be silently
+            // skipped — the wide cell itself already advances the
+            // receiver's cursor by two columns.
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            prev_was_wide = cell.is_wide();
+            let cell_attrs = cell.attrs();
+            if cell_attrs != prev_attrs {
+                cell_attrs.write_escape_code_diff(contents, prev_attrs);
+                *prev_attrs = *cell_attrs;
+            }
+            if cell.has_contents() {
+                contents.extend_from_slice(cell.contents().as_bytes());
+            } else {
+                contents.push(b' ');
+            }
+        }
+    }
+
     pub fn write_contents_formatted(
         &self,
         contents: &mut Vec<u8>,

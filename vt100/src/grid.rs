@@ -131,6 +131,12 @@ impl Grid {
         self.origin_mode = self.saved_origin_mode;
     }
 
+    /// Iterate the saved scrollback rows, oldest first. Excludes
+    /// the rows currently on the visible grid.
+    pub fn scrollback_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
+        self.scrollback.iter()
+    }
+
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
         let scrollback_len = self.scrollback.len();
         let rows_len = self.rows.len();

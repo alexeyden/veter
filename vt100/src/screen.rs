@@ -234,6 +234,54 @@ impl Screen {
         contents
     }
 
+    /// Like [`state_formatted`](Self::state_formatted), but also replays
+    /// the saved scrollback so the receiving parser ends up with the
+    /// same history rows in its scrollback buffer (subject to its own
+    /// `scrollback_len`).
+    ///
+    /// This is intended for session-handover scenarios — when a fresh
+    /// parser must be brought up to a snapshot of an existing one's
+    /// state — and is the primary entry point for the session manager
+    /// described in `doc/session-manager.md`.
+    ///
+    /// Known v1 limitations (do not preserve through the round-trip):
+    /// alternate-screen buffer state, the DECSC saved cursor, the
+    /// scrolling region, and the active G0/G1 character set.
+    /// OSC-set window/icon titles are also not emitted here — they
+    /// belong to a higher level than the vt100 grid.
+    #[must_use]
+    pub fn full_contents_formatted(&self) -> Vec<u8> {
+        let mut out = vec![];
+        let grid = self.grid();
+        let scrollback_count = grid.scrollback_rows().count();
+        if scrollback_count > 0 {
+            // Phase 1 — stream the scrollback rows so they scroll
+            // into the receiver's history. After K content rows
+            // plus (visible_rows - 1) bonus CR+LFs, exactly K rows
+            // have been pushed into the receiver's scrollback and
+            // the visible area is empty.
+            let cols = grid.size().cols;
+            let mut prev_attrs = crate::attrs::Attrs::default();
+            for row in grid.scrollback_rows() {
+                row.write_contents_inline(&mut out, cols, &mut prev_attrs);
+                crate::term::Crlf.write_buf(&mut out);
+            }
+            let bonus = grid.size().rows.saturating_sub(1);
+            for _ in 0..bonus {
+                crate::term::Crlf.write_buf(&mut out);
+            }
+            // Reset attrs so Phase 2 starts from a known SGR state.
+            // `write_contents_formatted` does its own ClearAttrs but
+            // we want the byte stream to be self-consistent.
+            crate::term::ClearAttrs.write_buf(&mut out);
+        }
+        // Phase 2 — draw the visible screen.
+        self.write_contents_formatted(&mut out);
+        // Phase 3 — input modes.
+        self.write_input_mode_formatted(&mut out);
+        out
+    }
+
     /// Return escape codes sufficient to turn the terminal state of the
     /// screen `prev` into the current terminal state. This is a convenience
     /// wrapper around [`contents_diff`](Self::contents_diff) and
@@ -1452,5 +1500,97 @@ mod scs_tests {
         let mut p = Parser::new(2, 10, 0);
         p.process("\x1b(0é".as_bytes());
         assert_eq!(cell_at(&p, 0, 0), "é");
+    }
+}
+
+#[cfg(test)]
+mod full_contents_formatted_tests {
+    use crate::Parser;
+
+    fn visible_lines(p: &Parser) -> Vec<String> {
+        (0..p.screen().grid().size().rows)
+            .map(|r| {
+                (0..p.screen().grid().size().cols)
+                    .filter_map(|c| p.screen().cell(r, c))
+                    .map(|cell| {
+                        if cell.has_contents() {
+                            cell.contents().to_string()
+                        } else if cell.is_wide_continuation() {
+                            String::new()
+                        } else {
+                            " ".to_string()
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_trips_visible_screen_with_attrs() {
+        let mut p1 = Parser::new(5, 20, 100);
+        p1.process(b"\x1b[31mhello\x1b[m \x1b[1mworld\x1b[m\r\nsecond line");
+        let snap = p1.screen().full_contents_formatted();
+
+        let mut p2 = Parser::new(5, 20, 100);
+        p2.process(&snap);
+
+        assert_eq!(visible_lines(&p1), visible_lines(&p2));
+        assert_eq!(p1.screen().cursor_position(), p2.screen().cursor_position());
+        // SGR attrs at the (0, 0) cell.
+        let fg1 = p1.screen().cell(0, 0).unwrap().fgcolor();
+        let fg2 = p2.screen().cell(0, 0).unwrap().fgcolor();
+        assert_eq!(fg1, fg2);
+        let bold1 = p1.screen().cell(0, 12).unwrap().bold();
+        let bold2 = p2.screen().cell(0, 12).unwrap().bold();
+        assert_eq!(bold1, bold2);
+    }
+
+    #[test]
+    fn round_trips_scrollback() {
+        let mut p1 = Parser::new(3, 10, 100);
+        // Push 10 lines so 7 land in scrollback (10 - 3 visible).
+        for i in 0..10 {
+            p1.process(format!("line {i}\r\n").as_bytes());
+        }
+        let snap = p1.screen().full_contents_formatted();
+
+        let mut p2 = Parser::new(3, 10, 100);
+        p2.process(&snap);
+
+        // Visible rows match.
+        assert_eq!(visible_lines(&p1), visible_lines(&p2));
+        // Scrollback row counts match.
+        let scrollback1: usize = p1.screen().grid().scrollback_rows().count();
+        let scrollback2: usize = p2.screen().grid().scrollback_rows().count();
+        assert_eq!(scrollback1, scrollback2);
+        // Every scrollback row's textual content matches.
+        for (a, b) in p1
+            .screen()
+            .grid()
+            .scrollback_rows()
+            .zip(p2.screen().grid().scrollback_rows())
+        {
+            let mut sa = String::new();
+            a.write_contents(&mut sa, 0, p1.screen().grid().size().cols, false);
+            let mut sb = String::new();
+            b.write_contents(&mut sb, 0, p2.screen().grid().size().cols, false);
+            assert_eq!(sa, sb);
+        }
+    }
+
+    #[test]
+    fn round_trips_empty_screen() {
+        let p1 = Parser::new(4, 16, 100);
+        let snap = p1.screen().full_contents_formatted();
+
+        let mut p2 = Parser::new(4, 16, 100);
+        p2.process(&snap);
+
+        assert_eq!(visible_lines(&p1), visible_lines(&p2));
+        assert_eq!(p1.screen().cursor_position(), p2.screen().cursor_position());
+        assert_eq!(p2.screen().grid().scrollback_rows().count(), 0);
     }
 }
