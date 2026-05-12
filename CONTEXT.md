@@ -17,7 +17,10 @@ with `SCM_RIGHTS` stdio handover that:
 - replays a vt100 + VGE + PRT snapshot;
 - live-forwards subsequent inner-program output to the renderer;
 - detaches cleanly on the `Ctrl+\` + `d` hotkey, leaving the
-  session running for a later re-attach.
+  session running for a later re-attach;
+- handles mid-attach window resizes via a per-attach
+  `WinsizeWatcher` thread that polls `TIOCGWINSZ` every 250 ms and
+  re-applies the size to engines + inner PTY on change.
 
 ## What's done
 
@@ -41,6 +44,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `a832110` | feat: veterd: detach hotkey Ctrl+\\ then d |
 | `6c7dad7` | doc: CONTEXT.md: mark Commit C as landed |
 | `840adcf` | feat: veterd: upstream VGE/PRT probe + winsize at attach time |
+| `fe9e657` | doc: CONTEXT.md: mark Commit D as landed |
+| *(uncommitted)* | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll (Commit E) |
 
 ### Snapshot serializers (the core)
 
@@ -254,12 +259,32 @@ End-to-end smoke tests verified:
   forwarded to the inner PTY after the probe phase ends; an
   echoing bash session sees them and replies as usual.
 
-Still deferred:
+### Commit E — mid-attach SIGWINCH via TIOCGWINSZ poll (uncommitted, working tree)
 
-- Mid-attach SIGWINCH (the renderer's window resizes while
-  attached) is not observed. The daemon's inherited stdio is the
-  SSH PTY's slave; reading SIGWINCH on it would require either a
-  signal handler in the attach thread or a periodic re-probe.
+The daemon doesn't share a controlling tty with the renderer's PTY
+slave, so the kernel never delivers `SIGWINCH` to us. Instead,
+`attach::handler_main` spawns a per-attach `WinsizeWatcher` thread
+right after the probe. The watcher:
+
+- Dups the renderer-stdin and inner-PTY-master fds so its lifetime
+  is independent of the splice loop's fds (clean drop on detach).
+- Sleeps for `WINSIZE_POLL_INTERVAL` (250 ms) in a loop, then
+  calls `probe::read_winsize` on stdin.
+- On change: locks `EngineState`, calls
+  `Screen::set_size(rows, cols)`, then `TIOCSWINSZ`s the inner PTY
+  master so the child program `SIGWINCH`es and redraws.
+- Self-terminates via a shared `AtomicBool`; the `Drop` impl flips
+  the flag and joins the thread when the attach handler returns.
+
+The polling is purely local kernel state — `TIOCGWINSZ` reads the
+slave's winsize that the SSH server already wrote when the renderer
+sent a `window-change` packet. No additional SSH traffic. Cost is
+~4 ioctls/sec per active attach, in microseconds.
+
+End-to-end smoke tested with a Python PTY harness: attach to a
+session whose bash has a `WINCH` trap, resize the harness's PTY
+master to 50×200, and confirm `SIZE 50x200` is forwarded back via
+the renderer-stdout within one polling interval.
 
 ## What's left
 

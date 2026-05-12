@@ -241,7 +241,11 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
     })
 }
 
-fn read_winsize(fd: RawFd) -> Option<(u16, u16)> {
+/// Read `TIOCGWINSZ` on the given fd. Returns `None` if the ioctl
+/// fails or returns a zeroed winsize (which happens on non-tty fds
+/// and a few corner cases — we treat both as "size unknown, keep
+/// the existing one").
+pub fn read_winsize(fd: RawFd) -> Option<(u16, u16)> {
     let mut ws = libc::winsize {
         ws_row: 0,
         ws_col: 0,

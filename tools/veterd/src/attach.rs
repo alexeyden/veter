@@ -53,6 +53,16 @@ use crate::session::Session;
 /// connection.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Cadence for the mid-attach SIGWINCH watcher. The renderer's stdio
+/// is a tty fd that's been handed over to us via `SCM_RIGHTS`; we
+/// don't share a controlling tty with it, so the kernel doesn't
+/// `SIGWINCH` the daemon process when the user resizes their
+/// terminal. We poll `TIOCGWINSZ` on stdin at this interval and
+/// `TIOCSWINSZ` the inner PTY master + resize the engines on change.
+/// 250 ms picks up a resize within one frame of human reaction time
+/// without burning measurable CPU.
+const WINSIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Synchronous part of the attach dispatch. Runs on the accept-loop
 /// thread; receives the renderer's stdio fds, validates the session,
 /// and spawns the per-attach handler thread. Returns `Ok(())` if the
@@ -158,22 +168,135 @@ fn handler_main(
         );
     }
 
-    // Step 4: splice renderer stdin → inner PTY master until EOF /
+    // Step 4: spawn the SIGWINCH watcher so the renderer can resize
+    // its window mid-attach. The watcher polls `TIOCGWINSZ` on its
+    // own dup of stdin / master and re-applies on change; it
+    // self-terminates when the `_watcher` guard is dropped at the
+    // end of this function.
+    let _watcher = WinsizeWatcher::spawn(
+        &stdin_fd,
+        &master_writer_fd,
+        Arc::clone(&engines),
+        outcome.winsize,
+    );
+
+    // Step 5: splice renderer stdin → inner PTY master until EOF /
     // error. The worker thread handles the other direction (PTY
     // master output → renderer stdout) via `renderer_stdout` we just
     // installed. Per the PRT spec, input never crosses the engines —
     // we forward keystrokes verbatim.
     let result = splice_input(stdin_fd, master_writer_fd);
 
-    // Step 5: detach — clear the renderer-stdout fd on engines so the
+    // Step 6: detach — clear the renderer-stdout fd on engines so the
     // worker stops writing. Dropping `stdout_fd` here also closes our
     // copy of the renderer's stdout, which the local user sees as EOF
-    // / disconnect from the daemon.
+    // / disconnect from the daemon. The `_watcher` Drop joins its
+    // thread before we leave the function.
     {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         guard.renderer_stdout = None;
     }
     result
+}
+
+/// Per-attach SIGWINCH watcher. The daemon doesn't share a
+/// controlling tty with the renderer's PTY slave (the attach handler
+/// runs in a worker thread of a process started independently of the
+/// SSH login session), so the kernel never delivers `SIGWINCH` to us
+/// directly. We poll `TIOCGWINSZ` on the renderer's stdin and
+/// `TIOCSWINSZ` the inner PTY + resize the engines whenever the size
+/// changes. See [`WINSIZE_POLL_INTERVAL`] for the cadence trade-off.
+struct WinsizeWatcher {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WinsizeWatcher {
+    /// Spawn the watcher. `initial` is the size we already applied
+    /// during the probe so we don't trip the "size changed" branch on
+    /// the very first poll. The fds are dup'd so the watcher's
+    /// lifetime is independent of the caller's fds — dropping this
+    /// guard cleanly closes its dups.
+    fn spawn(
+        stdin_fd: &OwnedFd,
+        master_fd: &OwnedFd,
+        engines: Arc<Mutex<EngineState>>,
+        initial: Option<(u16, u16)>,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        // Dup fails extraordinarily rarely (EMFILE). On failure we
+        // skip spawning the watcher; mid-attach resize just won't
+        // work for this attach. The handler logs and proceeds.
+        let stdin_dup = match dup_owned(stdin_fd) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("veterd: winsize watcher: dup(stdin) failed: {e}; resize disabled for this attach");
+                return Self { stop, handle: None };
+            }
+        };
+        let master_dup = match dup_owned(master_fd) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("veterd: winsize watcher: dup(master) failed: {e}; resize disabled for this attach");
+                return Self { stop, handle: None };
+            }
+        };
+        let handle = std::thread::Builder::new()
+            .name("veterd-winsize".into())
+            .spawn(move || {
+                winsize_main(stdin_dup, master_dup, engines, initial, stop_for_thread)
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for WinsizeWatcher {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn winsize_main(
+    stdin_fd: OwnedFd,
+    master_fd: OwnedFd,
+    engines: Arc<Mutex<EngineState>>,
+    initial: Option<(u16, u16)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let raw_stdin = stdin_fd.as_raw_fd();
+    let raw_master = master_fd.as_raw_fd();
+    let mut last = initial;
+    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(WINSIZE_POLL_INTERVAL);
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let Some((rows, cols)) = probe::read_winsize(raw_stdin) else {
+            // ioctl failed (stdin closed?) — back off and let the
+            // splice loop notice the disconnect.
+            continue;
+        };
+        if last == Some((rows, cols)) {
+            continue;
+        }
+        last = Some((rows, cols));
+
+        // Apply: resize the parser, then SIGWINCH the inner program
+        // via TIOCSWINSZ on the master. The inner program's redraw
+        // bytes flow through the worker thread, which forwards them
+        // to the (still-attached) renderer.
+        {
+            let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
+            guard.parser.screen_mut().set_size(rows, cols);
+        }
+        probe::set_inner_winsize(raw_master, rows, cols);
+    }
 }
 
 /// Apply probe + winsize results to the per-session engines and to
