@@ -30,6 +30,7 @@ mod daemon;
 mod engines;
 mod fdpass;
 mod ipc;
+mod probe;
 mod session;
 
 use ipc::{Request, Response};

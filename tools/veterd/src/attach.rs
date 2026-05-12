@@ -36,12 +36,22 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::engines::EngineState;
 use crate::fdpass;
+use crate::probe;
 use crate::session::Session;
+
+/// How long to wait for the renderer to respond to the upstream
+/// VGE / PRT probe before falling back to the daemon's defaults.
+/// Non-VGE / non-PRT terminals ignore the probe envelopes (they parse
+/// them as no-op APCs), so this is also the renderer-capability
+/// timeout. 500 ms is a generous round-trip even over a slow SSH
+/// connection.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Synchronous part of the attach dispatch. Runs on the accept-loop
 /// thread; receives the renderer's stdio fds, validates the session,
@@ -105,13 +115,29 @@ fn handler_main(
     master_writer_fd: OwnedFd,
     engines: Arc<Mutex<EngineState>>,
 ) -> Result<()> {
-    // Step 1: under the engines lock, compute the snapshot and write
+    // Step 1: probe the renderer for grid size + cell metrics. Falls
+    // back to whatever defaults the engines were created with if the
+    // renderer doesn't answer in time (non-VGE / non-PRT terminal).
+    //
+    // Non-probe bytes that arrive during this phase are kept as
+    // `typeahead` and forwarded to the inner PTY after we apply the
+    // probe results, so the user's keystrokes during attach aren't
+    // dropped.
+    let outcome = probe::run(&stdin_fd, &stdout_fd, PROBE_TIMEOUT)
+        .with_context(|| "running upstream probe")?;
+    apply_probe(&engines, &master_writer_fd, &outcome);
+    if !outcome.typeahead.is_empty() {
+        write_all_raw(master_writer_fd.as_raw_fd(), &outcome.typeahead)
+            .with_context(|| "forwarding probe-phase typeahead")?;
+    }
+
+    // Step 2: under the engines lock, compute the snapshot and write
     // it to the renderer. We hold the lock for the duration so the
     // per-session worker can't interleave live bytes between snapshot
     // chunks — otherwise the renderer would see "partial replay +
     // post-replay byte + more replay" and paint inconsistent state.
     //
-    // Step 2: while still under the lock, install the stdout fd on
+    // Step 3: while still under the lock, install the stdout fd on
     // engines so the worker starts forwarding live bytes the moment
     // we release.
     {
@@ -132,14 +158,14 @@ fn handler_main(
         );
     }
 
-    // Step 3: splice renderer stdin → inner PTY master until EOF /
+    // Step 4: splice renderer stdin → inner PTY master until EOF /
     // error. The worker thread handles the other direction (PTY
     // master output → renderer stdout) via `renderer_stdout` we just
     // installed. Per the PRT spec, input never crosses the engines —
     // we forward keystrokes verbatim.
     let result = splice_input(stdin_fd, master_writer_fd);
 
-    // Step 4: detach — clear the renderer-stdout fd on engines so the
+    // Step 5: detach — clear the renderer-stdout fd on engines so the
     // worker stops writing. Dropping `stdout_fd` here also closes our
     // copy of the renderer's stdout, which the local user sees as EOF
     // / disconnect from the daemon.
@@ -148,6 +174,33 @@ fn handler_main(
         guard.renderer_stdout = None;
     }
     result
+}
+
+/// Apply probe + winsize results to the per-session engines and to
+/// the inner PTY master. SIGWINCHing the inner program here means
+/// its redraw bytes arrive before the snapshot is serialized, so the
+/// snapshot reflects the renderer's actual grid (modulo whatever
+/// races the inner program loses to our `engines.lock()`).
+fn apply_probe(
+    engines: &Arc<Mutex<EngineState>>,
+    master_writer_fd: &OwnedFd,
+    outcome: &probe::ProbeOutcome,
+) {
+    let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some((rows, cols)) = outcome.winsize {
+        guard.parser.screen_mut().set_size(rows, cols);
+        // SIGWINCH the inner program so its next redraw is at the
+        // right size. Best effort; the engines have already been
+        // resized so a stale dimension on the slave's tty is the only
+        // failure mode.
+        probe::set_inner_winsize(master_writer_fd.as_raw_fd(), rows, cols);
+    }
+    if let Some(vge) = outcome.vge {
+        let cell_px = (vge.cell_pixel_width, vge.cell_pixel_height);
+        guard.vge.set_dimensions(cell_px, vge.scale_factor);
+        guard.prt.set_metrics(cell_px, vge.scale_factor);
+    }
 }
 
 /// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 veterd

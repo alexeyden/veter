@@ -297,6 +297,18 @@ impl PrtEngine {
         }
     }
 
+    /// Update the cell pixel dimensions and scale factor this engine
+    /// reports to inner programs. Used by veterd's attach path so that
+    /// per-portal sub-engines spawned after the renderer's probe
+    /// arrives inherit the renderer's real metrics instead of the
+    /// session-creation-time defaults. Existing portals keep the
+    /// metrics they were spawned with; mid-flight reflow is not
+    /// supported.
+    pub fn set_metrics(&mut self, cell_px: (u16, u16), scale_factor: f32) {
+        self.cell_px = cell_px;
+        self.scale_factor = scale_factor;
+    }
+
     /// Drain every pending image-delete in this engine's subtree:
     /// (a) IDs accumulated from portal removals at this scope,
     /// (b) per-portal VGE engines' pending DropImage IDs,

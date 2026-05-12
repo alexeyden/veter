@@ -6,14 +6,19 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: clean. Branch: `master`. The build is green and the
-full workspace test suite passes (`cargo test`). End-to-end
-smoke-tested: `new` / `list` / `kill` / `kill-server` over the Unix
-socket, plus `attach <name>` with `SCM_RIGHTS` stdio handover that
-replays a vt100 + VGE + PRT snapshot, live-forwards subsequent
-inner-program output to the renderer, and detaches cleanly on the
-`Ctrl+\` + `d` hotkey while leaving the session running for a
-later re-attach.
+Working tree: dirty (Commit D plus this doc update). Branch:
+`master`. The build is green and the full workspace test suite
+passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+`kill` / `kill-server` over the Unix socket, plus `attach <name>`
+with `SCM_RIGHTS` stdio handover that:
+
+- probes the renderer for cell metrics + reads `TIOCGWINSZ` for
+  the actual grid, resizes the per-session engines and inner PTY
+  accordingly;
+- replays a vt100 + VGE + PRT snapshot;
+- live-forwards subsequent inner-program output to the renderer;
+- detaches cleanly on the `Ctrl+\` + `d` hotkey, leaving the
+  session running for a later re-attach.
 
 ## What's done
 
@@ -35,6 +40,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `0564ee8` | feat: veterd: attach with snapshot replay over SCM_RIGHTS |
 | `cf34bbf` | doc: CONTEXT.md: log Commit A and B |
 | `a832110` | feat: veterd: detach hotkey Ctrl+\\ then d |
+| `6c7dad7` | doc: CONTEXT.md: mark Commit C as landed |
+| *(uncommitted)* | feat: veterd: upstream VGE/PRT probe at attach (Commit D) |
 
 ### Snapshot serializers (the core)
 
@@ -173,20 +180,15 @@ Files added/changed:
 - `tools/veterd/Cargo.toml` — `nix` gains the `uio` feature for
   `sendmsg`/`recvmsg`.
 
-What's intentionally not in Commit B (still on the "what's left"
-list):
+What's intentionally not in Commit B (some now done in later commits):
 
-- **No upstream probe.** The daemon does not yet write a
-  `VGEProbe` / `PRTProbe` to the renderer's stdout to learn its
-  actual cell pixel dims, scale, image encodings, or chunk limit.
-  Defaults are 24×80 grid, 8×16 px cells, 1.0× scale. Inner
-  programs report those dims to themselves via DSR; the renderer
-  may paint slightly off until probe wiring lands. Reuse
-  `tools/vft-client/src/probe.rs` for shape.
+- ~~No upstream probe.~~ Done in Commit D (see below).
 - **No detach hotkey.** Disconnect is detected only via fd EOF on
   the renderer's stdin. See Commit C below.
-- **No resize handling.** The daemon doesn't observe SIGWINCH on
-  its inherited stdio; the inner PTY stays at 24×80.
+- ~~No resize handling.~~ Folded into Commit D — at attach time we
+  read `TIOCGWINSZ` on stdin, resize the parser, and TIOCSWINSZ
+  the inner PTY. Mid-attach SIGWINCH (the user resizing their
+  window after attach) is still not wired up.
 
 ### Commit C — detach hotkey (committed)
 
@@ -214,6 +216,51 @@ and snapshot replay still contains the session's prior output.
 
 Configurability via env var is deferred — the architecture doc
 called this out as fine for v1.
+
+### Commit D — upstream VGE/PRT probe + winsize handover (uncommitted, working tree)
+
+Files added/changed:
+
+- `tools/veterd/src/probe.rs` (new) — `probe::run(stdin, stdout, timeout)`
+  writes VGE + PRT `Probe` envelopes to stdout, reads stdin with
+  `nix::poll`, parses `ProbeResponse` payloads via the two protocol
+  crates' `ApcStream`s (one for VGE T2C `vge`, one for PRT T2C
+  `prt`), and returns the parsed `VgeProbeData` / `PrtProbeData`
+  along with any non-probe bytes (typeahead) that arrived during
+  the probe phase. Also reads `TIOCGWINSZ` on stdin for the
+  renderer's actual `(rows, cols)`. Tests cover both parsers plus
+  the encoder marker bytes.
+- `tools/veterd/src/attach.rs` — `handler_main` now opens with a
+  500 ms probe round. The outcome is applied to the per-session
+  engines (`Screen::set_size`, `VgeEngine::set_dimensions`,
+  `PrtEngine::set_metrics`) and forwarded to the inner PTY via
+  `TIOCSWINSZ`. Typeahead is pushed to the inner PTY before the
+  snapshot is serialized so the user's keystrokes during attach
+  aren't dropped.
+- `veter/src/prt/state.rs` — new `PrtEngine::set_metrics(cell_px,
+  scale_factor)` setter mirroring `VgeEngine::set_dimensions`.
+  Future per-portal sub-engines inherit the new metrics; existing
+  portals keep their construction-time values (mid-flight reflow
+  unsupported).
+
+Non-VGE / non-PRT renderers still attach cleanly: the probe times
+out, defaults are kept, the snapshot is still emitted (the renderer
+just ignores the embedded VGE/PRT envelopes).
+
+End-to-end smoke tests verified:
+
+- Non-VGE renderer (plain pipe): probe times out at 500 ms, attach
+  proceeds with defaults, vt100 snapshot reaches stdout.
+- Typeahead-during-probe: keystrokes piped to attach's stdin are
+  forwarded to the inner PTY after the probe phase ends; an
+  echoing bash session sees them and replies as usual.
+
+Still deferred:
+
+- Mid-attach SIGWINCH (the renderer's window resizes while
+  attached) is not observed. The daemon's inherited stdio is the
+  SSH PTY's slave; reading SIGWINCH on it would require either a
+  signal handler in the attach thread or a periodic re-probe.
 
 ## What's left
 
