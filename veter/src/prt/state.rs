@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(parsed.frame_type, RSP_PROBE);
         assert_eq!(parsed.request_id, 0xCAFE_BABE);
         let mut r = Reader::new(&parsed.body);
-        assert_eq!(r.u16().unwrap(), 1); // protocol_version
+        assert_eq!(r.u16().unwrap(), 0); // protocol_version
         assert_eq!(r.u32().unwrap(), 64); // max_portals
         assert_eq!(r.u32().unwrap(), 1024); // max_portal_cells_w
         assert_eq!(r.u32().unwrap(), 512); // max_portal_cells_h

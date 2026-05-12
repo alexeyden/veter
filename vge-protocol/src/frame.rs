@@ -5,7 +5,9 @@
 // surface stays declared even before its handlers exist.
 #![allow(dead_code)]
 
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Unstable WIP protocol — version 0. Bumps to 1 when the wire
+/// format is declared stable. See `doc/vector-graphics-extension.md`.
+pub const PROTOCOL_VERSION: u8 = 0;
 
 // §3 command codes
 pub const CMD_PROBE: u8 = 0x01;

@@ -1,5 +1,11 @@
 # File Transfer Extension (VFT)
 
+> **Status: unstable WIP — v0.** The wire format may change in
+> incompatible ways without notice. Clients and host implementations
+> ship from this repo in lockstep. The version byte in every envelope
+> is `0` and the probe response advertises `protocol_version = 0`;
+> both bump to `1` once the format is declared stable.
+
 This extension lets a client move file bytes between its own filesystem
 and the host's: a CLI tool running inside the terminal can hand the host
 a local file (`vsend`) or pull a host-side file back to the client side
@@ -55,7 +61,7 @@ it goes into the envelope, and unstuffed after extraction.
 The unstuffed payload begins with:
 
 ```
-u8   protocol_version       // 1 (this document)
+u8   protocol_version       // 0 (this document — unstable WIP)
 u32  payload_length         // little-endian, length of the rest, in bytes
 ```
 

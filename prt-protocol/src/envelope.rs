@@ -191,7 +191,7 @@ mod tests {
     fn probe_body_encoded_size() {
         // Required prefix: 2 + 4*5 + 1 + 1 = 24 bytes.
         let pb = ProbeBody {
-            protocol_version: 1,
+            protocol_version: 0,
             max_portals: 64,
             max_portal_cells_w: 1024,
             max_portal_cells_h: 512,

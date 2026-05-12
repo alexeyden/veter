@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn probe_body_encoded_size() {
         let pb = ProbeBody {
-            protocol_version: 1,
+            protocol_version: 0,
             cell_pixel_width: 9,
             cell_pixel_height: 20,
             scale_factor: 1.0,

@@ -5,7 +5,9 @@
 // surface stays declared even before the engine consumes it.
 #![allow(dead_code)]
 
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Unstable WIP protocol — version 0. Bumps to 1 when the wire
+/// format is declared stable. See `doc/file-transfer-extension.md`.
+pub const PROTOCOL_VERSION: u8 = 0;
 
 // §3 command codes (client → host)
 pub const CMD_PROBE: u8 = 0x01;

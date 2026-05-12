@@ -1225,7 +1225,7 @@ mod tests {
         // Skip header (u8 version + u4 length + u8 frame + u4 reqid + u4 body_len = 14 bytes)
         let body = &payload[14..];
         let mut r = Reader::new(body);
-        assert_eq!(r.u16().unwrap(), 1); // protocol_version
+        assert_eq!(r.u16().unwrap(), 0); // protocol_version
         assert_eq!(r.u16().unwrap(), 9); // cell_w
         assert_eq!(r.u16().unwrap(), 20); // cell_h
         assert_eq!(r.f32().unwrap(), 1.5); // scale_factor

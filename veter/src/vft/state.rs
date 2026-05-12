@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(*ft, RSP_PROBE);
         assert_eq!(*rid, 1);
         let mut r = Reader::new(body);
-        assert_eq!(r.u16().unwrap(), 1);
+        assert_eq!(r.u16().unwrap(), 0); // protocol_version
         assert_eq!(r.u32().unwrap(), 8); // max_concurrent_transfers
         let _ = r.u32().unwrap(); // max_chunk_bytes
         let _ = r.u32().unwrap(); // max_path_bytes

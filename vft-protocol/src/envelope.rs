@@ -156,7 +156,7 @@ mod tests {
     fn probe_body_encoded_size() {
         // 2 + 4 + 4 + 4 + 8 + 1 = 23 bytes.
         let pb = ProbeBody {
-            protocol_version: 1,
+            protocol_version: 0,
             max_concurrent_transfers: 8,
             max_chunk_bytes: 4 << 20,
             max_path_bytes: 4096,
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn probe_body_round_trip() {
         let pb = ProbeBody {
-            protocol_version: 1,
+            protocol_version: 0,
             max_concurrent_transfers: 8,
             max_chunk_bytes: 4 << 20,
             max_path_bytes: 4096,
@@ -178,7 +178,7 @@ mod tests {
         };
         let body = pb.encode();
         let mut r = Reader::new(&body);
-        assert_eq!(r.u16().unwrap(), 1);
+        assert_eq!(r.u16().unwrap(), 0);
         assert_eq!(r.u32().unwrap(), 8);
         assert_eq!(r.u32().unwrap(), 4 << 20);
         assert_eq!(r.u32().unwrap(), 4096);
