@@ -355,6 +355,79 @@ impl PrtEngine {
         self.depth
     }
 
+    /// Serialize this engine's currently-active portal table as a
+    /// wire-ready APC envelope (or chain of envelopes) of PRT
+    /// commands. Each portal becomes a `CreatePortal` immediately
+    /// followed by a `WritePortal` carrying the portal's full inner
+    /// state: vt100 grid + scrollback + the portal's nested
+    /// PRT/VGE serialized streams. Feeding the result into a fresh
+    /// `PrtEngine` of matching capabilities reproduces the same
+    /// tree.
+    ///
+    /// Intended for veterd attach-time replay
+    /// (`doc/session-manager.md` §4). The caller is responsible for
+    /// having replayed the host vt100 grid + scrollback first so
+    /// the receiver's `top_of_live_screen` matches what was captured
+    /// here — scrollback-anchored portal origins are computed
+    /// relative to that.
+    ///
+    /// v1 limitations:
+    /// - Only the currently-active screen's portal table is emitted;
+    ///   any suspended alt/main set is dropped.
+    /// - VFT engines inside portals are not serialized — in-flight
+    ///   transfers are abandoned by reattach.
+    /// - Engine-level state (focus chain, cursor style, polled
+    ///   state caches) is not yet round-tripped; the receiver
+    ///   starts with default focus and the renderer re-derives
+    ///   polled caches from each portal's screen.
+    pub fn serialize_state(&self) -> Vec<u8> {
+        let mut frames: Vec<(Command, u32)> = Vec::new();
+        let top_offset = self.line_tracker.top_of_live_screen;
+        let mut ordered: Vec<&Portal> =
+            self.state.current().portals.values().collect();
+        ordered.sort_by_key(|p| (p.draw_order, p.creation_seq));
+        for portal in ordered {
+            let (anchor_mode, origin_y) = match portal.anchor {
+                PortalAnchor::Live { origin_y } => (AnchorMode::Live, origin_y),
+                PortalAnchor::Scrollback { anchor_line } => (
+                    AnchorMode::Scrollback,
+                    (anchor_line - top_offset) as i32,
+                ),
+            };
+            frames.push((
+                Command::CreatePortal(CreatePortalBody {
+                    id: portal.id.clone(),
+                    size_w: portal.size_w,
+                    size_h: portal.size_h,
+                    origin_x: portal.origin_x,
+                    origin_y,
+                    anchor_mode,
+                    is_visible: portal.is_visible,
+                    draw_order: portal.draw_order,
+                    flags: 0,
+                    scrollback_lines: portal.scrollback_lines,
+                }),
+                0,
+            ));
+            // Build the portal's inner-state byte stream:
+            //   1. vt100 grid + scrollback (raw escape bytes).
+            //   2. The portal's nested PRT tree (sub-portal envelopes).
+            //   3. The portal's VGE state (envelopes the portal's
+            //      private VGE engine will consume).
+            let mut data = portal.vt.screen().full_contents_formatted();
+            data.extend_from_slice(&portal.children.serialize_state());
+            data.extend_from_slice(&portal.vge.serialize_state());
+            frames.push((
+                Command::WritePortal(WritePortalBody {
+                    id: portal.id.clone(),
+                    data,
+                }),
+                0,
+            ));
+        }
+        prt_protocol::encode::build_envelope(&frames)
+    }
+
     /// Drain queued response bytes (one or more APC envelopes) ready to
     /// write to the PTY master.
     pub fn take_responses(&mut self) -> Vec<u8> {
@@ -2939,5 +3012,81 @@ mod tests {
         assert_eq!(b64_decode(b"aGVs\nbG8=").unwrap(), b"hello");
         // Garbage is not.
         assert!(b64_decode(b"!!!!").is_none());
+    }
+
+    // ---- serialize_state roundtrip --------------------------------
+
+    #[test]
+    fn serialize_state_roundtrips_portal_table() {
+        let mut a = PrtEngine::new();
+        let p1 = encode::create_portal_body(&CreatePortalBody {
+            id: "p1".into(),
+            size_w: 20,
+            size_h: 5,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 64,
+        });
+        let p2 = encode::create_portal_body(&CreatePortalBody {
+            id: "p2".into(),
+            size_w: 30,
+            size_h: 8,
+            origin_x: 5,
+            origin_y: 6,
+            anchor_mode: AnchorMode::Live,
+            is_visible: false,
+            draw_order: 3,
+            flags: 0,
+            scrollback_lines: 64,
+        });
+        let write = encode::write_portal_body(&WritePortalBody {
+            id: "p1".into(),
+            data: b"hello\r\nworld".to_vec(),
+        });
+        let mut frames = Vec::new();
+        append_frame(&mut frames, CMD_CREATE_PORTAL, 1, &p1);
+        append_frame(&mut frames, CMD_CREATE_PORTAL, 2, &p2);
+        append_frame(&mut frames, CMD_WRITE_PORTAL, 3, &write);
+        a.process_pty_chunk(&wrap_c2t_envelope(&frames));
+        let _ = a.take_responses();
+
+        let snapshot = a.serialize_state();
+        let mut b = PrtEngine::new();
+        let passthrough = b.process_pty_chunk(&snapshot);
+        assert!(passthrough.is_empty(), "snapshot must not leak to host vt100");
+        let _ = b.take_responses();
+
+        let portals_a = &a.state.current().portals;
+        let portals_b = &b.state.current().portals;
+        assert_eq!(portals_b.len(), portals_a.len(), "portal count");
+
+        let ap1 = portals_a.get("p1").expect("source p1");
+        let bp1 = portals_b.get("p1").expect("dest p1");
+        assert_eq!((bp1.size_w, bp1.size_h), (ap1.size_w, ap1.size_h));
+        assert_eq!(bp1.draw_order, ap1.draw_order);
+        assert_eq!(bp1.is_visible, ap1.is_visible);
+        // The portal's vt100 should have received the replayed text.
+        assert_eq!(bp1.vt.screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(bp1.vt.screen().cell(1, 0).unwrap().contents(), "w");
+
+        let bp2 = portals_b.get("p2").expect("dest p2");
+        assert_eq!(bp2.is_visible, false);
+        assert_eq!(bp2.draw_order, 3);
+    }
+
+    #[test]
+    fn serialize_state_empty_engine_replays_no_op() {
+        let a = PrtEngine::new();
+        let snapshot = a.serialize_state();
+
+        let mut b = PrtEngine::new();
+        b.process_pty_chunk(&snapshot);
+        let _ = b.take_responses();
+
+        assert!(b.state.current().portals.is_empty());
     }
 }
