@@ -12,12 +12,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, BufWriter};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::attach;
 use crate::ipc::{Request, Response, SessionInfo};
 use crate::session::Session;
 
@@ -87,30 +87,32 @@ pub fn run() -> Result<()> {
 }
 
 fn handle_connection(
-    stream: UnixStream,
+    mut stream: UnixStream,
     sessions: &mut HashMap<String, Session>,
     quit: &mut bool,
 ) {
-    let mut reader = BufReader::new(
-        stream.try_clone().expect("clone unix stream for reader"),
-    );
-    let mut writer = BufWriter::new(stream);
-    let req = match Request::read_from(&mut reader) {
+    // No `BufReader` wrapping here: an Attach request follows up with
+    // a `sendmsg(2)` carrying `SCM_RIGHTS` ancillary data, and any
+    // bytes BufReader buffers ahead would also strip the cmsg they
+    // were delivered with. The frames are tiny — direct reads are
+    // fine.
+    let req = match Request::read_from(&mut stream) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("veterd: bad request: {e}");
-            let _ = Response::Err(format!("bad request: {e}")).write_to(&mut writer);
+            let _ = Response::Err(format!("bad request: {e}")).write_to(&mut stream);
             return;
         }
     };
-    let resp = dispatch(req, sessions, quit);
-    if let Err(e) = resp.write_to(&mut writer) {
+    let resp = dispatch(req, &mut stream, sessions, quit);
+    if let Err(e) = resp.write_to(&mut stream) {
         eprintln!("veterd: write reply: {e}");
     }
 }
 
 fn dispatch(
     req: Request,
+    stream: &mut UnixStream,
     sessions: &mut HashMap<String, Session>,
     quit: &mut bool,
 ) -> Response {
@@ -131,6 +133,10 @@ fn dispatch(
             *quit = true;
             Response::Ok
         }
+        Request::Attach { name } => match attach::start(stream, sessions, &name) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Err(format!("{e:#}")),
+        },
     }
 }
 
@@ -163,7 +169,7 @@ fn list_sessions(sessions: &HashMap<String, Session>) -> Vec<SessionInfo> {
             name: s.name.clone(),
             age_secs: s.age_secs(),
             alive: s.is_alive(),
-            attached: s.attached,
+            attached: s.is_attached(),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));

@@ -32,6 +32,17 @@ pub enum Request {
     Kill { name: String },
     /// Shut the daemon down immediately, killing every session.
     KillServer,
+    /// Attach the caller's stdio to the named session. After this
+    /// frame, the client immediately follows up with a single
+    /// `SCM_RIGHTS` ancillary-data message carrying stdin then stdout
+    /// (in that order) over the same Unix-domain socket; see
+    /// [`crate::fdpass`] for the helpers. The daemon takes ownership
+    /// of those fds, writes a snapshot replay, then splices bytes
+    /// between the renderer and the inner PTY. The reply over this
+    /// connection is `Ok` on success (the client can then exit; its
+    /// stdin/stdout fds live on in the daemon) or `Err(msg)` if the
+    /// session cannot be attached (unknown name, already attached, …).
+    Attach { name: String },
 }
 
 /// Response: daemon → client.
@@ -58,6 +69,7 @@ const REQ_NEW: u8 = 0x01;
 const REQ_LIST: u8 = 0x02;
 const REQ_KILL: u8 = 0x03;
 const REQ_KILL_SERVER: u8 = 0x04;
+const REQ_ATTACH: u8 = 0x05;
 
 const RSP_OK: u8 = 0x10;
 const RSP_SESSIONS: u8 = 0x11;
@@ -78,6 +90,10 @@ impl Request {
                 write_string(&mut body, name);
             }
             Request::KillServer => body.push(REQ_KILL_SERVER),
+            Request::Attach { name } => {
+                body.push(REQ_ATTACH);
+                write_string(&mut body, name);
+            }
         }
         write_frame(w, &body)
     }
@@ -101,6 +117,10 @@ impl Request {
                 Ok(Request::Kill { name })
             }
             REQ_KILL_SERVER => Ok(Request::KillServer),
+            REQ_ATTACH => {
+                let name = read_string(&mut rest)?;
+                Ok(Request::Attach { name })
+            }
             _ => Err(invalid(&format!("unknown request kind 0x{kind:02X}"))),
         }
     }
@@ -290,6 +310,14 @@ mod tests {
     #[test]
     fn list_round_trip() {
         assert!(matches!(roundtrip_request(Request::List), Request::List));
+    }
+
+    #[test]
+    fn attach_round_trip() {
+        match roundtrip_request(Request::Attach { name: "cool".into() }) {
+            Request::Attach { name } => assert_eq!(name, "cool"),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

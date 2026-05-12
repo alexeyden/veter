@@ -63,6 +63,13 @@ pub struct EngineState {
     pub parser: vt100::Parser,
     pub vge: VgeEngine,
     pub prt: PrtEngine,
+    /// Write side of the renderer's stdout while a renderer is
+    /// attached. The worker forwards every PTY-master chunk it reads
+    /// into this fd verbatim (without the engine transforms) so the
+    /// renderer paints exactly what the inner program produces. The
+    /// attach handler installs this on attach and clears it on detach
+    /// or write error.
+    pub renderer_stdout: Option<OwnedFd>,
 }
 
 impl EngineState {
@@ -78,6 +85,7 @@ impl EngineState {
                 DEFAULT_SCALE,
                 Arc::new(|| {}),
             ),
+            renderer_stdout: None,
         }
     }
 }
@@ -141,12 +149,17 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             }
         };
 
-        let to_write = {
+        let (to_write, forward_to_renderer) = {
             let mut guard = match engines.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let EngineState { parser, vge, prt } = &mut *guard;
+            let EngineState {
+                parser,
+                vge,
+                prt,
+                renderer_stdout,
+            } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
             let vge_passthrough = vge.process_pty_chunk(&prt_chunk.passthrough);
@@ -161,7 +174,13 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
 
             let mut out = prt.take_responses();
             out.extend_from_slice(&vge.take_responses());
-            out
+
+            // Forward verbatim to the renderer while attached. The
+            // renderer parses PRT/VGE/VFT envelopes natively, so we
+            // ship the raw chunk we just received from the inner PTY
+            // (not the engine-transformed view).
+            let forward = renderer_stdout.is_some();
+            (out, forward)
         };
 
         if !to_write.is_empty() {
@@ -171,6 +190,57 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             if let Err(e) = writer.write_all(&to_write) {
                 eprintln!("veterd: worker write error: {e}");
                 break;
+            }
+        }
+
+        if forward_to_renderer {
+            // Write outside the engines lock so a slow renderer
+            // doesn't stall the engines. We dup the fd briefly to
+            // avoid holding the lock during the write; on write error
+            // we clear `renderer_stdout` so the next chunk doesn't
+            // retry into a closed pipe.
+            let raw = {
+                let guard = match engines.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard
+                    .renderer_stdout
+                    .as_ref()
+                    .map(|fd| fd.as_raw_fd())
+            };
+            if let Some(raw) = raw {
+                let mut wrote_ok = true;
+                let mut off = 0;
+                while off < n {
+                    match nix::unistd::write(
+                        // SAFETY: `raw` is borrowed from the OwnedFd
+                        // held by engines.renderer_stdout; we don't
+                        // close it. write(2) takes a BorrowedFd.
+                        unsafe {
+                            std::os::fd::BorrowedFd::borrow_raw(raw)
+                        },
+                        &buf[off..n],
+                    ) {
+                        Ok(0) => {
+                            wrote_ok = false;
+                            break;
+                        }
+                        Ok(k) => off += k,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(_) => {
+                            wrote_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !wrote_ok {
+                    let mut guard = match engines.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.renderer_stdout = None;
+                }
             }
         }
     }

@@ -5,6 +5,7 @@
 //! ```text
 //!   veterd --foreground         # run the daemon in the foreground
 //!   veterd new <name> [cmd ...] # create a new session
+//!   veterd attach <name>        # connect this terminal to a session
 //!   veterd list                 # enumerate sessions
 //!   veterd kill <name>          # tear down a session
 //!   veterd kill-server          # stop the daemon and every session
@@ -13,8 +14,10 @@
 //! The subcommands other than `--foreground` are short-lived CLI calls
 //! that connect to the daemon socket at
 //! `$XDG_RUNTIME_DIR/veterd/sock`. The `--foreground` mode runs the
-//! daemon's accept loop in the current process. `attach` and the
-//! `SCM_RIGHTS`-driven stdio handover land in task #6.
+//! daemon's accept loop in the current process. `attach` hands the
+//! caller's stdin/stdout fds to the daemon over `SCM_RIGHTS`; the
+//! daemon then writes a state snapshot and splices the renderer to
+//! the inner PTY for the duration of the attach.
 
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -22,8 +25,10 @@ use std::os::unix::net::UnixStream;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+mod attach;
 mod daemon;
 mod engines;
+mod fdpass;
 mod ipc;
 mod session;
 
@@ -58,6 +63,10 @@ enum Cmd {
     Kill { name: String },
     /// Shut the daemon down and tear down every session.
     KillServer,
+    /// Attach the current terminal to a session. Blocks until the
+    /// daemon acknowledges; the daemon then owns this process's stdio
+    /// fds for the duration of the attach.
+    Attach { name: String },
 }
 
 fn main() -> Result<()> {
@@ -68,14 +77,44 @@ fn main() -> Result<()> {
     let cmd = cli
         .cmd
         .ok_or_else(|| anyhow!("missing subcommand (use --help)"))?;
+    if let Cmd::Attach { name } = cmd {
+        return run_attach(&name);
+    }
     let req = match cmd {
         Cmd::New { name, argv } => Request::New { name, argv },
         Cmd::List => Request::List,
         Cmd::Kill { name } => Request::Kill { name },
         Cmd::KillServer => Request::KillServer,
+        Cmd::Attach { .. } => unreachable!("handled above"),
     };
     let resp = call_daemon(req)?;
     render_response(resp)
+}
+
+/// Connect to the daemon, send `Attach { name }`, hand stdin/stdout
+/// over `SCM_RIGHTS`, and wait for the daemon's ack before exiting.
+/// The daemon now owns the stdio fds; the CLI exit is intentional.
+fn run_attach(name: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let sock = daemon::socket_path();
+    let mut stream = UnixStream::connect(&sock)
+        .with_context(|| format!("connecting to daemon at {}", sock.display()))?;
+    Request::Attach { name: name.to_string() }
+        .write_to(&mut stream)
+        .context("writing attach request")?;
+
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let stdout_fd = std::io::stdout().as_raw_fd();
+    fdpass::send_stdio(&stream, stdin_fd, stdout_fd)
+        .context("sending stdio fds to daemon")?;
+
+    let resp = Response::read_from(&mut stream).context("reading attach response")?;
+    match resp {
+        Response::Ok => Ok(()),
+        Response::Err(msg) => bail!("{msg}"),
+        Response::Sessions(_) => bail!("daemon returned unexpected response variant"),
+    }
 }
 
 /// Connect to the daemon socket and round-trip a single request.

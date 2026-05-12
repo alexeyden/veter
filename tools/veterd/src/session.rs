@@ -7,7 +7,8 @@
 //! in [`crate::engines`], so the attach path can replay an
 //! authoritative state snapshot when a renderer connects.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -30,13 +31,16 @@ pub struct Session {
     pub master: OwnedFd,
     pub child: Pid,
     pub created_at: Instant,
-    /// Whether a renderer is currently attached. Reserved for task #6
-    /// — the skeleton never flips this from `false`.
-    pub attached: bool,
-    /// Authoritative host engine state. The worker thread holds the
-    /// other Arc and mutates this under the lock; the daemon's accept
-    /// loop will lock it on attach to serialize a snapshot.
-    #[allow(dead_code)]
+    /// Whether a renderer is currently attached. The attach-handler
+    /// thread flips this to `true` after the snapshot replay, and back
+    /// to `false` on detach (either side closes its fd). The accept
+    /// loop reads it for `Request::List` and to reject duplicate
+    /// attaches.
+    pub attached: Arc<AtomicBool>,
+    /// Authoritative host engine state. The worker thread holds one
+    /// `Arc` of this and mutates it under the lock; the attach handler
+    /// thread holds another `Arc` so it can serialize a snapshot and
+    /// install / clear the renderer-stdout fd.
     pub engines: Arc<Mutex<EngineState>>,
 }
 
@@ -77,7 +81,7 @@ impl Session {
                     master,
                     child,
                     created_at: Instant::now(),
-                    attached: false,
+                    attached: Arc::new(AtomicBool::new(false)),
                     engines,
                 })
             }
@@ -100,10 +104,10 @@ impl Session {
         }
     }
 
-    /// Raw fd accessor for the attach path (task #6).
-    #[allow(dead_code)]
-    pub fn master_fd(&self) -> RawFd {
-        self.master.as_raw_fd()
+    /// Convenience: is this session currently attached? Reads through
+    /// the shared `Arc<AtomicBool>` that the attach handler maintains.
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Acquire)
     }
 
     /// Send SIGTERM and reap. Returns Ok even if the child is already
