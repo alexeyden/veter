@@ -36,6 +36,15 @@ terminal → client:   ESC _ v g e <payload> ESC \
   flag.
 - `0x1B 0x5C` (`ESC \`) closes APC.
 
+A terminal that implements VGE MUST forward APC envelopes whose marker
+is not `VGE`/`vge` (PRT, VFT, iTerm-style `ESC _ G …`, or anything
+else) verbatim to its downstream layer. This pass-through rule is what
+lets a stack of nested hosts — for example a remote `veterd`
+consuming PRT + VGE while a `vsend` running inside its session emits
+VFT bytes that must reach the local user's terminal — layer cleanly
+without each level having to understand every extension. See
+`doc/session-manager.md` for the driving use case.
+
 ### 1.2 Payload framing
 
 The payload is a single binary blob with byte stuffing applied (§1.3) before

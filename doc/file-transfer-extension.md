@@ -53,6 +53,14 @@ host-side APC parser route VFT envelopes to this extension while
 passing other APC sequences (PRT, VGE, iTerm-style `ESC _ G …`)
 through to whatever else handles them.
 
+A host that implements VFT MUST forward APC envelopes whose marker
+is not `VFT`/`vft` verbatim to its downstream layer. This pass-through
+rule is what lets a stack of nested hosts — for example a remote
+`veterd` consuming PRT + VGE while a `vsend` running inside its
+session emits VFT bytes that must reach the local user's terminal —
+layer cleanly without each level having to understand every
+extension. See `doc/session-manager.md` for the driving use case.
+
 ### 1.2 Payload framing
 
 The payload is one binary blob with byte stuffing applied (§1.3) before
