@@ -2705,6 +2705,101 @@ mod tests {
     }
 
     #[test]
+    fn nested_dsr_query_through_two_portals_round_trips() {
+        // Reproduces the user-reported vcat-over-vmux-over-vmux scenario.
+        // Chain: outer host → portal "outer" → portal "inner" inside it.
+        // The innermost program writes `\x1b[6n` (a few newlines first so
+        // the cursor lands somewhere distinguishable).
+        //
+        // The outer engine should surface ONE RawReply event for "outer";
+        // its body should itself be a PRT T2C envelope carrying a
+        // RawReply event for "inner" whose body is the DSR cursor-position
+        // reply bytes — the exact shape vmux+ssh+vmux chains require to
+        // route the DSR back to the innermost program.
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("outer", 80, 24),
+        );
+
+        // Inside "outer": create "inner", then write some newlines + DSR
+        // into "inner". Wrap each command in a c2t envelope so the outer
+        // engine extracts the same way an inner-vmux program would have
+        // emitted them.
+        let inner_create_body = make_create_body("inner", 40, 12);
+        let inner_data = b"\n\n\x1b[6n";
+        let inner_write_body = encode::write_portal_body(&WritePortalBody {
+            id: "inner".into(),
+            data: inner_data.to_vec(),
+        });
+        let mut inner_frames = Vec::new();
+        append_frame(&mut inner_frames, CMD_CREATE_PORTAL, 7, &inner_create_body);
+        append_frame(&mut inner_frames, CMD_WRITE_PORTAL, 8, &inner_write_body);
+        let inner_envelope = wrap_c2t_envelope(&inner_frames);
+
+        let outer_write_body = encode::write_portal_body(&WritePortalBody {
+            id: "outer".into(),
+            data: inner_envelope,
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &outer_write_body);
+
+        // Outer side: a single RawReply for "outer".
+        let raw = first_event(&frames, EVT_RAW_REPLY)
+            .expect("outer engine should emit a RawReply event for outer");
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "outer");
+        let inner_wire = r.bytes().unwrap();
+
+        // The inner_wire bytes ARE the inner T2C envelope that vmux is
+        // supposed to forward to the inner portal's PTY. Parse it as a
+        // T2C envelope and check the inner RawReply.
+        let mut inner_apc = ApcStream::with_marker(*MARKER_T2C);
+        let out = inner_apc.feed(inner_wire);
+        assert!(
+            out.passthrough.is_empty(),
+            "inner_wire should be a clean envelope, got {} bytes of passthrough",
+            out.passthrough.len()
+        );
+        assert_eq!(out.payloads.len(), 1, "exactly one inner envelope");
+
+        // The inner envelope's payload may carry multiple frames (the
+        // RSP_OK that acknowledges the inner WritePortal, plus the
+        // RawReply for "inner"). Walk all frames looking for the
+        // RawReply.
+        let inner_payload = &out.payloads[0];
+        let mut r = Reader::new(inner_payload);
+        let _version = r.u8().unwrap();
+        let _payload_len = r.u32().unwrap();
+        let mut found_dsr: Option<Vec<u8>> = None;
+        while !r.at_end() {
+            let ft = r.u8().unwrap();
+            let _req_id = r.u32().unwrap();
+            let body_len = r.u32().unwrap() as usize;
+            let body = r.take(body_len).unwrap();
+            if ft != EVT_RAW_REPLY {
+                continue;
+            }
+            let mut br = Reader::new(body);
+            let id = br.string().unwrap();
+            if id != "inner" {
+                continue;
+            }
+            found_dsr = Some(br.bytes().unwrap().to_vec());
+            break;
+        }
+        let dsr_bytes =
+            found_dsr.expect("no RawReply event for inner in the inner envelope");
+        // Inner vt100 wrote two newlines first; cursor was at (0,0), now
+        // at (2,0) in 0-indexed terms → DSR reports row 3, col 1.
+        assert_eq!(
+            dsr_bytes, b"\x1b[3;1R",
+            "DSR reply for inner should be \"\\x1b[3;1R\" (row 3, col 1)"
+        );
+    }
+
+    #[test]
     fn per_portal_vge_does_not_double_reply_dsr() {
         // Inner program sends `\x1b[6n` which both the PRT apc and the
         // VGE apc observe. PRT must be the sole responder — VGE has

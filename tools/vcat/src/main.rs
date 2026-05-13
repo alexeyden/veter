@@ -43,8 +43,11 @@ struct Cli {
     width: Option<u32>,
 
     /// Milliseconds to wait for the terminal's probe / cursor
-    /// responses before giving up.
-    #[arg(long, default_value_t = 500)]
+    /// responses before giving up. 2000 ms covers nested chains
+    /// (e.g. vmux-over-ssh-over-vmux-over-veter) where each layer
+    /// adds a poll-cadence boundary plus SSH round-trip; bump higher
+    /// if the chain is deeper still.
+    #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
 
     /// Print progress to stderr at each pipeline stage.
@@ -146,8 +149,29 @@ fn main() -> Result<()> {
     trace!(v, "querying cursor");
     stdout.write_all(b"\x1b[6n")?;
     stdout.flush()?;
-    let cursor_row = read_cursor_row(Duration::from_millis(cli.timeout_ms))?
-        .ok_or_else(|| anyhow!("cursor-position query timed out"))?;
+    let cursor_row = match read_cursor_row(Duration::from_millis(cli.timeout_ms))? {
+        Some(r) => r,
+        None => {
+            // DSR timed out. Common cause is a multi-hop chain
+            // (vmux-in-vmux over ssh) where the round trip exceeds
+            // the configured timeout. Fall back to TIOCGWINSZ — the
+            // assumption is that vcat is being run interactively and
+            // the cursor scrolled to the bottom of the live screen
+            // after the h_cells newlines (which is the common case for
+            // images taller than the remaining rows). The image then
+            // ends up flush with the prompt that re-appears below it.
+            // If the chain didn't actually scroll, the image will sit
+            // a few rows higher than ideal — much better than aborting.
+            let rows = winsize_rows().unwrap_or(24) as u32;
+            eprintln!(
+                "vcat: cursor-position query timed out at {}ms; falling \
+                 back to row {} (TIOCGWINSZ). If the placement looks off, \
+                 retry with --timeout-ms <larger>.",
+                cli.timeout_ms, rows
+            );
+            rows
+        }
+    };
     trace!(v, "cursor row={cursor_row}");
     // After printing h_cells newlines the cursor is at row C (1-indexed,
     // top of screen = 1). The image should occupy rows
@@ -493,13 +517,21 @@ fn read_stdin(buf: &mut [u8]) -> Result<usize> {
 }
 
 fn winsize_cols() -> Option<u16> {
+    winsize().map(|ws| ws.ws_col).filter(|c| *c != 0)
+}
+
+fn winsize_rows() -> Option<u16> {
+    winsize().map(|ws| ws.ws_row).filter(|r| *r != 0)
+}
+
+fn winsize() -> Option<libc::winsize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let fd = std::io::stdout().as_raw_fd();
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws as *mut _) };
-    if rc != 0 || ws.ws_col == 0 {
+    if rc != 0 {
         None
     } else {
-        Some(ws.ws_col)
+        Some(ws)
     }
 }
 
