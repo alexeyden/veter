@@ -6,8 +6,9 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: clean. Branch: `master`. The build is green and the
-full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: dirty (Commit H plus this doc update). Branch:
+`master`. The build is green and the full workspace test suite
+passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -50,6 +51,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `db8042c` | refactor: extract veter-host crate (GUI-free host engines) |
 | `2dbc61d` | doc: CONTEXT.md: mark Commit F as landed |
 | `966c251` | build: cross-compile veterd to aarch64-musl, bundle in dist |
+| `2e3674b` | doc: CONTEXT.md: mark Commit G as landed |
+| *(uncommitted)* | feat: vge: preserve encoded image bytes for snapshot reship (Commit H) |
 
 ### Snapshot serializers (the core)
 
@@ -73,8 +76,10 @@ v1 limitations called out in the docstrings:
 
 - vt100 serializer drops alt-screen-buffer state, DECSC saved cursor,
   scrolling region, and the active G0/G1 charset.
-- VGE serializer ships images as Raw RGBA8 regardless of original
-  encoding (engine doesn't retain WebP source bytes).
+- ~~VGE serializer ships images as Raw RGBA8 regardless of original
+  encoding.~~ Fixed in Commit H — `UploadedImage` now retains
+  `source_encoding` + `source_data` so snapshots reship the original
+  WebP bytes.
 - PRT serializer skips per-portal VFT engines (in-flight transfers
   are abandoned by reattach) and engine-level focus/cursor-style/
   polled-cache state.
@@ -338,6 +343,43 @@ as the linker), not a crate-graph issue.
 All 121 prt + 60 vge + 25 vft + 19 veterd + 14 vt100 unit tests
 remain green; no behavior changes, pure code organization.
 
+### Commit H — preserve encoded image bytes in VGE snapshots (uncommitted, working tree)
+
+Closes the bandwidth blowup that made reattach on slow SSH links
+unusable. Before this commit, `VgeEngine::serialize_state` re-encoded
+images as Raw RGBA8 because the engine had thrown away the original
+on-wire bytes — a 50 KiB WebP avatar inflated to width × height × 4
+bytes on every replay.
+
+Now `UploadedImage` carries two extra fields:
+
+```rust
+pub source_encoding: u8,   // 0x01 = Raw, 0x02 = WebP
+pub source_data: Vec<u8>,  // the bytes that came in via cmd_upload_image
+```
+
+`cmd_upload_image` stashes both at upload time; `serialize_state`
+reuses them verbatim in the snapshot's `UploadImage` body. Round-trip
+is byte-identical: WebP stays WebP, Raw stays Raw, exact wire bytes
+are preserved.
+
+Two new tests pin the contract:
+
+- `serialize_state_preserves_image_source_encoding_and_bytes` — Raw
+  uploads survive the round-trip with byte-identical payload.
+- `serialize_state_reships_webp_in_its_original_encoding` —
+  constructs an `UploadedImage` with `source_encoding=0x02` and an
+  opaque source-data blob (no need to synthesize a valid WebP);
+  asserts the snapshot's `UploadImage` body has encoding 0x02 and
+  the same opaque bytes, *not* a re-derived RGBA blob.
+
+A shared `unwrap_envelope` helper was factored out so tests can
+inspect both T2C (responses) and C2T (snapshot commands) envelopes
+without duplicating the un-stuffing logic.
+
+`cmd_update_image` was unaffected: it only swaps image-id references
+inside DrawCmds, never touches pixels or source data.
+
 ## What's left
 
 ### #7 — Detach hotkey
@@ -392,9 +434,10 @@ the second shoe to drop.
   to private fns in the lib face, use `text` or `ignore` to keep
   cargo test green.
 - **Doctest for new lib doc comments:** as above.
-- **VGE serializer ships decoded pixels** for images. A 50 KiB WebP
-  inflates to width×height×4 bytes on every reattach. Future:
-  retain original encoded bytes alongside decoded pixels.
+- ~~**VGE serializer ships decoded pixels** for images.~~ Fixed in
+  Commit H: `UploadedImage` carries `source_encoding` + `source_data`,
+  and `serialize_state` reships the originals byte-for-byte. WebP
+  uploads stay WebP across reattaches.
 - **PRT serializer doesn't carry VFT state.** Reattach drops
   in-flight `vsend`/`vrecv` transfers. The pass-through contract
   means VFT envelopes ride through veterd verbatim to local veter,

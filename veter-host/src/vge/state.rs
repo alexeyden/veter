@@ -63,11 +63,24 @@ pub struct GpuImageId(pub u64);
 /// `gpu` is `Cell<Option<GpuImageId>>` so the renderer can populate it
 /// while only holding a `&VgeState` (the renderer doesn't need any
 /// other mutation, and `GpuImageId` is `Copy`).
+///
+/// `source_encoding` and `source_data` retain the original wire-format
+/// bytes alongside the decoded pixels so [`VgeEngine::serialize_state`]
+/// can reship the image in its original form on reattach. Without this,
+/// a 50 KiB WebP avatar would inflate to `width × height × 4` bytes
+/// every time a renderer reconnects — punishing on bad SSH links.
 pub struct UploadedImage {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<RGBA8>,
     pub gpu: Cell<Option<GpuImageId>>,
+    /// Encoding byte from the original `UploadImage` body (§8.1):
+    /// `0x01` = Raw RGBA8, `0x02` = WebP. Used by `serialize_state`.
+    pub source_encoding: u8,
+    /// Encoded bytes as they arrived on the wire. For Raw uploads this
+    /// matches what `pixels` was decoded from byte-for-byte; for WebP
+    /// it's the much smaller compressed form.
+    pub source_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -481,31 +494,27 @@ impl VgeEngine {
     /// v1 limitations (called out in the doc):
     /// - Only the currently-active screen's element set is emitted.
     ///   Suspended alt/main set state is dropped.
-    /// - Images are emitted as Raw RGBA8 regardless of how they were
-    ///   uploaded; the original encoded bytes (e.g. WebP) aren't
-    ///   retained on the engine. This inflates a 50 KiB WebP avatar
-    ///   to `width*height*4` bytes on every replay.
+    ///
+    /// Images are reshipped in their original encoding (`source_data`
+    /// + `source_encoding` on [`UploadedImage`]). A WebP avatar stays
+    /// WebP on the wire instead of inflating to `width × height × 4`
+    /// bytes, which matters a lot for reattaches over slow links.
     pub fn serialize_state(&self) -> Vec<u8> {
         let mut frames: Vec<(Command, u32)> = Vec::new();
         let state = &self.state;
 
-        // 1. Image table — UploadImage per entry. We only have the
-        //    decoded RGBA8 pixels, so emit as Raw.
+        // 1. Image table — UploadImage per entry. Reuses the original
+        //    on-wire bytes we stashed at upload time, so WebP stays
+        //    WebP and a `tail -f` over SSH doesn't have to push the
+        //    decoded RGBA on every reattach.
         for (id, img) in &state.shared.images {
-            let mut data = Vec::with_capacity(img.pixels.len() * 4);
-            for px in &img.pixels {
-                data.push(px.r);
-                data.push(px.g);
-                data.push(px.b);
-                data.push(px.a);
-            }
             frames.push((
                 Command::UploadImage(UploadImageBody {
                     id: id.clone(),
-                    encoding: 0x01,
+                    encoding: img.source_encoding,
                     width: img.width,
                     height: img.height,
-                    data,
+                    data: img.source_data.clone(),
                 }),
                 0,
             ));
@@ -865,6 +874,10 @@ impl VgeEngine {
             _ => return Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
         };
 
+        // Preserve the on-wire form so snapshot replay can reship the
+        // image in its original encoding rather than inflating to RGBA8.
+        let source_encoding = b.encoding;
+        let source_data = b.data;
         self.state.shared.images.insert(
             b.id,
             UploadedImage {
@@ -872,6 +885,8 @@ impl VgeEngine {
                 height: b.height,
                 pixels,
                 gpu: Cell::new(None),
+                source_encoding,
+                source_data,
             },
         );
         Ok(Vec::new())
@@ -1301,11 +1316,21 @@ mod tests {
     /// ApcStream only matches uppercase `VGE`, so we strip the
     /// `ESC _ vge` prefix and `ESC \` suffix by hand here.
     fn unwrap_t2c_envelope(env: &[u8]) -> Vec<u8> {
+        unwrap_envelope(env, MARKER_T2C)
+    }
+
+    /// Like [`unwrap_t2c_envelope`] but for client-to-terminal envelopes
+    /// (`ESC _ VGE`). `serialize_state` produces these — the snapshot is
+    /// commands the receiving engine replays as a fresh client.
+    fn unwrap_c2t_envelope(env: &[u8]) -> Vec<u8> {
+        unwrap_envelope(env, MARKER_C2T)
+    }
+
+    fn unwrap_envelope(env: &[u8], marker: &[u8; 3]) -> Vec<u8> {
         assert!(env.len() >= 7);
         assert_eq!(&env[..2], &[ESC, APC_OPEN]);
-        assert_eq!(&env[2..5], MARKER_T2C);
+        assert_eq!(&env[2..5], marker);
         assert_eq!(&env[env.len() - 2..], &[ESC, ST_CLOSE]);
-        // Un-stuff the body.
         let mut out = Vec::new();
         let mut i = 5;
         while i < env.len() - 2 {
@@ -2461,6 +2486,94 @@ mod tests {
         // Child origin is parent-relative; should round-trip verbatim.
         assert!((child.origin_x - 1.5).abs() < 1e-3);
         assert!((child.origin_y - 2.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn serialize_state_preserves_image_source_encoding_and_bytes() {
+        // Raw round-trip: uploading via the wire path then snapshotting
+        // must yield byte-identical UploadImage payload (same encoding,
+        // same data). Raw is the easy case — the snapshot used to also
+        // be Raw — but this test pins the invariant for cell-by-cell
+        // preservation.
+        let mut a = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        a.process_pty_chunk(&build_envelope(&frames));
+        let _ = a.take_responses();
+
+        let snap = a.serialize_state();
+        let inner = unwrap_c2t_envelope(&snap);
+        let mut r = Reader::new(&inner);
+        assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
+        let _payload_len = r.u32().unwrap();
+        // First frame should be UploadImage with the original Raw body.
+        assert_eq!(r.u8().unwrap(), CMD_UPLOAD_IMAGE);
+        let _req_id = r.u32().unwrap();
+        let body_len = r.u32().unwrap() as usize;
+        let body = r.take(body_len).unwrap();
+        let mut br = Reader::new(body);
+        assert_eq!(br.string().unwrap(), "logo");
+        assert_eq!(br.u8().unwrap(), 0x01, "encoding preserved");
+        assert_eq!(br.u32().unwrap(), 2); // width
+        assert_eq!(br.u32().unwrap(), 2); // height
+        let payload = br.bytes().unwrap();
+        // Matches the 4 RGBA8 pixels from `upload_raw_2x2`.
+        assert_eq!(
+            payload,
+            &[
+                0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF,
+            ]
+        );
+    }
+
+    #[test]
+    fn serialize_state_reships_webp_in_its_original_encoding() {
+        // Constructs an engine with an `UploadedImage` whose
+        // `source_encoding` is 0x02 (WebP) and whose `source_data` is
+        // arbitrary opaque bytes. `serialize_state` must reship those
+        // verbatim — not re-encode from `pixels`. This is the
+        // bandwidth fix: a 50 KiB WebP must not turn into a
+        // width*height*4 RGBA blob on every reattach.
+        //
+        // We bypass the wire upload path because synthesizing a valid
+        // WebP just to prove the no-re-encode property would couple the
+        // test to the image crate's encoder. The contract `serialize_state`
+        // must uphold is simply "emit whatever encoding came in"; the
+        // straight-line code path here is enough to pin it.
+        let fake_webp_bytes: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let mut a = VgeEngine::new((9, 20), 1.0);
+        a.state.shared.images.insert(
+            "avatar".into(),
+            UploadedImage {
+                width: 32,
+                height: 32,
+                pixels: vec![RGBA8::new(0, 0, 0, 0); 32 * 32],
+                gpu: Cell::new(None),
+                source_encoding: 0x02,
+                source_data: fake_webp_bytes.clone(),
+            },
+        );
+
+        let snap = a.serialize_state();
+        let inner = unwrap_c2t_envelope(&snap);
+        let mut r = Reader::new(&inner);
+        let _ = r.u8().unwrap(); // protocol version
+        let _ = r.u32().unwrap(); // payload_len
+        assert_eq!(r.u8().unwrap(), CMD_UPLOAD_IMAGE);
+        let _ = r.u32().unwrap(); // request_id
+        let body_len = r.u32().unwrap() as usize;
+        let body = r.take(body_len).unwrap();
+        let mut br = Reader::new(body);
+        assert_eq!(br.string().unwrap(), "avatar");
+        assert_eq!(br.u8().unwrap(), 0x02, "encoding stayed WebP");
+        assert_eq!(br.u32().unwrap(), 32);
+        assert_eq!(br.u32().unwrap(), 32);
+        let payload = br.bytes().unwrap();
+        assert_eq!(payload, fake_webp_bytes.as_slice());
+        // And critically, the snapshot is *much* smaller than a 32×32
+        // RGBA8 blob would have been: 64 bytes of source < 4096 RGBA.
+        assert!(payload.len() < 32 * 32 * 4);
     }
 
     #[test]
