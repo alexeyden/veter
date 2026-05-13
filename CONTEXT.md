@@ -6,9 +6,8 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: dirty (Commit F plus this doc update). Branch:
-`master`. The build is green and the full workspace test suite
-passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: clean. Branch: `master`. The build is green and the
+full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -48,7 +47,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `fe9e657` | doc: CONTEXT.md: mark Commit D as landed |
 | `dc35a2a` | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll |
 | `b121a6b` | doc: CONTEXT.md: mark Commit E as landed |
-| *(uncommitted)* | refactor: extract veter-host crate (Commit F) |
+| `db8042c` | refactor: extract veter-host crate (GUI-free host engines) |
 
 ### Snapshot serializers (the core)
 
@@ -289,7 +288,7 @@ session whose bash has a `WINCH` trap, resize the harness's PTY
 master to 50×200, and confirm `SIZE 50x200` is forwarded back via
 the renderer-stdout within one polling interval.
 
-### Commit F — extract `veter-host` crate (uncommitted, working tree)
+### Commit F — extract `veter-host` crate (committed)
 
 The lib face in `veter/src/lib.rs` was the v1 unblock for veterd
 but pulled every GUI dep into veterd transitively. This commit
