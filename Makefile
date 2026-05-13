@@ -39,7 +39,8 @@ RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
 .PHONY: all build install uninstall clean help install-desktop install-icon \
-        dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb dist-clean
+        dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb dist-clean \
+        install-remote-aarch64
 
 all: install
 
@@ -56,11 +57,17 @@ help:
 	@echo "  dist-aarch64-deb    bundle the above into veter-tools_<v>_arm64.deb"
 	@echo "  dist-clean          rm -rf dist/"
 	@echo
+	@echo "  install-remote-aarch64"
+	@echo "                      cross-compile and scp+install the aarch64-musl"
+	@echo "                      binaries into REMOTE_BINDIR on REMOTE (over ssh)"
+	@echo
 	@echo "Variables (override on the command line):"
 	@echo "  PREFIX=$(PREFIX)"
 	@echo "  BINDIR=$(BINDIR)"
 	@echo "  APPDIR=$(APPDIR)"
 	@echo "  DIST_VERSION=$(DIST_VERSION)"
+	@echo "  REMOTE=$(REMOTE)  (e.g. ha@home-assistant.local — required for install-remote-aarch64)"
+	@echo "  REMOTE_BINDIR=$(REMOTE_BINDIR)"
 
 build:
 	$(CARGO) build --release $(addprefix --package=,$(PACKAGES))
@@ -161,6 +168,14 @@ clean:
 DIST_TOOLS := vmux vcat vsend vrecv veterd
 DIST_VERSION ?= 0.1.0
 DIST_ARCH := aarch64-unknown-linux-musl
+
+# `install-remote-aarch64` knobs. `REMOTE` is required — it's whatever
+# ssh(1) would accept (`user@host`, `host`, or a `Host` alias from
+# `~/.ssh/config`). `REMOTE_BINDIR` is where the binaries land on the
+# remote; ~/.local/bin keeps things user-scoped, no sudo needed. Both
+# variables can be set on the make CLI or in the environment.
+REMOTE ?=
+REMOTE_BINDIR ?= ~/.local/bin
 DIST_DEB_ARCH := arm64
 DIST_BINDIR := $(TARGET_DIR)/$(DIST_ARCH)/release
 DIST_DIR := $(CURDIR)/dist
@@ -247,6 +262,26 @@ dist-aarch64-deb: dist-aarch64-build
 	@rm -rf $(DIST_DEB_STAGING)
 	@echo "    veter-tools deb -> $(DIST_DEB_FILE)"
 	@ls -l $(DIST_DEB_FILE)
+
+# One-shot deploy to a remote aarch64 host. Streams the freshly-built
+# release binaries through a single ssh connection (no intermediate
+# tarball lands on disk), then mkdirs REMOTE_BINDIR and untars there.
+# Permissions are preserved by tar(1); the binaries land 0755.
+#
+# Usage:
+#   make install-remote-aarch64 REMOTE=ha@home-assistant.local
+#   make install-remote-aarch64 REMOTE=ha@home-assistant.local REMOTE_BINDIR=/opt/veter/bin
+#   REMOTE=ha@home-assistant.local make install-remote-aarch64
+install-remote-aarch64: dist-aarch64-build
+	@if [ -z "$(REMOTE)" ]; then \
+	    echo "error: REMOTE not set" >&2; \
+	    echo "  example: make install-remote-aarch64 REMOTE=ha@home-assistant.local" >&2; \
+	    exit 1; \
+	fi
+	@echo "    veter-tools -> $(REMOTE):$(REMOTE_BINDIR)/"
+	@tar -cf - -C $(DIST_BINDIR) $(DIST_TOOLS) \
+	    | ssh $(REMOTE) "mkdir -p $(REMOTE_BINDIR) && tar -xpf - -C $(REMOTE_BINDIR)"
+	@for t in $(DIST_TOOLS); do echo "    $$t -> $(REMOTE):$(REMOTE_BINDIR)/$$t"; done
 
 dist-clean:
 	@rm -rf $(DIST_DIR)
