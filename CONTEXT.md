@@ -6,8 +6,9 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: clean. Branch: `master`. The build is green and the
-full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: dirty (Commit G plus this doc update). Branch:
+`master`. The build is green and the full workspace test suite
+passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -48,6 +49,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `dc35a2a` | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll |
 | `b121a6b` | doc: CONTEXT.md: mark Commit E as landed |
 | `db8042c` | refactor: extract veter-host crate (GUI-free host engines) |
+| `2dbc61d` | doc: CONTEXT.md: mark Commit F as landed |
+| *(uncommitted)* | build: cross-compile veterd to aarch64-musl, bundle in dist (Commit G) |
 
 ### Snapshot serializers (the core)
 
@@ -346,15 +349,13 @@ daemon-side env var (e.g. `VETERD_DETACH_PREFIX`).
 
 ### #8 — aarch64-musl packaging for veterd
 
-Crate-graph blocker is gone (see Commit F): `cargo build -p veterd
---target aarch64-unknown-linux-musl` now compiles every Rust
-dependency cleanly. The remaining failure is purely the linker —
-the host's `/usr/bin/ld` doesn't speak aarch64. Setup work:
-configure `aarch64-linux-musl-gcc` as the linker for the
-`aarch64-unknown-linux-musl` target via either
-`.cargo/config.toml` or a per-build `RUSTFLAGS=-C linker=...`.
-After that, wire the build into the `dist-aarch64-deb` make
-target alongside the existing client tools.
+Done in Commit G. `.cargo/config.toml` sets
+`target.aarch64-unknown-linux-musl.linker = "rust-lld"` (rust-lld
+ships with the rustup toolchain, so no external cross-gcc is
+required), and the Makefile's existing `dist-aarch64-{build,tarxz,deb}`
+targets now include `veterd` alongside vmux/vcat/vsend/vrecv. The
+resulting .deb (`veter-tools_<v>_arm64.deb`) bundles all five
+binaries; the daemon's release binary is ~2.6 MB static.
 
 For local installs `veterd` is already in `make install`'s
 `PACKAGES` list and lands at `$(BINDIR)/veterd`.

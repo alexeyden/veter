@@ -50,8 +50,8 @@ help:
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
-	@echo "  dist-aarch64-build  cross-compile vmux/vcat/vsend/vrecv for"
-	@echo "                      aarch64-unknown-linux-musl (static, rust-lld)"
+	@echo "  dist-aarch64-build  cross-compile vmux/vcat/vsend/vrecv/veterd"
+	@echo "                      for aarch64-unknown-linux-musl (static, rust-lld)"
 	@echo "  dist-aarch64-tarxz  bundle the above into a .tar.xz under dist/"
 	@echo "  dist-aarch64-deb    bundle the above into veter-tools_<v>_arm64.deb"
 	@echo "  dist-clean          rm -rf dist/"
@@ -158,7 +158,7 @@ clean:
 # are fully static — no dynamic loader, no libc dependency on the
 # target system — and ride into either a .tar.xz or a .deb.
 
-CLIENT_TOOLS := vmux vcat vsend vrecv
+DIST_TOOLS := vmux vcat vsend vrecv veterd
 DIST_VERSION ?= 0.1.0
 DIST_ARCH := aarch64-unknown-linux-musl
 DIST_DEB_ARCH := arm64
@@ -171,17 +171,16 @@ DIST_TARXZ_FILE := $(DIST_DIR)/veter-tools-$(DIST_VERSION)-$(DIST_ARCH).tar.xz
 DIST_MAINTAINER := Alexey Denisov <rtgbnm@gmail.com>
 
 dist-aarch64-build:
-	@# rust-lld lives in rustc's sysroot, not on PATH — `-C linker=rust-lld`
-	@# below resolves it via the toolchain. If it's somehow absent, the
-	@# build will fail with a clear linker error.
+	@# Linker for this target is configured in `.cargo/config.toml`:
+	@# `linker = "rust-lld"`. rust-lld ships inside the rustup
+	@# toolchain so no host cross-gcc is required.
 	@rustup target list --installed 2>/dev/null | grep -qx '$(DIST_ARCH)' || { \
 	    echo "Installing rust-std for $(DIST_ARCH)..."; \
 	    rustup target add $(DIST_ARCH); \
 	}
-	RUSTFLAGS="-C linker=rust-lld" \
-	    $(CARGO) build --release --target $(DIST_ARCH) \
-	    $(addprefix --package=,$(CLIENT_TOOLS))
-	@for t in $(CLIENT_TOOLS); do \
+	$(CARGO) build --release --target $(DIST_ARCH) \
+	    $(addprefix --package=,$(DIST_TOOLS))
+	@for t in $(DIST_TOOLS); do \
 	    src="$(DIST_BINDIR)/$$t"; \
 	    if [ ! -x "$$src" ]; then \
 	        echo "error: $$t binary not found at $$src" >&2; \
@@ -193,23 +192,24 @@ dist-aarch64-tarxz: dist-aarch64-build
 	@$(INSTALL) -d $(DIST_DIR)
 	@rm -rf $(DIST_TARXZ_STAGING)
 	@$(INSTALL) -d $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)
-	@for t in $(CLIENT_TOOLS); do \
+	@for t in $(DIST_TOOLS); do \
 	    $(INSTALL) -m 0755 $(DIST_BINDIR)/$$t \
 	        $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)/$$t; \
 	done
 	@printf '%s\n' \
 	    'veter-tools $(DIST_VERSION) — $(DIST_ARCH)' \
 	    '' \
-	    'Client-side tools for the Veter terminal emulator. Statically' \
+	    'Remote-side tools for the Veter terminal emulator. Statically' \
 	    'linked against musl libc; drop the binaries anywhere on $$PATH on' \
 	    'an aarch64 Linux host and they will work without any runtime' \
 	    'dependencies.' \
 	    '' \
 	    'Tools:' \
-	    '  vmux   terminal multiplexer (PRT + VGE)' \
-	    '  vcat   display images inline (VGE)' \
-	    '  vsend  upload local files (VFT)' \
-	    '  vrecv  download remote files (VFT)' \
+	    '  vmux    terminal multiplexer (PRT + VGE)' \
+	    '  vcat    display images inline (VGE)' \
+	    '  vsend   upload local files (VFT)' \
+	    '  vrecv   download remote files (VFT)' \
+	    '  veterd  persistent session daemon (doc/session-manager.md)' \
 	    > $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)/README
 	@tar -cJf $(DIST_TARXZ_FILE) \
 	    -C $(DIST_TARXZ_STAGING) veter-tools-$(DIST_VERSION)
@@ -225,7 +225,7 @@ dist-aarch64-deb: dist-aarch64-build
 	@$(INSTALL) -d $(DIST_DIR)
 	@rm -rf $(DIST_DEB_STAGING)
 	@$(INSTALL) -d $(DIST_DEB_STAGING)/DEBIAN $(DIST_DEB_STAGING)/usr/bin
-	@for t in $(CLIENT_TOOLS); do \
+	@for t in $(DIST_TOOLS); do \
 	    $(INSTALL) -m 0755 $(DIST_BINDIR)/$$t $(DIST_DEB_STAGING)/usr/bin/$$t; \
 	done
 	@printf '%s\n' \
@@ -235,11 +235,13 @@ dist-aarch64-deb: dist-aarch64-build
 	    'Priority: optional' \
 	    'Architecture: $(DIST_DEB_ARCH)' \
 	    'Maintainer: $(DIST_MAINTAINER)' \
-	    'Description: Client-side tools for the Veter terminal emulator' \
-	    ' Statically-linked aarch64 binaries for vmux, vcat, vsend, and' \
-	    ' vrecv. These talk PRT, VGE, and VFT to a Veter-aware terminal' \
-	    ' (or to vmux running inside one) and have no runtime dependencies' \
-	    ' on the target system.' \
+	    'Description: Remote-side tools for the Veter terminal emulator' \
+	    ' Statically-linked aarch64 binaries for vmux, vcat, vsend, vrecv,' \
+	    ' and veterd. The first four talk PRT/VGE/VFT to a Veter-aware' \
+	    ' terminal (or to vmux running inside one); veterd is a persistent' \
+	    ' session daemon that owns inner PTYs across renderer attach/detach' \
+	    ' cycles (see doc/session-manager.md). All binaries have no runtime' \
+	    ' dependencies on the target system.' \
 	    > $(DIST_DEB_STAGING)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(DIST_DEB_STAGING) $(DIST_DEB_FILE) >/dev/null
 	@rm -rf $(DIST_DEB_STAGING)

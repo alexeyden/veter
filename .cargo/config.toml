@@ -1,0 +1,13 @@
+# Project-local cargo config.
+#
+# Cross-compiling veterd to aarch64-musl: rust's bundled lld
+# (`rust-lld`, shipped inside the rustup toolchain) can link the
+# fully-static musl target without an external cross-gcc. This is the
+# minimum config to get `cargo build -p veterd --target
+# aarch64-unknown-linux-musl` to produce a working static binary on
+# a host that doesn't have aarch64-linux-musl-gcc installed.
+#
+# We intentionally do NOT set a linker for the host triples here —
+# the user's ~/.cargo/config.toml already handles that.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
