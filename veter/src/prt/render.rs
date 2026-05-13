@@ -217,33 +217,9 @@ fn render_portal_at<T: Renderer>(
         portal_sel_range.as_ref(),
     );
 
-    // 2. §10 — per-portal VGE elements. They render *inside* the
-    //    portal's clip rect, on top of the portal's text grid, in the
-    //    portal's own cell coordinate space. We translate the canvas
-    //    so the existing VGE walker (which assumes canvas-origin
-    //    coords) applies to the portal-local frame; the enclosing
-    //    `intersect_scissor` from the portal's own clip stays in
-    //    effect because femtovg compounds clips correctly across
-    //    transforms.
-    let portal_scrollback = portal.vt.screen().scrollback();
-    if !portal.vge.state.elements().is_empty() {
-        canvas.save();
-        canvas.translate(ox_px, oy_px);
-        for el in portal.vge.state.top_level_sorted() {
-            vge::render::render_one_top_level(
-                canvas,
-                term_renderer,
-                &portal.vge.state,
-                el,
-                portal.vge.top_of_live_screen(),
-                portal.size_h as u16,
-                portal_scrollback,
-            );
-        }
-        canvas.restore();
-    }
-
-    // 3. Unfocused-style cursor (everyone except the focused leaf).
+    // 2. Unfocused-style cursor (everyone except the focused leaf).
+    //    Drawn before any overlays so VGE chrome / images / sub-portals
+    //    layer on top of it consistently.
     if !is_focused_leaf && cursor_visible {
         draw_unfocused_cursor(
             canvas,
@@ -257,48 +233,85 @@ fn render_portal_at<T: Renderer>(
         );
     }
 
-    // 4. Sub-portals. Their anchor frame is the parent portal's vt100,
-    //    not the host's: line tracking is per-engine. Sub-portal
-    //    `origin_x` is in cells from the parent portal's left edge, so
-    //    pixel origin is `(ox_px, oy_px)` plus the cell offset.
+    // 3. Per-portal VGE elements + sub-portals, interleaved in a single
+    //    `(draw_order, creation_seq)` order. Mirrors what
+    //    `render_layers` does at the top level. Doing this here means
+    //    e.g. a vmux pane (PORTAL_DRAW_ORDER=0) carrying an image
+    //    correctly renders UNDER vmux's chrome scrollbar (drawn as
+    //    CHROME_DRAW_ORDER=10 VGE elements) — without this merge,
+    //    sub-portals were drawn after VGE so any image inside a sub-
+    //    portal painted over the chrome.
+    //
+    //    Sub-portal anchor frame is the parent portal's vt100, not the
+    //    host's. Sub-portal `origin_x` / anchor row are in cells from
+    //    the parent portal's top-left, so pixel origin is
+    //    `(ox_px, oy_px)` plus the cell offset.
+    let portal_scrollback = portal.vt.screen().scrollback();
     let sub_top = portal.children.top_of_live_screen();
     let sub_scrollback = portal.vt.screen().scrollback();
-    let mut subs: Vec<&Portal> = portal
-        .children
-        .state
-        .current()
-        .portals
-        .values()
-        .collect();
-    subs.sort_by_key(|p| (p.draw_order, p.creation_seq));
-    for sub in subs {
-        let next_sel = portal_selection.and_then(|s| {
-            let first = s.remaining_path.first().map(|s| s.as_str())?;
-            if first != sub.id.as_str() {
-                return None;
+
+    let mut layers: Vec<(i32, u64, Layer<'_>)> = Vec::new();
+    for el in portal.vge.state.top_level_sorted() {
+        layers.push((el.draw_order, el.creation_seq, Layer::Vge(el)));
+    }
+    for sub in portal.children.state.current().portals.values() {
+        layers.push((sub.draw_order, sub.creation_seq, Layer::Portal(sub)));
+    }
+    // `top_level_sorted` already returns elements in (draw_order,
+    // creation_seq) order, but we re-sort the merged list to interleave
+    // with sub-portals correctly.
+    layers.sort_by_key(|(d, c, _)| (*d, *c));
+
+    for (_, _, layer) in layers {
+        match layer {
+            Layer::Vge(el) => {
+                // VGE elements assume canvas-origin coords, so translate
+                // to the portal's pixel origin for the duration of one
+                // element. The enclosing `intersect_scissor` stays in
+                // effect across transforms.
+                canvas.save();
+                canvas.translate(ox_px, oy_px);
+                vge::render::render_one_top_level(
+                    canvas,
+                    term_renderer,
+                    &portal.vge.state,
+                    el,
+                    portal.vge.top_of_live_screen(),
+                    portal.size_h as u16,
+                    portal_scrollback,
+                );
+                canvas.restore();
             }
-            Some(PortalSelectionCtx {
-                remaining_path: &s.remaining_path[1..],
-                anchor_line: s.anchor_line,
-                anchor_col: s.anchor_col,
-                head_line: s.head_line,
-                head_col: s.head_col,
-            })
-        });
-        render_portal_at(
-            canvas,
-            term_renderer,
-            sub,
-            ox_px,
-            oy_px,
-            sub_top,
-            sub_scrollback,
-            cell_w,
-            cell_h,
-            unfocused_style,
-            sub_focus_chain,
-            next_sel.as_ref(),
-        );
+            Layer::Portal(sub) => {
+                let next_sel = portal_selection.and_then(|s| {
+                    let first = s.remaining_path.first().map(|s| s.as_str())?;
+                    if first != sub.id.as_str() {
+                        return None;
+                    }
+                    Some(PortalSelectionCtx {
+                        remaining_path: &s.remaining_path[1..],
+                        anchor_line: s.anchor_line,
+                        anchor_col: s.anchor_col,
+                        head_line: s.head_line,
+                        head_col: s.head_col,
+                    })
+                });
+                render_portal_at(
+                    canvas,
+                    term_renderer,
+                    sub,
+                    ox_px,
+                    oy_px,
+                    sub_top,
+                    sub_scrollback,
+                    cell_w,
+                    cell_h,
+                    unfocused_style,
+                    sub_focus_chain,
+                    next_sel.as_ref(),
+                );
+            }
+        }
     }
 
     canvas.restore();
