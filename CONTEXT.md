@@ -6,9 +6,8 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: dirty (Commit G plus this doc update). Branch:
-`master`. The build is green and the full workspace test suite
-passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: clean. Branch: `master`. The build is green and the
+full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -50,7 +49,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `b121a6b` | doc: CONTEXT.md: mark Commit E as landed |
 | `db8042c` | refactor: extract veter-host crate (GUI-free host engines) |
 | `2dbc61d` | doc: CONTEXT.md: mark Commit F as landed |
-| *(uncommitted)* | build: cross-compile veterd to aarch64-musl, bundle in dist (Commit G) |
+| `966c251` | build: cross-compile veterd to aarch64-musl, bundle in dist |
 
 ### Snapshot serializers (the core)
 
