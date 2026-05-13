@@ -5,7 +5,7 @@ edition = "2024"
 description = "Persistent veter session daemon — holds host vt100 / PRT / VGE state across renderer disconnects (see doc/session-manager.md)."
 
 [dependencies]
-veter = { path = "../../veter" }
+veter-host = { path = "../../veter-host" }
 vt100 = { path = "../../vt100" }
 prt-protocol = { path = "../../prt-protocol" }
 vge-protocol = { path = "../../vge-protocol" }

@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use veter::prt::PrtEngine;
-use veter::vge::VgeEngine;
+use veter_host::prt::PrtEngine;
+use veter_host::vge::VgeEngine;
 
 /// Default grid size used until the renderer attaches and reports its
 /// actual cell count. Mirrors `veter/src/main.rs`'s startup defaults.

@@ -30,14 +30,17 @@ pub enum PickerResult {
 /// `Cancelled` is sent, so unit tests can exercise the spawn /
 /// drain / response-slot plumbing without blocking on a real UI.
 pub fn run_picker(title: String, tx: Sender<PickerResult>, wakeup: Wakeup) {
-    #[cfg(test)]
+    // Suppressed under cfg(test) so unit tests don't spawn real UI;
+    // suppressed when the `gui` feature is off (headless veterd) so
+    // the picker becomes a deterministic Cancelled and the renderer's
+    // own picker handles the real interaction.
+    #[cfg(any(test, not(feature = "gui")))]
     {
         let _ = title;
         let _ = tx.send(PickerResult::Cancelled);
         wakeup();
-        return;
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), feature = "gui"))]
     {
         let result = std::panic::catch_unwind(move || {
             rfd::FileDialog::new().set_title(title).pick_file()
@@ -279,16 +282,18 @@ fn classify_io_error(e: &std::io::Error) -> u8 {
 /// viewer. Errors are swallowed — failing to launch the app does not
 /// abort the transfer; the file is already durable.
 ///
-/// Disabled under `cfg(test)` so unit tests don't spawn the user's
-/// real applications.
-#[cfg(not(test))]
+/// Disabled under `cfg(test)` (don't spawn real apps from unit tests)
+/// and when the `gui` feature is off (headless veterd: the renderer
+/// has the real default-app launcher; opening from the daemon would
+/// happen on the wrong machine anyway).
+#[cfg(all(not(test), feature = "gui"))]
 fn maybe_open_default(path: &PathBuf) {
     let _ = opener::open(path);
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(feature = "gui")))]
 fn maybe_open_default(_path: &PathBuf) {
-    // intentional no-op in test builds
+    // intentional no-op
 }
 
 #[cfg(unix)]

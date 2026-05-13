@@ -2769,17 +2769,31 @@ dependencies = [
  "imgref",
  "libc",
  "nix 0.29.0",
- "opener",
  "parley",
  "prt-protocol",
  "raw-window-handle",
- "rfd",
  "rgb",
  "swash",
+ "veter-host",
  "vft-protocol",
  "vge-protocol",
  "vt100",
  "winit",
+]
+
+[[package]]
+name = "veter-host"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "libc",
+ "opener",
+ "prt-protocol",
+ "rfd",
+ "rgb",
+ "vft-protocol",
+ "vge-protocol",
+ "vt100",
 ]
 
 [[package]]
@@ -2791,7 +2805,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "prt-protocol",
- "veter",
+ "veter-host",
  "vge-protocol",
  "vt100",
 ]

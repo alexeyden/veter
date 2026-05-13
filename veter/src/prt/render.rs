@@ -15,8 +15,8 @@ use femtovg::{Canvas, Color, Paint, Path, Renderer};
 
 use prt_protocol::command::CursorStyle;
 
-use super::portal::{Portal, PortalAnchor};
-use super::state::PrtState;
+use veter_host::prt::portal::{Portal, PortalAnchor};
+use veter_host::prt::state::PrtState;
 use crate::renderer::TerminalRenderer;
 use crate::vge;
 

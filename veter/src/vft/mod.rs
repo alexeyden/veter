@@ -1,17 +1,6 @@
-// Host-side VFT engine: command dispatch, transfer table, worker
-// threads. Wire-format types live in the `vft-protocol` crate and are
-// re-exported here for convenience.
-//
-// Phase B introduces the engine; Phase C (vsend / vrecv) and Phase D
-// (per-portal engines) consume the rest of these re-exports, so allow
-// them unused for now.
-#![allow(unused_imports)]
+// VFT engine lives in the `veter-host` crate so headless consumers
+// (veterd) can use it without dragging GUI dependencies. The veter
+// binary re-exports everything here for backwards compatibility with
+// existing `crate::vft::*` call sites.
 
-pub mod path;
-pub mod state;
-pub mod worker;
-
-pub use state::{Limits, VftEngine};
-pub use worker::Wakeup;
-
-pub use vft_protocol::*;
+pub use veter_host::vft::*;

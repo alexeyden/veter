@@ -17,6 +17,7 @@ name = "veter"
 path = "src/main.rs"
 
 [dependencies]
+veter-host = { path = "../veter-host", features = ["gui"] }
 vge-protocol = { path = "../vge-protocol" }
 prt-protocol = { path = "../prt-protocol" }
 vft-protocol = { path = "../vft-protocol" }
@@ -34,5 +35,3 @@ rgb = "0.8"
 imgref = "1"
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
-opener = "0.8"
-rfd = { version = "0.15", default-features = false, features = ["gtk3"] }

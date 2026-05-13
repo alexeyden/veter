@@ -9,7 +9,7 @@ use imgref::ImgRef;
 use vge_protocol::command::{Color, ConcreteStyle, DrawCmd, Style};
 use vge_protocol::path::{arc_to_beziers, PathNode, PathSegment};
 
-use super::state::{UploadedImage, VgeState};
+use veter_host::vge::state::{UploadedImage, VgeState};
 use crate::renderer::TerminalRenderer;
 
 const MAGENTA: FemtoColor = FemtoColor {

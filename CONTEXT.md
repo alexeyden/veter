@@ -6,8 +6,9 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: clean. Branch: `master`. The build is green and the
-full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: dirty (Commit F plus this doc update). Branch:
+`master`. The build is green and the full workspace test suite
+passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -46,6 +47,8 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `840adcf` | feat: veterd: upstream VGE/PRT probe + winsize at attach time |
 | `fe9e657` | doc: CONTEXT.md: mark Commit D as landed |
 | `dc35a2a` | feat: veterd: mid-attach SIGWINCH via TIOCGWINSZ poll |
+| `b121a6b` | doc: CONTEXT.md: mark Commit E as landed |
+| *(uncommitted)* | refactor: extract veter-host crate (Commit F) |
 
 ### Snapshot serializers (the core)
 
@@ -286,6 +289,54 @@ session whose bash has a `WINCH` trap, resize the harness's PTY
 master to 50×200, and confirm `SIZE 50x200` is forwarded back via
 the renderer-stdout within one polling interval.
 
+### Commit F — extract `veter-host` crate (uncommitted, working tree)
+
+The lib face in `veter/src/lib.rs` was the v1 unblock for veterd
+but pulled every GUI dep into veterd transitively. This commit
+finishes the split: a new `veter-host` workspace crate owns the
+GUI-free host engines (vge state, prt state + portal tree, vft
+state + worker), and veterd depends on `veter-host` directly with
+no `veter` dep at all.
+
+Layout:
+
+- `veter-host/` (new crate)
+  - `vge/{mod,state}.rs`
+  - `prt/{mod,state,portal}.rs`
+  - `vft/{mod,state,worker,path}.rs`
+  - `Cargo.toml` — deps: vt100, vge/prt/vft-protocol, rgb, libc,
+    image (for WebP/PNG decode). `rfd` / `opener` are optional
+    behind the `"gui"` feature.
+- `veter/src/{vge,prt}/mod.rs` — now `pub use veter_host::{vge,prt}::*;`
+  with `pub mod render;` for the GUI-only render module that stays
+  in the binary. `veter/src/vft/mod.rs` is a pure re-export.
+- `veter/src/{vge,prt}/render.rs` — import state types from
+  `veter_host::{vge,prt}::state::*` instead of `super::state`.
+- `veter/Cargo.toml` — adds `veter-host = { features = ["gui"] }`,
+  drops the direct `rfd` and `opener` deps (now transitively via
+  veter-host).
+- `tools/veterd/Cargo.toml` — replaces `veter` dep with
+  `veter-host` (no `"gui"` feature). The daemon's transitive deps
+  are now just protocol crates + vt100 + image + rgb + libc + nix
+  + anyhow + clap. No femtovg, no winit, no glutin, no parley, no
+  fontconfig, no swash, no arboard, no rfd, no opener.
+
+VFT `gui`-feature wiring: `worker::run_picker` returns `Cancelled`
+when the feature is off (was previously `cfg(not(test))`), and
+`maybe_open_default` becomes a no-op. These are the right semantics
+for a headless daemon — VFT envelopes pass through to the renderer
+where the real file picker and default-app launcher live.
+
+The aarch64-musl cross-build that was the original blocker now
+gets all the way to the linker: `cargo build -p veterd --target
+aarch64-unknown-linux-musl` compiles every dependency cleanly,
+failing only on the host `ld` not being aarch64-aware. That's a
+toolchain/sysroot setup task (configure `aarch64-linux-musl-gcc`
+as the linker), not a crate-graph issue.
+
+All 121 prt + 60 vge + 25 vft + 19 veterd + 14 vt100 unit tests
+remain green; no behavior changes, pure code organization.
+
 ## What's left
 
 ### #7 — Detach hotkey
@@ -296,50 +347,25 @@ daemon-side env var (e.g. `VETERD_DETACH_PREFIX`).
 
 ### #8 — aarch64-musl packaging for veterd
 
-Currently deferred. veterd depends on `veter` the lib which
-transitively pulls parley → fontconfig and glutin/winit. None of
-those musl-cross without a sysroot. The cross-build fails on
-`yeslogic-fontconfig-sys`'s build script ("pkg-config has not been
-configured to support cross-compilation"). The proper fix is the
-"full veter-host extraction" — splitting the host engines into a
-GUI-free `veter-host` crate. See "Known limitations" below.
+Crate-graph blocker is gone (see Commit F): `cargo build -p veterd
+--target aarch64-unknown-linux-musl` now compiles every Rust
+dependency cleanly. The remaining failure is purely the linker —
+the host's `/usr/bin/ld` doesn't speak aarch64. Setup work:
+configure `aarch64-linux-musl-gcc` as the linker for the
+`aarch64-unknown-linux-musl` target via either
+`.cargo/config.toml` or a per-build `RUSTFLAGS=-C linker=...`.
+After that, wire the build into the `dist-aarch64-deb` make
+target alongside the existing client tools.
 
 For local installs `veterd` is already in `make install`'s
 `PACKAGES` list and lands at `$(BINDIR)/veterd`.
 
-### #1 (lingering work) — full veter-host extraction
+### #1 — full veter-host extraction
 
-The lib+bin split in 6781832 was the minimal unblock. It does NOT
-get us a GUI-free face for the host engines: the lib drags every
-GUI dep along. The proper end-state is:
-
-- A new `veter-host` workspace crate that contains
-  `vge/state.rs`, `prt/{state,portal}.rs`, and the parts of
-  `vft/{state,worker}.rs` that don't need rfd / opener.
-- `vge/render.rs`, `prt/render.rs`, `renderer.rs` stay in the GUI
-  binary. The render path imports state types from `veter_host::*`.
-- `veterd` depends on `veter-host` only — no femtovg / winit /
-  parley / fontconfig in the dep tree.
-
-Gotchas the partial work surfaced:
-
-- `vge/render.rs` references `crate::renderer::TerminalRenderer`.
-  TerminalRenderer is GUI-only and shouldn't live in veter-host.
-  Either move TerminalRenderer's GpuImageId map onto a separate
-  small struct that lives in veter-host (and is `&mut`-passed
-  into render functions), or accept a render-only sibling module in
-  the binary.
-- `Portal` (in `prt/portal.rs`) owns a `VftEngine`. If VftEngine
-  doesn't move to veter-host, Portal can't either. Options:
-  - Move VftEngine too. Worker.rs's `rfd`/`opener` deps need to
-    be feature-flagged; the picker / open-after handlers become
-    no-ops when the "gui" feature is off, and the GUI binary
-    activates the feature.
-  - Make `Portal::vft` an `Option`/generic so headless hosts
-    don't carry one. Bigger API churn.
-- Tests inside `veter/src/{vge,prt}/state.rs` will need their
-  scaffolding (`build_envelope`, `unwrap_t2c_envelope`, etc.) to
-  move with them.
+Done in Commit F. veterd's transitive deps are now just protocol
+crates + vt100 + image + rgb + libc + nix + anyhow + clap. No
+femtovg, winit, glutin, parley, fontconfig, swash, arboard, rfd,
+or opener.
 
 ### Companion `doc/session-extension.md` (deferred per architecture doc)
 
@@ -357,10 +383,8 @@ the second shoe to drop.
 
 ## Known limitations & gotchas
 
-- **veter's lib face drags GUI deps.** The fix is the veter-host
-  extraction (see above). Symptom you'll hit: `cargo build -p veterd
-  --target aarch64-unknown-linux-musl` fails on fontconfig sys
-  crate.
+- **veter's lib face drags GUI deps.** ~~Resolved by Commit F:
+  veterd depends on `veter-host` (GUI-free) instead of `veter`.~~
 - **veter's lib also added a doctest pass.** When the lib was
   introduced, cargo started running doctests on lib doc comments.
   One pre-existing comment block in `prt::state::cmd_set_portal_scrollback`
@@ -380,8 +404,8 @@ the second shoe to drop.
 - **Sessions are in-memory only.** Daemon dying = sessions gone.
   This matches the spec; persistence is out of scope.
 - **Single-attach.** Multiple renderers attaching to the same
-  session is not implemented; the IPC doesn't even have an attach
-  variant yet.
+  session is not implemented; a second `Attach` of an
+  already-attached session returns `Err` (see `attach::start`).
 - **No auth.** Socket is mode 0700 in `$XDG_RUNTIME_DIR`. Per-user
   isolation only; cross-user attach is unsupported.
 
