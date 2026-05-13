@@ -6,9 +6,8 @@ session can pick it up cold. Architecture lives in
 
 ## Where things stand
 
-Working tree: dirty (Commit H plus this doc update). Branch:
-`master`. The build is green and the full workspace test suite
-passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
+Working tree: clean. Branch: `master`. The build is green and the
+full workspace test suite passes (`cargo test`). End-to-end smoke-tested: `new` / `list` /
 `kill` / `kill-server` over the Unix socket, plus `attach <name>`
 with `SCM_RIGHTS` stdio handover that:
 
@@ -52,7 +51,7 @@ Commits on `master`, oldest first, after the WIP-banner cleanup:
 | `2dbc61d` | doc: CONTEXT.md: mark Commit F as landed |
 | `966c251` | build: cross-compile veterd to aarch64-musl, bundle in dist |
 | `2e3674b` | doc: CONTEXT.md: mark Commit G as landed |
-| *(uncommitted)* | feat: vge: preserve encoded image bytes for snapshot reship (Commit H) |
+| `5212b08` | feat: vge: preserve encoded image bytes for snapshot reship |
 
 ### Snapshot serializers (the core)
 
@@ -343,7 +342,7 @@ as the linker), not a crate-graph issue.
 All 121 prt + 60 vge + 25 vft + 19 veterd + 14 vt100 unit tests
 remain green; no behavior changes, pure code organization.
 
-### Commit H — preserve encoded image bytes in VGE snapshots (uncommitted, working tree)
+### Commit H — preserve encoded image bytes in VGE snapshots (committed)
 
 Closes the bandwidth blowup that made reattach on slow SSH links
 unusable. Before this commit, `VgeEngine::serialize_state` re-encoded
