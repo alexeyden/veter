@@ -99,6 +99,13 @@ fn handle_connection(
     let req = match Request::read_from(&mut stream) {
         Ok(r) => r,
         Err(e) => {
+            // UnexpectedEof here means the peer connected and closed
+            // without sending — that's how the CLI's auto-spawn path
+            // probes whether the socket is responsive. Treat it as a
+            // ping, not an error.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return;
+            }
             eprintln!("veterd: bad request: {e}");
             let _ = Response::Err(format!("bad request: {e}")).write_to(&mut stream);
             return;
