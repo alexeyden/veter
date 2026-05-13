@@ -125,6 +125,19 @@ fn handler_main(
     master_writer_fd: OwnedFd,
     engines: Arc<Mutex<EngineState>>,
 ) -> Result<()> {
+    // Step 0: put the renderer's tty into raw mode. Without this, the
+    // SSH PTY slave we just inherited stays in canonical (line-edited)
+    // mode with kernel ECHO on — bytes are buffered until newline, the
+    // kernel ECHOes input independently of the inner program, and
+    // bash's readline ECHO inside the session adds a second layer.
+    // The two echo paths collide, the canonical line buffer fights
+    // with raw splicing, and the visible result is dropped or
+    // duplicated characters during typing.
+    //
+    // The RawTty guard restores the saved termios when the handler
+    // exits — detach via Ctrl+\ d, EOF, splice error, anything.
+    let _raw = RawTty::enable(stdin_fd.as_raw_fd());
+
     // Step 1: probe the renderer for grid size + cell metrics. Falls
     // back to whatever defaults the engines were created with if the
     // renderer doesn't answer in time (non-VGE / non-PRT terminal).
@@ -447,6 +460,90 @@ fn write_all_raw(raw: std::os::fd::RawFd, mut data: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// RAII guard that flips the renderer's tty into raw mode for the
+/// duration of an attach and restores the previous attributes on drop.
+///
+/// Why this matters: the fds we receive over `SCM_RIGHTS` reference the
+/// renderer's controlling tty (the SSH PTY slave for a remote attach,
+/// or a local terminal for a local one). Whatever termios that tty was
+/// in when the CLI handed off is what we inherit — usually canonical
+/// mode with kernel ECHO on, because that's how bash leaves its tty
+/// at the prompt.
+///
+/// Canonical mode line-buffers stdin (the daemon only sees bytes once
+/// the user hits Enter) and ECHOes keystrokes from the kernel. Inside
+/// the session the inner bash's readline ALSO ECHOes via its own
+/// line discipline, so the user gets two echo paths fighting each
+/// other plus a kernel line buffer ahead of our splice loop. Symptom:
+/// characters appear to drop or duplicate at random as the two
+/// pipelines drift.
+///
+/// vmux and tmux both put their own tty in raw mode for the same
+/// reason. We do exactly that here, and restore on drop so a detach
+/// (Ctrl+\ d, EOF, or any error) leaves the user's shell in the
+/// termios state they started in.
+struct RawTty {
+    fd: std::os::fd::RawFd,
+    saved: Option<nix::sys::termios::Termios>,
+}
+
+impl RawTty {
+    /// Enable raw mode on `fd`. Returns a guard that restores the
+    /// saved termios on drop. Failure to read or apply the termios is
+    /// logged and the guard becomes a no-op; better to attach without
+    /// raw mode than to refuse the attach entirely.
+    fn enable(fd: std::os::fd::RawFd) -> Self {
+        use nix::sys::termios::{
+            tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg,
+        };
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let saved = match tcgetattr(borrowed) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("veterd: tcgetattr on renderer stdin failed: {e}; \
+                           attaching without raw mode");
+                return Self { fd, saved: None };
+            }
+        };
+        let mut raw = saved.clone();
+        // Mirror what vmux's RawTty guard does: drop the line discipline
+        // bits that fight a raw splice (ICANON, ECHO, signals from
+        // user-typed keys), drop output post-processing on this fd
+        // (output goes to the renderer via a separate channel anyway),
+        // and disable input transformations like XON/XOFF and CR↔LF
+        // remapping so the bytes the program sees match what was typed.
+        raw.local_flags &=
+            !(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ISIG);
+        raw.output_flags &= !OutputFlags::OPOST;
+        raw.input_flags &= !(InputFlags::IXON
+            | InputFlags::IXOFF
+            | InputFlags::INLCR
+            | InputFlags::ICRNL
+            | InputFlags::IGNCR);
+        if let Err(e) = tcsetattr(borrowed, SetArg::TCSANOW, &raw) {
+            eprintln!("veterd: tcsetattr raw on renderer stdin failed: {e}; \
+                       attaching without raw mode");
+            return Self { fd, saved: None };
+        }
+        Self {
+            fd,
+            saved: Some(saved),
+        }
+    }
+}
+
+impl Drop for RawTty {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            use nix::sys::termios::{tcsetattr, SetArg};
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
+            // Best-effort restore — at this point the attach is ending
+            // and we can't do anything useful with the error.
+            let _ = tcsetattr(borrowed, SetArg::TCSANOW, &saved);
+        }
+    }
 }
 
 #[cfg(test)]
