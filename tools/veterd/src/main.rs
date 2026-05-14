@@ -217,9 +217,17 @@ fn spawn_detached_daemon(log_path: &std::path::Path) -> Result<()> {
 }
 
 /// Connect to the daemon, send `Attach { name }`, hand stdin/stdout
-/// over `SCM_RIGHTS`, and wait for the daemon's ack before exiting.
-/// The daemon now owns the stdio fds; the CLI exit is intentional.
+/// over `SCM_RIGHTS`, wait for the daemon's ack, and then **stay
+/// blocked on the socket** until the daemon closes it (which it does
+/// when the attach ends). Keeping this process alive matters: it
+/// remains the foreground of the calling shell's controlling tty, so
+/// the shell stays suspended and isn't competing with the daemon for
+/// stdin bytes. Without this loop, the parent shell would regain the
+/// tty's foreground immediately and start reading keystrokes in
+/// parallel with the daemon — keystrokes would race between the two
+/// readers and appear to randomly drop. tmux uses the same trick.
 fn run_attach(name: &str) -> Result<()> {
+    use std::io::Read;
     use std::os::fd::AsRawFd;
 
     let sock = daemon::socket_path();
@@ -236,9 +244,30 @@ fn run_attach(name: &str) -> Result<()> {
 
     let resp = Response::read_from(&mut stream).context("reading attach response")?;
     match resp {
-        Response::Ok => Ok(()),
+        Response::Ok => {}
         Response::Err(msg) => bail!("{msg}"),
         Response::Sessions(_) => bail!("daemon returned unexpected response variant"),
+    }
+
+    // Hold the tty's foreground process group by staying blocked on a
+    // read. The daemon's handler thread holds the other end of this
+    // socket; it drops the handle when the attach ends (detach hotkey,
+    // EOF, error). At that point our `read_exact` returns
+    // `UnexpectedEof` and the CLI exits, handing the tty back to the
+    // parent shell.
+    let mut sink = [0u8; 32];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                // Daemon shouldn't push extra bytes during an attach,
+                // but if anything arrives just drop it on the floor —
+                // we're only here to keep the connection open.
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("waiting for attach to end"),
+        }
     }
 }
 

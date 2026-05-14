@@ -31,7 +31,6 @@
 //!      running.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
@@ -95,6 +94,22 @@ pub fn start(
             return Err(e).context("duping inner-PTY master for attach writer");
         }
     };
+    // Clone the IPC socket and hand the clone to the handler thread.
+    // The handler keeps it alive for the duration of the attach so the
+    // CLI process can stay blocked on a read, keeping its parent
+    // (typically a login shell) backgrounded — without this, the shell
+    // regains the tty's foreground process group after the CLI exits
+    // and starts reading stdin in parallel with us. With two readers
+    // on the same tty, keystrokes are race-distributed between them
+    // and inputs appear to drop or duplicate. See the long fix-commit
+    // message for the trace data that pinned this down.
+    let cli_socket = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            attached_flag.store(false, Ordering::Release);
+            return Err(e).context("cloning IPC socket for attach handler");
+        }
+    };
 
     let session_name = name.to_string();
     let flag_for_thread = Arc::clone(&attached_flag);
@@ -105,6 +120,11 @@ pub fn start(
                 eprintln!("veterd: attach `{session_name}` ended: {e:#}");
             }
             flag_for_thread.store(false, Ordering::Release);
+            // Dropping `cli_socket` here closes the daemon's last
+            // reference to the IPC socket for this attach. The CLI
+            // sees EOF on its blocked read and exits, restoring the
+            // user's local shell to the foreground.
+            drop(cli_socket);
         });
     if let Err(e) = spawn {
         attached_flag.store(false, Ordering::Release);
@@ -160,12 +180,22 @@ fn handler_main(
     // chunks — otherwise the renderer would see "partial replay +
     // post-replay byte + more replay" and paint inconsistent state.
     //
+    // We prefix the snapshot with `CSI ?1049 h` (enter alt-screen,
+    // save cursor + DECAWM state). The detach path below pairs it
+    // with `CSI ?1049 l` so the renderer ends the attach in exactly
+    // the screen state it was in before we started — same trick tmux
+    // uses for `attach` / `detach`. Without this, the session's
+    // final cursor position and any vt100 modes the inner program
+    // tweaked (auto-wrap, scroll region, SGR) leak into the user's
+    // shell after the session exits.
+    //
     // Step 3: while still under the lock, install the stdout fd on
     // engines so the worker starts forwarding live bytes the moment
     // we release.
     {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot: Vec<u8> = Vec::new();
+        snapshot.extend_from_slice(ATTACH_ENTER);
         snapshot.extend_from_slice(&guard.parser.screen().full_contents_formatted());
         snapshot.extend_from_slice(&guard.vge.serialize_state());
         snapshot.extend_from_slice(&guard.prt.serialize_state());
@@ -193,24 +223,53 @@ fn handler_main(
         outcome.winsize,
     );
 
-    // Step 5: splice renderer stdin → inner PTY master until EOF /
-    // error. The worker thread handles the other direction (PTY
-    // master output → renderer stdout) via `renderer_stdout` we just
-    // installed. Per the PRT spec, input never crosses the engines —
-    // we forward keystrokes verbatim.
-    let result = splice_input(stdin_fd, master_writer_fd);
+    // Step 5: install the shutdown self-pipe so the worker thread can
+    // wake the splice when the session dies (inner program EOF /
+    // Ctrl+D from the shell). Without this the splice keeps reading
+    // the renderer's stdin and the attached terminal looks hung.
+    let (shutdown_read, shutdown_write) = nix::unistd::pipe()
+        .with_context(|| "creating attach shutdown self-pipe")?;
+    {
+        let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
+        guard.attach_shutdown = Some(shutdown_write);
+    }
 
-    // Step 6: detach — clear the renderer-stdout fd on engines so the
-    // worker stops writing. Dropping `stdout_fd` here also closes our
-    // copy of the renderer's stdout, which the local user sees as EOF
-    // / disconnect from the daemon. The `_watcher` Drop joins its
-    // thread before we leave the function.
+    // Step 6: splice renderer stdin → inner PTY master until EOF /
+    // error / shutdown. The worker thread handles the other direction
+    // (PTY master output → renderer stdout) via `renderer_stdout` we
+    // installed above. Per the PRT spec, input never crosses the
+    // engines — we forward keystrokes verbatim.
+    let result = splice_input(stdin_fd, master_writer_fd, shutdown_read);
+
+    // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
+    // on engines so the worker stops writing / signaling, then emit
+    // the cleanup sequence that pairs with `ATTACH_ENTER` (exit
+    // alt-screen, plus belt-and-suspenders for modes the inner
+    // program may have changed). Order matters: we clear
+    // `renderer_stdout` first so a final worker write can't interleave
+    // between our cleanup bytes. The `_watcher` Drop joins its thread
+    // before we leave the function.
     {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         guard.renderer_stdout = None;
+        guard.attach_shutdown = None;
     }
+    let _ = write_all_raw(stdout_fd.as_raw_fd(), ATTACH_EXIT);
     result
 }
+
+/// Sent to the renderer just before the snapshot. `CSI ?1049 h`
+/// switches to the alt-screen buffer and saves the cursor + DECAWM
+/// state, so [`ATTACH_EXIT`] can restore them on detach. The attach
+/// then lives entirely in the alt-screen — matches tmux behavior.
+const ATTACH_ENTER: &[u8] = b"\x1b[?1049h";
+
+/// Sent to the renderer right before the handler returns. Reverses
+/// `ATTACH_ENTER` (`CSI ?1049 l` exits alt-screen and restores the
+/// saved cursor / DECAWM) and then asserts a few defaults in case
+/// the inner program touched them: re-enable auto-wrap (DECAWM, ?7h),
+/// reset scroll region (CSI r), show cursor (?25h), and clear SGR.
+const ATTACH_EXIT: &[u8] = b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[?25h\x1b[0m";
 
 /// Per-attach SIGWINCH watcher. The daemon doesn't share a
 /// controlling tty with the renderer's PTY slave (the attach handler
@@ -417,14 +476,47 @@ impl DetachScanner {
 
 /// Renderer-stdin → inner-PTY-master forwarding loop. Returns on EOF
 /// of stdin (renderer disconnected cleanly), on write error (inner
-/// program gone), or when the [`DetachScanner`] fires.
-fn splice_input(stdin_fd: OwnedFd, master_writer_fd: OwnedFd) -> Result<()> {
-    let mut reader = std::fs::File::from(stdin_fd);
+/// program gone), when the [`DetachScanner`] fires, or when the
+/// `shutdown_read` self-pipe becomes readable (the per-session worker
+/// signaled session shutdown — typically because the inner program
+/// exited).
+fn splice_input(
+    stdin_fd: OwnedFd,
+    master_writer_fd: OwnedFd,
+    shutdown_read: OwnedFd,
+) -> Result<()> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+
+    let stdin_raw = stdin_fd.as_raw_fd();
     let writer_raw = master_writer_fd.as_raw_fd();
     let mut buf = [0u8; 4096];
     let mut scanner = DetachScanner::default();
+    let mut trace_log = open_input_trace();
     loop {
-        let n = match reader.read(&mut buf) {
+        let mut fds = [
+            PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
+            PollFd::new(shutdown_read.as_fd(), PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(anyhow!("splice poll: {e}")),
+        }
+
+        // Shutdown beats stdin: if the session is gone we want to
+        // tear down even if there are buffered keystrokes.
+        let shutdown_revents = fds[1].revents().unwrap_or(PollFlags::empty());
+        if shutdown_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            return Ok(());
+        }
+
+        let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
+        if !stdin_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            continue;
+        }
+
+        let n = match nix::unistd::read(stdin_raw, &mut buf) {
             Ok(0) => {
                 if let Some(b) = scanner.flush_on_eof() {
                     let _ = write_all_raw(writer_raw, &[b]);
@@ -432,8 +524,13 @@ fn splice_input(stdin_fd: OwnedFd, master_writer_fd: OwnedFd) -> Result<()> {
                 return Ok(());
             }
             Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("renderer stdin read: {e}")),
         };
+
+        if let Some(log) = trace_log.as_mut() {
+            let _ = log_input_chunk(log, &buf[..n]);
+        }
 
         let out = scanner.feed(&buf[..n]);
         if !out.forward.is_empty() {
@@ -449,6 +546,57 @@ fn splice_input(stdin_fd: OwnedFd, master_writer_fd: OwnedFd) -> Result<()> {
 /// Loop around `nix::unistd::write` so a short write or EINTR doesn't
 /// drop bytes on the floor. Writes to a `RawFd` directly so we don't
 /// have to clone an `OwnedFd` into a `File` and back.
+/// Open the splice-input trace file when `VETERD_DEBUG_INPUT=1` is set.
+/// One file per attach (truncated on open) so consecutive runs don't
+/// mix. Returns `None` if the env var is unset or the file can't be
+/// opened — tracing is purely diagnostic.
+fn open_input_trace() -> Option<std::fs::File> {
+    if std::env::var_os("VETERD_DEBUG_INPUT")
+        .map(|v| v != "0" && !v.is_empty())
+        != Some(true)
+    {
+        return None;
+    }
+    let dir = crate::daemon::socket_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let path = dir.join("input.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+}
+
+/// Append one chunk of received bytes to the trace log as
+/// `[seconds.millis] hexdump  |ascii|` — easy to eyeball.
+fn log_input_chunk(log: &mut std::fs::File, chunk: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "[{:>10}.{:03}] {:3} bytes: ",
+        ts.as_secs(),
+        ts.subsec_millis(),
+        chunk.len()
+    );
+    for &b in chunk {
+        line.push_str(&format!("{:02X} ", b));
+    }
+    line.push('|');
+    for &b in chunk {
+        line.push(if b.is_ascii_graphic() || b == b' ' {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    line.push_str("|\n");
+    log.write_all(line.as_bytes())
+}
+
 fn write_all_raw(raw: std::os::fd::RawFd, mut data: &[u8]) -> Result<()> {
     while !data.is_empty() {
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };

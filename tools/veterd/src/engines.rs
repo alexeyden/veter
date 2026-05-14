@@ -70,13 +70,33 @@ pub struct EngineState {
     /// attach handler installs this on attach and clears it on detach
     /// or write error.
     pub renderer_stdout: Option<OwnedFd>,
+    /// Write end of a self-pipe the attach handler uses to wake its
+    /// `splice_input` loop when the session itself is gone (inner
+    /// program EOF / worker fatal error). Without this the splice
+    /// stays blocked on the renderer's stdin and the attached
+    /// terminal "hangs" after the user types `exit` / Ctrl+D inside
+    /// the session. Installed by the attach handler before splicing,
+    /// cleared on detach.
+    pub attach_shutdown: Option<OwnedFd>,
 }
 
 impl EngineState {
     pub fn new() -> Self {
+        let mut vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
+        // veterd is a state-mirroring middleman, not the real
+        // terminal. The renderer upstream (e.g. local veter) is the
+        // authoritative VGE host and the sole command responder.
+        // veterd still parses every VGE command and updates its own
+        // engine state for snapshot replay, but it must not generate
+        // response frames — otherwise the inner program (e.g. vcat)
+        // gets two response envelopes per command, consumes one,
+        // and the leftover bytes leak to whatever's now reading the
+        // inner PTY (typically a shell, which interprets payload
+        // bytes like 0x12 as Ctrl-R and triggers reverse-i-search).
+        vge.set_auto_reply_commands(false);
         Self {
             parser: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, DEFAULT_SCROLLBACK),
-            vge: VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE),
+            vge,
             // No-op VFT wakeup: the daemon has no event loop to nudge.
             // Per-portal VFT workers still tick, but the host loop polls
             // them every chunk anyway via `drive_and_flush_vft`.
@@ -86,6 +106,7 @@ impl EngineState {
                 Arc::new(|| {}),
             ),
             renderer_stdout: None,
+            attach_shutdown: None,
         }
     }
 }
@@ -159,6 +180,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 vge,
                 prt,
                 renderer_stdout,
+                attach_shutdown: _,
             } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
@@ -243,5 +265,28 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 }
             }
         }
+    }
+
+    // Worker is exiting (PTY EOF, EIO, or other read error). If an
+    // attach handler is currently splicing renderer-stdin into the
+    // master, it needs to be woken — otherwise the attached terminal
+    // hangs after the user types `exit` or Ctrl+D inside the session.
+    // A single byte on the self-pipe is enough; the attach handler's
+    // poll loop wakes, sees the readable fd, and tears the splice down.
+    let shutdown = {
+        let mut guard = match engines.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.attach_shutdown.take()
+    };
+    if let Some(fd) = shutdown {
+        let borrowed = unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd())
+        };
+        let _ = nix::unistd::write(borrowed, &[0u8]);
+        // Drop closes the write end; if there was no attach the fd
+        // simply closes here without effect.
+        drop(fd);
     }
 }
