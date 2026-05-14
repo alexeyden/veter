@@ -31,6 +31,17 @@ pub const RSP_OK: u8 = 0x01;
 pub const RSP_ERR: u8 = 0x02;
 pub const RSP_PROBE: u8 = 0x03;
 
+/// Sentinel `request_id` value that asks the host to apply the
+/// command but not emit a response frame. Used for "state push"
+/// scenarios where the sender is a stateful middleman (e.g. veterd
+/// replaying its session snapshot to a freshly attached renderer)
+/// and a response would just round-trip through the upstream chain
+/// back into the inner program's PTY, where stray bytes get
+/// interpreted by whatever is reading there. Clients that need an
+/// ack must use any other value (typically a monotonically
+/// increasing counter starting at 1).
+pub const REQ_ID_NO_RESPONSE: u32 = u32::MAX;
+
 // §4 error codes
 pub const ERR_UNKNOWN_COMMAND: u16 = 0x0001;
 pub const ERR_BAD_PAYLOAD: u16 = 0x0002;

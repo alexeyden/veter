@@ -430,6 +430,21 @@ pub struct VgeEngine {
     /// otherwise both PRT and the per-portal VGE would synthesise a
     /// reply for the same query and the inner program would see two.
     auto_reply_dsr: bool,
+    /// When `false`, every VGE command is still parsed and applied
+    /// (so engine state stays consistent — for snapshot replay etc.)
+    /// but **no** response frame is generated. Used by veterd's
+    /// session VGE engine: veterd is a state-mirroring middleman, not
+    /// the authoritative host, so it must not double-answer Probe,
+    /// UploadImage, CreateElement, etc. The real host upstream
+    /// (e.g. local veter's per-portal VGE for the SSH pane) is the
+    /// sole responder. Without this, the inner program (vcat) gets
+    /// two responses to each command; it consumes one and exits, and
+    /// the leftover bytes get read by the shell that takes over the
+    /// inner PTY — which interprets payload bytes like `0x12` (Ctrl-R
+    /// in the payload_len header of a 2-RSP_OK envelope = 18 bytes,
+    /// or in the cell_pixel_height field of a ProbeResponse) as
+    /// keystrokes, triggering reverse-i-search and other surprises.
+    auto_reply_commands: bool,
 }
 
 impl VgeEngine {
@@ -445,6 +460,7 @@ impl VgeEngine {
             pending_image_deletes: Vec::new(),
             pending_cursor_queries: 0,
             auto_reply_dsr: true,
+            auto_reply_commands: true,
         }
     }
 
@@ -452,6 +468,14 @@ impl VgeEngine {
     /// `auto_reply_dsr` — used by per-portal VGE engines.
     pub fn set_auto_reply_dsr(&mut self, enabled: bool) {
         self.auto_reply_dsr = enabled;
+    }
+
+    /// Toggle VGE command auto-replies. See the field doc on
+    /// `auto_reply_commands` — veterd uses this so the upstream real
+    /// host is the sole responder and the inner program doesn't get
+    /// two response envelopes per command.
+    pub fn set_auto_reply_commands(&mut self, enabled: bool) {
+        self.auto_reply_commands = enabled;
     }
 
     /// Hand off any image GPU handles whose owners have been dropped.
@@ -516,7 +540,7 @@ impl VgeEngine {
                     height: img.height,
                     data: img.source_data.clone(),
                 }),
-                0,
+                REQ_ID_NO_RESPONSE,
             ));
         }
 
@@ -527,7 +551,7 @@ impl VgeEngine {
                     id: id.clone(),
                     style: style.clone(),
                 },
-                0,
+                REQ_ID_NO_RESPONSE,
             ));
         }
 
@@ -746,38 +770,52 @@ impl VgeEngine {
         body: &[u8],
         out_frames: &mut Vec<u8>,
     ) {
+        // `REQ_ID_NO_RESPONSE` (see vge-protocol §4) is the sender's
+        // explicit "apply but don't ack" sentinel — used by
+        // `serialize_state` for snapshot replay so the renderer's
+        // per-portal engine doesn't echo ack frames back through the
+        // PRT chain into the inner program's PTY.
+        let quiet = !self.auto_reply_commands || request_id == REQ_ID_NO_RESPONSE;
         match command::parse(frame_type, body) {
             Err(code) => {
-                append_frame(
-                    out_frames,
-                    RSP_ERR,
-                    request_id,
-                    &err_body(code, ""),
-                );
+                if !quiet {
+                    append_frame(out_frames, RSP_ERR, request_id, &err_body(code, ""));
+                }
             }
-            Ok(cmd) => match self.apply_command(cmd) {
-                Ok(rsp_body) => {
-                    let frame_type = match frame_type {
-                        CMD_PROBE => RSP_PROBE,
-                        _ => RSP_OK,
-                    };
-                    append_frame(out_frames, frame_type, request_id, &rsp_body);
+            Ok(cmd) => {
+                let result = self.apply_command(cmd);
+                if quiet {
+                    // State changes are already applied; skip the
+                    // response frame entirely.
+                    return;
                 }
-                Err((code, msg)) => {
-                    append_frame(
-                        out_frames,
-                        RSP_ERR,
-                        request_id,
-                        &err_body(code, msg),
-                    );
+                match result {
+                    Ok(rsp_body) => {
+                        let frame_type = match frame_type {
+                            CMD_PROBE => RSP_PROBE,
+                            _ => RSP_OK,
+                        };
+                        append_frame(out_frames, frame_type, request_id, &rsp_body);
+                    }
+                    Err((code, msg)) => {
+                        append_frame(
+                            out_frames,
+                            RSP_ERR,
+                            request_id,
+                            &err_body(code, msg),
+                        );
+                    }
                 }
-            },
+            }
         }
     }
 
     fn apply_command(&mut self, cmd: Command) -> Result<Vec<u8>, (u16, &'static str)> {
         match cmd {
             Command::Probe => {
+                // dispatch_frame already swallowed the envelope if
+                // auto_reply_probe is off; if we get here, we want
+                // to respond.
                 let pb = ProbeBody {
                     protocol_version: PROTOCOL_VERSION as u16,
                     cell_pixel_width: self.cell_px.0,
@@ -1266,7 +1304,7 @@ fn emit_element_subtree(
             parent: el.parent.clone(),
             size: el.clip_size,
         }),
-        0,
+        REQ_ID_NO_RESPONSE,
     ));
 
     // Recurse into children, in (draw_order, creation_seq) order so
@@ -1365,6 +1403,47 @@ mod tests {
         assert_eq!(r.u8().unwrap(), RSP_PROBE);
         assert_eq!(r.u32().unwrap(), 7); // request_id echoed
         assert_eq!(r.u32().unwrap(), 32); // body_len for ProbeBody (incl. max_nesting_depth)
+    }
+
+    #[test]
+    fn auto_reply_commands_disabled_suppresses_responses() {
+        // veterd disables command auto-reply on its session VGE
+        // engine so the upstream real host (e.g. local veter) is the
+        // sole responder. Envelopes must still be consumed (not
+        // leaked to vt100) and state changes still applied — only
+        // the response frames are suppressed.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.set_auto_reply_commands(false);
+
+        // Probe — would normally produce a ProbeResponse.
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_PROBE, 42, &[]);
+        let env = build_envelope(&frames);
+        let passthrough = engine.process_pty_chunk(&env);
+        assert!(passthrough.is_empty(), "Probe envelope consumed");
+        assert!(
+            engine.take_responses().is_empty(),
+            "no ProbeResponse should be queued with auto_reply_commands=false"
+        );
+
+        // UploadImage — would normally produce an RSP_OK. State must
+        // still update (image gets stored) so future snapshot replay
+        // is correct.
+        let body = upload_raw_2x2("logo");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 7, &body);
+        let env = build_envelope(&frames);
+        let passthrough = engine.process_pty_chunk(&env);
+        assert!(passthrough.is_empty(), "UploadImage envelope consumed");
+        assert!(
+            engine.take_responses().is_empty(),
+            "no RSP_OK should be queued with auto_reply_commands=false"
+        );
+        // Sanity: state mirror was actually updated.
+        assert!(
+            engine.state.shared.images.contains_key("logo"),
+            "image must be stored even when responses are suppressed"
+        );
     }
 
     #[test]
@@ -2574,6 +2653,35 @@ mod tests {
         // And critically, the snapshot is *much* smaller than a 32×32
         // RGBA8 blob would have been: 64 bytes of source < 4096 RGBA.
         assert!(payload.len() < 32 * 32 * 4);
+    }
+
+    #[test]
+    fn req_id_no_response_suppresses_ack_but_applies_state() {
+        // The middleman-snapshot contract: a command sent with the
+        // `REQ_ID_NO_RESPONSE` sentinel still mutates engine state, but
+        // the engine must not emit a response frame. Snapshot replay
+        // through a downstream renderer depends on this — without it,
+        // the renderer's acks round-trip back into the inner PTY and
+        // get interpreted as keystrokes by whatever shell is reading.
+        let mut eng = VgeEngine::new((9, 20), 1.0);
+
+        let frames = vec![(Command::Probe, REQ_ID_NO_RESPONSE)];
+        let env = vge_protocol::encode::build_envelope(&frames);
+        let passthrough = eng.process_pty_chunk(&env);
+        assert!(passthrough.is_empty(), "VGE envelope must not leak");
+        assert!(
+            eng.take_responses().is_empty(),
+            "REQ_ID_NO_RESPONSE must suppress the ack frame"
+        );
+
+        // Sanity check: a normal req_id _does_ produce a response.
+        let frames = vec![(Command::Probe, 7u32)];
+        let env = vge_protocol::encode::build_envelope(&frames);
+        eng.process_pty_chunk(&env);
+        assert!(
+            !eng.take_responses().is_empty(),
+            "non-sentinel req_id must still get an ack"
+        );
     }
 
     #[test]

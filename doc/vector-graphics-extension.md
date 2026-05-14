@@ -75,6 +75,15 @@ order, in one or more response envelopes.
 correlate responses MAY set it to 0 for every command. The terminal echoes
 the value verbatim in the corresponding response.
 
+One value is reserved: `request_id == 0xFFFFFFFF` (`REQ_ID_NO_RESPONSE`) is
+a "state-push" sentinel. The terminal MUST apply the command's effect on
+state but MUST NOT emit any response (including error responses) for it.
+This is intended for stateful middlemen (e.g. a session manager that
+replays a snapshot to a freshly attached renderer): without the
+suppression, the renderer's acks would round-trip through the chain and
+get re-interpreted as input by the inner program's tty. Clients that need
+acknowledgement MUST use any other value.
+
 ### 1.3 ESC byte stuffing
 
 All bytes of the payload (after computing `payload_length`, before placing
