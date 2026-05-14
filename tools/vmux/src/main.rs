@@ -2612,6 +2612,7 @@ fn main() -> Result<()> {
                 break;
             }
             dlog("stdin", &rd_buf[..n]);
+            trace_vmux_stdin(&rd_buf[..n]);
             handle_stdin_chunk(
                 &mut state,
                 &mut prt_apc,
@@ -3157,6 +3158,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     .unwrap_or(bytes.len());
                 if let Some(pane) = state.panes.get(&focus_id) {
                     dlog(&format!("key>{focus_id}"), &bytes[idx..stop]);
+                    trace_vmux_to_pane(&focus_id, &bytes[idx..stop]);
                     pane.pty.write_all(&bytes[idx..stop])?;
                 }
                 idx = stop;
@@ -3554,4 +3556,66 @@ fn handle_scroll_byte(state: &mut State, pane_id: &str, b: u8) -> Result<Vec<u8>
             Ok(Vec::new())
         }
     }
+}
+
+/// Diagnostic trace of bytes vmux reads from stdin (what veter sent
+/// downstream). Enable with `VMUX_DEBUG_INPUT=1`; output to
+/// `/tmp/vmux-input.log`.
+fn trace_vmux_stdin(bytes: &[u8]) {
+    trace_bytes("/tmp/vmux-input.log", "stdin", bytes);
+}
+
+/// Diagnostic trace of bytes vmux writes to a focused pane's PTY
+/// master. Same env var, separate log file
+/// (`/tmp/vmux-output.log`).
+fn trace_vmux_to_pane(pane_id: &str, bytes: &[u8]) {
+    trace_bytes(
+        "/tmp/vmux-output.log",
+        &format!("pane:{pane_id}"),
+        bytes,
+    );
+}
+
+fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
+    use std::io::Write;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var_os("VMUX_DEBUG_INPUT")
+            .map(|v| v != "0" && !v.is_empty())
+            == Some(true)
+    });
+    if !enabled {
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "[{:>10}.{:03}] {:>14} {:3} bytes: ",
+        ts.as_secs(),
+        ts.subsec_millis(),
+        label,
+        bytes.len()
+    );
+    for &b in bytes {
+        line.push_str(&format!("{:02X} ", b));
+    }
+    line.push('|');
+    for &b in bytes {
+        line.push(if b.is_ascii_graphic() || b == b' ' {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    line.push_str("|\n");
+    let _ = file.write_all(line.as_bytes());
 }

@@ -140,6 +140,15 @@ pub fn run(stdin_fd: &OwnedFd, stdout_fd: &OwnedFd, timeout: Duration) -> Result
         if n == 0 {
             break;
         }
+        // Trace probe-phase reads so diagnostic correlation with the
+        // splice phase doesn't lose any bytes. Same env var
+        // (`VETERD_DEBUG_INPUT=1`), same log path.
+        if std::env::var_os("VETERD_DEBUG_INPUT")
+            .map(|v| v != "0" && !v.is_empty())
+            == Some(true)
+        {
+            log_probe_chunk(&buf[..n]);
+        }
         // Run VGE filter first; its passthrough feeds the PRT filter.
         let vge_out = vge_apc.feed(&buf[..n]);
         let prt_out = prt_apc.feed(&vge_out.passthrough);
@@ -275,6 +284,48 @@ pub fn set_inner_winsize(master_fd: RawFd, rows: u16, cols: u16) {
     unsafe {
         libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
     }
+}
+
+/// Diagnostic: append a probe-phase stdin read to the same input.log
+/// the splice loop uses, prefixed with `probe>` so it's
+/// distinguishable from splice reads at correlation time.
+fn log_probe_chunk(chunk: &[u8]) {
+    use std::io::Write;
+    let dir = crate::daemon::socket_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let path = dir.join("input.log");
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "[{:>10}.{:03}] probe> {:3} bytes: ",
+        ts.as_secs(),
+        ts.subsec_millis(),
+        chunk.len()
+    );
+    for &b in chunk {
+        line.push_str(&format!("{:02X} ", b));
+    }
+    line.push('|');
+    for &b in chunk {
+        line.push(if b.is_ascii_graphic() || b == b' ' {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    line.push_str("|\n");
+    let _ = file.write_all(line.as_bytes());
 }
 
 #[cfg(test)]

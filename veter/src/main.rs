@@ -641,11 +641,13 @@ impl App {
                         && ch.is_ascii_alphabetic()
                     {
                         let ctrl = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+                        trace_keyboard_send(&[ctrl]);
                         let _ = pty.write_all(&[ctrl]);
                         return;
                     }
                 }
                 Key::Named(NamedKey::Space) => {
+                    trace_keyboard_send(&[0x00]);
                     let _ = pty.write_all(&[0x00]);
                     return;
                 }
@@ -660,6 +662,7 @@ impl App {
         {
             let mut bytes = vec![0x1b];
             bytes.extend_from_slice(text.as_bytes());
+            trace_keyboard_send(&bytes);
             let _ = pty.write_all(&bytes);
             return;
         }
@@ -723,12 +726,14 @@ impl App {
         };
 
         if let Some(b) = bytes {
+            trace_keyboard_send(b);
             let _ = pty.write_all(b);
             return;
         }
 
         // Text input
         if let Some(text) = &event.text {
+            trace_keyboard_send(text.as_bytes());
             let _ = pty.write_all(text.as_bytes());
         }
     }
@@ -1327,4 +1332,52 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
+}
+
+/// Diagnostic-only trace of keyboard bytes about to be written to the
+/// inner PTY. Enable with `VETER_DEBUG_INPUT=1`; output goes to
+/// `/tmp/veter-input.log` with the same hexdump format as veterd's
+/// renderer-input trace, so the two logs can be lined up
+/// timestamp-wise to find where bytes go missing or get reordered.
+fn trace_keyboard_send(bytes: &[u8]) {
+    use std::io::Write;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var_os("VETER_DEBUG_INPUT")
+            .map(|v| v != "0" && !v.is_empty())
+            == Some(true)
+    });
+    if !enabled {
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/veter-input.log")
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "[{:>10}.{:03}] {:3} bytes: ",
+        ts.as_secs(),
+        ts.subsec_millis(),
+        bytes.len()
+    );
+    for &b in bytes {
+        line.push_str(&format!("{:02X} ", b));
+    }
+    line.push('|');
+    for &b in bytes {
+        line.push(if b.is_ascii_graphic() || b == b' ' {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    line.push_str("|\n");
+    let _ = file.write_all(line.as_bytes());
 }
