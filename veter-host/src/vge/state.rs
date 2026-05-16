@@ -549,6 +549,7 @@ impl VgeEngine {
             &self.state,
             self.cell_px,
             self.scale_factor,
+            self.line_tracker.top_of_live_screen,
             &mut out,
         );
         out
@@ -581,7 +582,13 @@ impl VgeEngine {
         self.pending_response_bytes.clear();
         self.pending_image_deletes.clear();
         self.pending_cursor_queries = 0;
+        // Pin top_of_live_screen to the snapshotted value so element
+        // `anchor_line`s line up with where they were drawn in the
+        // source engine. The rest of LineTracker stays uninitialised
+        // so the next `update()` call (re-)synchronises against this
+        // engine's own parser scrollback.
         self.line_tracker = LineTracker::new();
+        self.line_tracker.top_of_live_screen = decoded.top_of_live_screen;
         Ok(())
     }
 

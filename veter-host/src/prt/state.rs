@@ -349,17 +349,31 @@ impl PrtEngine {
         crate::vft::VftEngine::with_wakeup(self.vft_wakeup.clone())
     }
 
+    /// Engine-level `top_of_live_screen`, exposed for the snapshot
+    /// encoder. Mirrors `VgeEngine::top_of_live_screen`.
+    pub(in crate::prt) fn line_tracker_top_of_live_screen(&self) -> i64 {
+        self.line_tracker.top_of_live_screen
+    }
+
     /// Replace `state` with one decoded from a binary snapshot. Used
     /// only by [`crate::prt::snapshot::decode_engine_into`]; the new
     /// state is constructed with the recursion already done.
-    pub(in crate::prt) fn install_state_from_snapshot(&mut self, state: PrtState) {
+    pub(in crate::prt) fn install_state_from_snapshot(
+        &mut self,
+        state: PrtState,
+        top_of_live_screen: i64,
+    ) {
         self.state = state;
         // Transient queues are stale w.r.t. the restored state.
         self.pending_response_bytes.clear();
         self.pending_events.clear();
         self.pending_image_deletes.clear();
         self.pending_clipboard_writes.clear();
+        // Pin top_of_live_screen so `Scrollback`-anchored portals
+        // render at the right row; the rest of `LineTracker` re-syncs
+        // against this engine's own parser on next update.
         self.line_tracker = LineTracker::new();
+        self.line_tracker.top_of_live_screen = top_of_live_screen;
     }
 
     /// Serialize this engine's state as a binary blob for the VSS

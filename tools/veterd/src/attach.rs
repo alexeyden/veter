@@ -195,8 +195,18 @@ fn handler_main(
     {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot: Vec<u8> = Vec::new();
-        snapshot.extend_from_slice(ATTACH_ENTER);
-
+        // No ATTACH_ENTER (alt-screen wrap) for the VSS path: the
+        // snapshot's `modes` byte authoritatively sets whether the
+        // portal is on main or alt, and `restore_from_binary_snapshot`
+        // replaces the portal vt100 state wholesale. If we ran
+        // `CSI ?1049 h` first, ATTACH_ENTER would be processed by the
+        // portal vt100 *after* the snapshot apply (the bytes flow
+        // through the same pipeline), leaving the portal on an empty
+        // alt grid with the session's content hidden in main. The
+        // tmux-style "restore pre-attach screen on detach" trick the
+        // replay path relied on is a v1.1 follow-up — a dedicated
+        // VSS Detach frame would tell the renderer to swap back.
+        //
         // VSS binary snapshot — replaces the v1 replay-style command
         // stream. The renderer's per-portal VssEngine (or its host-
         // level one, when veterd attaches directly without an
@@ -262,13 +272,14 @@ fn handler_main(
     let result = splice_input(stdin_fd, master_writer_fd, shutdown_read);
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
-    // on engines so the worker stops writing / signaling, then emit
-    // the cleanup sequence that pairs with `ATTACH_ENTER` (exit
-    // alt-screen, plus belt-and-suspenders for modes the inner
-    // program may have changed). Order matters: we clear
-    // `renderer_stdout` first so a final worker write can't interleave
-    // between our cleanup bytes. The `_watcher` Drop joins its thread
-    // before we leave the function.
+    // on engines so the worker stops writing / signaling, then emit a
+    // mode-reset sequence so the portal vt100 (which now holds the
+    // session's final state) is left with sane defaults for the inner
+    // program that will take over the local pane next (typically
+    // ssh's bash). Order matters: we clear `renderer_stdout` first so
+    // a final worker write can't interleave between our cleanup
+    // bytes. The `_watcher` Drop joins its thread before we leave the
+    // function.
     {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         guard.renderer_stdout = None;
@@ -278,17 +289,12 @@ fn handler_main(
     result
 }
 
-/// Sent to the renderer just before the snapshot. `CSI ?1049 h`
-/// switches to the alt-screen buffer and saves the cursor + DECAWM
-/// state, so [`ATTACH_EXIT`] can restore them on detach. The attach
-/// then lives entirely in the alt-screen — matches tmux behavior.
-const ATTACH_ENTER: &[u8] = b"\x1b[?1049h";
-
-/// Sent to the renderer right before the handler returns. Reverses
-/// `ATTACH_ENTER` (`CSI ?1049 l` exits alt-screen and restores the
-/// saved cursor / DECAWM) and then asserts a few defaults in case
-/// the inner program touched them: re-enable auto-wrap (DECAWM, ?7h),
-/// reset scroll region (CSI r), show cursor (?25h), and clear SGR.
+/// Sent to the renderer right before the handler returns. Asserts a
+/// few defaults in case the inner program touched them: exit
+/// alt-screen if somehow on it (no-op otherwise — the snapshot's
+/// `modes` byte normally has us on main already), re-enable
+/// auto-wrap (DECAWM, ?7h), reset scroll region (CSI r), show cursor
+/// (?25h), and clear SGR.
 const ATTACH_EXIT: &[u8] = b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[?25h\x1b[0m";
 
 /// Per-attach SIGWINCH watcher. The daemon doesn't share a
@@ -513,12 +519,28 @@ fn splice_input(
     let mut buf = [0u8; 4096];
     let mut scanner = DetachScanner::default();
     let mut trace_log = open_input_trace();
+    // Strip the renderer's upstream VSS envelopes (`ESC _ vss … ESC \`)
+    // before forwarding bytes to the inner PTY. The renderer queues
+    // SnapshotAccepted / SnapshotRejected frames in response to the
+    // attach-time snapshot; those bytes route back through PRT
+    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. v1 of veterd
+    // doesn't act on them yet (no version-mismatch UI), but they must
+    // not reach the inner shell — `ESC _` is meta-paren and the
+    // payload chars get inserted as literal keystrokes.
+    let mut vss_filter =
+        vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
+    // Bounded poll timeout so a lone Esc keystroke that lands in
+    // `vss_filter`'s `EscPending` state still reaches the inner PTY
+    // when no follow-up byte arrives — same idea as the terminfo
+    // `ESCDELAY` (default 100 ms) used by curses apps to disambiguate
+    // a bare Esc from the start of a multi-byte escape sequence.
+    let esc_timeout_ms = 50u16;
     loop {
         let mut fds = [
             PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
             PollFd::new(shutdown_read.as_fd(), PollFlags::POLLIN),
         ];
-        match poll(&mut fds, PollTimeout::NONE) {
+        match poll(&mut fds, PollTimeout::from(esc_timeout_ms)) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("splice poll: {e}")),
@@ -533,6 +555,19 @@ fn splice_input(
 
         let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
         if !stdin_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            // No input this tick. Flush a held lone Esc so vim et al.
+            // see the mode-switch keystroke at all.
+            let flushed = vss_filter.flush_pending_esc();
+            if !flushed.is_empty() {
+                let out = scanner.feed(&flushed);
+                if !out.forward.is_empty() {
+                    write_all_raw(writer_raw, &out.forward)
+                        .with_context(|| "writing flushed Esc to inner PTY")?;
+                }
+                if out.detach {
+                    return Ok(());
+                }
+            }
             continue;
         }
 
@@ -552,7 +587,17 @@ fn splice_input(
             let _ = log_input_chunk(log, &buf[..n]);
         }
 
-        let out = scanner.feed(&buf[..n]);
+        // Filter out any renderer-side VSS envelopes; what's left is
+        // user keystrokes destined for the inner shell.
+        let vss_out = vss_filter.feed(&buf[..n]);
+        // `vss_out.payloads` would carry SnapshotAccepted / Rejected
+        // bodies if v1.1 grows version-mismatch UX; for now we drop
+        // them.
+        if vss_out.passthrough.is_empty() {
+            continue;
+        }
+
+        let out = scanner.feed(&vss_out.passthrough);
         if !out.forward.is_empty() {
             write_all_raw(writer_raw, &out.forward)
                 .with_context(|| "writing renderer input to inner PTY")?;

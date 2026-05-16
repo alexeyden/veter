@@ -19,7 +19,12 @@ pub const PROTOCOL_VERSION: u8 = 0;
 /// differs. Bump on every breaking change to *any* of the three
 /// sub-snapshot layouts (vt100 / VGE / PRT). See
 /// `doc/session-manager.md` §4.2.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// History:
+/// - v2: VGE and PRT sub-snapshots gained `top_of_live_screen` so
+///   anchor-line semantics survive across attach.
+/// - v1: initial layout.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 // Engine → renderer frame codes (marker `VSS`).
 pub const FRM_SNAPSHOT_BEGIN: u8 = 0x01;

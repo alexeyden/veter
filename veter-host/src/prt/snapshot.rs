@@ -19,7 +19,13 @@ use prt_protocol::command::CursorStyle;
 
 /// Bumped on any breaking change to the binary layout below. Strict
 /// match — see [`PrtEngine::restore_from_binary_snapshot`].
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 1;
+///
+/// History:
+/// - v2: include `top_of_live_screen` so portal
+///   `PortalAnchor::Scrollback { anchor_line }` values stay aligned
+///   with the receiving engine's `LineTracker`.
+/// - v1: initial layout.
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 2;
 
 /// Error returned when a PRT binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -81,6 +87,10 @@ impl From<crate::vge::SnapshotError> for SnapshotError {
 pub(crate) fn encode_engine(engine: &PrtEngine, out: &mut Vec<u8>) {
     let mut w = Writer::new();
     w.u16(SNAPSHOT_KIND_VERSION);
+    // See VGE snapshot for the rationale: portals anchored to a
+    // scrollback line need the source engine's `top_of_live_screen`
+    // so the receiver renders them at the right row.
+    w.i64(engine.line_tracker_top_of_live_screen());
 
     encode_focus(&engine.state.focus, &mut w);
     encode_cursor_style(engine.state.cursor_style, &mut w);
@@ -108,6 +118,7 @@ pub(crate) fn decode_engine_into(
             want: SNAPSHOT_KIND_VERSION,
         });
     }
+    let top_of_live_screen = r.i64()?;
 
     let focus = decode_focus(&mut r)?;
     let cursor_style = decode_cursor_style(&mut r)?;
@@ -126,13 +137,10 @@ pub(crate) fn decode_engine_into(
         return Err(SnapshotError::TrailingBytes);
     }
 
-    engine.install_state_from_snapshot(PrtState::from_raw_parts(
-        main,
-        alt,
-        on_alt,
-        focus,
-        cursor_style,
-    ));
+    engine.install_state_from_snapshot(
+        PrtState::from_raw_parts(main, alt, on_alt, focus, cursor_style),
+        top_of_live_screen,
+    );
     Ok(())
 }
 
