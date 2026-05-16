@@ -85,9 +85,9 @@ pub enum FocusKind {
 }
 
 pub struct PrtState {
-    main: PortalSet,
-    alt: Option<PortalSet>,
-    on_alt: bool,
+    pub(in crate::prt) main: PortalSet,
+    pub(in crate::prt) alt: Option<PortalSet>,
+    pub(in crate::prt) on_alt: bool,
     pub focus: FocusKind,
     pub cursor_style: CursorStyle,
 }
@@ -101,6 +101,18 @@ impl PrtState {
             focus: FocusKind::Host,
             cursor_style: CursorStyle::Hollow,
         }
+    }
+
+    /// Construct from already-decoded parts. The intended caller is
+    /// the snapshot decoder in [`crate::prt::snapshot`].
+    pub(in crate::prt) fn from_raw_parts(
+        main: PortalSet,
+        alt: Option<PortalSet>,
+        on_alt: bool,
+        focus: FocusKind,
+        cursor_style: CursorStyle,
+    ) -> Self {
+        Self { main, alt, on_alt, focus, cursor_style }
     }
 
     pub fn on_alt(&self) -> bool {
@@ -309,6 +321,70 @@ impl PrtEngine {
         self.scale_factor = scale_factor;
     }
 
+    /// Cell metrics inherited by per-portal sub-engines spawned in
+    /// this scope. Used by the snapshot decoder.
+    pub(in crate::prt) fn metrics_for_children(&self) -> ((u16, u16), f32) {
+        (self.cell_px, self.scale_factor)
+    }
+
+    /// Build a fresh child PrtEngine sized like one of this engine's
+    /// portals (one nesting level deeper), inheriting `Limits`,
+    /// `cell_px`, `scale_factor`, and the VFT wakeup. Used by the
+    /// snapshot decoder before recursively populating the child's
+    /// state.
+    pub(in crate::prt) fn child_engine_scaffold(&self) -> Self {
+        Self::with_all(
+            self.limits,
+            self.depth + 1,
+            self.cell_px,
+            self.scale_factor,
+            self.vft_wakeup.clone(),
+        )
+    }
+
+    /// Build a fresh per-portal VFT engine carrying this engine's
+    /// wakeup. VFT in-flight transfer state is not snapshotted; on
+    /// reattach every portal starts with an empty transfer table.
+    pub(in crate::prt) fn spawn_portal_vft(&self) -> crate::vft::VftEngine {
+        crate::vft::VftEngine::with_wakeup(self.vft_wakeup.clone())
+    }
+
+    /// Replace `state` with one decoded from a binary snapshot. Used
+    /// only by [`crate::prt::snapshot::decode_engine_into`]; the new
+    /// state is constructed with the recursion already done.
+    pub(in crate::prt) fn install_state_from_snapshot(&mut self, state: PrtState) {
+        self.state = state;
+        // Transient queues are stale w.r.t. the restored state.
+        self.pending_response_bytes.clear();
+        self.pending_events.clear();
+        self.pending_image_deletes.clear();
+        self.pending_clipboard_writes.clear();
+        self.line_tracker = LineTracker::new();
+    }
+
+    /// Serialize this engine's state as a binary blob for the VSS
+    /// extension's `PrtFragment` payload. Recursive: each portal's
+    /// payload contains its own vt100 snapshot, per-portal VGE
+    /// snapshot, and a child PRT snapshot. See `doc/session-manager.md`
+    /// §4.3. VFT engines are not serialized (in-flight transfers are
+    /// abandoned on reattach).
+    #[must_use]
+    pub fn binary_snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::prt::snapshot::encode_engine(self, &mut out);
+        out
+    }
+
+    /// Replace this engine's state with one decoded from a snapshot
+    /// produced by [`Self::binary_snapshot`]. On error the engine
+    /// state is left untouched.
+    pub fn restore_from_binary_snapshot(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::prt::snapshot::SnapshotError> {
+        crate::prt::snapshot::decode_engine_into(self, bytes)
+    }
+
     /// Drain every pending image-delete in this engine's subtree:
     /// (a) IDs accumulated from portal removals at this scope,
     /// (b) per-portal VGE engines' pending DropImage IDs,
@@ -365,79 +441,6 @@ impl PrtEngine {
     #[allow(dead_code)] // Phase 6 / introspection
     pub fn depth(&self) -> u32 {
         self.depth
-    }
-
-    /// Serialize this engine's currently-active portal table as a
-    /// wire-ready APC envelope (or chain of envelopes) of PRT
-    /// commands. Each portal becomes a `CreatePortal` immediately
-    /// followed by a `WritePortal` carrying the portal's full inner
-    /// state: vt100 grid + scrollback + the portal's nested
-    /// PRT/VGE serialized streams. Feeding the result into a fresh
-    /// `PrtEngine` of matching capabilities reproduces the same
-    /// tree.
-    ///
-    /// Intended for veterd attach-time replay
-    /// (`doc/session-manager.md` §4). The caller is responsible for
-    /// having replayed the host vt100 grid + scrollback first so
-    /// the receiver's `top_of_live_screen` matches what was captured
-    /// here — scrollback-anchored portal origins are computed
-    /// relative to that.
-    ///
-    /// v1 limitations:
-    /// - Only the currently-active screen's portal table is emitted;
-    ///   any suspended alt/main set is dropped.
-    /// - VFT engines inside portals are not serialized — in-flight
-    ///   transfers are abandoned by reattach.
-    /// - Engine-level state (focus chain, cursor style, polled
-    ///   state caches) is not yet round-tripped; the receiver
-    ///   starts with default focus and the renderer re-derives
-    ///   polled caches from each portal's screen.
-    pub fn serialize_state(&self) -> Vec<u8> {
-        let mut frames: Vec<(Command, u32)> = Vec::new();
-        let top_offset = self.line_tracker.top_of_live_screen;
-        let mut ordered: Vec<&Portal> =
-            self.state.current().portals.values().collect();
-        ordered.sort_by_key(|p| (p.draw_order, p.creation_seq));
-        for portal in ordered {
-            let (anchor_mode, origin_y) = match portal.anchor {
-                PortalAnchor::Live { origin_y } => (AnchorMode::Live, origin_y),
-                PortalAnchor::Scrollback { anchor_line } => (
-                    AnchorMode::Scrollback,
-                    (anchor_line - top_offset) as i32,
-                ),
-            };
-            frames.push((
-                Command::CreatePortal(CreatePortalBody {
-                    id: portal.id.clone(),
-                    size_w: portal.size_w,
-                    size_h: portal.size_h,
-                    origin_x: portal.origin_x,
-                    origin_y,
-                    anchor_mode,
-                    is_visible: portal.is_visible,
-                    draw_order: portal.draw_order,
-                    flags: 0,
-                    scrollback_lines: portal.scrollback_lines,
-                }),
-                0,
-            ));
-            // Build the portal's inner-state byte stream:
-            //   1. vt100 grid + scrollback (raw escape bytes).
-            //   2. The portal's nested PRT tree (sub-portal envelopes).
-            //   3. The portal's VGE state (envelopes the portal's
-            //      private VGE engine will consume).
-            let mut data = portal.vt.screen().full_contents_formatted();
-            data.extend_from_slice(&portal.children.serialize_state());
-            data.extend_from_slice(&portal.vge.serialize_state());
-            frames.push((
-                Command::WritePortal(WritePortalBody {
-                    id: portal.id.clone(),
-                    data,
-                }),
-                0,
-            ));
-        }
-        prt_protocol::encode::build_envelope(&frames)
     }
 
     /// Drain queued response bytes (one or more APC envelopes) ready to
@@ -928,6 +931,7 @@ impl PrtEngine {
             children: child_engine,
             vge: portal_vge,
             vft: portal_vft,
+            vss: crate::vss::VssEngine::new(),
             state_cache: initial_cache,
             pending_cursor_queries: 0,
         };
@@ -1125,10 +1129,31 @@ impl PrtEngine {
             // EndUpload that fsync'd very fast on local SSD).
             portal.vft.drive();
 
+            // 2c. VSS — extract any ESC_VSS envelopes carrying a
+            //     binary engine-state snapshot from a veterd attach
+            //     running inside this portal. Apply each completed
+            //     snapshot to this portal's own engines (vt100,
+            //     children PRT, per-portal VGE). See
+            //     `doc/session-manager.md` §4.5.
+            let vss_passthrough = portal.vss.process_pty_chunk(&vft_passthrough);
+            let completed = portal.vss.take_completed_snapshots();
+            for cs in completed {
+                if let Err(_e) = portal.vt.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes) {
+                    // On any restore error we drop the snapshot
+                    // silently; the Reject envelope was already queued
+                    // by VssEngine if the version mismatched. Other
+                    // errors leave the portal in its pre-snapshot
+                    // state, which is the right failure mode (no
+                    // partial-apply corruption).
+                }
+                let _ = portal.vge.restore_from_binary_snapshot(&cs.vge_bytes);
+                let _ = portal.children.restore_from_binary_snapshot(&cs.prt_bytes);
+            }
+
             // 3. Feed the remaining bytes into the portal's vt100. The
             //    `PortalCallbacks` instance accumulates Bell / Title /
             //    Icon / Clipboard / OSC events.
-            portal.vt.process(&vft_passthrough);
+            portal.vt.process(&vss_passthrough);
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
             // 4. Update the children engine's line tracker against the
@@ -1161,6 +1186,7 @@ impl PrtEngine {
             let mut reverse = portal.children.take_responses();
             reverse.extend_from_slice(&portal.vge.take_responses());
             reverse.extend_from_slice(&portal.vft.take_responses());
+            reverse.extend_from_slice(&portal.vss.take_responses());
             if portal.pending_cursor_queries > 0 {
                 let (row, col) = portal.vt.screen().cursor_position();
                 let reply = format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
@@ -3121,79 +3147,136 @@ mod tests {
         assert!(b64_decode(b"!!!!").is_none());
     }
 
-    // ---- serialize_state roundtrip --------------------------------
+    // ---- Binary snapshot (VSS) round-trip tests --------------------
 
     #[test]
-    fn serialize_state_roundtrips_portal_table() {
-        let mut a = PrtEngine::new();
-        let p1 = encode::create_portal_body(&CreatePortalBody {
-            id: "p1".into(),
-            size_w: 20,
-            size_h: 5,
-            origin_x: 0,
-            origin_y: 0,
-            anchor_mode: AnchorMode::Live,
-            is_visible: true,
-            draw_order: 0,
-            flags: 0,
-            scrollback_lines: 64,
-        });
-        let p2 = encode::create_portal_body(&CreatePortalBody {
-            id: "p2".into(),
-            size_w: 30,
-            size_h: 8,
-            origin_x: 5,
-            origin_y: 6,
-            anchor_mode: AnchorMode::Live,
-            is_visible: false,
-            draw_order: 3,
-            flags: 0,
-            scrollback_lines: 64,
-        });
-        let write = encode::write_portal_body(&WritePortalBody {
-            id: "p1".into(),
-            data: b"hello\r\nworld".to_vec(),
-        });
-        let mut frames = Vec::new();
-        append_frame(&mut frames, CMD_CREATE_PORTAL, 1, &p1);
-        append_frame(&mut frames, CMD_CREATE_PORTAL, 2, &p2);
-        append_frame(&mut frames, CMD_WRITE_PORTAL, 3, &write);
-        a.process_pty_chunk(&wrap_c2t_envelope(&frames));
-        let _ = a.take_responses();
-
-        let snapshot = a.serialize_state();
+    fn binary_snapshot_empty_engine_round_trips() {
+        let a = PrtEngine::new();
+        let bytes1 = a.binary_snapshot();
         let mut b = PrtEngine::new();
-        let passthrough = b.process_pty_chunk(&snapshot);
-        assert!(passthrough.is_empty(), "snapshot must not leak to host vt100");
-        let _ = b.take_responses();
-
-        let portals_a = &a.state.current().portals;
-        let portals_b = &b.state.current().portals;
-        assert_eq!(portals_b.len(), portals_a.len(), "portal count");
-
-        let ap1 = portals_a.get("p1").expect("source p1");
-        let bp1 = portals_b.get("p1").expect("dest p1");
-        assert_eq!((bp1.size_w, bp1.size_h), (ap1.size_w, ap1.size_h));
-        assert_eq!(bp1.draw_order, ap1.draw_order);
-        assert_eq!(bp1.is_visible, ap1.is_visible);
-        // The portal's vt100 should have received the replayed text.
-        assert_eq!(bp1.vt.screen().cell(0, 0).unwrap().contents(), "h");
-        assert_eq!(bp1.vt.screen().cell(1, 0).unwrap().contents(), "w");
-
-        let bp2 = portals_b.get("p2").expect("dest p2");
-        assert_eq!(bp2.is_visible, false);
-        assert_eq!(bp2.draw_order, 3);
+        b.restore_from_binary_snapshot(&bytes1).expect("restore");
+        let bytes2 = b.binary_snapshot();
+        assert_eq!(bytes1, bytes2);
     }
 
     #[test]
-    fn serialize_state_empty_engine_replays_no_op() {
-        let a = PrtEngine::new();
-        let snapshot = a.serialize_state();
+    fn binary_snapshot_with_single_portal_round_trips() {
+        let mut a = PrtEngine::new();
+        dispatch_one(&mut a, CMD_CREATE_PORTAL, 1, &make_create_body("p1", 24, 8));
+        // Have the portal render something so its vt100 has cells set.
+        dispatch_one(
+            &mut a,
+            CMD_WRITE_PORTAL,
+            2,
+            &encode::write_portal_body(&WritePortalBody {
+                id: "p1".into(),
+                data: b"hello".to_vec(),
+            }),
+        );
 
+        let bytes1 = a.binary_snapshot();
         let mut b = PrtEngine::new();
-        b.process_pty_chunk(&snapshot);
-        let _ = b.take_responses();
+        b.restore_from_binary_snapshot(&bytes1).expect("restore");
+        let bytes2 = b.binary_snapshot();
+        assert_eq!(bytes1, bytes2);
 
-        assert!(b.state.current().portals.is_empty());
+        let portal = &b.state.current().portals["p1"];
+        assert_eq!(portal.size_w, 24);
+        assert_eq!(portal.size_h, 8);
+        assert!(matches!(portal.anchor, PortalAnchor::Live { origin_y: 0 }));
+        // vt100 state survived — first row contains "hello".
+        let row0: String = (0..5)
+            .filter_map(|c| portal.vt.screen().cell(0, c))
+            .map(|c| c.contents().to_string())
+            .collect();
+        assert_eq!(row0, "hello");
+    }
+
+    #[test]
+    fn binary_snapshot_with_nested_portal_round_trips() {
+        let mut a = PrtEngine::new();
+        dispatch_one(&mut a, CMD_CREATE_PORTAL, 1, &make_create_body("outer", 40, 12));
+        // Inside the outer portal, drive a PRT command that creates a
+        // sub-portal: wrap a CreatePortal frame in a PRT envelope and
+        // ship it to the outer portal via WritePortal. The outer's
+        // children PrtEngine picks it up.
+        let mut inner_frames = Vec::new();
+        append_frame(
+            &mut inner_frames,
+            CMD_CREATE_PORTAL,
+            42,
+            &make_create_body("inner", 10, 4),
+        );
+        let inner_env = wrap_c2t_envelope(&inner_frames);
+        dispatch_one(
+            &mut a,
+            CMD_WRITE_PORTAL,
+            2,
+            &encode::write_portal_body(&WritePortalBody {
+                id: "outer".into(),
+                data: inner_env,
+            }),
+        );
+
+        // Sanity: the outer portal has one child.
+        assert!(
+            a.state.current().portals["outer"]
+                .children
+                .state
+                .current()
+                .portals
+                .contains_key("inner")
+        );
+
+        let bytes1 = a.binary_snapshot();
+        let mut b = PrtEngine::new();
+        b.restore_from_binary_snapshot(&bytes1).expect("restore");
+        let bytes2 = b.binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+
+        // Nested structure survived.
+        let outer = &b.state.current().portals["outer"];
+        assert!(outer.children.state.current().portals.contains_key("inner"));
+        let inner = &outer.children.state.current().portals["inner"];
+        assert_eq!(inner.size_w, 10);
+        assert_eq!(inner.size_h, 4);
+    }
+
+    #[test]
+    fn binary_snapshot_preserves_focus_and_cursor_style() {
+        let mut a = PrtEngine::new();
+        dispatch_one(&mut a, CMD_CREATE_PORTAL, 1, &make_create_body("p", 10, 4));
+        // SetFocus → portal "p".
+        a.state.focus = FocusKind::Portal("p".into());
+        a.state.cursor_style = CursorStyle::Dim;
+        let bytes1 = a.binary_snapshot();
+        let mut b = PrtEngine::new();
+        b.restore_from_binary_snapshot(&bytes1).unwrap();
+        assert!(matches!(b.state.focus, FocusKind::Portal(ref id) if id == "p"));
+        assert_eq!(b.state.cursor_style, CursorStyle::Dim);
+    }
+
+    #[test]
+    fn binary_snapshot_version_mismatch_rejects() {
+        let a = PrtEngine::new();
+        let mut bytes = a.binary_snapshot();
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+        let mut b = PrtEngine::new();
+        let err = b.restore_from_binary_snapshot(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::prt::SnapshotError::KindVersionMismatch { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn binary_snapshot_trailing_bytes_reject() {
+        let a = PrtEngine::new();
+        let mut bytes = a.binary_snapshot();
+        bytes.push(0xAA);
+        let mut b = PrtEngine::new();
+        let err = b.restore_from_binary_snapshot(&bytes).unwrap_err();
+        assert!(matches!(err, crate::prt::SnapshotError::TrailingBytes), "{err}");
     }
 }

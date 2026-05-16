@@ -67,6 +67,85 @@ impl Grid {
         self.scrollback_offset = 0;
     }
 
+    pub(crate) fn serialize_binary(&self, w: &mut crate::snapshot::Writer) {
+        w.u16(self.size.rows);
+        w.u16(self.size.cols);
+        w.u16(self.pos.row);
+        w.u16(self.pos.col);
+        w.u16(self.saved_pos.row);
+        w.u16(self.saved_pos.col);
+        w.u16(self.scroll_top);
+        w.u16(self.scroll_bottom);
+        w.bool(self.origin_mode);
+        w.bool(self.saved_origin_mode);
+
+        w.varu(self.rows.len() as u64);
+        for row in &self.rows {
+            row.serialize_binary(w);
+        }
+
+        w.varu(self.scrollback_len as u64);
+        w.varu(self.scrollback.len() as u64);
+        for row in &self.scrollback {
+            row.serialize_binary(w);
+        }
+        w.varu(self.scrollback_offset as u64);
+    }
+
+    pub(crate) fn deserialize_binary(
+        r: &mut crate::snapshot::Reader,
+    ) -> Result<Self, crate::snapshot::SnapshotError> {
+        let size = Size {
+            rows: r.u16()?,
+            cols: r.u16()?,
+        };
+        let pos = Pos {
+            row: r.u16()?,
+            col: r.u16()?,
+        };
+        let saved_pos = Pos {
+            row: r.u16()?,
+            col: r.u16()?,
+        };
+        let scroll_top = r.u16()?;
+        let scroll_bottom = r.u16()?;
+        let origin_mode = r.bool()?;
+        let saved_origin_mode = r.bool()?;
+
+        let n = r.varu()? as usize;
+        if n > u16::MAX as usize {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "grid row count exceeds u16::MAX",
+            ));
+        }
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            rows.push(crate::row::Row::deserialize_binary(r)?);
+        }
+
+        let scrollback_len = r.varu()? as usize;
+        let sb_count = r.varu()? as usize;
+        let mut scrollback = std::collections::VecDeque::with_capacity(sb_count);
+        for _ in 0..sb_count {
+            scrollback.push_back(crate::row::Row::deserialize_binary(r)?);
+        }
+        let scrollback_offset = r.varu()? as usize;
+
+        Ok(Self {
+            size,
+            pos,
+            saved_pos,
+            rows,
+            scroll_top,
+            scroll_bottom,
+            origin_mode,
+            saved_origin_mode,
+            scrollback,
+            scrollback_len,
+            scrollback_offset,
+        })
+    }
+
     pub fn size(&self) -> Size {
         self.size
     }
@@ -132,7 +211,10 @@ impl Grid {
     }
 
     /// Iterate the saved scrollback rows, oldest first. Excludes
-    /// the rows currently on the visible grid.
+    /// the rows currently on the visible grid. Used by inline tests
+    /// and external consumers that want to inspect scrollback
+    /// without going through the snapshot path.
+    #[allow(dead_code)]
     pub fn scrollback_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
         self.scrollback.iter()
     }

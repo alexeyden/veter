@@ -2793,6 +2793,7 @@ dependencies = [
  "rgb",
  "vft-protocol",
  "vge-protocol",
+ "vss-protocol",
  "vt100",
 ]
 
@@ -2807,6 +2808,7 @@ dependencies = [
  "prt-protocol",
  "veter-host",
  "vge-protocol",
+ "vss-protocol",
  "vt100",
 ]
 
@@ -2874,6 +2876,10 @@ dependencies = [
  "vft-client",
  "vft-protocol",
 ]
+
+[[package]]
+name = "vss-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "vt100"

@@ -19,6 +19,7 @@ gui = ["dep:rfd", "dep:opener"]
 vge-protocol = { path = "../vge-protocol" }
 prt-protocol = { path = "../prt-protocol" }
 vft-protocol = { path = "../vft-protocol" }
+vss-protocol = { path = "../vss-protocol" }
 vt100 = { path = "../vt100" }
 rgb = "0.8"
 libc = "0.2"

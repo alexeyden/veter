@@ -8,6 +8,7 @@ use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Parser, Screen}
 use super::state::PrtEngine;
 use crate::vft::VftEngine;
 use crate::vge::VgeEngine;
+use crate::vss::VssEngine;
 
 /// A portal's vertical anchor.
 ///
@@ -156,6 +157,11 @@ pub struct Portal {
     /// host's filesystem with the host's user permissions; isolation
     /// is OS-level (containers, user accounts), not VFT-level.
     pub vft: VftEngine,
+    /// Every portal owns its own VSS engine so a `veterd attach`
+    /// running inside *this* portal can ship its binary engine
+    /// snapshot into this scope. See `doc/session-manager.md` §4.5
+    /// (renderer-side application).
+    pub vss: VssEngine,
     pub state_cache: PolledStateCache,
     /// DSR cursor-position queries observed on inbound bytes that
     /// haven't yet been answered. Drained after `vt.process` so the

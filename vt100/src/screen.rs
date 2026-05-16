@@ -234,52 +234,86 @@ impl Screen {
         contents
     }
 
-    /// Like [`state_formatted`](Self::state_formatted), but also replays
-    /// the saved scrollback so the receiving parser ends up with the
-    /// same history rows in its scrollback buffer (subject to its own
-    /// `scrollback_len`).
-    ///
-    /// This is intended for session-handover scenarios — when a fresh
-    /// parser must be brought up to a snapshot of an existing one's
-    /// state — and is the primary entry point for the session manager
-    /// described in `doc/session-manager.md`.
-    ///
-    /// Known v1 limitations (do not preserve through the round-trip):
-    /// alternate-screen buffer state, the DECSC saved cursor, the
-    /// scrolling region, and the active G0/G1 character set.
-    /// OSC-set window/icon titles are also not emitted here — they
-    /// belong to a higher level than the vt100 grid.
+    /// Serialize the full `Screen` state as a binary blob suitable for
+    /// shipping over the VSS extension's `VtFragment`. Captures every
+    /// internal field — visible grid, alternate grid, cursor and saved
+    /// cursor, scroll region, origin mode, charset, all input modes —
+    /// so [`restore_from_binary_snapshot`](Self::restore_from_binary_snapshot)
+    /// can reconstruct an identical `Screen` on the receiver. Closes
+    /// every state gap that the v1 replay serializer
+    /// [`full_contents_formatted`](Self::full_contents_formatted) leaves
+    /// open. OSC-set window/icon titles still belong to a higher level
+    /// than `Screen` and are not included here.
     #[must_use]
-    pub fn full_contents_formatted(&self) -> Vec<u8> {
-        let mut out = vec![];
-        let grid = self.grid();
-        let scrollback_count = grid.scrollback_rows().count();
-        if scrollback_count > 0 {
-            // Phase 1 — stream the scrollback rows so they scroll
-            // into the receiver's history. After K content rows
-            // plus (visible_rows - 1) bonus CR+LFs, exactly K rows
-            // have been pushed into the receiver's scrollback and
-            // the visible area is empty.
-            let cols = grid.size().cols;
-            let mut prev_attrs = crate::attrs::Attrs::default();
-            for row in grid.scrollback_rows() {
-                row.write_contents_inline(&mut out, cols, &mut prev_attrs);
-                crate::term::Crlf.write_buf(&mut out);
-            }
-            let bonus = grid.size().rows.saturating_sub(1);
-            for _ in 0..bonus {
-                crate::term::Crlf.write_buf(&mut out);
-            }
-            // Reset attrs so Phase 2 starts from a known SGR state.
-            // `write_contents_formatted` does its own ClearAttrs but
-            // we want the byte stream to be self-consistent.
-            crate::term::ClearAttrs.write_buf(&mut out);
+    pub fn binary_snapshot(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut w = crate::snapshot::Writer::new(&mut buf);
+        w.u16(crate::snapshot::SNAPSHOT_KIND_VERSION);
+
+        self.grid.serialize_binary(&mut w);
+        self.alternate_grid.serialize_binary(&mut w);
+
+        crate::snapshot::encode_attrs(&mut w, &self.attrs);
+        crate::snapshot::encode_attrs(&mut w, &self.saved_attrs);
+
+        crate::snapshot::encode_charset_state(&mut w, &self.charset);
+        crate::snapshot::encode_charset_state(&mut w, &self.saved_charset);
+
+        w.u8(self.modes);
+        crate::snapshot::encode_mouse_mode(&mut w, self.mouse_protocol_mode);
+        crate::snapshot::encode_mouse_encoding(&mut w, self.mouse_protocol_encoding);
+
+        buf
+    }
+
+    /// Decode a payload produced by [`binary_snapshot`](Self::binary_snapshot)
+    /// and overwrite this `Screen`'s state with it. Side-effect-free:
+    /// no callbacks are invoked. Returns an error on version mismatch
+    /// or malformed payload, leaving the existing `Screen` state
+    /// untouched.
+    pub fn restore_from_binary_snapshot(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        let mut r = crate::snapshot::Reader::new(bytes);
+        let kind_version = r.u16()?;
+        if kind_version != crate::snapshot::SNAPSHOT_KIND_VERSION {
+            return Err(crate::snapshot::SnapshotError::kind_version_mismatch(
+                kind_version,
+                crate::snapshot::SNAPSHOT_KIND_VERSION,
+            ));
         }
-        // Phase 2 — draw the visible screen.
-        self.write_contents_formatted(&mut out);
-        // Phase 3 — input modes.
-        self.write_input_mode_formatted(&mut out);
-        out
+
+        let grid = crate::grid::Grid::deserialize_binary(&mut r)?;
+        let alternate_grid = crate::grid::Grid::deserialize_binary(&mut r)?;
+
+        let attrs = crate::snapshot::decode_attrs(&mut r)?;
+        let saved_attrs = crate::snapshot::decode_attrs(&mut r)?;
+
+        let charset = crate::snapshot::decode_charset_state(&mut r)?;
+        let saved_charset = crate::snapshot::decode_charset_state(&mut r)?;
+
+        let modes = r.u8()?;
+        let mouse_protocol_mode = crate::snapshot::decode_mouse_mode(&mut r)?;
+        let mouse_protocol_encoding = crate::snapshot::decode_mouse_encoding(&mut r)?;
+
+        if !r.at_end() {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "trailing bytes after vt100 snapshot",
+            ));
+        }
+
+        self.grid = grid;
+        self.alternate_grid = alternate_grid;
+        self.attrs = attrs;
+        self.saved_attrs = saved_attrs;
+        self.charset = charset;
+        self.saved_charset = saved_charset;
+        self.modes = modes;
+        self.mouse_protocol_mode = mouse_protocol_mode;
+        self.mouse_protocol_encoding = mouse_protocol_encoding;
+
+        Ok(())
     }
 
     /// Return escape codes sufficient to turn the terminal state of the
@@ -1504,93 +1538,204 @@ mod scs_tests {
 }
 
 #[cfg(test)]
-mod full_contents_formatted_tests {
+mod binary_snapshot_tests {
     use crate::Parser;
 
-    fn visible_lines(p: &Parser) -> Vec<String> {
-        (0..p.screen().grid().size().rows)
-            .map(|r| {
-                (0..p.screen().grid().size().cols)
-                    .filter_map(|c| p.screen().cell(r, c))
-                    .map(|cell| {
-                        if cell.has_contents() {
-                            cell.contents().to_string()
-                        } else if cell.is_wide_continuation() {
-                            String::new()
-                        } else {
-                            " ".to_string()
-                        }
-                    })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+    /// Apply `bytes` to a fresh parser, then snapshot. Used to verify
+    /// that encode→decode→encode is byte-equal.
+    fn snapshot_after(bytes: &[u8], rows: u16, cols: u16, scrollback: usize) -> Vec<u8> {
+        let mut p = Parser::new(rows, cols, scrollback);
+        p.process(bytes);
+        p.screen().binary_snapshot()
+    }
+
+    fn restore_into_fresh(bytes: &[u8], rows: u16, cols: u16, scrollback: usize) -> Parser {
+        let mut p = Parser::new(rows, cols, scrollback);
+        p.screen_mut()
+            .restore_from_binary_snapshot(bytes)
+            .expect("restore");
+        p
     }
 
     #[test]
-    fn round_trips_visible_screen_with_attrs() {
-        let mut p1 = Parser::new(5, 20, 100);
-        p1.process(b"\x1b[31mhello\x1b[m \x1b[1mworld\x1b[m\r\nsecond line");
-        let snap = p1.screen().full_contents_formatted();
-
-        let mut p2 = Parser::new(5, 20, 100);
-        p2.process(&snap);
-
-        assert_eq!(visible_lines(&p1), visible_lines(&p2));
-        assert_eq!(p1.screen().cursor_position(), p2.screen().cursor_position());
-        // SGR attrs at the (0, 0) cell.
-        let fg1 = p1.screen().cell(0, 0).unwrap().fgcolor();
-        let fg2 = p2.screen().cell(0, 0).unwrap().fgcolor();
-        assert_eq!(fg1, fg2);
-        let bold1 = p1.screen().cell(0, 12).unwrap().bold();
-        let bold2 = p2.screen().cell(0, 12).unwrap().bold();
-        assert_eq!(bold1, bold2);
+    fn empty_screen_roundtrips_byte_equal() {
+        let bytes1 = snapshot_after(b"", 4, 16, 100);
+        let restored = restore_into_fresh(&bytes1, 4, 16, 100);
+        let bytes2 = restored.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
     }
 
     #[test]
-    fn round_trips_scrollback() {
-        let mut p1 = Parser::new(3, 10, 100);
-        // Push 10 lines so 7 land in scrollback (10 - 3 visible).
+    fn visible_screen_with_attrs_roundtrips_byte_equal() {
+        let bytes1 = snapshot_after(
+            b"\x1b[31mhello\x1b[m \x1b[1mworld\x1b[m\r\nsecond line",
+            5,
+            20,
+            100,
+        );
+        let restored = restore_into_fresh(&bytes1, 5, 20, 100);
+        let bytes2 = restored.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn scrollback_roundtrips_byte_equal() {
+        // 10 lines, only 3 visible — 7 should land in scrollback.
+        let mut input = Vec::new();
         for i in 0..10 {
-            p1.process(format!("line {i}\r\n").as_bytes());
+            input.extend_from_slice(format!("line {i}\r\n").as_bytes());
         }
-        let snap = p1.screen().full_contents_formatted();
-
-        let mut p2 = Parser::new(3, 10, 100);
-        p2.process(&snap);
-
-        // Visible rows match.
-        assert_eq!(visible_lines(&p1), visible_lines(&p2));
-        // Scrollback row counts match.
-        let scrollback1: usize = p1.screen().grid().scrollback_rows().count();
-        let scrollback2: usize = p2.screen().grid().scrollback_rows().count();
-        assert_eq!(scrollback1, scrollback2);
-        // Every scrollback row's textual content matches.
-        for (a, b) in p1
-            .screen()
-            .grid()
-            .scrollback_rows()
-            .zip(p2.screen().grid().scrollback_rows())
-        {
-            let mut sa = String::new();
-            a.write_contents(&mut sa, 0, p1.screen().grid().size().cols, false);
-            let mut sb = String::new();
-            b.write_contents(&mut sb, 0, p2.screen().grid().size().cols, false);
-            assert_eq!(sa, sb);
-        }
+        let bytes1 = snapshot_after(&input, 3, 10, 100);
+        let restored = restore_into_fresh(&bytes1, 3, 10, 100);
+        let bytes2 = restored.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+        // Trailing `\r\n` after "line 9" scrolls the visible area one
+        // more time, so 8 rows (not 7) end up in scrollback. The
+        // byte-equality assertion above is the load-bearing one;
+        // this sanity-check just confirms the scrollback is populated.
+        let sb = restored.screen().grid().scrollback_rows().count();
+        assert!(sb >= 7, "expected >= 7 scrollback rows, got {sb}");
     }
 
     #[test]
-    fn round_trips_empty_screen() {
-        let p1 = Parser::new(4, 16, 100);
-        let snap = p1.screen().full_contents_formatted();
+    fn alt_screen_state_preserved() {
+        // Enter alt-screen, write something on it; the primary grid
+        // still has its pre-alt contents.
+        let mut p1 = Parser::new(4, 10, 50);
+        p1.process(b"primary\r\n");
+        // Save cursor + enter alt-screen via DECSET 1049.
+        p1.process(b"\x1b[?1049h");
+        p1.process(b"ALT");
+        let bytes1 = p1.screen().binary_snapshot();
 
-        let mut p2 = Parser::new(4, 16, 100);
-        p2.process(&snap);
+        // Restore into a fresh parser, then re-snapshot.
+        let mut p2 = Parser::new(4, 10, 50);
+        p2.screen_mut()
+            .restore_from_binary_snapshot(&bytes1)
+            .unwrap();
+        let bytes2 = p2.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
 
-        assert_eq!(visible_lines(&p1), visible_lines(&p2));
-        assert_eq!(p1.screen().cursor_position(), p2.screen().cursor_position());
-        assert_eq!(p2.screen().grid().scrollback_rows().count(), 0);
+        // Exit alt-screen — restored "primary" must reappear.
+        p2.process(b"\x1b[?1049l");
+        // The visible row 0 should contain "primary" again.
+        let row0: String = (0..10)
+            .filter_map(|c| p2.screen().cell(0, c))
+            .map(|c| if c.has_contents() { c.contents().to_string() } else { " ".into() })
+            .collect();
+        assert!(row0.starts_with("primary"), "got {row0:?}");
+    }
+
+    #[test]
+    fn decsc_saved_cursor_preserved() {
+        // Move to (1, 2), save cursor, then move elsewhere; saved
+        // position must survive a snapshot round-trip.
+        let mut p1 = Parser::new(5, 20, 50);
+        p1.process(b"\x1b[2;3H"); // CUP row=2 col=3 (1-based) → (1,2) 0-based
+        p1.process(b"\x1b7"); // DECSC: save cursor
+        p1.process(b"\x1b[5;10H"); // move elsewhere
+        let bytes1 = p1.screen().binary_snapshot();
+
+        let p2 = restore_into_fresh(&bytes1, 5, 20, 50);
+        let bytes2 = p2.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+
+        // DECRC on the restored parser should land back at (1, 2).
+        let mut p2 = p2;
+        p2.process(b"\x1b8"); // DECRC: restore cursor
+        assert_eq!(p2.screen().cursor_position(), (1, 2));
+    }
+
+    #[test]
+    fn scroll_region_preserved() {
+        let mut p1 = Parser::new(10, 20, 50);
+        // DECSTBM rows 3..=7 (1-based).
+        p1.process(b"\x1b[3;7r");
+        let bytes1 = p1.screen().binary_snapshot();
+        let bytes2 = restore_into_fresh(&bytes1, 10, 20, 50)
+            .screen()
+            .binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn charset_state_preserved() {
+        // Designate G1 = DEC special graphics; SO selects G1.
+        let mut p1 = Parser::new(3, 20, 50);
+        p1.process(b"\x1b)0"); // designate G1 = special graphics
+        p1.process(b"\x0e"); // SO — shift to G1 (GL = 1)
+        p1.process(b"qx"); // 'q' → ─, 'x' → │
+        let bytes1 = p1.screen().binary_snapshot();
+        let bytes2 = restore_into_fresh(&bytes1, 3, 20, 50)
+            .screen()
+            .binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+
+        // After restore, typing more 'q'/'x' should still be in graphics.
+        let mut p2 = restore_into_fresh(&bytes1, 3, 20, 50);
+        p2.process(b"q");
+        let next_cell = p2.screen().cell(0, 2).unwrap();
+        assert_eq!(next_cell.contents(), "─");
+    }
+
+    #[test]
+    fn mouse_mode_and_input_modes_preserved() {
+        let mut p1 = Parser::new(4, 16, 0);
+        p1.process(b"\x1b[?1000h"); // mouse X11 press
+        p1.process(b"\x1b[?1006h"); // SGR encoding
+        p1.process(b"\x1b[?2004h"); // bracketed paste
+        p1.process(b"\x1b="); // application keypad
+        let bytes1 = p1.screen().binary_snapshot();
+        let p2 = restore_into_fresh(&bytes1, 4, 16, 0);
+        let bytes2 = p2.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+        assert!(p2.screen().bracketed_paste());
+        assert!(p2.screen().application_keypad());
+    }
+
+    #[test]
+    fn wide_character_cell_roundtrips() {
+        // CJK and emoji are wide; the continuation cell carries the flag.
+        let mut p1 = Parser::new(3, 10, 0);
+        p1.process("日本".as_bytes());
+        let bytes1 = p1.screen().binary_snapshot();
+        let p2 = restore_into_fresh(&bytes1, 3, 10, 0);
+        let bytes2 = p2.screen().binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+        assert!(p2.screen().cell(0, 0).unwrap().is_wide());
+        assert!(p2.screen().cell(0, 1).unwrap().is_wide_continuation());
+        assert_eq!(p2.screen().cell(0, 0).unwrap().contents(), "日");
+    }
+
+    #[test]
+    fn version_mismatch_rejects() {
+        let p = Parser::new(1, 1, 0);
+        let mut bytes = p.screen().binary_snapshot();
+        // First two bytes are the u16 SNAPSHOT_KIND_VERSION; corrupt them.
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+        let mut p2 = Parser::new(1, 1, 0);
+        let err = p2.screen_mut().restore_from_binary_snapshot(&bytes);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn truncated_payload_rejects() {
+        let p = Parser::new(2, 4, 0);
+        let bytes = p.screen().binary_snapshot();
+        let mut p2 = Parser::new(2, 4, 0);
+        // Lop off the tail; should fail somewhere in decoding.
+        let err = p2.screen_mut().restore_from_binary_snapshot(&bytes[..bytes.len() - 1]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn trailing_garbage_rejects() {
+        let p = Parser::new(2, 4, 0);
+        let mut bytes = p.screen().binary_snapshot();
+        bytes.push(0xAA);
+        let mut p2 = Parser::new(2, 4, 0);
+        let err = p2.screen_mut().restore_from_binary_snapshot(&bytes);
+        assert!(err.is_err());
     }
 }

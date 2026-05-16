@@ -196,9 +196,29 @@ fn handler_main(
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot: Vec<u8> = Vec::new();
         snapshot.extend_from_slice(ATTACH_ENTER);
-        snapshot.extend_from_slice(&guard.parser.screen().full_contents_formatted());
-        snapshot.extend_from_slice(&guard.vge.serialize_state());
-        snapshot.extend_from_slice(&guard.prt.serialize_state());
+
+        // VSS binary snapshot — replaces the v1 replay-style command
+        // stream. The renderer's per-portal VssEngine (or its host-
+        // level one, when veterd attaches directly without an
+        // intervening vmux pane) reassembles the fragments and applies
+        // the three sub-snapshots to its vt100 / VGE / PRT engines via
+        // their `restore_from_binary_snapshot` methods. See
+        // `doc/session-manager.md` §4.
+        let vt_bytes = guard.parser.screen().binary_snapshot();
+        let vge_bytes = guard.vge.binary_snapshot();
+        let prt_bytes = guard.prt.binary_snapshot();
+        let (rows, cols) = guard.parser.screen().size();
+        let vss_env = vss_protocol::encode_snapshot(
+            vss_protocol::SNAPSHOT_VERSION,
+            rows,
+            cols,
+            1, // sequence_id — only one snapshot per attach for v1
+            &vt_bytes,
+            &vge_bytes,
+            &prt_bytes,
+            vss_protocol::DEFAULT_MAX_FRAGMENT_BYTES,
+        );
+        snapshot.extend_from_slice(&vss_env);
 
         // Best-effort write of the snapshot. A failed write here means
         // the renderer is already gone; we propagate to the caller so

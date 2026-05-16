@@ -17,3 +17,4 @@
 pub mod prt;
 pub mod vft;
 pub mod vge;
+pub mod vss;

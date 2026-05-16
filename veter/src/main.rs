@@ -1,7 +1,7 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
 // re-imports them for in-file references. veterd and other workspace
 // crates pull the same code through `veter::*`.
-use veter::{clipboard, prt, pty, renderer, vft, vge};
+use veter::{clipboard, prt, pty, renderer, vft, vge, vss};
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -235,6 +235,7 @@ struct App {
     vge: Option<vge::VgeEngine>,
     prt: Option<prt::PrtEngine>,
     vft: Option<vft::VftEngine>,
+    vss: Option<vss::VssEngine>,
     clipboard: clipboard::ClipboardManager,
 
     // GL state (dropped in reverse-creation order so the EGL surface
@@ -275,6 +276,7 @@ impl App {
             vge: None,
             prt: None,
             vft: None,
+            vss: None,
             proxy,
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
@@ -800,6 +802,10 @@ impl App {
             Some(v) => v,
             None => return false,
         };
+        let vss = match &mut self.vss {
+            Some(v) => v,
+            None => return false,
+        };
         let pty = match &self.pty {
             Some(p) => p,
             None => return false,
@@ -822,8 +828,30 @@ impl App {
                     let prt_chunk = prt.process_pty_chunk_full(&data);
                     let vge_passthrough = engine.process_pty_chunk(&prt_chunk.passthrough);
                     let vft_passthrough = vft.process_pty_chunk(&vge_passthrough);
-                    if !vft_passthrough.is_empty() {
-                        parser.process(&vft_passthrough);
+                    let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
+                    if !vss_passthrough.is_empty() {
+                        parser.process(&vss_passthrough);
+                    }
+                    // Apply any completed host-level VSS snapshots.
+                    // A snapshot arriving at this level replaces the
+                    // host's vt100 / VGE / PRT engines wholesale —
+                    // used when veterd runs directly under a veter
+                    // host with no intervening vmux pane. The more
+                    // common case is per-portal snapshots, handled
+                    // by `prt::WritePortal` recursively.
+                    let completed = vss.take_completed_snapshots();
+                    for cs in completed {
+                        if let Err(e) =
+                            parser.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes)
+                        {
+                            eprintln!("veter: host VSS vt100 restore failed: {e}");
+                        }
+                        if let Err(e) = engine.restore_from_binary_snapshot(&cs.vge_bytes) {
+                            eprintln!("veter: host VSS VGE restore failed: {e}");
+                        }
+                        if let Err(e) = prt.restore_from_binary_snapshot(&cs.prt_bytes) {
+                            eprintln!("veter: host VSS PRT restore failed: {e}");
+                        }
                     }
                     // PRT host-screen reactions: scope_reset / cull on
                     // observed RIS/DECSTR/2J/3J, then alt-screen swap +
@@ -859,6 +887,10 @@ impl App {
                     let vft_resp = vft.take_responses();
                     if !vft_resp.is_empty() {
                         let _ = pty.write_all(&vft_resp);
+                    }
+                    let vss_resp = vss.take_responses();
+                    if !vss_resp.is_empty() {
+                        let _ = pty.write_all(&vss_resp);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1016,6 +1048,7 @@ impl ApplicationHandler for App {
         self.vge = Some(vge_engine);
         self.prt = Some(prt_engine);
         self.vft = Some(vft_engine);
+        self.vss = Some(vss::VssEngine::new());
 
         self.window.as_ref().unwrap().request_redraw();
     }

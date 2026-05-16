@@ -140,7 +140,7 @@ fn write_style(w: &mut Writer, s: &Style) {
     }
 }
 
-fn write_concrete_style(w: &mut Writer, s: &ConcreteStyle) {
+pub fn write_concrete_style(w: &mut Writer, s: &ConcreteStyle) {
     write_style(w, &s.as_style());
 }
 
@@ -208,7 +208,7 @@ fn write_path_node(w: &mut Writer, n: &PathNode) {
     }
 }
 
-fn write_draw_cmd(w: &mut Writer, cmd: &DrawCmd) {
+pub fn write_draw_cmd(w: &mut Writer, cmd: &DrawCmd) {
     match cmd {
         DrawCmd::FillRectangles { fill, rects } => {
             w.u8(OP_FILL_RECTANGLES);

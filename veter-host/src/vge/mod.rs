@@ -5,8 +5,10 @@
 // Wire-format types live in the `vge-protocol` crate and are
 // re-exported here for convenience.
 
+pub mod snapshot;
 pub mod state;
 
+pub use snapshot::SnapshotError;
 pub use state::{GpuImageId, VgeEngine, VgeState};
 
 pub use vge_protocol::*;

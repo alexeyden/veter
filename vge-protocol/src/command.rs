@@ -360,7 +360,7 @@ fn read_style(r: &mut Reader<'_>) -> DecodeResult<Style> {
 
 /// Like `read_style` but rejects `Style::Ref`. Used by SetGlobalStyle
 /// where nested refs are forbidden by §7.3.
-fn read_concrete_style(r: &mut Reader<'_>) -> DecodeResult<ConcreteStyle> {
+pub fn read_concrete_style(r: &mut Reader<'_>) -> DecodeResult<ConcreteStyle> {
     ConcreteStyle::from_style(read_style(r)?)
 }
 
@@ -373,7 +373,7 @@ fn validate_line_width(w: f32) -> DecodeResult<f32> {
     Ok(w)
 }
 
-fn read_draw_cmd(r: &mut Reader<'_>) -> DecodeResult<DrawCmd> {
+pub fn read_draw_cmd(r: &mut Reader<'_>) -> DecodeResult<DrawCmd> {
     let op = r.u8()?;
     match op {
         OP_FILL_RECTANGLES => {

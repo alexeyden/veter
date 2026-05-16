@@ -56,6 +56,7 @@ mod parser;
 mod perform;
 mod row;
 mod screen;
+mod snapshot;
 mod term;
 
 pub use attrs::Color;
@@ -63,3 +64,4 @@ pub use callbacks::Callbacks;
 pub use cell::Cell;
 pub use parser::Parser;
 pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use snapshot::SnapshotError;

@@ -65,7 +65,7 @@ pub struct GpuImageId(pub u64);
 /// other mutation, and `GpuImageId` is `Copy`).
 ///
 /// `source_encoding` and `source_data` retain the original wire-format
-/// bytes alongside the decoded pixels so [`VgeEngine::serialize_state`]
+/// bytes alongside the decoded pixels so [`VgeEngine::binary_snapshot`]
 /// can reship the image in its original form on reattach. Without this,
 /// a 50 KiB WebP avatar would inflate to `width × height × 4` bytes
 /// every time a renderer reconnects — punishing on bad SSH links.
@@ -160,9 +160,9 @@ impl ElementSet {
 
 pub struct VgeState {
     pub shared: SharedTables,
-    main: ElementSet,
-    alt: Option<ElementSet>,
-    on_alt: bool,
+    pub(in crate::vge) main: ElementSet,
+    pub(in crate::vge) alt: Option<ElementSet>,
+    pub(in crate::vge) on_alt: bool,
 }
 
 impl VgeState {
@@ -173,6 +173,20 @@ impl VgeState {
             alt: None,
             on_alt: false,
         }
+    }
+
+    /// Build a [`VgeState`] from parts decoded out of a binary
+    /// snapshot. The decoder in [`crate::vge::snapshot`] is the
+    /// intended caller — splitting state assembly from decoding lets
+    /// the decoder live in its own module without needing access to
+    /// private fields.
+    pub(in crate::vge) fn from_raw_parts(
+        shared: SharedTables,
+        main: ElementSet,
+        alt: Option<ElementSet>,
+        on_alt: bool,
+    ) -> Self {
+        Self { shared, main, alt, on_alt }
     }
 
     /// True iff the engine is currently on the alternate screen.
@@ -384,6 +398,23 @@ fn decode_raw_rgba8(
     Ok(pixels)
 }
 
+/// Snapshot-decode entry point. Same Raw / WebP dispatch as the
+/// upload path, but maps the protocol-level error into a snapshot
+/// error so the VSS engine surfaces a single error type.
+pub(in crate::vge) fn decode_image_pixels_from_snapshot(
+    encoding: u8,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<Vec<RGBA8>, crate::vge::snapshot::SnapshotError> {
+    let res = match encoding {
+        0x01 => decode_raw_rgba8(data, width, height),
+        0x02 => decode_webp(data, width, height),
+        _ => return Err(crate::vge::snapshot::SnapshotError::BadPayload),
+    };
+    res.map_err(|_| crate::vge::snapshot::SnapshotError::BadPayload)
+}
+
 /// Decode an UploadImage WebP payload (§8.1, encoding 0x02). Decoded
 /// dimensions must match the announced width/height; mismatch or any
 /// decoder error → `err_image_decode`.
@@ -502,68 +533,56 @@ impl VgeEngine {
         self.line_tracker.history_cap
     }
 
-    /// Serialize the engine's current state as a wire-ready APC
-    /// envelope (or chain of envelopes) of VGE commands. Feeding the
-    /// result into a fresh `VgeEngine` of matching probe capabilities
-    /// reproduces the image table, global style table, and currently-
-    /// active element set.
+    /// Serialize the engine's full state as a binary blob for the VSS
+    /// extension's `VgeFragment` payload. Captures both main and
+    /// alternate element sets, the shared image / style tables (with
+    /// original `source_data` preserved), `on_alt`, and engine-level
+    /// `cell_px` / `scale_factor`. Decode with
+    /// [`Self::restore_from_binary_snapshot`].
     ///
-    /// Intended for veterd attach-time replay
-    /// (`doc/session-manager.md` §4). The caller is responsible for
-    /// having replayed the vt100 grid + scrollback first so the
-    /// receiver's `top_of_live_screen` matches the value captured
-    /// here at snapshot time — top-level element origins are
-    /// computed relative to that.
+    /// Side-effect-free; does not consume any pending responses or
+    /// touch line-tracker / DSR state.
+    #[must_use]
+    pub fn binary_snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::vge::snapshot::encode_state(
+            &self.state,
+            self.cell_px,
+            self.scale_factor,
+            &mut out,
+        );
+        out
+    }
+
+    /// Replace this engine's state with one decoded from a VSS
+    /// snapshot produced by [`Self::binary_snapshot`]. Returns an
+    /// error on version mismatch or malformed payload; on error the
+    /// engine state is left untouched.
     ///
-    /// v1 limitations (called out in the doc):
-    /// - Only the currently-active screen's element set is emitted.
-    ///   Suspended alt/main set state is dropped.
-    ///
-    /// Images are reshipped in their original encoding (`source_data`
-    /// + `source_encoding` on [`UploadedImage`]). A WebP avatar stays
-    /// WebP on the wire instead of inflating to `width × height × 4`
-    /// bytes, which matters a lot for reattaches over slow links.
-    pub fn serialize_state(&self) -> Vec<u8> {
-        let mut frames: Vec<(Command, u32)> = Vec::new();
-        let state = &self.state;
-
-        // 1. Image table — UploadImage per entry. Reuses the original
-        //    on-wire bytes we stashed at upload time, so WebP stays
-        //    WebP and a `tail -f` over SSH doesn't have to push the
-        //    decoded RGBA on every reattach.
-        for (id, img) in &state.shared.images {
-            frames.push((
-                Command::UploadImage(UploadImageBody {
-                    id: id.clone(),
-                    encoding: img.source_encoding,
-                    width: img.width,
-                    height: img.height,
-                    data: img.source_data.clone(),
-                }),
-                REQ_ID_NO_RESPONSE,
-            ));
-        }
-
-        // 2. Global style table.
-        for (id, style) in &state.shared.styles {
-            frames.push((
-                Command::SetGlobalStyle {
-                    id: id.clone(),
-                    style: style.clone(),
-                },
-                REQ_ID_NO_RESPONSE,
-            ));
-        }
-
-        // 3. Elements. Top-level in (draw_order, creation_seq) order,
-        //    each followed by its full subtree in the same order, so
-        //    every parent is created before its children.
-        let top_offset = self.line_tracker.top_of_live_screen;
-        for top in state.top_level_sorted() {
-            emit_element_subtree(top, state, top_offset, &mut frames);
-        }
-
-        vge_protocol::encode::build_envelope(&frames)
+    /// Side-effect-free: no responses are queued, no callbacks fire,
+    /// and the line tracker / DSR pending counts are reset to the
+    /// values implied by the snapshot — image GPU handles are left
+    /// `None` so the renderer lazily registers them on first paint.
+    /// `pending_response_bytes`, `pending_image_deletes`,
+    /// `pending_cursor_queries`, and the `auto_reply_*` flags retain
+    /// their previous values (they're engine-policy state, not
+    /// session state).
+    pub fn restore_from_binary_snapshot(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::vge::snapshot::SnapshotError> {
+        let decoded = crate::vge::snapshot::decode_state(bytes)?;
+        self.state = decoded.state;
+        self.cell_px = decoded.cell_px;
+        self.scale_factor = decoded.scale_factor;
+        // Reset transient state that doesn't belong to the snapshot:
+        // any in-flight responses or cursor queries from before the
+        // restore are stale.
+        self.pending_response_bytes.clear();
+        self.pending_image_deletes.clear();
+        self.pending_cursor_queries = 0;
+        self.line_tracker = LineTracker::new();
+        Ok(())
     }
 
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that
@@ -1267,56 +1286,6 @@ impl VgeEngine {
     fn queue_envelope(&mut self, frames_buf: Vec<u8>) {
         let env = wrap_envelope(&frames_buf);
         self.pending_response_bytes.extend_from_slice(&env);
-    }
-}
-
-/// Walk `el`'s subtree and append `CreateElement` frames in
-/// (draw_order, creation_seq) order, parents before children. Used
-/// by [`VgeEngine::serialize_state`]. Top-level origins are
-/// reconstructed from the engine's `top_offset` so the receiver
-/// computes the same `anchor_line` when this stream replays into
-/// a vt100 with matching scrollback height.
-fn emit_element_subtree(
-    el: &Element,
-    state: &VgeState,
-    top_offset: i64,
-    frames: &mut Vec<(Command, u32)>,
-) {
-    let id_for_wire = el.id.clone().unwrap_or_default();
-    let origin = if el.parent.is_some() {
-        Point {
-            x: el.origin_x,
-            y: el.origin_y,
-        }
-    } else {
-        Point {
-            x: el.origin_x,
-            y: (el.anchor_line - top_offset) as f32 + el.sub_row,
-        }
-    };
-    frames.push((
-        Command::CreateElement(CreateElementBody {
-            id: id_for_wire,
-            commands: el.commands.clone(),
-            origin,
-            is_visible: el.is_visible,
-            draw_order: el.draw_order,
-            parent: el.parent.clone(),
-            size: el.clip_size,
-        }),
-        REQ_ID_NO_RESPONSE,
-    ));
-
-    // Recurse into children, in (draw_order, creation_seq) order so
-    // the receiver's tie-breaks match ours.
-    let mut kids: Vec<&Element> = el
-        .children
-        .iter()
-        .filter_map(|k| state.current().elements.get(k))
-        .collect();
-    kids.sort_by_key(|c| (c.draw_order, c.creation_seq));
-    for child in kids {
-        emit_element_subtree(child, state, top_offset, frames);
     }
 }
 
@@ -2481,180 +2450,6 @@ mod tests {
         w.buf
     }
 
-    /// Snapshot engine A, replay into a fresh engine B, and confirm
-    /// the relevant state has been reproduced.
-    #[test]
-    fn serialize_state_roundtrips_images_styles_and_top_level_elements() {
-        let mut a = VgeEngine::new((9, 20), 1.0);
-        let mut frames = Vec::new();
-        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
-        append_command(
-            &mut frames,
-            CMD_SET_GLOBAL_STYLE,
-            2,
-            &set_global_style_flat("accent", 0, 200, 50, 255),
-        );
-        append_command(
-            &mut frames,
-            CMD_CREATE_ELEMENT,
-            3,
-            &create_top_level_rect("rectA", 1.0, 2.5, 5, 200),
-        );
-        append_command(
-            &mut frames,
-            CMD_CREATE_ELEMENT,
-            4,
-            &create_top_level_rect("rectB", 3.0, 4.0, 10, 100),
-        );
-        a.process_pty_chunk(&build_envelope(&frames));
-        let _ = a.take_responses();
-
-        let snapshot = a.serialize_state();
-
-        let mut b = VgeEngine::new((9, 20), 1.0);
-        let passthrough = b.process_pty_chunk(&snapshot);
-        assert!(passthrough.is_empty(), "snapshot must not leak to vt100");
-        let _ = b.take_responses();
-
-        // Image table copied.
-        assert_eq!(b.state.shared.images.len(), 1);
-        let img = b.state.shared.images.get("logo").unwrap();
-        assert_eq!((img.width, img.height), (2, 2));
-        assert_eq!(img.pixels.len(), 4);
-        // Style table copied.
-        assert_eq!(b.state.shared.styles.len(), 1);
-        // Elements copied with correct order.
-        assert_eq!(b.state.elements().len(), 2);
-        let a_rect_a = a.state.elements().get("rectA").unwrap();
-        let b_rect_a = b.state.elements().get("rectA").unwrap();
-        assert_eq!(a_rect_a.draw_order, b_rect_a.draw_order);
-        assert_eq!(a_rect_a.anchor_line, b_rect_a.anchor_line);
-        assert!((a_rect_a.sub_row - b_rect_a.sub_row).abs() < 1e-3);
-        assert_eq!(a_rect_a.is_visible, b_rect_a.is_visible);
-    }
-
-    #[test]
-    fn serialize_state_roundtrips_parent_child_subtree() {
-        let mut a = VgeEngine::new((9, 20), 1.0);
-        let mut frames = Vec::new();
-        append_command(
-            &mut frames,
-            CMD_CREATE_ELEMENT,
-            1,
-            &create_top_level_rect("parent", 0.0, 0.0, 0, 100),
-        );
-        append_command(
-            &mut frames,
-            CMD_CREATE_ELEMENT,
-            2,
-            &create_child_rect("child", "parent", 1.5, 2.5, 3),
-        );
-        a.process_pty_chunk(&build_envelope(&frames));
-        let _ = a.take_responses();
-
-        let mut b = VgeEngine::new((9, 20), 1.0);
-        b.process_pty_chunk(&a.serialize_state());
-        let _ = b.take_responses();
-
-        // Both elements present, parent relationship preserved.
-        let parent = b.state.elements().get("parent").unwrap();
-        let child = b.state.elements().get("child").unwrap();
-        assert_eq!(child.parent.as_deref(), Some("parent"));
-        assert!(parent.children.iter().any(|k| k == "child"));
-        assert_eq!(child.draw_order, 3);
-        // Child origin is parent-relative; should round-trip verbatim.
-        assert!((child.origin_x - 1.5).abs() < 1e-3);
-        assert!((child.origin_y - 2.5).abs() < 1e-3);
-    }
-
-    #[test]
-    fn serialize_state_preserves_image_source_encoding_and_bytes() {
-        // Raw round-trip: uploading via the wire path then snapshotting
-        // must yield byte-identical UploadImage payload (same encoding,
-        // same data). Raw is the easy case — the snapshot used to also
-        // be Raw — but this test pins the invariant for cell-by-cell
-        // preservation.
-        let mut a = VgeEngine::new((9, 20), 1.0);
-        let mut frames = Vec::new();
-        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
-        a.process_pty_chunk(&build_envelope(&frames));
-        let _ = a.take_responses();
-
-        let snap = a.serialize_state();
-        let inner = unwrap_c2t_envelope(&snap);
-        let mut r = Reader::new(&inner);
-        assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
-        let _payload_len = r.u32().unwrap();
-        // First frame should be UploadImage with the original Raw body.
-        assert_eq!(r.u8().unwrap(), CMD_UPLOAD_IMAGE);
-        let _req_id = r.u32().unwrap();
-        let body_len = r.u32().unwrap() as usize;
-        let body = r.take(body_len).unwrap();
-        let mut br = Reader::new(body);
-        assert_eq!(br.string().unwrap(), "logo");
-        assert_eq!(br.u8().unwrap(), 0x01, "encoding preserved");
-        assert_eq!(br.u32().unwrap(), 2); // width
-        assert_eq!(br.u32().unwrap(), 2); // height
-        let payload = br.bytes().unwrap();
-        // Matches the 4 RGBA8 pixels from `upload_raw_2x2`.
-        assert_eq!(
-            payload,
-            &[
-                0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-                0xFF, 0xFF,
-            ]
-        );
-    }
-
-    #[test]
-    fn serialize_state_reships_webp_in_its_original_encoding() {
-        // Constructs an engine with an `UploadedImage` whose
-        // `source_encoding` is 0x02 (WebP) and whose `source_data` is
-        // arbitrary opaque bytes. `serialize_state` must reship those
-        // verbatim — not re-encode from `pixels`. This is the
-        // bandwidth fix: a 50 KiB WebP must not turn into a
-        // width*height*4 RGBA blob on every reattach.
-        //
-        // We bypass the wire upload path because synthesizing a valid
-        // WebP just to prove the no-re-encode property would couple the
-        // test to the image crate's encoder. The contract `serialize_state`
-        // must uphold is simply "emit whatever encoding came in"; the
-        // straight-line code path here is enough to pin it.
-        let fake_webp_bytes: Vec<u8> = (0..64).map(|i| i as u8).collect();
-        let mut a = VgeEngine::new((9, 20), 1.0);
-        a.state.shared.images.insert(
-            "avatar".into(),
-            UploadedImage {
-                width: 32,
-                height: 32,
-                pixels: vec![RGBA8::new(0, 0, 0, 0); 32 * 32],
-                gpu: Cell::new(None),
-                source_encoding: 0x02,
-                source_data: fake_webp_bytes.clone(),
-            },
-        );
-
-        let snap = a.serialize_state();
-        let inner = unwrap_c2t_envelope(&snap);
-        let mut r = Reader::new(&inner);
-        let _ = r.u8().unwrap(); // protocol version
-        let _ = r.u32().unwrap(); // payload_len
-        assert_eq!(r.u8().unwrap(), CMD_UPLOAD_IMAGE);
-        let _ = r.u32().unwrap(); // request_id
-        let body_len = r.u32().unwrap() as usize;
-        let body = r.take(body_len).unwrap();
-        let mut br = Reader::new(body);
-        assert_eq!(br.string().unwrap(), "avatar");
-        assert_eq!(br.u8().unwrap(), 0x02, "encoding stayed WebP");
-        assert_eq!(br.u32().unwrap(), 32);
-        assert_eq!(br.u32().unwrap(), 32);
-        let payload = br.bytes().unwrap();
-        assert_eq!(payload, fake_webp_bytes.as_slice());
-        // And critically, the snapshot is *much* smaller than a 32×32
-        // RGBA8 blob would have been: 64 bytes of source < 4096 RGBA.
-        assert!(payload.len() < 32 * 32 * 4);
-    }
-
     #[test]
     fn req_id_no_response_suppresses_ack_but_applies_state() {
         // The middleman-snapshot contract: a command sent with the
@@ -2684,18 +2479,172 @@ mod tests {
         );
     }
 
+    // ---- Binary snapshot (VSS) round-trip tests --------------------
+
+    fn drive_with_envelope(engine: &mut VgeEngine, frames: &[u8]) {
+        let env = build_envelope(frames);
+        let _passthrough = engine.process_pty_chunk(&env);
+        let _ = engine.take_responses();
+    }
+
+    /// Build a UploadImage Raw command body (encoding 0x01) for a
+    /// 2×2 image. Useful for populating shared.images.
+    fn raw_upload_body(id: &str, color: [u8; 4]) -> Vec<u8> {
+        let mut w = vge_protocol::codec::Writer::new();
+        w.str(id);
+        w.u8(0x01); // encoding=Raw
+        w.u32(2);
+        w.u32(2);
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&color);
+        }
+        w.bytes(&data);
+        w.buf
+    }
+
+    fn populate_engine() -> VgeEngine {
+        let mut e = VgeEngine::new((9, 20), 1.25);
+
+        // Upload an image.
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &raw_upload_body("pic", [1, 2, 3, 4]));
+        drive_with_envelope(&mut e, &frames);
+
+        // Set a global style: SetGlobalStyle id="accent" Flat(red).
+        let mut body = vge_protocol::codec::Writer::new();
+        body.str("accent");
+        body.u8(STYLE_FLAT);
+        body.u8(COLOR_RGBA8888);
+        body.u8(255); body.u8(0); body.u8(0); body.u8(255);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_SET_GLOBAL_STYLE, 2, &body.buf);
+        drive_with_envelope(&mut e, &frames);
+
+        // Create an element with one FillRectangles command. Body
+        // layout per command.rs CMD_CREATE_ELEMENT decoder:
+        //   id, commands, origin (Point), is_visible, draw_order,
+        //   optional (extra_flags + parent + size) trailing block.
+        let mut body = vge_protocol::codec::Writer::new();
+        body.str("el1");
+        // commands list — varu count then each DrawCmd.
+        body.varu(1);
+        body.u8(OP_FILL_RECTANGLES);
+        // Style::Flat(blue)
+        body.u8(STYLE_FLAT);
+        body.u8(COLOR_RGBA8888);
+        body.u8(0); body.u8(0); body.u8(255); body.u8(255);
+        // rects list
+        body.varu(1);
+        body.f32(1.0); body.f32(2.0); body.f32(3.0); body.f32(4.0);
+        // origin Point (top-level element — anchor logic uses this).
+        body.f32(0.0);
+        body.f32(0.0);
+        // is_visible, draw_order
+        body.u8(1);
+        body.i32(7);
+        // Omit trailing extra block (no parent, no size).
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_CREATE_ELEMENT, 3, &body.buf);
+        drive_with_envelope(&mut e, &frames);
+
+        e
+    }
+
     #[test]
-    fn serialize_state_empty_engine_produces_no_op_replay() {
-        let a = VgeEngine::new((9, 20), 1.0);
-        let snapshot = a.serialize_state();
+    fn binary_snapshot_round_trips_byte_equal() {
+        let e1 = populate_engine();
+        let bytes1 = e1.binary_snapshot();
+        let mut e2 = VgeEngine::new((9, 20), 1.0); // different defaults
+        e2.restore_from_binary_snapshot(&bytes1).expect("restore");
+        let bytes2 = e2.binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+        // Sanity checks on restored state.
+        assert!(e2.state.shared.images.contains_key("pic"));
+        assert!(e2.state.shared.styles.contains_key("accent"));
+        assert_eq!(e2.state.elements().len(), 1);
+    }
 
-        let mut b = VgeEngine::new((9, 20), 1.0);
-        b.process_pty_chunk(&snapshot);
-        let _ = b.take_responses();
+    #[test]
+    fn binary_snapshot_preserves_image_source_data() {
+        let e1 = populate_engine();
+        let bytes1 = e1.binary_snapshot();
+        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        e2.restore_from_binary_snapshot(&bytes1).unwrap();
+        let img1 = e1.state.shared.images.get("pic").unwrap();
+        let img2 = e2.state.shared.images.get("pic").unwrap();
+        assert_eq!(img1.source_encoding, img2.source_encoding);
+        assert_eq!(img1.source_data, img2.source_data);
+        assert_eq!(img1.width, img2.width);
+        assert_eq!(img1.height, img2.height);
+        // Decoded pixels are recomputed; they must match too.
+        assert_eq!(img1.pixels, img2.pixels);
+        // GPU handle is renderer-private — restored copy must start fresh.
+        assert!(img2.gpu.get().is_none());
+    }
 
-        assert!(b.state.elements().is_empty());
-        assert!(b.state.shared.images.is_empty());
-        assert!(b.state.shared.styles.is_empty());
+    #[test]
+    fn binary_snapshot_empty_engine_round_trips() {
+        let e1 = VgeEngine::new((9, 20), 1.5);
+        let bytes1 = e1.binary_snapshot();
+        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        e2.restore_from_binary_snapshot(&bytes1).unwrap();
+        let bytes2 = e2.binary_snapshot();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn binary_snapshot_carries_cell_px_and_scale() {
+        let e1 = VgeEngine::new((11, 24), 2.5);
+        let bytes = e1.binary_snapshot();
+        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        e2.restore_from_binary_snapshot(&bytes).unwrap();
+        // Round-trip another snapshot from the restored engine; both
+        // engines must serialize identically.
+        let bytes2 = e2.binary_snapshot();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn binary_snapshot_version_mismatch_rejects() {
+        let e = populate_engine();
+        let mut bytes = e.binary_snapshot();
+        // First two bytes are u16 SNAPSHOT_KIND_VERSION; corrupt them.
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+        let mut e2 = VgeEngine::new((9, 20), 1.0);
+        let err = e2.restore_from_binary_snapshot(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::vge::snapshot::SnapshotError::KindVersionMismatch { .. }),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn binary_snapshot_trailing_bytes_reject() {
+        let e = populate_engine();
+        let mut bytes = e.binary_snapshot();
+        bytes.push(0xAA);
+        let mut e2 = VgeEngine::new((9, 20), 1.0);
+        let err = e2.restore_from_binary_snapshot(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::vge::snapshot::SnapshotError::TrailingBytes),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn binary_snapshot_truncated_rejects() {
+        let e = populate_engine();
+        let bytes = e.binary_snapshot();
+        let mut e2 = VgeEngine::new((9, 20), 1.0);
+        let err = e2
+            .restore_from_binary_snapshot(&bytes[..bytes.len() - 1])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::vge::snapshot::SnapshotError::BadPayload),
+            "{err:?}",
+        );
     }
 }
 

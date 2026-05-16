@@ -1,20 +1,7 @@
-// Binary primitives shared by all VGE frame bodies (§1.4).
+// Binary primitives shared by all VSS frame bodies (§1.4 of the
+// extension specs — identical to PRT/VGE/VFT).
 
 use super::frame::{ERR_BAD_PAYLOAD, ESC};
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct Point {
-    pub x: f32,
-    pub y: f32,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
 
 #[derive(Debug, Copy, Clone)]
 pub struct DecodeError(pub u16);
@@ -78,11 +65,6 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    pub fn i32(&mut self) -> DecodeResult<i32> {
-        let b = self.take(4)?;
-        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
     pub fn u64(&mut self) -> DecodeResult<u64> {
         let b = self.take(8)?;
         Ok(u64::from_le_bytes([
@@ -95,15 +77,6 @@ impl<'a> Reader<'a> {
         Ok(i64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
-    }
-
-    pub fn bool(&mut self) -> DecodeResult<bool> {
-        Ok(self.u8()? != 0)
-    }
-
-    pub fn f32(&mut self) -> DecodeResult<f32> {
-        let b = self.take(4)?;
-        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// LEB128 unsigned varint (§1.4 `varu`).
@@ -134,20 +107,6 @@ impl<'a> Reader<'a> {
     pub fn string(&mut self) -> DecodeResult<&'a str> {
         let raw = self.bytes()?;
         std::str::from_utf8(raw).map_err(|_| DecodeError::bad_payload())
-    }
-
-    pub fn point(&mut self) -> DecodeResult<Point> {
-        let x = self.f32()?;
-        let y = self.f32()?;
-        Ok(Point { x, y })
-    }
-
-    pub fn rect(&mut self) -> DecodeResult<Rect> {
-        let x = self.f32()?;
-        let y = self.f32()?;
-        let w = self.f32()?;
-        let h = self.f32()?;
-        Ok(Rect { x, y, w, h })
     }
 }
 
@@ -192,18 +151,6 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    pub fn i32(&mut self, v: i32) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
-    pub fn bool(&mut self, v: bool) {
-        self.u8(u8::from(v));
-    }
-
-    pub fn f32(&mut self, v: f32) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
     pub fn varu(&mut self, mut v: u64) {
         loop {
             let mut b = (v & 0x7F) as u8;
@@ -228,8 +175,8 @@ impl Writer {
     }
 }
 
-/// Replace each `0x1B` byte with `0x1B 0x1B`. Used when emitting the APC
-/// payload (§1.3).
+/// Replace each `0x1B` byte with `0x1B 0x1B`. Used when emitting an
+/// APC payload (§1.3).
 pub fn stuff(input: &[u8], out: &mut Vec<u8>) {
     for &b in input {
         out.push(b);
@@ -260,7 +207,8 @@ mod tests {
         w.u8(0xAB);
         w.u16(0xBEEF);
         w.u32(0xDEAD_BEEF);
-        w.f32(-1.5);
+        w.u64(0x0123_4567_89AB_CDEF);
+        w.i64(-1);
         w.str("hello");
         w.bytes(&[1, 2, 3]);
 
@@ -268,7 +216,8 @@ mod tests {
         assert_eq!(r.u8().unwrap(), 0xAB);
         assert_eq!(r.u16().unwrap(), 0xBEEF);
         assert_eq!(r.u32().unwrap(), 0xDEAD_BEEF);
-        assert_eq!(r.f32().unwrap(), -1.5);
+        assert_eq!(r.u64().unwrap(), 0x0123_4567_89AB_CDEF);
+        assert_eq!(r.i64().unwrap(), -1);
         assert_eq!(r.string().unwrap(), "hello");
         assert_eq!(r.bytes().unwrap(), &[1, 2, 3]);
         assert!(r.at_end());
@@ -278,6 +227,21 @@ mod tests {
     fn truncated_buffer() {
         let mut r = Reader::new(&[0x01]);
         assert!(r.u32().is_err());
+        let mut r = Reader::new(&[0x01, 0x02, 0x03, 0x04]);
+        assert!(r.u64().is_err());
+    }
+
+    #[test]
+    fn empty_string_decodes() {
+        let mut r = Reader::new(&[0x00]);
+        assert_eq!(r.string().unwrap(), "");
+        assert!(r.at_end());
+    }
+
+    #[test]
+    fn invalid_utf8_string_errors() {
+        let mut r = Reader::new(&[0x02, 0xFF, 0xFE]);
+        assert!(r.string().is_err());
     }
 
     #[test]

@@ -1,9 +1,11 @@
 # Veter Session Manager (veterd)
 
-> **Status: design sketch — WIP.** This document captures the
-> architecture for persistent veter sessions. Nothing here is
-> implemented yet. The companion `doc/session-extension.md` (vmux ↔
-> veterd integration protocol) is deferred and will be written
+> **Status: WIP.** The architecture, lifecycle (§§1–3, 5–7), and
+> v1 replay-style attach (former §4) are implemented and tracked in
+> `CONTEXT.md`. §4 below describes the **v2 binary-snapshot protocol
+> (VSS)** that replaces the replay path; this is the next track of
+> work. The companion `doc/session-extension.md` (vmux ↔ veterd
+> integration protocol) is still deferred and will be written
 > separately.
 
 `veterd` is a persistent host-side session manager. Its role is to
@@ -191,83 +193,189 @@ engine modules (`veter/src/prt`, `veter/src/vge`, plus the vendored
 and `veterd` link against. No public-API change; no protocol
 change. See §8.
 
-## 4. The snapshot serializer
+## 4. The snapshot protocol (VSS)
 
-On every `attach`, `veterd` has to re-paint the session for a fresh
-renderer that knows nothing about it. Because the renderer parses
-PRT / VGE / VFT envelopes natively, the serializer's job is to
-walk the engines' internal state and emit **a stream of ordinary
-PRT / VGE envelopes** that, applied to a fresh host, reconstructs
-the same state.
+On every `attach`, `veterd` has to bring a fresh renderer into the
+session's exact current state. The chosen format is a **versioned
+binary state dump** that the renderer decodes and writes directly
+into its engine structs — no parsing of replayed commands, no side
+effects re-firing.
 
-Replay is then *just normal command processing on the receiving
-side*. No new wire format, no decoder asymmetry.
+### 4.0 Why not the replay serializer?
 
-### 4.1 What the stream contains
+The v1 of this section described a *replay-style* serializer (emit
+ordinary PRT / VGE envelopes that, processed by a fresh renderer,
+reconstruct state). Commits `ee89c77` / `1f8d874` / `858472e` landed
+that design and it works for the common case, but it structurally
+leaks state:
 
-In order, per session:
+- vt100: alternate-screen buffer, DECSC saved cursor, scrolling
+  region (DECSTBM), origin mode, current G0/G1 charset, saved
+  attributes — all dropped.
+- VGE: only the currently-active screen's element set is emitted.
+- PRT: per-portal VFT engines, engine-level focus and cursor style,
+  per-portal `PolledStateCache`, suspended-screen portals.
 
-1. **Image table.** For every uploaded image, one `UploadImage` (or
-   `UploadImageBegin` + chunks, if the image is large) per entry,
-   so any subsequent `DrawImage` references resolve.
-2. **Global style table.** One `SetGlobalStyle` per registered
-   style, so any `StyleRef` in element commands resolves.
-3. **Top-level VGE elements.** Walk the element tree in
-   `(draw_order, creation_order)` and emit `CreateElement` for
-   each. Children are emitted after their parents so `parent_id`
-   resolves at processing time. `is_visible` and `draw_order` go
-   in the create body.
-4. **PRT portals.** For each portal (recursively):
-   - `CreatePortal` with the portal's recorded geometry.
-   - A stream of `WritePortal` envelopes carrying *vt100 escape
-     sequences* that bring a fresh portal vt100 to the daemon's
-     current grid + scrollback state. (§4.2)
-   - Per-portal VGE elements (same shape as step 3, but scoped to
-     this portal — using the existing portal-recursive VGE state
-     model).
-   - Recursively, any nested portals.
+Closing each gap in the replay world means inventing the right
+command sequence to emit, in the right order, with no side effects
+re-firing on the receiver — fiddly per-field work, every gap costs
+its own week. A direct binary dump captures every field once and
+sidesteps the side-effect problem entirely (no parsing on the
+receive path, no event callbacks to silence).
 
-### 4.2 The vt100 redraw stream
+### 4.1 Wire format
 
-This is the only genuinely new bit of engineering. The serializer
-walks each vt100's grid + scrollback and emits:
+A new APC-framed extension, **VSS** (Veter State Snapshot), parallel
+to PRT / VGE / VFT and routed by the same per-portal pipeline:
 
-- For each line of scrollback (oldest first): SGR setup
-  + cursor positioning + the line's cells + `CR LF` to push it
-  into history.
-- For the visible screen: SGR setup + cursor positioning + cells
-  + the final cursor position, scrolling region, alt-screen flag,
-  saved cursor (`DECSC`/`DECRC` state), character set state.
+- Engine → renderer envelope: `ESC _ V S S <payload> ESC \`
+- Renderer → engine envelope: `ESC _ v s s <payload> ESC \`
+- Payload framing matches PRT §1.1–1.4: `u8 protocol_version = 0`,
+  `u32 payload_length`, then a sequence of
+  `(u8 frame_type, u32 request_id, u32 body_length, body[body_length])`
+  frames. ESC byte-stuffing applied to the payload.
+- Primitive encoding (`u8`, `u16`, `u32`, `i32`, `varu`, `string`,
+  `bytes`) per PRT §1.4.
 
-Coalesce identical-attribute runs into a single SGR + text span so
-the byte cost stays close to "grid area × bytes per visible char".
+#### Frame types (engine → renderer, marker `VSS`)
 
-This serializer lives next to the vt100 it reads (likely as a new
-method on the vendored `vt100::Screen`), so it has access to the
-private grid representation without exposing it. **Replay flicker**
-during attach is unavoidable but bounded: the renderer paints
-intermediate states as the stream is consumed. Mitigations (e.g.
-"render only the final state per attach") are a v2 optimization.
+| Code | Frame | Body |
+|---|---|---|
+| 0x01 | `SnapshotBegin` | `u32 snapshot_version`, `u16 rows`, `u16 cols`, `u32 sequence_id` |
+| 0x02 | `VtFragment`    | `varu index`, `varu total`, `bytes payload` |
+| 0x03 | `VgeFragment`   | `varu index`, `varu total`, `bytes payload` |
+| 0x04 | `PrtFragment`   | `varu index`, `varu total`, `bytes payload` |
+| 0x05 | `SnapshotEnd`   | `u32 sequence_id` |
 
-### 4.3 Bandwidth
+#### Frame types (renderer → engine, marker `vss`)
 
-A 200 × 80 grid with 4 K scrollback lines and tight attribute
-coalescing comes out to roughly 200–600 KiB. Images push that up
-fast — a single 1 MiB WebP avatar re-shipped on every attach is the
-biggest variable cost.
+| Code | Frame | Body |
+|---|---|---|
+| 0x01 | `SnapshotAccepted` | `u32 sequence_id` |
+| 0x02 | `SnapshotRejected` | `u32 sequence_id`, `u8 reason` (1 = version, 2 = malformed, 3 = capacity) |
 
-Mitigations (deferred):
+Fragmenting lets a multi-megabyte snapshot (images!) span several
+envelopes without busting any single APC budget. Reassembly is by
+`(frame_type, total)` count; a complete `Vt+Vge+Prt` set within one
+`Begin … End` window applies atomically.
 
-- Image table digest. `veterd` keeps the SHA-256 of every uploaded
-  image; the renderer sends its current set of known image
-  digests on attach via a small new probe extension, and `veterd`
-  skips re-uploading matches. Saves bandwidth on tight reattach
-  cycles where the renderer is reused.
-- Delta snapshots. `veterd` keeps a serialized hash of its last
-  shipped state and emits only diffs since then. Substantially
-  more complex; only worth it if profiling shows it's needed.
+### 4.2 Version policy
 
-v1 ships the full state on every attach. The simpler model first.
+`snapshot_version` is a single monotonic `u32` baked into both
+binaries at build time. Bump on every breaking change to any
+sub-snapshot layout. **Strict match.** On mismatch the renderer
+emits `SnapshotRejected { reason = 1 }`; `veterd` writes a plain-text
+banner to the renderer's alt-screen view, holds for ~2 s, and tears
+the attach down via the existing `ATTACH_LEAVE`. No replay fallback.
+The operational expectation is that `veterd` and `veter` ship in
+lockstep.
+
+### 4.3 Snapshot payload
+
+Three independent sub-snapshots, each carrying its own
+`u16 kind_version` so subsystems can rev independently of the
+envelope version. Exact field lists live in the implementation;
+the doc-level inventory:
+
+**VtFragment** — vt100 state. The full `vt100::Screen`: visible grid,
+**alternate grid**, cursor and **saved cursor (DECSC)**, **scroll
+region (DECSTBM)** + saved scroll region, **origin mode** + saved
+origin mode, current and **saved SGR attributes**, current and
+**saved G0/G1 charset**, all input modes (application keypad / cursor,
+hide cursor, bracketed paste, alt-screen flag, mouse protocol mode
++ encoding), title, icon name, the scrollback ring with current
+scrollback offset. Lives in the vt100 fork as
+`Screen::binary_snapshot()` / `restore_from_binary_snapshot()`.
+Bolded items are gaps the v1 replay serializer drops.
+
+**VgeFragment** — VGE state. `shared.{styles, images}` (images keep
+`source_encoding` + `source_data` — WebP stays WebP, never
+re-encoded), **both `main` and `alt` element sets** (the v1 replay
+shipped only the active one), the `on_alt` flag, and engine-level
+scalars (`cell_px`, `scale_factor`). GPU image handles are *not* on
+the wire; the renderer re-creates them lazily through the existing
+`Renderer::register_gpu_image` path on first paint. Lives in
+`veter-host` as `VgeEngine::binary_snapshot()` /
+`restore_from_binary_snapshot()`.
+
+**PrtFragment** — PRT state, recursive. `main` and **`alt`** portal
+sets, `on_alt`, **engine-level `FocusKind` and `CursorStyle`**, and
+per portal: id, geometry, anchor, visibility, draw order, creation
+sequence, scrollback length, plus three nested binary blobs — that
+portal's vt100 snapshot, its `children` PrtEngine snapshot
+(recursive), and its VgeEngine snapshot — plus its
+**`PolledStateCache`** and **`pending_cursor_queries`** counter.
+VFT engines are deliberately *not* serialized: in-flight transfers
+are abandoned on reattach (same policy as the v1 replay). Lives in
+`veter-host` as `PrtEngine::binary_snapshot()` /
+`restore_from_binary_snapshot()`.
+
+### 4.4 Engine-side composition (veterd)
+
+`tools/veterd/src/attach.rs::handler_main` replaces the v1 replay
+composition (lines ~237–245). Under the engines lock:
+
+1. Grab `vt`, `vge`, `prt` binary snapshots.
+2. Wrap them into
+   `SnapshotBegin → VtFragment* → VgeFragment* → PrtFragment* → SnapshotEnd`
+   envelopes via `vss-protocol::encode_snapshot`.
+3. Write `ATTACH_ENTER` (`CSI ?1049 h`) + envelopes to the
+   renderer's stdout.
+4. Read upstream for `SnapshotAccepted` / `SnapshotRejected` with a
+   ~1 s timeout (matches the existing `PROBE_TIMEOUT`).
+5. On accept: install the renderer-stdout fd on the engines so the
+   worker forwards live PTY bytes; release the lock; splice input
+   and run the winsize watcher exactly as today.
+6. On reject: print a plain-text mismatch banner to the alt-screen
+   view; `ATTACH_LEAVE`; tear the attach down.
+
+The per-session worker thread (`tools/veterd/src/engines.rs`) is
+**unchanged**: it keeps forwarding inner-PTY bytes verbatim once
+the snapshot is acknowledged. Pass-through after attach is exactly
+what it is today, modulo the new VSS marker that PRT / VGE / VFT
+forward verbatim per §1.1 of each spec.
+
+### 4.5 Renderer-side application
+
+The renderer's byte pipeline
+(`veter/src/main.rs::App::process_pty_output`,
+`PRT → VGE → VFT → vt100`) and the equivalent per-portal pipeline in
+`veter-host/src/prt/state.rs::WritePortal` gain a fourth stage:
+`VssEngine`, sitting between VFT and vt100.
+
+`VssEngine` (new module, `veter-host/src/vss/state.rs`) is an APC
+parser and fragment reassembler with the same shape as `VftEngine`.
+On a complete snapshot (`SnapshotBegin` … `SnapshotEnd` matched and
+validated):
+
+1. Check `snapshot_version` against the compile-time constant.
+   Mismatch → emit `SnapshotRejected { reason = 1 }`, drop the
+   payload.
+2. Decode the three sub-snapshots and call
+   `restore_from_binary_snapshot()` on the **owning context's**
+   engines — host-level vt100 / PRT / VGE for the top-level
+   `VssEngine`, `portal.{vt, children, vge}` for a per-portal
+   `VssEngine`.
+3. Emit `SnapshotAccepted { sequence_id }` upstream via the
+   engine's `pending_response_bytes` queue (the same path PRT and
+   VGE already use for upstream responses).
+
+Restore is **side-effect-free by construction**: binary fields are
+assigned directly, so engine callbacks
+(`HostCallbacks::on_title_change`, bell, mouse-mode-change, …) are
+not invoked. A "post-restore reconcile" pass on the renderer pushes
+title / cursor / mouse-mode to the GUI by reading the new field
+values directly, without going through the callback path.
+
+### 4.6 Bandwidth
+
+A 200 × 80 grid with 4 K scrollback lines, binary cell encoding
+(content + attrs + width, no run-coalescing) lands in the 300–600
+KiB range, comparable to the replay-with-coalescing estimate. Images
+dominate, exactly as before: WebP `source_data` is reshipped on
+every attach. The content-hash image cache previously listed as a
+deferred optimization remains a v1.1 lever — its design is
+unchanged by the VSS switch.
 
 ## 5. SSH and the wire
 
@@ -336,48 +444,82 @@ deferred companion document, `doc/session-extension.md`.
 
 ## 8. Staging
 
-A staged landing, smallest reviewable steps first:
+### 8.1 v1 (replay-style attach) — landed
 
-1. **Extract `veter-host` crate.** Move `veter/src/prt`,
-   `veter/src/vge`, and re-export the vendored `vt100` through a
-   single host-engine façade. `veter` keeps existing behaviour;
-   no protocol change. Mechanical refactor.
-2. **Pass-through rule for unknown extensions.** Audit the PRT
-   and VGE host engines so a daemon that consumes one extension
-   but not another forwards the foreign envelopes verbatim
-   (already true for PRT/VGE crossing each other; needs to be
-   spelled out as a contract).
-3. **vt100 redraw serializer.** Add `Screen::serialize_state() ->
-   Vec<u8>` to the vendored vt100 fork; test by round-tripping
-   through a fresh `Screen`.
-4. **PRT / VGE state serializers.** In `veter-host`, walk the
-   engines' tables and emit equivalent `CreateElement` /
-   `CreatePortal` / `UploadImage` / etc. streams; round-trip
-   tested against a fresh engine pair.
-5. **`veterd` binary skeleton.** Daemon process, socket, session
-   table, `new` / `list` / `kill` / `kill-server`. No `attach`
-   yet; sessions can be created but the only way to observe them
-   is `list`.
-6. **`attach` with snapshot replay.** Hook the serializers up to
-   the attach path, including `SCM_RIGHTS` stdio handover.
-   First end-to-end use.
-7. **Detach hotkey.** Configurable, default `Ctrl+\ d`.
-8. **Packaging.** Cross-compile `veterd` to static aarch64-musl
-   alongside the existing client tools (`vmux`, `vcat`, `vsend`,
-   `vrecv`) and add it to the `dist-aarch64-deb` target.
+Tracked in `CONTEXT.md`. Summarised:
 
-Steps 1–4 are pure refactor + serializer work — they don't change
-any user-facing behaviour and can land independently. Step 5
-starts being externally observable. Step 6 is the first user-
-useful state.
+1. Extract `veter-host` crate (mechanical refactor).
+2. Pass-through rule for unknown extensions (PRT / VGE / VFT spec
+   §1.1 contract).
+3. vt100 redraw serializer (`Screen::full_contents_formatted`).
+4. PRT / VGE state serializers (`PrtEngine::serialize_state`,
+   `VgeEngine::serialize_state`).
+5. `veterd` skeleton (`new` / `list` / `kill` / `kill-server`).
+6. `attach` with replay snapshot over `SCM_RIGHTS` stdio handover.
+7. Detach hotkey (`Ctrl+\ d`).
+8. Packaging (cross-compile to aarch64-musl, included in
+   `dist-aarch64-deb`).
+
+These are end-to-end smoke-tested. The replay path is the current
+production code path on the `veterd` branch.
+
+### 8.2 v2 (VSS binary snapshot) — next track
+
+The replay-style serializers stay in tree while VSS lands so the
+two can be A/B-tested. The `veterd` switchover (step 7 below) is
+the cutover moment; step 8 garbage-collects the replay path.
+
+1. **`vss-protocol` crate.** Wire-format only (envelope codec, frame
+   types, primitive helpers), mirroring `prt-protocol` /
+   `vge-protocol` / `vft-protocol`. Inline roundtrip tests.
+2. **vt100 binary snapshot.** `Screen::binary_snapshot()` /
+   `restore_from_binary_snapshot()` in the vt100 fork, covering all
+   the fields the replay serializer drops (alt-screen, DECSC, scroll
+   region, charset, …). Round-trip test asserts encode → decode →
+   encode is byte-equal across alt-screen-active, DECSC-saved,
+   scroll-region-set, charset-shifted, scrollback-populated cases.
+3. **VGE binary snapshot.** `VgeEngine::binary_snapshot()` /
+   `restore_from_binary_snapshot()` covering main + alt element
+   sets, image table (with WebP `source_data` preserved), style
+   table, element ordering. Round-trip + GPU-image-id reattachment
+   test.
+4. **PRT binary snapshot.** `PrtEngine::binary_snapshot()` /
+   `restore_from_binary_snapshot()`, recursive over the portal
+   tree. Round-trip test with a two-level nested portal carrying
+   VGE elements.
+5. **`VssEngine` in `veter-host`.** APC parser, fragment
+   reassembler, restore dispatcher. Per-portal field on `Portal`,
+   plus the host-level engine. Inline tests for fragment reordering,
+   malformed frames, version mismatch.
+6. **Renderer pipeline wire-up.** Add the VSS stage to
+   `veter/src/main.rs::App::process_pty_output` and to the
+   per-portal pipeline in `veter-host/src/prt/state.rs::WritePortal`.
+   Manual end-to-end test by hand-rolling a VSS envelope inside a
+   vmux pane.
+7. **`veterd` switches to VSS.** `attach.rs` composition rewritten;
+   accept / reject upstream wired. End-to-end smoke (see §4.4 and
+   §4.5). Replay serializers still in tree but unused.
+8. **Remove replay serializers.** Delete
+   `Screen::full_contents_formatted`, `VgeEngine::serialize_state`,
+   `PrtEngine::serialize_state`, and any helpers
+   (`Row::write_contents_inline`, `Grid::scrollback_rows`) that no
+   longer have callers. Update `CONTEXT.md`.
+
+Steps 1–4 are pure additive work — they don't change runtime
+behaviour and can land independently and out of order. Step 5
+introduces the `VssEngine` type but is inert without step 6 wiring.
+Step 7 is the user-visible switchover; step 8 is cleanup.
 
 ## 9. Open questions
 
-- **Where does the vt100 serializer live?** Inside the vendored
-  `vt100` fork (cleanest abstraction, but fork grows) or in
-  `veter-host` using `vt100`'s public read API (no fork change,
-  but probably less efficient). Leaning toward the fork — the
-  serializer wants the private grid representation.
+Resolved by the VSS design:
+
+- ~~**Where does the vt100 serializer live?**~~ Fork. The binary
+  snapshot needs every private field; a public-API serializer was
+  never going to work.
+
+Still open:
+
 - **`veterd new` versus auto-create on attach.** Should
   `veterd attach foo` create `foo` if it doesn't exist (tmux-
   style) or require an explicit `new`? tmux-style is friendlier;
@@ -389,11 +531,35 @@ useful state.
   read final scrollback)? tmux ends it; the alternative has
   ergonomic value but complicates the lifecycle. Default to
   ending, with `veterd new --linger` as an opt-in later.
-- **Image table digest probe.** Mentioned in §4.3 as a deferred
-  optimization. The minimum viable version is a one-frame VGE
+- **Image table digest probe.** Mentioned in §4.6 as a deferred
+  optimisation. The minimum viable version is a one-frame VGE
   capability bit ("renderer remembers image digests across
   attaches") plus a probe response field for the current digest
   set. Defer until profiling justifies it.
+
+VSS-specific:
+
+- **`SnapshotAccepted` timeout.** Tentative 1 s, matching the
+  existing `PROBE_TIMEOUT` (see
+  `tools/veterd/src/attach.rs`). Revisit if WAN attaches feel
+  sluggish.
+- **VFT in-flight transfer survival.** Current decision: abandon
+  on reattach (matches v1). A small "live-transfer state"
+  snapshot is a v2 design idea; not blocking VSS.
+- **Reply suppression on the renderer side during an attach.**
+  The renderer's per-portal engines see forwarded inner-program
+  bytes and may generate CPR / DSR / title responses that
+  `veterd` has already answered locally. Correctness is fine —
+  `veterd` discards the stray PRT responses — but it's wasted
+  upstream bandwidth. Defer to v1.1.
+- **Multi-attach.** Out of scope for v1. The
+  `session.attached` flag stays as "exactly one renderer at a
+  time."
+- **`engine_build_id` alongside `snapshot_version`.** Cheap to
+  add (a 7-byte git short hash in `SnapshotBegin`) and catches
+  the silent failure mode of "someone bumped a field but forgot
+  to bump the version constant." Recommend adding in step 8.1
+  of §8.2.
 
 ## 10. Companion documents
 

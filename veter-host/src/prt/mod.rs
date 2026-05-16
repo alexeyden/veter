@@ -8,9 +8,11 @@
 #![allow(unused_imports)]
 
 pub mod portal;
+pub mod snapshot;
 pub mod state;
 
 pub use portal::{Portal, PortalAnchor, PortalSet};
+pub use snapshot::SnapshotError;
 pub use state::{FocusKind, Limits, PrtEngine, PrtState};
 
 pub use prt_protocol::*;

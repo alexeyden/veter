@@ -42,6 +42,38 @@ impl Cell {
         usize::from(self.len & LEN_BITS)
     }
 
+    pub(crate) fn serialize_binary(&self, w: &mut crate::snapshot::Writer) {
+        // `self.len` carries both the wide-flag bits (top 2) and the
+        // UTF-8 content length (bottom 5). Encoding the byte verbatim
+        // preserves the flags; we then emit only the live content
+        // bytes — the rest of `contents` is padding.
+        w.u8(self.len);
+        let content_len = (self.len & LEN_BITS) as usize;
+        w.buf.extend_from_slice(&self.contents[..content_len]);
+        crate::snapshot::encode_attrs(w, &self.attrs);
+    }
+
+    pub(crate) fn deserialize_binary(
+        r: &mut crate::snapshot::Reader,
+    ) -> Result<Self, crate::snapshot::SnapshotError> {
+        let len = r.u8()?;
+        let content_len = (len & LEN_BITS) as usize;
+        if content_len > CONTENT_BYTES {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "cell content length exceeds CONTENT_BYTES",
+            ));
+        }
+        let content_bytes = r.take(content_len)?;
+        let mut contents = [0u8; CONTENT_BYTES];
+        contents[..content_len].copy_from_slice(content_bytes);
+        let attrs = crate::snapshot::decode_attrs(r)?;
+        Ok(Self {
+            contents,
+            len,
+            attrs,
+        })
+    }
+
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
         self.len = 0;
         self.append_char(0, c);
