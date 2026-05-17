@@ -21,10 +21,12 @@ pub const PROTOCOL_VERSION: u8 = 0;
 /// `doc/session-manager.md` §4.2.
 ///
 /// History:
+/// - v3: added `DetachNotify` downstream frame so the renderer can
+///   restore its pre-attach state when an attach ends.
 /// - v2: VGE and PRT sub-snapshots gained `top_of_live_screen` so
 ///   anchor-line semantics survive across attach.
 /// - v1: initial layout.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 // Engine → renderer frame codes (marker `VSS`).
 pub const FRM_SNAPSHOT_BEGIN: u8 = 0x01;
@@ -32,6 +34,10 @@ pub const FRM_VT_FRAGMENT: u8 = 0x02;
 pub const FRM_VGE_FRAGMENT: u8 = 0x03;
 pub const FRM_PRT_FRAGMENT: u8 = 0x04;
 pub const FRM_SNAPSHOT_END: u8 = 0x05;
+/// Tell the renderer that the attach is ending. Restore the
+/// pre-attach engine state that was saved on the first
+/// `SnapshotBegin` of this attach window. Body is empty.
+pub const FRM_DETACH_NOTIFY: u8 = 0x06;
 
 // Renderer → engine frame codes (marker `vss`).
 pub const FRM_SNAPSHOT_ACCEPTED: u8 = 0x01;

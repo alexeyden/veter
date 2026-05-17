@@ -336,7 +336,9 @@ fn decode_portal(
     // A restored portal starts with a fresh VssEngine: any in-flight
     // snapshot transfer inside the previous attach has by definition
     // already completed (it produced *this* snapshot) or been
-    // abandoned with the old renderer.
+    // abandoned with the old renderer. Same for `pre_attach_backup` —
+    // a snapshot loaded from outside doesn't carry an "even older"
+    // state to roll back to.
     let vss = crate::vss::VssEngine::new();
 
     Ok(Portal {
@@ -354,6 +356,7 @@ fn decode_portal(
         vge,
         vft,
         vss,
+        pre_attach_backup: None,
         state_cache,
         pending_cursor_queries,
     })

@@ -1,5 +1,5 @@
 //! Length-prefixed binary IPC between the `veterd` CLI front-end and
-//! the long-lived daemon process.
+//! the per-session daemon processes.
 //!
 //! Frame layout (both directions):
 //!
@@ -9,47 +9,47 @@
 //! ...  kind-specific body
 //! ```
 //!
-//! Strings are `u32 len` (LE) + UTF-8 bytes. Lists are `u32 count`
-//! followed by elements. The protocol is intentionally tiny — it
-//! evolves alongside the daemon and lives entirely within this repo,
-//! so robust evolution rules (capability negotiation, etc.) are not
-//! a v1 concern. Frames are sent over a per-user Unix-domain socket
-//! at `$XDG_RUNTIME_DIR/veterd/sock` (mode 0700).
+//! Strings are `u32 len` (LE) + UTF-8 bytes. The protocol is
+//! intentionally tiny — it evolves alongside `veterd` and lives
+//! entirely within this repo, so robust evolution rules are not a
+//! v1 concern. Frames are sent over a per-session Unix-domain socket
+//! at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock` (mode 0700).
+//!
+//! Each session is its own process listening on its own socket;
+//! `New` / `List` / `KillServer` from the v1 daemon-of-many-sessions
+//! design are gone. `New` is now a CLI-only operation (forks the
+//! session process); `List` is a directory scan + parallel `Status`
+//! round-trips.
 
 use std::io::{self, Read, Write};
 
-/// Request: client → daemon.
+/// Request: CLI → session process.
 #[derive(Debug, Clone)]
 pub enum Request {
-    /// Create a new session named `name`, spawning `argv[0] argv[1..]`
-    /// inside the session's inner PTY. If `argv` is empty the daemon
-    /// uses `$SHELL` (or `/bin/sh` as a final fallback).
-    New { name: String, argv: Vec<String> },
-    /// Enumerate every session known to the daemon.
-    List,
-    /// Tear down the named session (signal its inner process and drop
-    /// the entry). Idempotent: unknown names yield `Err`.
-    Kill { name: String },
-    /// Shut the daemon down immediately, killing every session.
-    KillServer,
-    /// Attach the caller's stdio to the named session. After this
-    /// frame, the client immediately follows up with a single
-    /// `SCM_RIGHTS` ancillary-data message carrying stdin then stdout
-    /// (in that order) over the same Unix-domain socket; see
-    /// [`crate::fdpass`] for the helpers. The daemon takes ownership
-    /// of those fds, writes a snapshot replay, then splices bytes
-    /// between the renderer and the inner PTY. The reply over this
-    /// connection is `Ok` on success (the client can then exit; its
-    /// stdin/stdout fds live on in the daemon) or `Err(msg)` if the
-    /// session cannot be attached (unknown name, already attached, …).
-    Attach { name: String },
+    /// Attach the caller's stdio to this session. After this frame
+    /// the client immediately follows up with a single `SCM_RIGHTS`
+    /// ancillary-data message carrying stdin then stdout (in that
+    /// order) over the same socket; see [`crate::fdpass`] for the
+    /// helpers. The session takes ownership of those fds, writes the
+    /// snapshot, then splices bytes between the renderer and the
+    /// inner PTY. Reply: `Ok` on success (client stays blocked on the
+    /// socket until the session ends the attach) or `Err(msg)` if the
+    /// session is already attached.
+    Attach,
+    /// Terminate this session: SIGTERM the inner PTY child, unlink
+    /// the socket, exit the session process. Idempotent — a second
+    /// `Kill` won't reach anyone because the socket is gone.
+    Kill,
+    /// Return a [`SessionInfo`] snapshot describing this session.
+    /// Used by `veterd list` to populate the table.
+    Status,
 }
 
-/// Response: daemon → client.
+/// Response: session process → CLI.
 #[derive(Debug, Clone)]
 pub enum Response {
     Ok,
-    Sessions(Vec<SessionInfo>),
+    Status(SessionInfo),
     Err(String),
 }
 
@@ -58,42 +58,34 @@ pub struct SessionInfo {
     pub name: String,
     /// Seconds since the session was created.
     pub age_secs: u64,
-    /// True if the inner PTY child is still running.
+    /// True if the inner PTY child is still running. With per-session
+    /// processes a dead child triggers session-process exit, so a
+    /// `Status` response is only emitted while the child is alive —
+    /// this field is effectively always `true` on the wire. Retained
+    /// for table-column parity with the v1 output and as a hedge
+    /// against any future "linger after exit" mode.
     pub alive: bool,
-    /// True if a renderer is currently attached. Always false in the
-    /// skeleton — flipped to real meaning when task #6 lands.
+    /// True if a renderer is currently attached. The attach handler
+    /// thread flips this to `true` after the snapshot ships and back
+    /// to `false` on detach.
     pub attached: bool,
 }
 
-const REQ_NEW: u8 = 0x01;
-const REQ_LIST: u8 = 0x02;
-const REQ_KILL: u8 = 0x03;
-const REQ_KILL_SERVER: u8 = 0x04;
-const REQ_ATTACH: u8 = 0x05;
+const REQ_ATTACH: u8 = 0x01;
+const REQ_KILL: u8 = 0x02;
+const REQ_STATUS: u8 = 0x03;
 
 const RSP_OK: u8 = 0x10;
-const RSP_SESSIONS: u8 = 0x11;
+const RSP_STATUS: u8 = 0x11;
 const RSP_ERR: u8 = 0x12;
 
 impl Request {
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let mut body = Vec::new();
         match self {
-            Request::New { name, argv } => {
-                body.push(REQ_NEW);
-                write_string(&mut body, name);
-                write_string_list(&mut body, argv);
-            }
-            Request::List => body.push(REQ_LIST),
-            Request::Kill { name } => {
-                body.push(REQ_KILL);
-                write_string(&mut body, name);
-            }
-            Request::KillServer => body.push(REQ_KILL_SERVER),
-            Request::Attach { name } => {
-                body.push(REQ_ATTACH);
-                write_string(&mut body, name);
-            }
+            Request::Attach => body.push(REQ_ATTACH),
+            Request::Kill => body.push(REQ_KILL),
+            Request::Status => body.push(REQ_STATUS),
         }
         write_frame(w, &body)
     }
@@ -104,23 +96,10 @@ impl Request {
             return Err(invalid("empty request frame"));
         }
         let kind = body[0];
-        let mut rest = &body[1..];
         match kind {
-            REQ_NEW => {
-                let name = read_string(&mut rest)?;
-                let argv = read_string_list(&mut rest)?;
-                Ok(Request::New { name, argv })
-            }
-            REQ_LIST => Ok(Request::List),
-            REQ_KILL => {
-                let name = read_string(&mut rest)?;
-                Ok(Request::Kill { name })
-            }
-            REQ_KILL_SERVER => Ok(Request::KillServer),
-            REQ_ATTACH => {
-                let name = read_string(&mut rest)?;
-                Ok(Request::Attach { name })
-            }
+            REQ_ATTACH => Ok(Request::Attach),
+            REQ_KILL => Ok(Request::Kill),
+            REQ_STATUS => Ok(Request::Status),
             _ => Err(invalid(&format!("unknown request kind 0x{kind:02X}"))),
         }
     }
@@ -131,15 +110,12 @@ impl Response {
         let mut body = Vec::new();
         match self {
             Response::Ok => body.push(RSP_OK),
-            Response::Sessions(list) => {
-                body.push(RSP_SESSIONS);
-                write_u32(&mut body, list.len() as u32);
-                for s in list {
-                    write_string(&mut body, &s.name);
-                    write_u64(&mut body, s.age_secs);
-                    body.push(if s.alive { 1 } else { 0 });
-                    body.push(if s.attached { 1 } else { 0 });
-                }
+            Response::Status(info) => {
+                body.push(RSP_STATUS);
+                write_string(&mut body, &info.name);
+                write_u64(&mut body, info.age_secs);
+                body.push(u8::from(info.alive));
+                body.push(u8::from(info.attached));
             }
             Response::Err(msg) => {
                 body.push(RSP_ERR);
@@ -158,17 +134,17 @@ impl Response {
         let mut rest = &body[1..];
         match kind {
             RSP_OK => Ok(Response::Ok),
-            RSP_SESSIONS => {
-                let n = read_u32(&mut rest)? as usize;
-                let mut list = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let name = read_string(&mut rest)?;
-                    let age_secs = read_u64(&mut rest)?;
-                    let alive = read_u8(&mut rest)? != 0;
-                    let attached = read_u8(&mut rest)? != 0;
-                    list.push(SessionInfo { name, age_secs, alive, attached });
-                }
-                Ok(Response::Sessions(list))
+            RSP_STATUS => {
+                let name = read_string(&mut rest)?;
+                let age_secs = read_u64(&mut rest)?;
+                let alive = read_u8(&mut rest)? != 0;
+                let attached = read_u8(&mut rest)? != 0;
+                Ok(Response::Status(SessionInfo {
+                    name,
+                    age_secs,
+                    alive,
+                    attached,
+                }))
             }
             RSP_ERR => {
                 let msg = read_string(&mut rest)?;
@@ -215,13 +191,6 @@ fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-fn write_string_list(buf: &mut Vec<u8>, list: &[String]) {
-    write_u32(buf, list.len() as u32);
-    for s in list {
-        write_string(buf, s);
-    }
-}
-
 fn read_u8(rest: &mut &[u8]) -> io::Result<u8> {
     if rest.is_empty() {
         return Err(invalid("unexpected end of frame (u8)"));
@@ -261,15 +230,6 @@ fn read_string(rest: &mut &[u8]) -> io::Result<String> {
     Ok(s)
 }
 
-fn read_string_list(rest: &mut &[u8]) -> io::Result<Vec<String>> {
-    let n = read_u32(rest)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push(read_string(rest)?);
-    }
-    Ok(out)
-}
-
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
@@ -293,56 +253,40 @@ mod tests {
     }
 
     #[test]
-    fn new_round_trip() {
-        let req = Request::New {
-            name: "cool".into(),
-            argv: vec!["bash".into(), "-l".into()],
-        };
-        match roundtrip_request(req) {
-            Request::New { name, argv } => {
-                assert_eq!(name, "cool");
-                assert_eq!(argv, vec!["bash", "-l"]);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn list_round_trip() {
-        assert!(matches!(roundtrip_request(Request::List), Request::List));
-    }
-
-    #[test]
     fn attach_round_trip() {
-        match roundtrip_request(Request::Attach { name: "cool".into() }) {
-            Request::Attach { name } => assert_eq!(name, "cool"),
-            _ => panic!("wrong variant"),
-        }
+        assert!(matches!(
+            roundtrip_request(Request::Attach),
+            Request::Attach
+        ));
     }
 
     #[test]
     fn kill_round_trip() {
-        match roundtrip_request(Request::Kill { name: "x".into() }) {
-            Request::Kill { name } => assert_eq!(name, "x"),
-            _ => panic!("wrong variant"),
-        }
+        assert!(matches!(roundtrip_request(Request::Kill), Request::Kill));
     }
 
     #[test]
-    fn sessions_response_round_trip() {
-        let rsp = Response::Sessions(vec![SessionInfo {
+    fn status_round_trip() {
+        assert!(matches!(
+            roundtrip_request(Request::Status),
+            Request::Status
+        ));
+    }
+
+    #[test]
+    fn status_response_round_trip() {
+        let rsp = Response::Status(SessionInfo {
             name: "alpha".into(),
             age_secs: 42,
             alive: true,
             attached: false,
-        }]);
+        });
         match roundtrip_response(rsp) {
-            Response::Sessions(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].name, "alpha");
-                assert_eq!(list[0].age_secs, 42);
-                assert!(list[0].alive);
-                assert!(!list[0].attached);
+            Response::Status(info) => {
+                assert_eq!(info.name, "alpha");
+                assert_eq!(info.age_secs, 42);
+                assert!(info.alive);
+                assert!(!info.attached);
             }
             _ => panic!("wrong variant"),
         }
@@ -354,5 +298,10 @@ mod tests {
             Response::Err(m) => assert_eq!(m, "nope"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn ok_response_round_trip() {
+        assert!(matches!(roundtrip_response(Response::Ok), Response::Ok));
     }
 }

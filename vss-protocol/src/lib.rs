@@ -21,13 +21,14 @@ pub mod frames;
 pub use apc::{ApcStream, Output};
 pub use codec::{stuff, DecodeError, DecodeResult, Reader, Writer};
 pub use envelope::{
-    append_downstream, append_frame, append_upstream, encode_accepted, encode_rejected,
-    encode_snapshot, for_each_frame, wrap_e2r_envelope, wrap_r2e_envelope,
+    append_downstream, append_frame, append_upstream, encode_accepted, encode_detach_notify,
+    encode_rejected, encode_snapshot, for_each_frame, wrap_e2r_envelope, wrap_r2e_envelope,
 };
 pub use frame::{
-    DEFAULT_MAX_FRAGMENT_BYTES, ERR_BAD_PAYLOAD, ERR_UNKNOWN_FRAME, FRM_PRT_FRAGMENT,
-    FRM_SNAPSHOT_ACCEPTED, FRM_SNAPSHOT_BEGIN, FRM_SNAPSHOT_END, FRM_SNAPSHOT_REJECTED,
-    FRM_VGE_FRAGMENT, FRM_VT_FRAGMENT, MARKER_E2R, MARKER_R2E, PROTOCOL_VERSION,
-    REJECT_CAPACITY, REJECT_MALFORMED, REJECT_VERSION_MISMATCH, SNAPSHOT_VERSION,
+    DEFAULT_MAX_FRAGMENT_BYTES, ERR_BAD_PAYLOAD, ERR_UNKNOWN_FRAME, FRM_DETACH_NOTIFY,
+    FRM_PRT_FRAGMENT, FRM_SNAPSHOT_ACCEPTED, FRM_SNAPSHOT_BEGIN, FRM_SNAPSHOT_END,
+    FRM_SNAPSHOT_REJECTED, FRM_VGE_FRAGMENT, FRM_VT_FRAGMENT, MARKER_E2R, MARKER_R2E,
+    PROTOCOL_VERSION, REJECT_CAPACITY, REJECT_MALFORMED, REJECT_VERSION_MISMATCH,
+    SNAPSHOT_VERSION,
 };
 pub use frames::{DownstreamFrame, UpstreamFrame};

@@ -79,6 +79,18 @@ impl Callbacks for PortalCallbacks {
     }
 }
 
+/// Stashed pre-attach state used by the VSS "restore on detach"
+/// path. Held as raw binary-snapshot bytes — that's the same wire
+/// format used for over-the-wire attaches, so we avoid a separate
+/// in-memory shape just for this. Saved on the first
+/// `SnapshotBegin` of an attach; restored on `DetachNotify`.
+#[derive(Clone)]
+pub struct PreAttachBackup {
+    pub vt: Vec<u8>,
+    pub vge: Vec<u8>,
+    pub prt: Vec<u8>,
+}
+
 /// Snapshot of polled vt100 state for delta detection (§8.5–§8.9).
 ///
 /// `MouseModeChange` events are coalesced by spec: comparing snapshots
@@ -162,6 +174,10 @@ pub struct Portal {
     /// snapshot into this scope. See `doc/session-manager.md` §4.5
     /// (renderer-side application).
     pub vss: VssEngine,
+    /// Snapshot of this portal's vt100 / VGE / children-PRT state
+    /// taken on the first VSS `SnapshotBegin` of the current attach.
+    /// Restored on `DetachNotify`. `None` between attaches.
+    pub pre_attach_backup: Option<PreAttachBackup>,
     pub state_cache: PolledStateCache,
     /// DSR cursor-position queries observed on inbound bytes that
     /// haven't yet been answered. Drained after `vt.process` so the

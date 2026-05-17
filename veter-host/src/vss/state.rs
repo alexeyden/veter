@@ -142,6 +142,10 @@ pub struct VssEngine {
     /// via `take_rejected`. Independent of `pending_response_bytes`,
     /// which carries the on-wire response.
     rejected: Vec<(u32, RejectReason)>,
+    /// Count of `DetachNotify` frames observed since the last drain.
+    /// The caller uses this to know when to restore pre-attach state.
+    /// Drained via `take_detach_signals`.
+    detach_signals: usize,
 }
 
 impl Default for VssEngine {
@@ -158,6 +162,7 @@ impl VssEngine {
             builder: None,
             completed: Vec::new(),
             rejected: Vec::new(),
+            detach_signals: 0,
         }
     }
 
@@ -195,6 +200,14 @@ impl VssEngine {
     /// The wire response was already queued via `take_responses`.
     pub fn take_rejected(&mut self) -> Vec<(u32, RejectReason)> {
         std::mem::take(&mut self.rejected)
+    }
+
+    /// Drain the count of `DetachNotify` frames observed since the
+    /// last call. The caller restores pre-attach engine state when
+    /// this is non-zero. Coalesced — multiple notifies in one batch
+    /// collapse to a single restore at the caller.
+    pub fn take_detach_signals(&mut self) -> usize {
+        std::mem::take(&mut self.detach_signals)
     }
 
     fn handle_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
@@ -276,6 +289,13 @@ impl VssEngine {
                         // engine should not synthesise a reject for a
                         // snapshot it never started parsing.
                     }
+                }
+                DownstreamFrame::DetachNotify => {
+                    // Bump the counter for the caller to observe.
+                    // No response is sent — the engine has already
+                    // torn down the connection by the time we'd want
+                    // to reply.
+                    self.detach_signals += 1;
                 }
             }
             Ok::<(), u16>(())
@@ -478,6 +498,29 @@ mod tests {
         assert!(e.take_completed_snapshots().is_empty());
         let rejects = e.take_rejected();
         assert_eq!(rejects, vec![(11, RejectReason::Malformed)]);
+    }
+
+    #[test]
+    fn detach_notify_bumps_counter_no_response() {
+        let env = vss_protocol::encode_detach_notify();
+        let mut e = VssEngine::new();
+        let passthrough = e.process_pty_chunk(&env);
+        assert!(passthrough.is_empty());
+        assert_eq!(e.take_detach_signals(), 1);
+        // Drained — subsequent reads return 0 until next notify.
+        assert_eq!(e.take_detach_signals(), 0);
+        // No upstream response queued.
+        assert!(e.take_responses().is_empty());
+    }
+
+    #[test]
+    fn back_to_back_detach_notifies_coalesce_count() {
+        let mut env = vss_protocol::encode_detach_notify();
+        env.extend(vss_protocol::encode_detach_notify());
+        env.extend(vss_protocol::encode_detach_notify());
+        let mut e = VssEngine::new();
+        let _ = e.process_pty_chunk(&env);
+        assert_eq!(e.take_detach_signals(), 3);
     }
 
     #[test]

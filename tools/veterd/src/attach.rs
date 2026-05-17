@@ -30,10 +30,9 @@
 //!      `Session::attached` back to `false`. The session keeps
 //!      running.
 
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,7 +41,6 @@ use anyhow::{anyhow, Context, Result};
 use crate::engines::EngineState;
 use crate::fdpass;
 use crate::probe;
-use crate::session::Session;
 
 /// How long to wait for the renderer to respond to the upstream
 /// VGE / PRT probe before falling back to the daemon's defaults.
@@ -62,72 +60,70 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// without burning measurable CPU.
 const WINSIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Synchronous part of the attach dispatch. Runs on the accept-loop
-/// thread; receives the renderer's stdio fds, validates the session,
-/// and spawns the per-attach handler thread. Returns `Ok(())` if the
-/// handler is now running (in which case the dispatch caller replies
-/// `Response::Ok`). Errors here mean the attach was refused.
+/// Synchronous part of the attach dispatch. Runs on the session's
+/// accept loop; receives the renderer's stdio fds, takes the
+/// session's attached flag, and spawns the per-attach handler thread.
+/// Returns `Ok(())` if the handler is now running (in which case the
+/// caller replies `Response::Ok`). Errors here mean the attach was
+/// refused (already attached, dup failure, thread spawn failure).
+///
+/// `master_writer` must be a fresh `dup(2)` of the session's inner
+/// PTY master — the handler thread owns it for the duration of the
+/// attach and closes it on detach.
 pub fn start(
     stream: &mut UnixStream,
-    sessions: &mut HashMap<String, Session>,
-    name: &str,
+    engines: Arc<Mutex<EngineState>>,
+    master_writer: OwnedFd,
+    attached: Arc<AtomicBool>,
+    session_name: &str,
 ) -> Result<()> {
     let (stdin, stdout) =
         fdpass::recv_stdio(stream).with_context(|| "receiving renderer stdio fds")?;
 
-    let session = sessions
-        .get(name)
-        .ok_or_else(|| anyhow!("no such session: {name}"))?;
-    if session.attached.swap(true, Ordering::AcqRel) {
-        // Race-free check: if it was already true, refuse. The fds we
-        // just received go out of scope (dropped → closed).
-        return Err(anyhow!("session `{name}` is already attached"));
+    if attached.swap(true, Ordering::AcqRel) {
+        // Race-free check: if the flag was already true, refuse.
+        // `stdin` / `stdout` / `master_writer` drop here → fds close.
+        return Err(anyhow!("session `{session_name}` is already attached"));
     }
     // From here on, any error path must reset `attached` to false
     // before returning so the session isn't stuck looking attached.
-    let attached_flag = Arc::clone(&session.attached);
-    let engines = Arc::clone(&session.engines);
-    let master_writer = match dup_owned(&session.master) {
-        Ok(fd) => fd,
-        Err(e) => {
-            attached_flag.store(false, Ordering::Release);
-            return Err(e).context("duping inner-PTY master for attach writer");
-        }
-    };
     // Clone the IPC socket and hand the clone to the handler thread.
-    // The handler keeps it alive for the duration of the attach so the
-    // CLI process can stay blocked on a read, keeping its parent
-    // (typically a login shell) backgrounded — without this, the shell
-    // regains the tty's foreground process group after the CLI exits
-    // and starts reading stdin in parallel with us. With two readers
-    // on the same tty, keystrokes are race-distributed between them
-    // and inputs appear to drop or duplicate. See the long fix-commit
-    // message for the trace data that pinned this down.
+    // The handler keeps it alive for the duration of the attach so
+    // the CLI process can stay blocked on a read, keeping its parent
+    // (typically a login shell) backgrounded — without this, the
+    // shell regains the tty's foreground process group after the CLI
+    // exits and starts reading stdin in parallel with us. With two
+    // readers on the same tty, keystrokes are race-distributed
+    // between them and inputs appear to drop or duplicate. See the
+    // long fix-commit message for the trace data that pinned this
+    // down.
     let cli_socket = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
-            attached_flag.store(false, Ordering::Release);
+            attached.store(false, Ordering::Release);
             return Err(e).context("cloning IPC socket for attach handler");
         }
     };
 
-    let session_name = name.to_string();
-    let flag_for_thread = Arc::clone(&attached_flag);
+    let session_name_owned = session_name.to_string();
+    let flag_for_thread = Arc::clone(&attached);
     let spawn = std::thread::Builder::new()
         .name("veterd-attach".into())
         .spawn(move || {
             if let Err(e) = handler_main(stdin, stdout, master_writer, engines) {
-                eprintln!("veterd: attach `{session_name}` ended: {e:#}");
+                eprintln!(
+                    "veterd: attach `{session_name_owned}` ended: {e:#}"
+                );
             }
             flag_for_thread.store(false, Ordering::Release);
-            // Dropping `cli_socket` here closes the daemon's last
+            // Dropping `cli_socket` here closes the session's last
             // reference to the IPC socket for this attach. The CLI
             // sees EOF on its blocked read and exits, restoring the
             // user's local shell to the foreground.
             drop(cli_socket);
         });
     if let Err(e) = spawn {
-        attached_flag.store(false, Ordering::Release);
+        attached.store(false, Ordering::Release);
         return Err(e).context("spawning attach handler thread");
     }
     Ok(())
@@ -269,7 +265,7 @@ fn handler_main(
     // (PTY master output → renderer stdout) via `renderer_stdout` we
     // installed above. Per the PRT spec, input never crosses the
     // engines — we forward keystrokes verbatim.
-    let result = splice_input(stdin_fd, master_writer_fd, shutdown_read);
+    let result = splice_input(&stdin_fd, master_writer_fd, shutdown_read);
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
     // on engines so the worker stops writing / signaling, then emit a
@@ -285,17 +281,66 @@ fn handler_main(
         guard.renderer_stdout = None;
         guard.attach_shutdown = None;
     }
-    let _ = write_all_raw(stdout_fd.as_raw_fd(), ATTACH_EXIT);
+    // Tell the renderer to restore its pre-attach state (the local
+    // shell / vmux pane it was showing before the attach began). The
+    // VSS engine on the renderer side stashed that state on the
+    // first `SnapshotBegin` of this attach; `DetachNotify` is what
+    // pops the stash. After the renderer applies the restore the
+    // portal is back to the exact view it had right before attach,
+    // including modes.
+    let detach_env = vss_protocol::encode_detach_notify();
+    let _ = write_all_raw(stdout_fd.as_raw_fd(), &detach_env);
+    // Belt-and-suspenders: `ESC c` (RIS — full terminal reset).
+    let _ = write_all_raw(stdout_fd.as_raw_fd(), b"\x1bc");
+
+    // Explicitly restore tty termios here (instead of relying on
+    // `RawTty::Drop` only). The Drop path was leaving the stdin tty
+    // in raw mode in practice — `stty -a` post-detach showed
+    // `-echo -icanon -opost` — so an explicit, logged restore goes
+    // first. Loop on EINTR (SIGCHLD from the inner program exit can
+    // hit us mid-call). The RawTty guard's Drop still runs after
+    // and is a no-op iff we landed here cleanly.
+    restore_tty_canonical(stdin_fd.as_raw_fd());
+
     result
 }
 
-/// Sent to the renderer right before the handler returns. Asserts a
-/// few defaults in case the inner program touched them: exit
-/// alt-screen if somehow on it (no-op otherwise — the snapshot's
-/// `modes` byte normally has us on main already), re-enable
-/// auto-wrap (DECAWM, ?7h), reset scroll region (CSI r), show cursor
-/// (?25h), and clear SGR.
-const ATTACH_EXIT: &[u8] = b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[?25h\x1b[0m";
+/// Defensive end-of-attach tty restore: read current termios, OR-in
+/// the cooked-mode bits (`ICANON | ECHO | ISIG | IEXTEN`, plus
+/// `ICRNL` and `OPOST | ONLCR`), and `tcsetattr` it back. Logs to
+/// stderr on failure so we have something to diagnose with.
+fn restore_tty_canonical(fd: std::os::fd::RawFd) {
+    use nix::errno::Errno;
+    use nix::sys::termios::{tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg};
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let mut t = match tcgetattr(borrowed) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("veterd: post-detach tcgetattr failed: {e}");
+            return;
+        }
+    };
+    t.local_flags |=
+        LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN;
+    t.input_flags |= InputFlags::ICRNL;
+    t.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
+    let mut attempts = 0u8;
+    loop {
+        match tcsetattr(borrowed, SetArg::TCSANOW, &t) {
+            Ok(()) => return,
+            Err(Errno::EINTR) if attempts < 5 => {
+                attempts += 1;
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "veterd: post-detach tcsetattr failed after {attempts} retries: {e}"
+                );
+                return;
+            }
+        }
+    }
+}
 
 /// Per-attach SIGWINCH watcher. The daemon doesn't share a
 /// controlling tty with the renderer's PTY slave (the attach handler
@@ -506,8 +551,17 @@ impl DetachScanner {
 /// `shutdown_read` self-pipe becomes readable (the per-session worker
 /// signaled session shutdown — typically because the inner program
 /// exited).
+/// Note `stdin_fd` is borrowed, not moved: the caller (`handler_main`)
+/// needs the OwnedFd alive *after* this returns so the post-detach
+/// tty restore (`restore_tty_canonical` + `RawTty::Drop`) can call
+/// `tcsetattr` on a live fd. An earlier version took it by value,
+/// which closed the fd on return and left every restore attempt
+/// silently failing with `EBADF` — the user's tty stayed in raw mode
+/// (`-echo -icanon -opost`) until they ran `reset` by hand. The
+/// other two fds are owned because they're attach-private and should
+/// close here.
 fn splice_input(
-    stdin_fd: OwnedFd,
+    stdin_fd: &OwnedFd,
     master_writer_fd: OwnedFd,
     shutdown_read: OwnedFd,
 ) -> Result<()> {
@@ -622,10 +676,7 @@ fn open_input_trace() -> Option<std::fs::File> {
     {
         return None;
     }
-    let dir = crate::daemon::socket_path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let dir = crate::runtime::runtime_dir();
     let path = dir.join("input.log");
     std::fs::OpenOptions::new()
         .create(true)
@@ -749,12 +800,24 @@ impl RawTty {
 
 impl Drop for RawTty {
     fn drop(&mut self) {
-        if let Some(saved) = self.saved.take() {
-            use nix::sys::termios::{tcsetattr, SetArg};
+        if let Some(mut restored) = self.saved.take() {
+            use nix::sys::termios::{tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg};
+            // Belt-and-suspenders: whatever state the tty was in when
+            // we enabled raw mode (potentially mid-readline, mid-vim,
+            // mid-anything), assert a sane post-detach cooked tty
+            // here so the local shell that takes over isn't stuck
+            // without echo or line discipline. The user's shell will
+            // typically tweak modes again on its first readline
+            // cycle; this is just so they can SEE their typing while
+            // they get there.
+            restored.local_flags |=
+                LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN;
+            restored.input_flags |= InputFlags::ICRNL;
+            restored.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
             // Best-effort restore — at this point the attach is ending
             // and we can't do anything useful with the error.
-            let _ = tcsetattr(borrowed, SetArg::TCSANOW, &saved);
+            let _ = tcsetattr(borrowed, SetArg::TCSANOW, &restored);
         }
     }
 }

@@ -946,6 +946,7 @@ impl PrtEngine {
             vge: portal_vge,
             vft: portal_vft,
             vss: crate::vss::VssEngine::new(),
+            pre_attach_backup: None,
             state_cache: initial_cache,
             pending_cursor_queries: 0,
         };
@@ -1152,6 +1153,18 @@ impl PrtEngine {
             let vss_passthrough = portal.vss.process_pty_chunk(&vft_passthrough);
             let completed = portal.vss.take_completed_snapshots();
             for cs in completed {
+                // On the *first* snapshot of an attach window, stash
+                // the portal's current state so a DetachNotify can
+                // roll back to the pre-attach view (the user's ssh
+                // shell, vmux pane, etc.). Subsequent snapshots in
+                // the same attach overwrite without re-stashing.
+                if portal.pre_attach_backup.is_none() {
+                    portal.pre_attach_backup = Some(super::portal::PreAttachBackup {
+                        vt: portal.vt.screen().binary_snapshot(),
+                        vge: portal.vge.binary_snapshot(),
+                        prt: portal.children.binary_snapshot(),
+                    });
+                }
                 if let Err(_e) = portal.vt.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes) {
                     // On any restore error we drop the snapshot
                     // silently; the Reject envelope was already queued
@@ -1162,6 +1175,17 @@ impl PrtEngine {
                 }
                 let _ = portal.vge.restore_from_binary_snapshot(&cs.vge_bytes);
                 let _ = portal.children.restore_from_binary_snapshot(&cs.prt_bytes);
+            }
+            // 2d. VSS detach — restore the pre-attach state if a
+            //     DetachNotify came through. Multiple coalesced
+            //     notifies still produce one restore. After restoring,
+            //     drop the backup so the next attach saves anew.
+            if portal.vss.take_detach_signals() > 0 {
+                if let Some(backup) = portal.pre_attach_backup.take() {
+                    let _ = portal.vt.screen_mut().restore_from_binary_snapshot(&backup.vt);
+                    let _ = portal.vge.restore_from_binary_snapshot(&backup.vge);
+                    let _ = portal.children.restore_from_binary_snapshot(&backup.prt);
+                }
             }
 
             // 3. Feed the remaining bytes into the portal's vt100. The

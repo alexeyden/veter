@@ -1,12 +1,11 @@
 # Veter Session Manager (veterd)
 
-> **Status: WIP.** The architecture, lifecycle (§§1–3, 5–7), and
-> v1 replay-style attach (former §4) are implemented and tracked in
-> `CONTEXT.md`. §4 below describes the **v2 binary-snapshot protocol
-> (VSS)** that replaces the replay path; this is the next track of
-> work. The companion `doc/session-extension.md` (vmux ↔ veterd
-> integration protocol) is still deferred and will be written
-> separately.
+> **Status: WIP.** The architecture (§§1–3, 5–7), the **v2
+> binary-snapshot protocol** (§4 VSS), and the **v3 per-session
+> process model** (§2, §8.3) are implemented. Tracked in
+> `CONTEXT.md`. The companion `doc/session-extension.md` (vmux ↔
+> veterd integration protocol) is still deferred and will be
+> written separately.
 
 `veterd` is a persistent host-side session manager. Its role is to
 hold the state of a veter session (vt100 grids, scrollback, VGE
@@ -35,23 +34,30 @@ local: │ veter  │ ─────────▶ │ ssh server   │       
        │ tab B  │                    ▼                │        │                    ▼
        └────────┘            ┌───────────────┐        └────────┘            ┌───────────────┐
             ▲                │ veterd attach │              ▲               │ veterd attach │
-            │                │ cool          │              │               │ another       │
+            │                │ cool (CLI)    │              │               │ another (CLI) │
             │                └───────┬───────┘              │               └───────┬───────┘
             │                        │ SCM_RIGHTS           │                       │
             │                        ▼                      │                       ▼
-            │                ┌───────────────┐              │               ┌───────────────┐
-            │                │ veterd daemon │              │               │ veterd daemon │
-            │                │ ─ host vt100  │              │               │ ─ host vt100  │
-            │                │ ─ PRT engine  │              │               │ ─ VGE engine  │
-            │                │ ─ inner PTY   │              │               │ ─ inner PTY   │
-            │                │   (bash, …)   │              │               │   (bash, …)   │
-            │                └───────────────┘              │               └───────────────┘
+            │            ┌──────────────────────┐           │           ┌──────────────────────┐
+            │            │ veterd --session     │           │           │ veterd --session     │
+            │            │   cool               │           │           │   another            │
+            │            │ ─ host vt100         │           │           │ ─ host vt100         │
+            │            │ ─ PRT engine         │           │           │ ─ VGE engine         │
+            │            │ ─ inner PTY (bash)   │           │           │ ─ inner PTY (bash)   │
+            │            │ ─ <cool>.sock        │           │           │ ─ <another>.sock     │
+            │            └──────────────────────┘           │           └──────────────────────┘
             │                                               │
-            └──────────── PRT / VGE / VFT byte stream ──────┘
+            └──────────── PRT / VGE / VSS byte stream ──────┘
                           (rides the existing SSH PTY;
-                           each veterd emits envelopes
-                           inside its tab's portal)
+                           each session process emits
+                           envelopes inside its tab's portal)
 ```
+
+One process per session. Multiple sessions on the same machine =
+multiple `veterd --session` processes, each with its own socket.
+The CLI front-end (`new` / `attach` / `list` / `kill`) is short-
+lived and talks to per-session sockets — there is no central
+daemon.
 
 ### 1.2 Roles
 
@@ -60,12 +66,12 @@ local: │ veter  │ ─────────▶ │ ssh server   │       
 | `veter` | local, GUI | winit/glutin window, paint loop, host engines for *local* state (top-level vt100, PRT engine, VGE engine). Same as today. |
 | `vmux` | local, inside `veter` | Tabs and panes. Same as today. Each pane is a PRT portal in local `veter`. |
 | ssh client | local, inside a vmux pane | Unmodified. Transports stdio bytes to the remote host. |
-| `veterd attach <name>` | remote, inside the SSH PTY | Thin CLI. Hands its stdio over to the long-lived daemon and exits. |
-| `veterd` daemon | remote, background | Persistent. Owns one or more sessions. Each session = (inner PTY, host engines, accumulated state). |
+| `veterd` CLI (`new` / `attach` / `list` / `kill`) | remote, inside the SSH PTY | Thin, short-lived. `attach` hands its stdio over to the session process and stays blocked until detach. The others do single-shot IPC and exit. |
+| `veterd --session NAME` | remote, background | One process per session. Owns the inner PTY + host engines + a per-session socket at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock`. Spawned by `veterd new` via double-fork-and-exec. |
 | inner program | remote, inside a session | The user's shell, vim, htop, vmux-on-remote, anything. |
 
-The whole chain between local `veter` and a remote `veterd` is the
-plain SSH stdin/stdout pair. **No TCP socket, no port forwarding, no
+The whole chain between local `veter` and a remote `veterd --session`
+is the plain SSH stdin/stdout pair. **No TCP socket, no port forwarding, no
 custom transport.** The bytes on the wire are exactly the existing
 PRT / VGE / VFT envelopes. Local `veter`'s portal parser already
 treats every portal as a recursive host, so a remote `veterd`
@@ -100,13 +106,14 @@ plan.
 
 ### 2.1 Process model
 
-`veterd` is a single long-lived background process per remote user.
-On first invocation it daemonizes itself (double-fork, detach from
-the controlling terminal) and creates a Unix socket at
-`$XDG_RUNTIME_DIR/veterd/sock` (mode `0700`). All subsequent CLI
-calls (`veterd new`, `veterd attach`, …) connect to that socket.
+`veterd` runs **one process per session**, not a single daemon
+hosting many. Each session is a long-lived background process
+listening on its own Unix socket at
+`$XDG_RUNTIME_DIR/veterd/<NAME>.sock` (mode `0600`, owner-only).
+The runtime dir itself is `0700`. The CLI front-end is short-lived:
+it talks to per-session sockets and never owns engine state.
 
-Each *session* inside the daemon owns:
+Each session process owns:
 
 - An inner PTY pair, with a child process (default `$SHELL`, or
   whatever was passed to `veterd new`) running on its slave side.
@@ -115,66 +122,85 @@ Each *session* inside the daemon owns:
   - PRT engine (recursive — children for any nested portals the
     inner program spawns).
   - VGE engine (element table, style table, image table).
-- Session metadata: name, creation time, current row × column
-  dimensions, last-attached-by, last-attached-at.
+- Its own accept loop on `<NAME>.sock`, a worker thread reading the
+  inner PTY master, and (during an attach) a handler thread plus a
+  winsize-watcher thread.
 
 Sessions are identified by string name (≤ 64 bytes, the same rules
-as element IDs in §6.8 of the portal spec). Names are globally
-unique within one `veterd` instance.
+as element IDs in §6.8 of the portal spec). The runtime directory
+acts as the name registry: a name exists iff `<NAME>.sock` is
+connectable. Stale sockets from crashed session processes are
+auto-unlinked on the next probe.
 
-State is in-memory only. `veterd` exiting (intentionally or
-otherwise) drops every session.
+State is in-memory only. A session process exiting (intentionally
+or via crash / signal) drops that session's state; other sessions
+are unaffected.
 
-### 2.2 Daemon lifecycle
+### 2.2 Lifecycle
 
-- Started lazily by the first `veterd new` / `veterd attach` call
-  if no daemon is running.
-- Stays alive as long as at least one session exists. The last
-  session ending (its inner PTY exits) starts a short grace timer
-  (default 30 s) before the daemon exits, so the user can quickly
-  `veterd new` again without a respawn race.
-- `veterd kill-server` shuts everything down immediately.
+A session process:
+
+- Starts when `veterd new NAME [argv...]` re-execs the binary into
+  `--session NAME [argv...]` inside a double-forked detached child
+  (stdio redirected to `<NAME>.log`).
+- Exits when:
+  - the inner PTY child exits (worker observes EOF, main loop
+    breaks),
+  - a `Kill` IPC arrives,
+  - SIGTERM is delivered.
+- On exit, a `SocketGuard` Drop impl unlinks `<NAME>.sock` so the
+  runtime dir stays clean.
+
+There is no central server, no `kill-server`, no auto-spawn-on-
+attach. `veterd attach NAME` on a nonexistent session errors out.
 
 ### 2.3 CLI surface
 
-```
-veterd new <name> [cmd ...]      # create a session, default cmd = $SHELL,
-                                 # then attach the current stdio to it
-veterd attach <name>             # resume a named session (alias: `restore`)
-veterd list                      # one line per session: name, age, w×h, attached?
-veterd detach                    # called from inside an attached session via
-                                 # a hotkey (configurable; see §6)
-veterd kill <name>               # terminate a specific session
-veterd kill-server               # stop the daemon and every session
+```text
+veterd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
+veterd attach NAME                # attach the calling terminal
+veterd list                       # enumerate live sessions
+veterd kill NAME                  # tear down NAME
 ```
 
-`new` and `attach`/`restore` are the only commands that take over the
-caller's stdio. The others are short-lived control RPCs.
+`new` (without `-a`) returns once the session's socket is responding
+(3 s deadline). `attach` is the only command that takes over the
+caller's stdio. `list` is a CLI-side directory scan + per-socket
+`Status` round-trip — no central state to query. `kill` is a single
+`Request::Kill` round-trip on the session's socket.
+
+Internal modes invoked by `new`:
+
+```text
+veterd --session NAME [argv ...]              # detached session backend
+veterd --foreground-session NAME [argv ...]   # non-detached, for debugging
+```
+
+These are hidden from `--help`; users only invoke the four
+subcommands above.
 
 ### 2.4 Stdio handover
 
-When `veterd attach foo` is invoked, the CLI:
+When `veterd attach NAME` is invoked, the CLI:
 
-1. Connects to the daemon socket.
-2. Sends `Attach { name: "foo" }`.
-3. Passes its stdin and stdout fds to the daemon via `SCM_RIGHTS`
+1. Connects to `<NAME>.sock`.
+2. Sends `Request::Attach`.
+3. Passes its stdin and stdout fds to the session via `SCM_RIGHTS`
    over the same socket.
-4. Exits.
+4. Blocks on `read` until the session closes the connection.
 
-The daemon now owns those fds directly. From that point on, the
-SSH PTY is glued to `veterd` (not to the original CLI process),
-which means:
+The session process now owns those fds directly. From that point
+on, the SSH PTY is glued to the session process (not to the original
+CLI process), which means:
 
-- No long-lived `veterd-attach` middleman process is consuming a
-  PTY slot.
-- Detaching is a matter of the daemon closing its end of the fds
+- No long-lived `veterd-attach` middleman is consuming a PTY slot.
+- Detaching is a matter of the session closing its end of the fds
   and going silent; ssh-side stdio falls back to whatever shell
   the user was in before the attach.
 
 If a session is already attached when a second `attach` request
-arrives, the daemon kicks the prior attach (closes its fds with a
-warning event written first) and accepts the new one. Multi-attach
-is not in v1 (§7).
+arrives, the session refuses with `Err("session already attached")`.
+Multi-attach is not in v1 (§7).
 
 ## 3. veter (the local renderer)
 
@@ -509,6 +535,43 @@ Steps 1–4 are pure additive work — they don't change runtime
 behaviour and can land independently and out of order. Step 5
 introduces the `VssEngine` type but is inert without step 6 wiring.
 Step 7 is the user-visible switchover; step 8 is cleanup.
+
+### 8.3 v3 (per-session process) — landed
+
+The v1 daemon-of-many-sessions design (a single `veterd` process
+holding a `HashMap<String, Session>`) was replaced with one process
+per session. CLI shape changed:
+
+```text
+veterd new [-a] NAME [argv ...]
+veterd attach NAME
+veterd list
+veterd kill NAME
+```
+
+`start`, `kill-server`, and `--foreground` (daemon mode) were
+removed. Hidden internal flags `--session NAME [argv...]` and
+`--foreground-session NAME [argv...]` are what `new` re-execs into
+(detached vs. foreground). §2 documents the new model.
+
+What got simpler:
+
+- No central `HashMap<String, Session>`, no daemon-wide accept loop,
+  no auto-spawn-the-daemon-on-first-CLI-call.
+- `Arc<Mutex<EngineState>>` still exists, but its scope is now one
+  process. Crash in one session can't take down others.
+- `veterd list` is a CLI-side directory scan + per-session `Status`
+  round-trip; stale sockets from crashed sessions auto-unlink on
+  probe.
+
+What got swapped in:
+
+- A small `runtime.rs` module for the per-session socket-path
+  helpers, runtime-dir setup, and stale-socket probe/unlink.
+- `session.rs` absorbed the accept loop (was `daemon.rs`); each
+  session process binds `<NAME>.sock` and accepts `Attach` / `Kill`
+  / `Status`.
+- IPC trimmed: `New` / `List` / `KillServer` gone; `Status` added.
 
 ## 9. Open questions
 

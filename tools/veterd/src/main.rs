@@ -1,27 +1,26 @@
-//! veterd — persistent veter session daemon.
+//! veterd — per-session veter daemon.
 //!
 //! Usage:
 //!
 //! ```text
-//!   veterd --foreground         # run the daemon in the foreground (debug)
-//!   veterd start                # spawn a detached daemon in the background
-//!   veterd new <name> [cmd ...] # create a new session (auto-spawns)
-//!   veterd attach <name>        # connect this terminal to a session
-//!   veterd list                 # enumerate sessions
-//!   veterd kill <name>          # tear down a session
-//!   veterd kill-server          # stop the daemon and every session
+//!   veterd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
+//!   veterd attach NAME                # attach the calling terminal
+//!   veterd list                       # enumerate live sessions
+//!   veterd kill NAME                  # tear down NAME
 //! ```
 //!
-//! The subcommands other than `--foreground` and `start` are short-lived
-//! CLI calls that connect to the daemon socket at
-//! `$XDG_RUNTIME_DIR/veterd/sock`. They auto-spawn a detached daemon if
-//! no socket is responding — the user experience is tmux-like: you can
-//! `veterd new foo` cold and the daemon comes up to host it. `--foreground`
-//! is the explicit no-detach mode for debugging.
+//! The subcommands are short-lived CLI calls that talk to per-session
+//! Unix sockets at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock`. Each
+//! session is its own process; `new` re-execs this binary with the
+//! hidden `--session NAME [argv...]` flag inside a double-forked
+//! detached child. `--foreground-session NAME [argv...]` runs the
+//! same session backend but without the daemonisation step, for
+//! debugging.
 //!
-//! `attach` hands the caller's stdin/stdout fds to the daemon over
-//! `SCM_RIGHTS`; the daemon then writes a state snapshot and splices
-//! the renderer to the inner PTY for the duration of the attach.
+//! `attach` hands the caller's stdio fds to the session over
+//! `SCM_RIGHTS`; the session writes a VSS snapshot and splices
+//! bytes between the renderer and the inner PTY for the duration
+//! of the attach.
 
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -32,23 +31,33 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 mod attach;
-mod daemon;
 mod engines;
 mod fdpass;
 mod ipc;
 mod probe;
+mod runtime;
 mod session;
 
-use ipc::{Request, Response};
+use ipc::{Request, Response, SessionInfo};
 
 #[derive(Parser, Debug)]
-#[command(name = "veterd", about = "Persistent veter session daemon.")]
+#[command(name = "veterd", about = "Per-session veter daemon.")]
 struct Cli {
-    /// Run the daemon's accept loop in this process. Without this
-    /// flag, the binary acts as a thin CLI talking to an already-
-    /// running daemon over the socket.
-    #[arg(long)]
-    foreground: bool,
+    /// Internal: run the per-session backend in this process,
+    /// detached (used by `new`). The caller is responsible for
+    /// having double-forked us and redirected stdio to a log file.
+    #[arg(long, value_name = "NAME", hide = true)]
+    session: Option<String>,
+
+    /// Internal: run the per-session backend in this process,
+    /// foreground (no detachment). Useful for `gdb` / `cargo run`.
+    #[arg(long, value_name = "NAME", hide = true, conflicts_with = "session")]
+    foreground_session: Option<String>,
+
+    /// argv for `--session` / `--foreground-session`. Ignored
+    /// otherwise.
+    #[arg(trailing_var_arg = true, hide = true)]
+    session_argv: Vec<String>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -56,141 +65,115 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Ensure the daemon is running in the background. Returns
-    /// immediately once the socket is responding. Does nothing if a
-    /// daemon is already up.
-    Start,
     /// Spawn a new session.
     New {
+        /// Attach the calling terminal once the session is up.
+        #[arg(short, long)]
+        attach: bool,
+        /// Session name.
         name: String,
-        /// Command and arguments to run inside the session. Defaults
-        /// to `$SHELL` (or `/bin/sh`) when omitted.
+        /// Command and arguments to run inside the session.
+        /// Defaults to `$SHELL` (or `/bin/sh` as a final fallback)
+        /// when omitted.
         #[arg(trailing_var_arg = true)]
         argv: Vec<String>,
     },
-    /// Enumerate the daemon's sessions.
-    List,
-    /// Terminate the named session.
-    Kill { name: String },
-    /// Shut the daemon down and tear down every session.
-    KillServer,
-    /// Attach the current terminal to a session. Blocks until the
-    /// daemon acknowledges; the daemon then owns this process's stdio
-    /// fds for the duration of the attach.
+    /// Attach the calling terminal to NAME. Errors if the session
+    /// doesn't exist.
     Attach { name: String },
+    /// Enumerate live sessions.
+    List,
+    /// Tear down NAME (SIGTERM its inner program, unlink its socket).
+    /// Idempotent on a missing session.
+    Kill { name: String },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.foreground {
-        return daemon::run();
+
+    // Internal session-backend modes — invoked by `new` re-execing
+    // self. These never return through the CLI dispatcher below.
+    if let Some(name) = cli.session {
+        return session::run(name, cli.session_argv);
     }
+    if let Some(name) = cli.foreground_session {
+        return session::run(name, cli.session_argv);
+    }
+
     let cmd = cli
         .cmd
         .ok_or_else(|| anyhow!("missing subcommand (use --help)"))?;
+    match cmd {
+        Cmd::New { attach, name, argv } => cmd_new(attach, name, argv),
+        Cmd::Attach { name } => run_attach(&name),
+        Cmd::List => cmd_list(),
+        Cmd::Kill { name } => cmd_kill(&name),
+    }
+}
 
-    // Auto-spawn policy (tmux-style): commands that need a live daemon
-    // bring one up if the socket isn't responding. `kill-server` is the
-    // exception — spawning a daemon just to shut it down is silly, and
-    // the error message is clearer when we report "no daemon running".
-    let spawn_policy = match &cmd {
-        Cmd::Start | Cmd::New { .. } | Cmd::List | Cmd::Kill { .. } | Cmd::Attach { .. } => {
-            SpawnPolicy::Auto
+/// `veterd new` — fork off a detached session process and (optionally)
+/// attach to it.
+fn cmd_new(attach: bool, name: String, argv: Vec<String>) -> Result<()> {
+    runtime::validate_name(&name)?;
+    runtime::ensure_runtime_dir()?;
+    let sock = runtime::socket_path(&name);
+    match runtime::probe_socket(&sock) {
+        runtime::SocketProbe::Alive => {
+            bail!("session `{name}` already exists");
         }
-        Cmd::KillServer => SpawnPolicy::None,
-    };
-    if spawn_policy == SpawnPolicy::Auto {
-        ensure_daemon_running().context("ensuring daemon is running")?;
+        runtime::SocketProbe::Missing | runtime::SocketProbe::Stale => {}
     }
 
-    if let Cmd::Start = cmd {
-        // ensure_daemon_running already brought it up (or confirmed it
-        // was already up); nothing else to do.
-        return Ok(());
-    }
-    if let Cmd::Attach { name } = cmd {
-        return run_attach(&name);
-    }
-    let req = match cmd {
-        Cmd::New { name, argv } => Request::New { name, argv },
-        Cmd::List => Request::List,
-        Cmd::Kill { name } => Request::Kill { name },
-        Cmd::KillServer => Request::KillServer,
-        Cmd::Start | Cmd::Attach { .. } => unreachable!("handled above"),
-    };
-    let resp = call_daemon(req)?;
-    render_response(resp)
-}
+    let log_path = runtime::log_path(&name);
+    spawn_detached_session(&name, &argv, &log_path)
+        .with_context(|| format!("spawning session process for `{name}`"))?;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SpawnPolicy {
-    Auto,
-    None,
-}
-
-/// Check whether `$XDG_RUNTIME_DIR/veterd/sock` is responding; if not,
-/// fork off a detached daemon process and wait briefly for the socket
-/// to appear. Idempotent and race-tolerant — concurrent callers that
-/// each try to spawn will each get one process; one of them wins the
-/// bind, the others exit on "address in use" almost immediately, and
-/// the surviving daemon is what answers everybody's retried connect.
-fn ensure_daemon_running() -> Result<()> {
-    let sock = daemon::socket_path();
-    if UnixStream::connect(&sock).is_ok() {
-        return Ok(());
-    }
-
-    let log_path = daemon_log_path();
-    spawn_detached_daemon(&log_path)
-        .with_context(|| "spawning detached daemon")?;
-
-    // Poll for the socket to come up. 50ms × 60 = 3s deadline, which
-    // is generous even on a slow Raspberry Pi.
+    // Poll for the socket to appear. 50ms × 60 = 3s deadline; a
+    // session process should bind well within that.
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if UnixStream::connect(&sock).is_ok() {
-            return Ok(());
+        match runtime::probe_socket(&sock) {
+            runtime::SocketProbe::Alive => {
+                if attach {
+                    return run_attach(&name);
+                }
+                return Ok(());
+            }
+            runtime::SocketProbe::Missing | runtime::SocketProbe::Stale => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
     bail!(
-        "daemon failed to start within 3s; check the log at {}",
+        "session `{name}` failed to come up within 3s; check {}",
         log_path.display()
     )
 }
 
-fn daemon_log_path() -> PathBuf {
-    let sock = daemon::socket_path();
-    let dir = sock
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    dir.join("veterd.log")
-}
-
-/// Re-exec ourselves with `--foreground` in a detached background
-/// process. The child:
-///   - has stdio redirected to `/dev/null` (stdin) and the log file
-///     (stdout/stderr), so it doesn't fight for the calling terminal;
-///   - calls `setsid(2)` via `pre_exec` so it leaves the parent's
-///     process group and won't be reaped if the CLI's controlling
-///     tty hangs up.
-/// We `.spawn()` without ever calling `.wait()` so the child becomes
-/// our orphan when the CLI exits.
-fn spawn_detached_daemon(log_path: &std::path::Path) -> Result<()> {
+/// Re-exec this binary with `--session NAME [argv...]` in a
+/// double-forked detached process. Stdio is redirected to the
+/// session's log file. The child calls `setsid(2)` so it leaves the
+/// parent's process group and isn't reaped if our controlling tty
+/// hangs up. We `.spawn()` without `.wait()` so the child outlives
+/// this CLI invocation.
+fn spawn_detached_session(
+    name: &str,
+    argv: &[String],
+    log_path: &std::path::Path,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating daemon log directory {}", parent.display())
+            format!("creating log directory {}", parent.display())
         })?;
     }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
-        .with_context(|| format!("opening daemon log {}", log_path.display()))?;
+        .with_context(|| format!("opening log {}", log_path.display()))?;
     let log_err = log
         .try_clone()
         .with_context(|| "cloning log fd for stderr")?;
@@ -198,10 +181,14 @@ fn spawn_detached_daemon(log_path: &std::path::Path) -> Result<()> {
         std::env::current_exe().with_context(|| "discovering own binary path")?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("--foreground")
+    cmd.arg("--session")
+        .arg(name)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    if !argv.is_empty() {
+        cmd.arg("--").args(argv);
+    }
     // SAFETY: pre_exec runs in the child between fork and exec; it
     // must only call async-signal-safe functions. setsid(2) is.
     unsafe {
@@ -210,104 +197,106 @@ fn spawn_detached_daemon(log_path: &std::path::Path) -> Result<()> {
             Ok(())
         });
     }
-    let _child = cmd.spawn().with_context(|| "spawn daemon")?;
+    let _child = cmd.spawn().with_context(|| "spawn session process")?;
     // Deliberately don't `.wait()` — the child is detached and we
     // want it to outlive this CLI invocation.
     Ok(())
 }
 
-/// Connect to the daemon, send `Attach { name }`, hand stdin/stdout
-/// over `SCM_RIGHTS`, wait for the daemon's ack, and then **stay
-/// blocked on the socket** until the daemon closes it (which it does
-/// when the attach ends). Keeping this process alive matters: it
-/// remains the foreground of the calling shell's controlling tty, so
-/// the shell stays suspended and isn't competing with the daemon for
-/// stdin bytes. Without this loop, the parent shell would regain the
-/// tty's foreground immediately and start reading keystrokes in
-/// parallel with the daemon — keystrokes would race between the two
-/// readers and appear to randomly drop. tmux uses the same trick.
+/// `veterd attach NAME` — connect to the session's socket, hand
+/// stdio over `SCM_RIGHTS`, then block on the socket until the
+/// session ends the attach.
 fn run_attach(name: &str) -> Result<()> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
 
-    let sock = daemon::socket_path();
-    let mut stream = UnixStream::connect(&sock)
-        .with_context(|| format!("connecting to daemon at {}", sock.display()))?;
-    Request::Attach { name: name.to_string() }
+    runtime::validate_name(name)?;
+    let sock = runtime::socket_path(name);
+    let mut stream = UnixStream::connect(&sock).with_context(|| {
+        format!("connecting to session `{name}` at {}", sock.display())
+    })?;
+    Request::Attach
         .write_to(&mut stream)
         .context("writing attach request")?;
 
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
     fdpass::send_stdio(&stream, stdin_fd, stdout_fd)
-        .context("sending stdio fds to daemon")?;
+        .context("sending stdio fds to session")?;
 
     let resp = Response::read_from(&mut stream).context("reading attach response")?;
     match resp {
         Response::Ok => {}
         Response::Err(msg) => bail!("{msg}"),
-        Response::Sessions(_) => bail!("daemon returned unexpected response variant"),
+        Response::Status(_) => bail!("session returned unexpected response variant"),
     }
 
-    // Hold the tty's foreground process group by staying blocked on a
-    // read. The daemon's handler thread holds the other end of this
-    // socket; it drops the handle when the attach ends (detach hotkey,
-    // EOF, error). At that point our `read_exact` returns
+    // Hold the tty's foreground process group by staying blocked on
+    // a read. The session's handler thread holds the other end of
+    // this socket; it drops the handle when the attach ends (detach
+    // hotkey, EOF, error). At that point our `read` returns
     // `UnexpectedEof` and the CLI exits, handing the tty back to the
     // parent shell.
     let mut sink = [0u8; 32];
     loop {
         match stream.read(&mut sink) {
             Ok(0) => return Ok(()),
-            Ok(_) => {
-                // Daemon shouldn't push extra bytes during an attach,
-                // but if anything arrives just drop it on the floor —
-                // we're only here to keep the connection open.
-                continue;
-            }
+            Ok(_) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e).context("waiting for attach to end"),
         }
     }
 }
 
-/// Connect to the daemon socket and round-trip a single request.
-fn call_daemon(req: Request) -> Result<Response> {
-    let sock = daemon::socket_path();
-    let stream = UnixStream::connect(&sock)
-        .with_context(|| format!("connecting to daemon at {}", sock.display()))?;
-    let mut writer = BufWriter::new(
-        stream.try_clone().with_context(|| "clone unix stream")?,
-    );
-    let mut reader = BufReader::new(stream);
-    req.write_to(&mut writer).context("writing request")?;
-    Response::read_from(&mut reader).context("reading response")
+/// `veterd list` — directory scan + parallel `Status` round-trips.
+fn cmd_list() -> Result<()> {
+    let names = runtime::enumerate_sessions();
+    let mut infos: Vec<SessionInfo> = Vec::with_capacity(names.len());
+    for name in names {
+        match status_of(&name) {
+            Ok(info) => infos.push(info),
+            Err(_) => {
+                // Session went away between enumerate and probe.
+                // Silently skip — runtime::probe_socket already
+                // unlinks stale entries.
+            }
+        }
+    }
+    render_session_table(&infos);
+    Ok(())
 }
 
-fn render_response(resp: Response) -> Result<()> {
-    match resp {
-        Response::Ok => Ok(()),
-        Response::Sessions(list) => {
-            if list.is_empty() {
-                println!("(no sessions)");
-                return Ok(());
-            }
-            println!(
-                "{:<24}  {:>10}  {:<5}  {}",
-                "NAME", "AGE", "ALIVE", "ATTACHED"
-            );
-            for s in list {
-                println!(
-                    "{:<24}  {:>10}  {:<5}  {}",
-                    s.name,
-                    format_age(s.age_secs),
-                    if s.alive { "yes" } else { "no" },
-                    if s.attached { "yes" } else { "no" },
-                );
-            }
-            Ok(())
-        }
-        Response::Err(msg) => bail!("{msg}"),
+fn status_of(name: &str) -> Result<SessionInfo> {
+    let sock = runtime::socket_path(name);
+    let mut stream = UnixStream::connect(&sock)
+        .with_context(|| format!("connecting to {}", sock.display()))?;
+    Request::Status
+        .write_to(&mut stream)
+        .context("writing status request")?;
+    match Response::read_from(&mut stream).context("reading status response")? {
+        Response::Status(info) => Ok(info),
+        Response::Err(msg) => Err(anyhow!("{msg}")),
+        Response::Ok => Err(anyhow!("session returned Ok where Status was expected")),
+    }
+}
+
+fn render_session_table(infos: &[SessionInfo]) {
+    if infos.is_empty() {
+        println!("(no sessions)");
+        return;
+    }
+    println!(
+        "{:<24}  {:>10}  {:<5}  {}",
+        "NAME", "AGE", "ALIVE", "ATTACHED"
+    );
+    for s in infos {
+        println!(
+            "{:<24}  {:>10}  {:<5}  {}",
+            s.name,
+            format_age(s.age_secs),
+            if s.alive { "yes" } else { "no" },
+            if s.attached { "yes" } else { "no" },
+        );
     }
 }
 
@@ -321,3 +310,42 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+/// `veterd kill NAME` — send `Request::Kill` to the per-session
+/// socket. Idempotent: missing socket → quiet success (matches v1
+/// `Kill` shape).
+fn cmd_kill(name: &str) -> Result<()> {
+    runtime::validate_name(name)?;
+    let sock = runtime::socket_path(name);
+    let stream = match UnixStream::connect(&sock) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no such session: {name}");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // Stale socket from a crashed session.
+            let _ = std::fs::remove_file(&sock);
+            bail!("no such session: {name} (stale socket cleaned)");
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("connecting to {}", sock.display()));
+        }
+    };
+    let mut writer = BufWriter::new(
+        stream.try_clone().with_context(|| "clone unix stream")?,
+    );
+    let mut reader = BufReader::new(stream);
+    Request::Kill
+        .write_to(&mut writer)
+        .context("writing kill request")?;
+    match Response::read_from(&mut reader).context("reading kill response")? {
+        Response::Ok => Ok(()),
+        Response::Err(msg) => bail!("{msg}"),
+        Response::Status(_) => bail!("session returned unexpected response variant"),
+    }
+}
+
+// Suppress an `unused import` warning on `PathBuf` — kept for future
+// helpers like log-rotation that take owned paths.
+#[allow(dead_code)]
+fn _path_buf_marker(_: PathBuf) {}

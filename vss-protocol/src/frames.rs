@@ -33,6 +33,14 @@ pub enum DownstreamFrame {
     SnapshotEnd {
         sequence_id: u32,
     },
+    /// "Restore pre-attach state, attach is ending." Sent by the
+    /// engine after live forwarding stops and before the connection
+    /// tears down. The renderer's owning context (host or per-portal
+    /// VssEngine) is expected to have stashed a binary snapshot of
+    /// its pre-attach engine state on the first `SnapshotBegin` of
+    /// this attach; on `DetachNotify` it restores from that stash.
+    /// No body.
+    DetachNotify,
 }
 
 impl DownstreamFrame {
@@ -43,6 +51,7 @@ impl DownstreamFrame {
             DownstreamFrame::VgeFragment { .. } => FRM_VGE_FRAGMENT,
             DownstreamFrame::PrtFragment { .. } => FRM_PRT_FRAGMENT,
             DownstreamFrame::SnapshotEnd { .. } => FRM_SNAPSHOT_END,
+            DownstreamFrame::DetachNotify => FRM_DETACH_NOTIFY,
         }
     }
 
@@ -70,6 +79,7 @@ impl DownstreamFrame {
             DownstreamFrame::SnapshotEnd { sequence_id } => {
                 w.u32(*sequence_id);
             }
+            DownstreamFrame::DetachNotify => {}
         }
         w.buf
     }
@@ -105,6 +115,7 @@ impl DownstreamFrame {
             FRM_SNAPSHOT_END => DownstreamFrame::SnapshotEnd {
                 sequence_id: r.u32()?,
             },
+            FRM_DETACH_NOTIFY => DownstreamFrame::DetachNotify,
             _ => return Err(ERR_UNKNOWN_FRAME),
         };
         if !r.at_end() {
@@ -229,6 +240,15 @@ mod tests {
             DownstreamFrame::parse(0xFE, &[]).unwrap_err(),
             ERR_UNKNOWN_FRAME
         );
+    }
+
+    #[test]
+    fn detach_notify_round_trip() {
+        let f = DownstreamFrame::DetachNotify;
+        let body = f.encode_body();
+        assert!(body.is_empty());
+        let parsed = DownstreamFrame::parse(f.frame_type(), &body).unwrap();
+        assert_eq!(parsed, f);
     }
 
     #[test]

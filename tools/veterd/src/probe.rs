@@ -291,10 +291,7 @@ pub fn set_inner_winsize(master_fd: RawFd, rows: u16, cols: u16) {
 /// distinguishable from splice reads at correlation time.
 fn log_probe_chunk(chunk: &[u8]) {
     use std::io::Write;
-    let dir = crate::daemon::socket_path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let dir = crate::runtime::runtime_dir();
     let path = dir.join("input.log");
     let mut file = match std::fs::OpenOptions::new()
         .create(true)

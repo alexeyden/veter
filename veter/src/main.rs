@@ -226,6 +226,17 @@ fn extract_text_from_parser<CB: vt100::Callbacks>(
     text
 }
 
+/// Host-level pre-attach state stashed on the first VSS
+/// `SnapshotBegin` so a `DetachNotify` later can roll back to the
+/// view the user had before they attached. Same idea as
+/// `veter_host::prt::portal::PreAttachBackup` but for the outermost
+/// host engines.
+struct HostVssBackup {
+    vt: Vec<u8>,
+    vge: Vec<u8>,
+    prt: Vec<u8>,
+}
+
 struct App {
     // Terminal state (dropped first — no GL dependency)
     parser: Option<vt100::Parser<clipboard::HostCallbacks>>,
@@ -236,6 +247,12 @@ struct App {
     prt: Option<prt::PrtEngine>,
     vft: Option<vft::VftEngine>,
     vss: Option<vss::VssEngine>,
+    /// Host-level pre-attach backup: same role as the per-portal
+    /// `Portal::pre_attach_backup`, but for the rare case where a
+    /// `veterd attach` writes to the host's outermost vt100 / VGE /
+    /// PRT instead of into a vmux pane portal. Saved on the first
+    /// VSS `SnapshotBegin` of an attach; restored on `DetachNotify`.
+    vss_pre_attach_backup: Option<HostVssBackup>,
     clipboard: clipboard::ClipboardManager,
 
     // GL state (dropped in reverse-creation order so the EGL surface
@@ -277,6 +294,7 @@ impl App {
             prt: None,
             vft: None,
             vss: None,
+            vss_pre_attach_backup: None,
             proxy,
             modifiers: ModifiersState::empty(),
             cursor_pos: None,
@@ -806,6 +824,7 @@ impl App {
             Some(v) => v,
             None => return false,
         };
+        let vss_backup = &mut self.vss_pre_attach_backup;
         let pty = match &self.pty {
             Some(p) => p,
             None => return false,
@@ -841,6 +860,16 @@ impl App {
                     // by `prt::WritePortal` recursively.
                     let completed = vss.take_completed_snapshots();
                     for cs in completed {
+                        // First snapshot of an attach: stash the
+                        // pre-attach state so DetachNotify can roll
+                        // it back later.
+                        if vss_backup.is_none() {
+                            *vss_backup = Some(HostVssBackup {
+                                vt: parser.screen().binary_snapshot(),
+                                vge: engine.binary_snapshot(),
+                                prt: prt.binary_snapshot(),
+                            });
+                        }
                         if let Err(e) =
                             parser.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes)
                         {
@@ -851,6 +880,23 @@ impl App {
                         }
                         if let Err(e) = prt.restore_from_binary_snapshot(&cs.prt_bytes) {
                             eprintln!("veter: host VSS PRT restore failed: {e}");
+                        }
+                    }
+                    // DetachNotify: roll back to whatever we stashed
+                    // on the first snapshot of this attach.
+                    if vss.take_detach_signals() > 0 {
+                        if let Some(backup) = vss_backup.take() {
+                            if let Err(e) =
+                                parser.screen_mut().restore_from_binary_snapshot(&backup.vt)
+                            {
+                                eprintln!("veter: host VSS detach-restore vt100 failed: {e}");
+                            }
+                            if let Err(e) = engine.restore_from_binary_snapshot(&backup.vge) {
+                                eprintln!("veter: host VSS detach-restore VGE failed: {e}");
+                            }
+                            if let Err(e) = prt.restore_from_binary_snapshot(&backup.prt) {
+                                eprintln!("veter: host VSS detach-restore PRT failed: {e}");
+                            }
                         }
                     }
                     // PRT host-screen reactions: scope_reset / cull on
