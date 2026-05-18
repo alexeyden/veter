@@ -1056,6 +1056,7 @@ const HELP_LINES: &[&str] = &[
     "  n / →    next tab",
     "  p / ←    previous tab",
     "  1..9     jump to tab N",
+    "  < / >    move current tab left / right",
     "  R        rename current tab",
     "",
     "Scroll  (prefix-[ enters; q/Esc/G exits)",
@@ -1671,6 +1672,35 @@ impl State {
             self.active_tab - 1
         };
         self.goto_tab(prev)
+    }
+
+    /// Swap the active tab with the one to its left, wrapping the
+    /// leftmost tab to the end. Focus follows the tab, so `active_tab`
+    /// moves with it.
+    fn move_tab_left(&mut self) -> Result<Vec<u8>> {
+        if self.tabs.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let dst = if self.active_tab == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.active_tab - 1
+        };
+        self.tabs.swap(self.active_tab, dst);
+        self.active_tab = dst;
+        self.relayout_and_render()
+    }
+
+    /// Swap the active tab with the one to its right, wrapping the
+    /// rightmost tab to position 0.
+    fn move_tab_right(&mut self) -> Result<Vec<u8>> {
+        if self.tabs.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let dst = (self.active_tab + 1) % self.tabs.len();
+        self.tabs.swap(self.active_tab, dst);
+        self.active_tab = dst;
+        self.relayout_and_render()
     }
 
     /// Recompute the active tab's pane rects, dispatching the diffs as
@@ -3261,6 +3291,8 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
             let idx = (b - b'1') as usize;
             state.goto_tab(idx)
         }
+        b'<' => state.move_tab_left(),
+        b'>' => state.move_tab_right(),
         // help
         b'?' => {
             state.mode = Mode::Help {
