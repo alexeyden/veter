@@ -3039,6 +3039,13 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
+    if !inner_wants_mouse {
+        // The inner program hasn't asked for mouse events, so the
+        // wire-encoded escape would otherwise be echoed in a plain
+        // shell. Drop it.
+        return Ok(());
+    }
+
     // Forward to the inner program. Translate host cells to
     // portal-relative cells (the inner expects coords inside its own
     // grid). If the click is on the chrome (border / title row),

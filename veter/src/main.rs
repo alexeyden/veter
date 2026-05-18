@@ -226,6 +226,129 @@ fn extract_text_from_parser<CB: vt100::Callbacks>(
     text
 }
 
+/// Word-boundary classifier. A "word" is any contiguous run of
+/// non-whitespace cells, so double-click grabs paths, URLs, flags,
+/// punctuation-glued identifiers, etc. — anything visually contiguous.
+/// Empty cells fall through `cell_char_at` as `None` and naturally
+/// stop the walk.
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace()
+}
+
+/// Read the character at (line, col) in `parser`'s grid, using the
+/// same temporarily-move-scrollback trick as `extract_text_from_parser`
+/// so any absolute line is reachable. Wide-character continuation
+/// cells return the lead cell's char so a double-click anywhere on a
+/// wide char treats it as one word atom.
+fn cell_char_at<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    line: i64,
+    col: u16,
+) -> Option<char> {
+    let (rows, _) = parser.screen().size();
+    let target = (top_of_live_screen - line).max(0) as usize;
+    parser.screen_mut().set_scrollback(target);
+    let actual = parser.screen().scrollback() as i64;
+    let viewport_top = top_of_live_screen - actual;
+    let row_in_view = line - viewport_top;
+    if row_in_view < 0 || row_in_view >= rows as i64 {
+        return None;
+    }
+    let row = row_in_view as u16;
+    let cell = parser.screen().cell(row, col)?;
+    if cell.is_wide_continuation() && col > 0 {
+        return parser.screen().cell(row, col - 1)?.contents().chars().next();
+    }
+    cell.contents().chars().next()
+}
+
+/// True if the row containing `line` has its wrap flag set, meaning
+/// the next absolute line is a visual continuation of this one. Used
+/// by word-boundary walking to span wrapped paragraphs.
+fn row_wrapped_at<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    line: i64,
+) -> bool {
+    let (rows, _) = parser.screen().size();
+    let target = (top_of_live_screen - line).max(0) as usize;
+    parser.screen_mut().set_scrollback(target);
+    let actual = parser.screen().scrollback() as i64;
+    let viewport_top = top_of_live_screen - actual;
+    let row_in_view = line - viewport_top;
+    if row_in_view < 0 || row_in_view >= rows as i64 {
+        return false;
+    }
+    parser.screen().row_wrapped(row_in_view as u16)
+}
+
+/// Find the (start, end) cell range of the word under (click_line,
+/// click_col) in `parser`'s grid. Returns inclusive endpoints in the
+/// same absolute-line coords used by `Selection`. If the click lands
+/// on a non-word cell, returns `None` so the caller can leave the
+/// existing selection untouched.
+fn find_word_range_in_parser<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    click_line: i64,
+    click_col: u16,
+) -> Option<((i64, u16), (i64, u16))> {
+    let (_, cols) = parser.screen().size();
+    let saved = parser.screen().scrollback();
+
+    let click_ch = cell_char_at(parser, top_of_live_screen, click_line, click_col);
+    let result = match click_ch {
+        Some(c) if is_word_char(c) => {
+            let mut s_line = click_line;
+            let mut s_col = click_col;
+            loop {
+                let (prev_line, prev_col) = if s_col == 0 {
+                    if !row_wrapped_at(parser, top_of_live_screen, s_line - 1) {
+                        break;
+                    }
+                    (s_line - 1, cols.saturating_sub(1))
+                } else {
+                    (s_line, s_col - 1)
+                };
+                match cell_char_at(parser, top_of_live_screen, prev_line, prev_col) {
+                    Some(c) if is_word_char(c) => {
+                        s_line = prev_line;
+                        s_col = prev_col;
+                    }
+                    _ => break,
+                }
+            }
+
+            let mut e_line = click_line;
+            let mut e_col = click_col;
+            loop {
+                let (next_line, next_col) = if e_col + 1 >= cols {
+                    if !row_wrapped_at(parser, top_of_live_screen, e_line) {
+                        break;
+                    }
+                    (e_line + 1, 0)
+                } else {
+                    (e_line, e_col + 1)
+                };
+                match cell_char_at(parser, top_of_live_screen, next_line, next_col) {
+                    Some(c) if is_word_char(c) => {
+                        e_line = next_line;
+                        e_col = next_col;
+                    }
+                    _ => break,
+                }
+            }
+
+            Some(((s_line, s_col), (e_line, e_col)))
+        }
+        _ => None,
+    };
+
+    parser.screen_mut().set_scrollback(saved);
+    result
+}
+
 /// Host-level pre-attach state stashed on the first VSS
 /// `SnapshotBegin` so a `DetachNotify` later can roll back to the
 /// view the user had before they attached. Same idea as
@@ -277,6 +400,46 @@ struct App {
     /// Deadline for the next auto-scroll step while dragging past the
     /// viewport edge. None when not auto-scrolling.
     autoscroll_deadline: Option<Instant>,
+    /// Most recent left-press recorded in the local-selection branch
+    /// (time, target, pixel position). A subsequent press within
+    /// `DOUBLE_CLICK_INTERVAL` and `DOUBLE_CLICK_RADIUS_PX` of the
+    /// same target counts as a double-click and triggers word
+    /// selection. Pixel-distance is used instead of cell equality so a
+    /// couple of pixels of inter-click jitter doesn't defeat the
+    /// detection by crossing a cell boundary. Presses that were
+    /// forwarded to the inner program (mouse-mode-on, no shift) don't
+    /// update this — they belong to the app, not to the host.
+    last_click: Option<(Instant, SelectionTarget, winit::dpi::PhysicalPosition<f64>)>,
+    /// Bitmask of mouse buttons currently held: bit 0 = left, 1 =
+    /// middle, 2 = right. Used to decide whether motion in
+    /// `ButtonMotion` mode should be forwarded and which button code
+    /// to report on a motion event.
+    mouse_buttons_held: u8,
+    /// Last host-cell coords reported as a motion event, used to
+    /// dedup so the inner program receives at most one motion event
+    /// per cell. `None` means "no motion forwarded yet".
+    last_motion_cell: Option<(u32, u32)>,
+}
+
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const DOUBLE_CLICK_RADIUS_PX: f64 = 6.0;
+
+/// Encode keyboard modifiers into the bits xterm-style SGR mouse
+/// encoding uses (shift=4, alt=8, ctrl=16). Used by both button and
+/// motion forwarders. Shift is gated out of forwarding above, but the
+/// bit is encoded defensively in case that ever changes.
+fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
+    let mut bits = 0;
+    if modifiers.shift_key() {
+        bits |= 4;
+    }
+    if modifiers.alt_key() {
+        bits |= 8;
+    }
+    if modifiers.control_key() {
+        bits |= 16;
+    }
+    bits
 }
 
 impl App {
@@ -301,6 +464,9 @@ impl App {
             clipboard: clipboard::ClipboardManager::new(),
             selection: None,
             autoscroll_deadline: None,
+            last_click: None,
+            mouse_buttons_held: 0,
+            last_motion_cell: None,
         }
     }
 
@@ -478,6 +644,127 @@ impl App {
                 let portal = resolve_portal_target_mut(prt, path)?;
                 let top_live = portal.children.top_of_live_screen();
                 Some(extract_text_from_parser(&mut portal.vt, top_live, &sel))
+            }
+        }
+    }
+
+    /// Host parser's mouse protocol mode and encoding. The host
+    /// parser is authoritative because the inner program that toggles
+    /// mouse mode (e.g. vmux, vim) speaks to the host's PTY. Defaults
+    /// to None/Default before the parser exists.
+    fn host_mouse_proto(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        self.parser
+            .as_ref()
+            .map(|p| {
+                let s = p.screen();
+                (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+            })
+            .unwrap_or((
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+            ))
+    }
+
+    /// 1-indexed host-grid cell under the current cursor, in the form
+    /// SGR mouse encoding expects. None if state isn't initialized.
+    fn cursor_to_host_cell(&self) -> Option<(u32, u32)> {
+        let pos = self.cursor_pos?;
+        let tr = self.term_renderer.as_ref()?;
+        let cw = tr.cell_width as f64;
+        let ch = tr.cell_height as f64;
+        let col = (pos.x / cw).floor().max(0.0) as u32 + 1;
+        let row = (pos.y / ch).floor().max(0.0) as u32 + 1;
+        Some((col, row))
+    }
+
+    /// Forward a button press/release to the inner program via SGR
+    /// mouse encoding (`\e[<b;c;r{M,m}`). Returns true if the event
+    /// was forwarded (caller skips local handling); false if mouse
+    /// mode isn't on or the encoding isn't SGR. Mirrors the gating
+    /// the wheel handler already does.
+    fn try_forward_mouse_button(&self, button: u32, press: bool) -> bool {
+        let (mode, encoding) = self.host_mouse_proto();
+        if mode == vt100::MouseProtocolMode::None
+            || !matches!(encoding, vt100::MouseProtocolEncoding::Sgr)
+        {
+            return false;
+        }
+        let Some((col, row)) = self.cursor_to_host_cell() else {
+            return false;
+        };
+        let code = button | encode_mouse_modifier_bits(self.modifiers);
+        let suffix = if press { 'M' } else { 'm' };
+        let payload = format!("\x1b[<{code};{col};{row}{suffix}");
+        if let Some(pty) = &self.pty {
+            let _ = pty.write_all(payload.as_bytes());
+        }
+        true
+    }
+
+    /// Forward a pointer-motion event to the inner program when it
+    /// has asked for one — `ButtonMotion` (1002) requires a held
+    /// button, `AnyMotion` (1003) always reports. Deduplicates per
+    /// host cell so the inner program sees at most one event per cell
+    /// crossing. Returns true if forwarded.
+    fn try_forward_mouse_motion(&mut self) -> bool {
+        let (mode, encoding) = self.host_mouse_proto();
+        if !matches!(encoding, vt100::MouseProtocolEncoding::Sgr) {
+            return false;
+        }
+        let held = self.mouse_buttons_held;
+        let report = match mode {
+            vt100::MouseProtocolMode::ButtonMotion => held != 0,
+            vt100::MouseProtocolMode::AnyMotion => true,
+            _ => false,
+        };
+        if !report {
+            return false;
+        }
+        let Some((col, row)) = self.cursor_to_host_cell() else {
+            return false;
+        };
+        if self.last_motion_cell == Some((col, row)) {
+            return false;
+        }
+        self.last_motion_cell = Some((col, row));
+        let button = if held & 1 != 0 {
+            0
+        } else if held & 2 != 0 {
+            1
+        } else if held & 4 != 0 {
+            2
+        } else {
+            3 // AnyMotion with nothing pressed: button-released code
+        };
+        // Bit 5 (0x20) is the SGR motion flag.
+        let code = button | 0x20 | encode_mouse_modifier_bits(self.modifiers);
+        let payload = format!("\x1b[<{code};{col};{row}M");
+        if let Some(pty) = &self.pty {
+            let _ = pty.write_all(payload.as_bytes());
+        }
+        true
+    }
+
+    /// Resolve a double-click at (line, col) on `target` to the word
+    /// range under the pointer. Mirrors `extract_selection_text` in
+    /// how it dispatches between the host parser and a portal's vt.
+    fn find_word_range(
+        &mut self,
+        target: &SelectionTarget,
+        line: i64,
+        col: u16,
+    ) -> Option<((i64, u16), (i64, u16))> {
+        match target {
+            SelectionTarget::Host => {
+                let parser = self.parser.as_mut()?;
+                let top_live = self.prt.as_ref()?.top_of_live_screen();
+                find_word_range_in_parser(parser, top_live, line, col)
+            }
+            SelectionTarget::Portal(path) => {
+                let prt = self.prt.as_mut()?;
+                let portal = resolve_portal_target_mut(prt, path)?;
+                let top_live = portal.children.top_of_live_screen();
+                find_word_range_in_parser(&mut portal.vt, top_live, line, col)
             }
         }
     }
@@ -1127,7 +1414,15 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
-                if matches!(&self.selection, Some(s) if s.dragging) {
+                let local_drag = matches!(&self.selection, Some(s) if s.dragging);
+                // When a local drag-select is in progress, motion
+                // belongs to the host (selection extension), not the
+                // inner program. Shift held means the user is in
+                // local-interaction mode regardless of mouse mode.
+                if !self.modifiers.shift_key() && !local_drag {
+                    self.try_forward_mouse_motion();
+                }
+                if local_drag {
                     self.update_selection_head();
                     self.maybe_arm_autoscroll();
                     if let Some(w) = &self.window {
@@ -1136,11 +1431,52 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Left) => {
-                    if self.modifiers.shift_key() {
-                        if let Some(pos) = self.cursor_pos {
-                            let target = self.hit_test_target(pos);
+            WindowEvent::MouseInput { state, button, .. } => {
+                let shift = self.modifiers.shift_key();
+                match (state, button) {
+                    (ElementState::Pressed, MouseButton::Left) => {
+                        self.mouse_buttons_held |= 1;
+                        if !shift && self.try_forward_mouse_button(0, true) {
+                            return;
+                        }
+                        let Some(pos) = self.cursor_pos else { return };
+                        let target = self.hit_test_target(pos);
+                        let now = Instant::now();
+                        let is_double =
+                            self.last_click.as_ref().is_some_and(|(t, prev_target, prev_pos)| {
+                                if now.duration_since(*t) >= DOUBLE_CLICK_INTERVAL {
+                                    return false;
+                                }
+                                if prev_target != &target {
+                                    return false;
+                                }
+                                let dx = pos.x - prev_pos.x;
+                                let dy = pos.y - prev_pos.y;
+                                dx * dx + dy * dy
+                                    <= DOUBLE_CLICK_RADIUS_PX * DOUBLE_CLICK_RADIUS_PX
+                            });
+                        if is_double
+                            && let Some((line, col)) = self.cursor_to_abs(pos, &target)
+                            && let Some(((s_line, s_col), (e_line, e_col))) =
+                                self.find_word_range(&target, line, col)
+                        {
+                            self.selection = Some(Selection {
+                                target,
+                                anchor_line: s_line,
+                                anchor_col: s_col,
+                                head_line: e_line,
+                                head_col: e_col,
+                                dragging: false,
+                            });
+                            self.copy_selection_to_clipboard(true);
+                            self.last_click = None;
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                        self.last_click = Some((now, target.clone(), pos));
+                        if shift {
                             if let Some((line, col)) = self.cursor_to_abs(pos, &target) {
                                 self.selection = Some(Selection {
                                     target,
@@ -1154,42 +1490,69 @@ impl ApplicationHandler for App {
                                     w.request_redraw();
                                 }
                             }
-                        }
-                    } else if self.selection.is_some() {
-                        // Plain click clears the highlight; matches
-                        // standard terminal/text-editor behavior.
-                        self.selection = None;
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
-                }
-                (ElementState::Released, MouseButton::Left) => {
-                    let was_dragging = matches!(&self.selection, Some(s) if s.dragging);
-                    if let Some(s) = &mut self.selection {
-                        s.dragging = false;
-                    }
-                    self.autoscroll_deadline = None;
-                    if was_dragging {
-                        // Linux convention: selection auto-populates the
-                        // PRIMARY selection only. Ctrl+Shift+C also
-                        // updates the main clipboard.
-                        self.copy_selection_to_clipboard(true);
-                    }
-                }
-                (ElementState::Pressed, MouseButton::Middle) => {
-                    if let Some(text) = self.clipboard.get_primary()
-                        && !text.is_empty()
-                    {
-                        let bracketed = self.focused_vt_bracketed_paste();
-                        let bytes = clipboard::build_paste_bytes(&text, bracketed);
-                        if let Some(pty) = &self.pty {
-                            let _ = pty.write_all(&bytes);
+                        } else if self.selection.is_some() {
+                            // Plain click in a non-mouse-mode terminal
+                            // clears the highlight; matches standard
+                            // terminal/text-editor behavior.
+                            self.selection = None;
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
                         }
                     }
+                    (ElementState::Released, MouseButton::Left) => {
+                        self.mouse_buttons_held &= !1;
+                        if !shift && self.try_forward_mouse_button(0, false) {
+                            return;
+                        }
+                        let was_dragging = matches!(&self.selection, Some(s) if s.dragging);
+                        if let Some(s) = &mut self.selection {
+                            s.dragging = false;
+                        }
+                        self.autoscroll_deadline = None;
+                        if was_dragging {
+                            // Linux convention: selection auto-populates the
+                            // PRIMARY selection only. Ctrl+Shift+C also
+                            // updates the main clipboard.
+                            self.copy_selection_to_clipboard(true);
+                        }
+                    }
+                    (ElementState::Pressed, MouseButton::Middle) => {
+                        self.mouse_buttons_held |= 2;
+                        if !shift && self.try_forward_mouse_button(1, true) {
+                            return;
+                        }
+                        if let Some(text) = self.clipboard.get_primary()
+                            && !text.is_empty()
+                        {
+                            let bracketed = self.focused_vt_bracketed_paste();
+                            let bytes = clipboard::build_paste_bytes(&text, bracketed);
+                            if let Some(pty) = &self.pty {
+                                let _ = pty.write_all(&bytes);
+                            }
+                        }
+                    }
+                    (ElementState::Released, MouseButton::Middle) => {
+                        self.mouse_buttons_held &= !2;
+                        if !shift {
+                            let _ = self.try_forward_mouse_button(1, false);
+                        }
+                    }
+                    (ElementState::Pressed, MouseButton::Right) => {
+                        self.mouse_buttons_held |= 4;
+                        if !shift {
+                            let _ = self.try_forward_mouse_button(2, true);
+                        }
+                    }
+                    (ElementState::Released, MouseButton::Right) => {
+                        self.mouse_buttons_held &= !4;
+                        if !shift {
+                            let _ = self.try_forward_mouse_button(2, false);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 // Decide whether to forward the wheel as a mouse-button
