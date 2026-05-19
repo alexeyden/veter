@@ -46,6 +46,26 @@ pub fn err_body(error_code: u16, message: &str) -> Vec<u8> {
     w.buf
 }
 
+/// Body for a ChunkAck response (§4). Emitted by the host after it
+/// absorbs each `UploadImage` chunk, so the sender can show real
+/// upload progress instead of guessing from the local stdout pipe.
+pub struct ChunkAckBody<'a> {
+    pub image_id: &'a str,
+    /// Cumulative bytes received for this image id so far (this chunk
+    /// included). When the host has seen the full payload, this equals
+    /// `total_bytes` from the originating `UploadImageBody`.
+    pub bytes_received: u32,
+}
+
+impl ChunkAckBody<'_> {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(1 + self.image_id.len() + 4);
+        w.str(self.image_id);
+        w.u32(self.bytes_received);
+        w.buf
+    }
+}
+
 /// Append a single frame to an unstuffed payload buffer.
 /// Frame layout (§1.2): u8 frame_type, u32 request_id, u32 body_length,
 /// body[body_length].

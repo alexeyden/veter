@@ -25,7 +25,10 @@ use clap::{Parser, ValueEnum};
 use image::ImageReader;
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::{Point, Reader, Rect};
-use vge_protocol::command::{Command, CreateElementBody, DrawCmd, UploadImageBody};
+use vge_protocol::command::{
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
+    UpdateCommandsBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
+};
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
 
@@ -250,44 +253,245 @@ fn main() -> Result<()> {
             (0x02u8, out)
         }
     };
-    let upload = Command::UploadImage(UploadImageBody {
-        id: img_id.clone(),
-        encoding,
-        width: placement.target_px_w,
-        height: placement.target_px_h,
-        data: payload,
-    });
-    let create = Command::CreateElement(CreateElementBody {
-        id: elem_id,
-        commands: vec![DrawCmd::DrawImage {
-            target_rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: placement.w_cells as f32,
-                h: placement.target_rect_h,
-            },
-            image_id: img_id,
-        }],
-        origin: Point {
-            x: 0.0,
-            y: origin_y,
-        },
-        is_visible: true,
-        draw_order: 0,
-        parent: None,
-        size: None,
-    });
-    let envelope = build_envelope(&[(upload, 1), (create, 2)]);
-    trace!(v, "writing envelope: {} bytes", envelope.len());
-    stdout.write_all(&envelope)?;
-    stdout.flush()?;
-    drop(stdout);
-    trace!(v, "envelope written, draining response");
+    // Chunked upload (§8.1). Over SSH we slice the payload into ~32 KB
+    // chunks so vcat can drive a placeholder progress UI from the
+    // host's per-chunk acks — invaluable when a 5 MB image takes 20s
+    // to traverse the link. Local runs send a single chunk: zero
+    // benefit from chunking when round-trip is sub-millisecond.
+    let total_bytes = payload.len() as u32;
+    let target_chunk_size: u32 = if is_ssh_session() { 32 * 1024 } else { total_bytes.max(1) };
+    let chunk_size = target_chunk_size.max(1).min(total_bytes.max(1));
+    let num_chunks = total_bytes.div_ceil(chunk_size).max(1);
+    let show_progress = num_chunks > 1;
+    trace!(
+        v,
+        "uploading {} bytes in {} chunk(s) of {} bytes (progress UI: {})",
+        total_bytes,
+        num_chunks,
+        chunk_size,
+        show_progress
+    );
 
-    let drained = drain_response_envelope(Duration::from_millis(cli.timeout_ms))?;
-    trace!(v, "drain result: {drained}");
+    let target_rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: placement.w_cells as f32,
+        h: placement.target_rect_h,
+    };
+    let final_draw = DrawCmd::DrawImage {
+        target_rect,
+        image_id: img_id.clone(),
+    };
+    let element_origin = Point { x: 0.0, y: origin_y };
+
+    // The placeholder + finalize sequences cross several iterations,
+    // but the element's command-index layout is fixed (see
+    // `build_placeholder_commands`): index 0 = bar track, 1 = bar
+    // fill, 2 = label. UpdateCommand / UpdateText target these.
+    let placeholder_cmds = build_placeholder_commands(target_rect, total_bytes);
+
+    let total_mb = bytes_to_mb(total_bytes);
+
+    for i in 0..num_chunks {
+        let offset = i * chunk_size;
+        let end = (offset + chunk_size).min(total_bytes);
+        let is_last = i == num_chunks - 1;
+        let chunk_data = payload[offset as usize..end as usize].to_vec();
+        let chunk_cmd = Command::UploadImage(UploadImageBody {
+            id: img_id.clone(),
+            encoding,
+            width: placement.target_px_w,
+            height: placement.target_px_h,
+            total_bytes,
+            chunk_offset: offset,
+            is_last,
+            data: chunk_data,
+        });
+        let req_id = (i + 1) as u32; // monotonic, distinct from REQ_ID_NO_RESPONSE
+
+        let mut frames: Vec<(Command, u32)> = Vec::with_capacity(4);
+
+        if i == 0 && show_progress {
+            // Carry the placeholder along with the first chunk. The
+            // host applies frames in order, so the placeholder lands
+            // before chunk[0] is even decoded — user sees the bar
+            // immediately at 0%.
+            frames.push((
+                Command::CreateElement(CreateElementBody {
+                    id: elem_id.clone(),
+                    commands: placeholder_cmds.clone(),
+                    origin: element_origin,
+                    is_visible: true,
+                    draw_order: 0,
+                    parent: None,
+                    size: None,
+                }),
+                REQ_ID_NO_RESPONSE,
+            ));
+        }
+
+        if i > 0 && show_progress {
+            // Visual lags by one chunk (we redraw based on the *previous*
+            // chunk's ack, then send this chunk in the same envelope —
+            // no extra round-trip for the redraw). Worth it: dropping
+            // an envelope here would double the wall-clock per chunk.
+            let acked = offset; // cumulative bytes acked so far
+            frames.push((
+                Command::UpdateCommand(UpdateCommandBody {
+                    id: elem_id.clone(),
+                    index: 1,
+                    command: bar_fill_cmd(target_rect, acked, total_bytes),
+                }),
+                REQ_ID_NO_RESPONSE,
+            ));
+            frames.push((
+                Command::UpdateText(UpdateTextBody {
+                    id: elem_id.clone(),
+                    command_index: 2,
+                    range: UpdateTextRange::Whole,
+                    replacement: progress_text(acked, total_bytes, total_mb),
+                }),
+                REQ_ID_NO_RESPONSE,
+            ));
+        }
+
+        frames.push((chunk_cmd, req_id));
+
+        if is_last {
+            // The chunk's host-side processing finalizes the image,
+            // so the swap/create lands in the same envelope and
+            // replaces (show_progress) or creates (single-shot) the
+            // element pointing at the now-registered image.
+            let final_element = if show_progress {
+                Command::UpdateCommands(UpdateCommandsBody {
+                    id: elem_id.clone(),
+                    commands: vec![final_draw.clone()],
+                })
+            } else {
+                Command::CreateElement(CreateElementBody {
+                    id: elem_id.clone(),
+                    commands: vec![final_draw.clone()],
+                    origin: element_origin,
+                    is_visible: true,
+                    draw_order: 0,
+                    parent: None,
+                    size: None,
+                })
+            };
+            frames.push((final_element, REQ_ID_NO_RESPONSE));
+        }
+
+        let envelope = build_envelope(&frames);
+        trace!(
+            v,
+            "chunk {}/{}: env={} bytes, chunk_offset={}, is_last={}",
+            i + 1,
+            num_chunks,
+            envelope.len(),
+            offset,
+            is_last
+        );
+        stdout.write_all(&envelope)?;
+        stdout.flush()?;
+
+        let bytes_received = wait_for_chunk_ack(
+            &img_id,
+            req_id,
+            Duration::from_millis(cli.timeout_ms),
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "chunk-ack timed out for chunk {}/{} (req_id {}); \
+                 try --timeout-ms <larger>",
+                i + 1,
+                num_chunks,
+                req_id
+            )
+        })?;
+        trace!(v, "chunk {} acked: bytes_received={}", i + 1, bytes_received);
+    }
+    drop(stdout);
 
     Ok(())
+}
+
+/// Cell-units height of the progress bar inside the image rect. Bigger
+/// images get a slightly taller bar so it stays visible.
+fn bar_height_cells(target_rect_h: f32) -> f32 {
+    (target_rect_h * 0.12).clamp(0.4, 1.2)
+}
+
+fn bar_track_rect(image_rect: Rect) -> Rect {
+    let h = bar_height_cells(image_rect.h);
+    let pad_x = (image_rect.w * 0.05).clamp(0.5, 4.0);
+    Rect {
+        x: image_rect.x + pad_x,
+        y: image_rect.y + (image_rect.h - h) * 0.5,
+        w: (image_rect.w - 2.0 * pad_x).max(0.5),
+        h,
+    }
+}
+
+fn bar_fill_cmd(image_rect: Rect, acked: u32, total: u32) -> DrawCmd {
+    let track = bar_track_rect(image_rect);
+    let frac = if total == 0 { 0.0 } else { acked as f32 / total as f32 };
+    let fill_w = (track.w * frac).clamp(0.0, track.w);
+    DrawCmd::FillRectangles {
+        fill: Style::Flat(Color { r: 0.42, g: 0.78, b: 1.0, a: 1.0 }),
+        rects: vec![Rect {
+            x: track.x,
+            y: track.y,
+            w: fill_w,
+            h: track.h,
+        }],
+    }
+}
+
+fn build_placeholder_commands(image_rect: Rect, total: u32) -> Vec<DrawCmd> {
+    let track = bar_track_rect(image_rect);
+    // Index 0: track (dark base).
+    let track_cmd = DrawCmd::FillRectangles {
+        fill: Style::Flat(Color { r: 0.20, g: 0.22, b: 0.27, a: 0.85 }),
+        rects: vec![track],
+    };
+    // Index 1: fill (starts empty; mutated via UpdateCommand on each ack).
+    let fill_cmd = bar_fill_cmd(image_rect, 0, total);
+    // Index 2: label, centered horizontally and sitting in the cell
+    // row immediately above the bar. DrawText.origin.y is the *top* of
+    // the text's cell row (renderer adds ascent to derive baseline),
+    // so the row spans [origin.y, origin.y + 1] in cell units. Picking
+    // `track.y - 1.0` places the row's bottom edge flush with the
+    // bar's top — clean, no overlap. Clamp so we never draw above the
+    // image rect on very-thin placements.
+    let total_mb = bytes_to_mb(total);
+    let label_origin = Point {
+        x: image_rect.x + image_rect.w * 0.5,
+        y: (track.y - 1.0).max(image_rect.y),
+    };
+    let label_cmd = DrawCmd::DrawText {
+        origin: label_origin,
+        align: Align::Center,
+        fill: Style::Flat(Color { r: 0.88, g: 0.92, b: 1.0, a: 1.0 }),
+        font_style: FontStyle::default(),
+        text: progress_text(0, total, total_mb),
+    };
+    vec![track_cmd, fill_cmd, label_cmd]
+}
+
+fn bytes_to_mb(bytes: u32) -> f32 {
+    bytes as f32 / (1024.0 * 1024.0)
+}
+
+fn progress_text(acked: u32, total: u32, total_mb: f32) -> String {
+    let pct = if total == 0 {
+        0.0
+    } else {
+        (acked as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
+    };
+    format!(
+        "{pct:>3.0}%  {acked_mb:.2} / {total_mb:.2} MB",
+        acked_mb = bytes_to_mb(acked),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -353,26 +557,80 @@ fn compute_placement(
 
 // --- terminal I/O helpers ---
 
-/// Read up to one full T2C response envelope and discard it. Used
-/// after the final UploadImage+CreateElement to keep response bytes
-/// from leaking to the next program's stdin.
-fn drain_response_envelope(timeout: Duration) -> Result<bool> {
+/// Read response envelopes until we see a ChunkAck whose request_id
+/// matches `expected_req`, then return its `bytes_received` field.
+/// Returns `Ok(None)` on timeout. Used after each UploadImage chunk so
+/// the sender can drive a progress UI from the host's view of bytes
+/// actually committed (§4).
+fn wait_for_chunk_ack(
+    expected_image_id: &str,
+    expected_req: u32,
+    timeout: Duration,
+) -> Result<Option<u32>> {
     let mut apc = ApcStream::with_marker(*MARKER_T2C);
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
     loop {
         if !poll_stdin_until(deadline)? {
-            return Ok(false);
+            return Ok(None);
         }
         let n = read_stdin(&mut buf)?;
         if n == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let out = apc.feed(&buf[..n]);
-        if !out.payloads.is_empty() {
-            return Ok(true);
+        for payload in out.payloads {
+            if let Some(bytes) =
+                find_chunk_ack(&payload, expected_image_id, expected_req)?
+            {
+                return Ok(Some(bytes));
+            }
+            // Non-matching envelope (e.g. spurious responses from
+            // earlier commands, or RSP_ERR). Keep reading — the next
+            // envelope should carry the ack.
         }
     }
+}
+
+/// Scan a single response envelope payload for an `RSP_CHUNK_ACK`
+/// frame matching `(image_id, req_id)`. Returns its `bytes_received`
+/// if found. RSP_ERR frames matching `req_id` are surfaced as errors
+/// (the host bailed mid-stream — e.g. budget exhausted).
+fn find_chunk_ack(
+    payload: &[u8],
+    expected_image_id: &str,
+    expected_req: u32,
+) -> Result<Option<u32>> {
+    let mut r = Reader::new(payload);
+    let _version = r.u8().map_err(|_| anyhow!("chunk-ack envelope: version"))?;
+    let _payload_len = r.u32().map_err(|_| anyhow!("chunk-ack envelope: payload_len"))?;
+    while !r.at_end() {
+        let frame_type = r.u8().map_err(|_| anyhow!("chunk-ack envelope: frame_type"))?;
+        let req_id = r.u32().map_err(|_| anyhow!("chunk-ack envelope: req_id"))?;
+        let body_len = r
+            .u32()
+            .map_err(|_| anyhow!("chunk-ack envelope: body_len"))?
+            as usize;
+        let body = r.take(body_len).map_err(|_| anyhow!("chunk-ack envelope: body"))?;
+        if frame_type == RSP_CHUNK_ACK && req_id == expected_req {
+            let mut br = Reader::new(body);
+            let img_id = br.string().map_err(|_| anyhow!("chunk-ack body: id"))?;
+            let bytes = br.u32().map_err(|_| anyhow!("chunk-ack body: bytes"))?;
+            if img_id != expected_image_id {
+                bail!(
+                    "chunk-ack id mismatch: expected {expected_image_id:?}, got {img_id:?}"
+                );
+            }
+            return Ok(Some(bytes));
+        }
+        if frame_type == RSP_ERR && req_id == expected_req {
+            let mut er = Reader::new(body);
+            let code = er.u16().unwrap_or(0);
+            let msg = er.string().unwrap_or("");
+            bail!("host rejected chunk req_id={expected_req}: code=0x{code:04X} {msg}");
+        }
+    }
+    Ok(None)
 }
 
 /// Pull anything currently sitting on stdin without blocking. Used at

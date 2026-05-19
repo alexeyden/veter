@@ -245,6 +245,19 @@ pub struct UploadImageBody {
     pub encoding: u8,
     pub width: u32,
     pub height: u32,
+    /// Total payload size in bytes (all chunks summed). Repeated in
+    /// every chunk so the host can allocate / validate on first contact
+    /// without keeping a Begin/Chunk/End state machine.
+    pub total_bytes: u32,
+    /// Byte offset of this chunk inside the full payload. First chunk
+    /// (and single-shot uploads) MUST set this to 0.
+    pub chunk_offset: u32,
+    /// True on the final chunk. The host finalizes (decodes + registers
+    /// the image) only on this transition. For single-shot uploads, set
+    /// `chunk_offset = 0`, `is_last = true`, and `data` carries the
+    /// whole payload.
+    pub is_last: bool,
+    /// Bytes for this chunk (NOT the full image — see `total_bytes`).
     pub data: Vec<u8>,
 }
 
@@ -687,6 +700,9 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             let encoding = r.u8()?;
             let width = r.u32()?;
             let height = r.u32()?;
+            let total_bytes = r.u32()?;
+            let chunk_offset = r.u32()?;
+            let is_last = r.bool()?;
             let data = r.bytes()?.to_vec();
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
@@ -696,6 +712,9 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 encoding,
                 width,
                 height,
+                total_bytes,
+                chunk_offset,
+                is_last,
                 data,
             }))
         }

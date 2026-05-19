@@ -30,6 +30,7 @@ pub const CMD_UPDATE_SIZE: u8 = 0x0F;
 pub const RSP_OK: u8 = 0x01;
 pub const RSP_ERR: u8 = 0x02;
 pub const RSP_PROBE: u8 = 0x03;
+pub const RSP_CHUNK_ACK: u8 = 0x04;
 
 /// Sentinel `request_id` value that asks the host to apply the
 /// command but not emit a response frame. Used for "state push"

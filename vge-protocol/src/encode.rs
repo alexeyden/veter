@@ -357,6 +357,9 @@ fn write_upload_image(w: &mut Writer, b: &UploadImageBody) {
     w.u8(b.encoding);
     w.u32(b.width);
     w.u32(b.height);
+    w.u32(b.total_bytes);
+    w.u32(b.chunk_offset);
+    w.bool(b.is_last);
     w.bytes(&b.data);
 }
 
@@ -570,15 +573,19 @@ mod tests {
 
     #[test]
     fn upload_image_raw_roundtrip() {
+        let data = vec![
+            0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ];
         roundtrip(Command::UploadImage(UploadImageBody {
             id: "logo".into(),
             encoding: 0x01,
             width: 2,
             height: 2,
-            data: vec![
-                0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-                0xFF, 0xFF,
-            ],
+            total_bytes: data.len() as u32,
+            chunk_offset: 0,
+            is_last: true,
+            data,
         }));
     }
 
@@ -586,12 +593,31 @@ mod tests {
     fn upload_image_webp_roundtrip() {
         // WebP body is opaque to the codec — exercise it with a small
         // fake byte buffer; round-trip just compares bytes.
+        let data: Vec<u8> = (0..200).map(|i| (i & 0xFF) as u8).collect();
         roundtrip(Command::UploadImage(UploadImageBody {
             id: "frame".into(),
             encoding: 0x02,
             width: 16,
             height: 16,
-            data: (0..200).map(|i| (i & 0xFF) as u8).collect(),
+            total_bytes: data.len() as u32,
+            chunk_offset: 0,
+            is_last: true,
+            data,
+        }));
+    }
+
+    #[test]
+    fn upload_image_chunked_roundtrip() {
+        // Mid-stream chunk: not first (offset > 0), not last.
+        roundtrip(Command::UploadImage(UploadImageBody {
+            id: "stream".into(),
+            encoding: 0x01,
+            width: 100,
+            height: 100,
+            total_bytes: 40_000,
+            chunk_offset: 16_384,
+            is_last: false,
+            data: (0..8_192).map(|i| (i & 0xFF) as u8).collect(),
         }));
     }
 

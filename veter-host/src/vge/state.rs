@@ -14,7 +14,9 @@ use vge_protocol::command::{
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use vge_protocol::codec::Point as ProtoPoint;
-use vge_protocol::envelope::{append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ProbeBody};
+use vge_protocol::envelope::{
+    append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ChunkAckBody, ProbeBody,
+};
 use vge_protocol::frame::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -436,6 +438,23 @@ fn decode_webp(
     Ok(pixels)
 }
 
+/// In-flight chunked image upload (§8.1). Allocated on the first chunk
+/// (`chunk_offset == 0`), grown by subsequent chunks, finalized — i.e.
+/// decoded + inserted into `shared.images` — on the chunk with
+/// `is_last = true`.
+///
+/// Transient: dropped on `VgeState::reset()` and on snapshot restore.
+/// Not snapshotted (a fresh attach cannot honor a sender's mid-stream
+/// chunk sequence anyway).
+struct PendingUpload {
+    encoding: u8,
+    width: u32,
+    height: u32,
+    total_bytes: u32,
+    buf: Vec<u8>,
+    bytes_received: u32,
+}
+
 pub struct VgeEngine {
     apc: ApcStream,
     pub state: VgeState,
@@ -444,6 +463,8 @@ pub struct VgeEngine {
     scale_factor: f32,
     line_tracker: LineTracker,
     pending_response_bytes: Vec<u8>,
+    /// Chunked image uploads still in flight, keyed by image id.
+    pending_uploads: HashMap<String, PendingUpload>,
     /// Renderer image handles for uploaded images that have been dropped
     /// but whose GPU resources still need releasing. The renderer drains
     /// this on each frame and translates each `GpuImageId` to its own
@@ -488,6 +509,7 @@ impl VgeEngine {
             scale_factor,
             line_tracker: LineTracker::new(),
             pending_response_bytes: Vec::new(),
+            pending_uploads: HashMap::new(),
             pending_image_deletes: Vec::new(),
             pending_cursor_queries: 0,
             auto_reply_dsr: true,
@@ -581,6 +603,7 @@ impl VgeEngine {
         // restore are stale.
         self.pending_response_bytes.clear();
         self.pending_image_deletes.clear();
+        self.pending_uploads.clear();
         self.pending_cursor_queries = 0;
         // Pin top_of_live_screen to the snapshotted value so element
         // `anchor_line`s line up with where they were drawn in the
@@ -616,6 +639,7 @@ impl VgeEngine {
             HardReset | SoftReset => {
                 let deletes = self.state.reset();
                 self.pending_image_deletes.extend(deletes);
+                self.pending_uploads.clear();
                 // Reset the line tracker too: scrollback state will be
                 // re-derived after vt100 finishes its own reset.
                 self.line_tracker = LineTracker::new();
@@ -819,6 +843,14 @@ impl VgeEngine {
                     Ok(rsp_body) => {
                         let frame_type = match frame_type {
                             CMD_PROBE => RSP_PROBE,
+                            // UploadImage is chunked — each chunk
+                            // produces a ChunkAck (§4) so the sender can
+                            // drive a progress UI. cmd_upload_image
+                            // emits the ChunkAck body; on the final
+                            // chunk (image registered) the body still
+                            // carries `bytes_received == total_bytes`,
+                            // signaling "done."
+                            CMD_UPLOAD_IMAGE => RSP_CHUNK_ACK,
                             _ => RSP_OK,
                         };
                         append_frame(out_frames, frame_type, request_id, &rsp_body);
@@ -922,38 +954,134 @@ impl VgeEngine {
         if b.id.is_empty() || b.id.len() > 64 {
             return Err((ERR_BAD_PAYLOAD, "image id"));
         }
-        if self.state.shared.images.contains_key(&b.id) {
-            return Err((ERR_DUPLICATE_IMAGE_ID, "image id in use"));
-        }
-        if self.state.shared.images.len() as u32 >= self.limits.max_images {
-            return Err((ERR_TOO_MANY_IMAGES, "image budget exhausted"));
-        }
-        if b.data.len() as u64 > self.limits.max_image_bytes as u64 {
-            return Err((ERR_IMAGE_TOO_LARGE, "image exceeds max_image_bytes"));
+
+        // Bounds (apply to every chunk so we fail fast on a corrupt
+        // mid-stream frame, not just the first).
+        let data_len = b.data.len() as u32;
+        let end = b.chunk_offset.checked_add(data_len).ok_or((
+            ERR_BAD_PAYLOAD,
+            "chunk overflow",
+        ))?;
+        if end > b.total_bytes {
+            return Err((ERR_BAD_PAYLOAD, "chunk past total_bytes"));
         }
 
-        let pixels = match b.encoding {
-            0x01 => decode_raw_rgba8(&b.data, b.width, b.height)?,
-            0x02 => decode_webp(&b.data, b.width, b.height)?,
+        if b.chunk_offset == 0 {
+            // First chunk for this id — fresh allocation. Validate
+            // against the live image table and pending uploads.
+            if self.state.shared.images.contains_key(&b.id) {
+                return Err((ERR_DUPLICATE_IMAGE_ID, "image id in use"));
+            }
+            if self.pending_uploads.contains_key(&b.id) {
+                return Err((ERR_DUPLICATE_IMAGE_ID, "upload already in progress"));
+            }
+            // Image budget counts both finalized images and pending
+            // uploads — otherwise a sender could exhaust memory by
+            // starting `max_images` uploads and never finishing them.
+            let live = self.state.shared.images.len() + self.pending_uploads.len();
+            if live as u32 >= self.limits.max_images {
+                return Err((ERR_TOO_MANY_IMAGES, "image budget exhausted"));
+            }
+            if (b.total_bytes as u64) > self.limits.max_image_bytes as u64 {
+                return Err((ERR_IMAGE_TOO_LARGE, "image exceeds max_image_bytes"));
+            }
+            // Encoding sniff: reject unknown encodings up front rather
+            // than waiting until the last chunk to decode and fail.
+            if !matches!(b.encoding, 0x01 | 0x02) {
+                return Err((ERR_BAD_PAYLOAD, "unknown image encoding"));
+            }
+
+            let mut pending = PendingUpload {
+                encoding: b.encoding,
+                width: b.width,
+                height: b.height,
+                total_bytes: b.total_bytes,
+                buf: vec![0; b.total_bytes as usize],
+                bytes_received: 0,
+            };
+            pending.buf[..data_len as usize].copy_from_slice(&b.data);
+            pending.bytes_received = data_len;
+
+            // Single-shot (offset=0, is_last=true) or stream — branch
+            // on the last-flag here so the finalize path is shared.
+            return self.absorb_or_finalize(b.id, pending, b.is_last);
+        }
+
+        // Subsequent chunk — must have a matching in-flight upload.
+        let mut pending = self
+            .pending_uploads
+            .remove(&b.id)
+            .ok_or((ERR_BAD_PAYLOAD, "no upload in progress for id"))?;
+
+        if pending.encoding != b.encoding
+            || pending.width != b.width
+            || pending.height != b.height
+            || pending.total_bytes != b.total_bytes
+            || pending.bytes_received != b.chunk_offset
+        {
+            // Metadata or order drifted — drop the buffer (we already
+            // removed it above) and surface the error.
+            return Err((ERR_BAD_PAYLOAD, "chunk does not match upload"));
+        }
+
+        pending.buf[b.chunk_offset as usize..end as usize].copy_from_slice(&b.data);
+        pending.bytes_received = end;
+
+        self.absorb_or_finalize(b.id, pending, b.is_last)
+    }
+
+    /// Either store the buffer back as pending (if more chunks remain)
+    /// or finalize it: decode → insert into `shared.images`. In both
+    /// cases the response body is a [`ChunkAckBody`] carrying the
+    /// cumulative `bytes_received` for the image id.
+    fn absorb_or_finalize(
+        &mut self,
+        id: String,
+        pending: PendingUpload,
+        is_last: bool,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        if !is_last {
+            let bytes_received = pending.bytes_received;
+            self.pending_uploads.insert(id.clone(), pending);
+            return Ok(ChunkAckBody {
+                image_id: &id,
+                bytes_received,
+            }
+            .encode());
+        }
+
+        // Last chunk: must have the full payload.
+        if pending.bytes_received != pending.total_bytes {
+            return Err((ERR_BAD_PAYLOAD, "is_last with bytes_received < total"));
+        }
+
+        let pixels = match pending.encoding {
+            0x01 => decode_raw_rgba8(&pending.buf, pending.width, pending.height)?,
+            0x02 => decode_webp(&pending.buf, pending.width, pending.height)?,
             _ => return Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
         };
 
         // Preserve the on-wire form so snapshot replay can reship the
         // image in its original encoding rather than inflating to RGBA8.
-        let source_encoding = b.encoding;
-        let source_data = b.data;
+        let bytes_received = pending.bytes_received;
+        let source_encoding = pending.encoding;
+        let source_data = pending.buf;
         self.state.shared.images.insert(
-            b.id,
+            id.clone(),
             UploadedImage {
-                width: b.width,
-                height: b.height,
+                width: pending.width,
+                height: pending.height,
                 pixels,
                 gpu: Cell::new(None),
                 source_encoding,
                 source_data,
             },
         );
-        Ok(Vec::new())
+        Ok(ChunkAckBody {
+            image_id: &id,
+            bytes_received,
+        }
+        .encode())
     }
 
     fn cmd_drop_image(&mut self, id: &str) -> Result<Vec<u8>, (u16, &'static str)> {
@@ -1631,17 +1759,21 @@ mod tests {
     }
 
     /// Build an `UploadImage` body for a 2x2 RGBA8 raw image (red,
-    /// green, blue, white).
+    /// green, blue, white). Single-chunk form: offset=0, is_last=true,
+    /// total_bytes = payload length.
     fn upload_raw_2x2(id: &str) -> Vec<u8> {
+        let pixels: [u8; 16] = [
+            0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ];
         let mut w = Writer::new();
         w.str(id);
         w.u8(0x01); // encoding Raw
         w.u32(2); // width
         w.u32(2); // height
-        let pixels = [
-            0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF,
-        ];
+        w.u32(pixels.len() as u32); // total_bytes
+        w.u32(0); // chunk_offset
+        w.bool(true); // is_last
         w.bytes(&pixels);
         w.buf
     }
@@ -1664,12 +1796,17 @@ mod tests {
     #[test]
     fn upload_raw_byte_count_mismatch_rejected() {
         let mut engine = VgeEngine::new((9, 20), 1.0);
-        // Announce 4x4 but send only 16 bytes (actually for 2x2).
+        // Announce 4x4 (64 bytes) but send only 16. is_last on this
+        // first-and-only chunk means the host hits the
+        // bytes_received < total_bytes finalization check.
         let mut w = Writer::new();
         w.str("bad");
         w.u8(0x01);
         w.u32(4);
         w.u32(4);
+        w.u32(64); // total_bytes
+        w.u32(0);
+        w.bool(true); // is_last with not enough data
         w.bytes(&[0u8; 16]);
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
@@ -1697,6 +1834,9 @@ mod tests {
         w.u8(0x99); // unknown encoding
         w.u32(1);
         w.u32(1);
+        w.u32(4);
+        w.u32(0);
+        w.bool(true);
         w.bytes(&[0u8; 4]);
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
@@ -1719,8 +1859,9 @@ mod tests {
         let mut r = Reader::new(&payload);
         let _ = r.u8();
         let _ = r.u32();
-        // Frame 1: Ok.
-        assert_eq!(r.u8().unwrap(), RSP_OK);
+        // Frame 1: ChunkAck (UploadImage uses the chunked-upload
+        // response frame, even for single-chunk uploads).
+        assert_eq!(r.u8().unwrap(), RSP_CHUNK_ACK);
         let _ = r.u32();
         let n1 = r.u32().unwrap() as usize;
         let _ = r.take(n1).unwrap();
@@ -1731,6 +1872,89 @@ mod tests {
         let err_body = r.take(body_len).unwrap();
         let mut er = Reader::new(err_body);
         assert_eq!(er.u16().unwrap(), ERR_DUPLICATE_IMAGE_ID);
+    }
+
+    /// Build one UploadImage chunk envelope body (just the command body
+    /// — caller still wraps with append_command).
+    fn upload_chunk_body(
+        id: &str,
+        encoding: u8,
+        width: u32,
+        height: u32,
+        total_bytes: u32,
+        chunk_offset: u32,
+        is_last: bool,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.u8(encoding);
+        w.u32(width);
+        w.u32(height);
+        w.u32(total_bytes);
+        w.u32(chunk_offset);
+        w.bool(is_last);
+        w.bytes(data);
+        w.buf
+    }
+
+    #[test]
+    fn upload_chunked_finalizes_on_last() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // 2x2 image (16 bytes) split into two 8-byte chunks.
+        let pixels: [u8; 16] = [
+            0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ];
+        let chunk_a = upload_chunk_body("stream", 0x01, 2, 2, 16, 0, false, &pixels[..8]);
+        let chunk_b = upload_chunk_body("stream", 0x01, 2, 2, 16, 8, true, &pixels[8..]);
+
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &chunk_a);
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 2, &chunk_b);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        // Image is only registered after the last chunk.
+        assert_eq!(engine.state.shared.images.len(), 1);
+        let img = engine.state.shared.images.get("stream").unwrap();
+        assert_eq!(img.source_data.as_slice(), &pixels);
+        // No leftover pending entry.
+        assert!(engine.pending_uploads.is_empty());
+
+        // Both frames produced a ChunkAck with the cumulative byte
+        // count for this id.
+        let response = engine.take_responses();
+        let payload = unwrap_t2c_envelope(&response);
+        let mut r = Reader::new(&payload);
+        let _ = r.u8(); // protocol_version
+        let _ = r.u32(); // payload_length
+        for expected_bytes in [8u32, 16u32] {
+            assert_eq!(r.u8().unwrap(), RSP_CHUNK_ACK);
+            let _ = r.u32(); // request_id
+            let body_len = r.u32().unwrap() as usize;
+            let body = r.take(body_len).unwrap();
+            let mut br = Reader::new(body);
+            assert_eq!(br.string().unwrap(), "stream");
+            assert_eq!(br.u32().unwrap(), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn upload_chunked_out_of_order_rejected() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // First chunk arrives, second chunk lies about its offset.
+        let chunk_a = upload_chunk_body("oo", 0x01, 2, 2, 16, 0, false, &[0u8; 8]);
+        let chunk_b = upload_chunk_body("oo", 0x01, 2, 2, 16, 12, true, &[0u8; 4]);
+
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &chunk_a);
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 2, &chunk_b);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        // Pending entry was dropped by the failing second chunk; no
+        // image was registered.
+        assert!(engine.state.shared.images.is_empty());
+        assert!(engine.pending_uploads.is_empty());
     }
 
     #[test]
@@ -2495,17 +2719,20 @@ mod tests {
     }
 
     /// Build a UploadImage Raw command body (encoding 0x01) for a
-    /// 2×2 image. Useful for populating shared.images.
+    /// 2×2 image. Single-chunk: offset=0, is_last=true.
     fn raw_upload_body(id: &str, color: [u8; 4]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&color);
+        }
         let mut w = vge_protocol::codec::Writer::new();
         w.str(id);
         w.u8(0x01); // encoding=Raw
         w.u32(2);
         w.u32(2);
-        let mut data = Vec::new();
-        for _ in 0..4 {
-            data.extend_from_slice(&color);
-        }
+        w.u32(data.len() as u32);
+        w.u32(0);
+        w.bool(true);
         w.bytes(&data);
         w.buf
     }

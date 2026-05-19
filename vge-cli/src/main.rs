@@ -717,11 +717,15 @@ fn build_command(cmd: Cmd) -> Result<Command> {
                     expected
                 );
             }
+            let total = data.len() as u32;
             Command::UploadImage(UploadImageBody {
                 id: a.id,
                 encoding: 0x01,
                 width: a.width,
                 height: a.height,
+                total_bytes: total,
+                chunk_offset: 0,
+                is_last: true,
                 data,
             })
         }
@@ -731,11 +735,15 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             // Peek dimensions so the user doesn't have to pass them.
             let img = image::load_from_memory_with_format(&data, image::ImageFormat::WebP)
                 .context("decoding WebP for dimension check")?;
+            let total = data.len() as u32;
             Command::UploadImage(UploadImageBody {
                 id: a.id,
                 encoding: 0x02,
                 width: img.width(),
                 height: img.height(),
+                total_bytes: total,
+                chunk_offset: 0,
+                is_last: true,
                 data,
             })
         }

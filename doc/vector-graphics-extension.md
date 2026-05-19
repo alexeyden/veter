@@ -129,14 +129,12 @@ f32  scale_factor              // device pixels per logical pixel (HiDPI)
 u32  max_elements              // soft cap; over-limit creates fail
 u32  max_commands_per_element
 u32  max_text_bytes            // per DrawText / UpdateText
-u32  max_image_bytes           // per UploadImage / UploadImageBegin
+u32  max_image_bytes           // per UploadImage (full image, not chunk)
 u32  max_images                // concurrent uploaded images; includes
-                               // in-progress chunked uploads (§8.3)
+                               // in-progress chunked uploads (§8.2)
 u8   supported_image_encodings // bitmask: bit0=Raw, bit1=WebP
 u8   max_nesting_depth         // parent-child nesting cap (§9); 0
                                // means parenting not supported
-u32  max_chunk_bytes           // upper bound on a single
-                               // UploadImageChunk payload (§8.3)
 ```
 
 If the terminal does not support the extension, no response is emitted; the
@@ -174,8 +172,6 @@ later sections.
 | 0x0D | DropImage          | §8.2         |
 | 0x0E | ClearAll           | §6.7         |
 | 0x0F | UpdateSize         | §9.5         |
-| 0x10 | UploadImageBegin   | §8.3         |
-| 0x11 | UploadImageChunk   | §8.3         |
 
 All other frame_type values are reserved and MUST be rejected with
 `err_unknown_command`.
@@ -190,6 +186,7 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x01 | Ok             | command-specific (often empty)                           |
 | 0x02 | Err            | `u16 error_code, string message`                         |
 | 0x03 | ProbeResponse  | as in §2.1                                               |
+| 0x04 | ChunkAck       | `string image_id, u32 bytes_received` (§8.2)             |
 
 `error_code` values:
 
@@ -209,9 +206,6 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x0032 | err_image_decode        | Image bytes failed to decode (e.g. bad WebP)     |
 | 0x0033 | err_duplicate_image_id  | image ID already in use (UploadImage)            |
 | 0x0034 | err_too_many_images     | Image budget exhausted                           |
-| 0x0035 | err_chunk_overflow      | UploadImageChunk would push cumulative > total_bytes |
-| 0x0036 | err_chunk_no_upload     | UploadImageChunk targets an id with no in-progress upload |
-| 0x0037 | err_chunk_too_large     | Single chunk exceeds advertised max_chunk_bytes  |
 | 0x0040 | err_max_nesting_depth   | parenting would exceed advertised cap            |
 | 0x00FF | err_internal            | Terminal-side failure                            |
 
@@ -701,16 +695,16 @@ ascent of the primary font).
 
 ```
 rect    target_rect           ; cell units, relative to element.origin
-string  image_id              ; references an uploaded image (§8.2 / §8.3)
+string  image_id              ; references an uploaded image (§8.2)
 u8      flags                 ; bit0 = has_source_rect
                               ; bits 1..7 reserved (must be 0)
 ; if bit0 (has_source_rect):
 rect    source_rect_px        ; f32 x,y,w,h in source image pixels
 ```
 
-The image must have been fully uploaded with `UploadImage` (§8.2) or
-finalized via `UploadImageBegin` / `UploadImageChunk` (§8.3) prior to
-the command being processed. An in-progress chunked upload is not yet
+The image must have been fully uploaded with `UploadImage` (§8.2) —
+the final chunk (`is_last = true`) must already have been processed
+when this command runs. An in-progress chunked upload is not yet
 visible; referencing its id → `err_unknown_image`. Unknown ID →
 `err_unknown_image` and the enclosing `CreateElement` /
 `UpdateCommands` / `UpdateCommand` fails atomically.
@@ -766,10 +760,12 @@ can hold large images once and reference them cheaply, and animations
 can cycle through pre-uploaded frames via `UpdateImage` without
 re-transmitting pixel data.
 
-Small images are uploaded in a single envelope (§8.2). Large images
-may be split across many envelopes using the chunked upload commands
-(§8.3) so the sender can pace its writes, surface byte-level progress
-to the user (e.g. over SSH), and stay within `max_chunk_bytes`.
+`UploadImage` (§8.2) is chunk-aware: every upload carries
+`total_bytes`, `chunk_offset`, and an `is_last` flag, so a small
+image fits in a single chunk (offset=0, is_last=true) while a large
+image streams across many envelopes. The terminal answers each chunk
+with a `ChunkAck` carrying `bytes_received` so the sender can surface
+byte-level progress to the user (e.g. over SSH).
 
 ### 8.1 ImageData encoding
 
@@ -789,23 +785,91 @@ oversized images before invoking the WebP decoder.)
 
 ```
 UploadImage:
-  string    id              ; non-empty, ≤ 64 UTF-8 bytes
-  ImageData data
+  string id                ; non-empty, ≤ 64 UTF-8 bytes
+  u8     encoding          ; 0x01 = Raw RGBA8, 0x02 = WebP (§8.1)
+  u32    width
+  u32    height
+  u32    total_bytes       ; size of the full payload (sum of all
+                           ; chunks). Repeated in every chunk.
+  u32    chunk_offset      ; byte offset of `data` inside the full
+                           ; payload. First chunk MUST set to 0.
+  bool   is_last           ; true on the final chunk; the terminal
+                           ; runs encoding-specific validation
+                           ; (§8.1) and registers the image only on
+                           ; this transition.
+  bytes  data              ; chunk bytes (varu length prefix); NOT
+                           ; the full image — see `total_bytes`.
 
 DropImage:
   string id
 ```
 
-`UploadImage` registers the image under `id`. If `id` is already in use
-→ `err_duplicate_image_id`. If the image table is at capacity
-(`max_images`) → `err_too_many_images`. If the encoded data exceeds
-`max_image_bytes` → `err_image_too_large`. If WebP decoding fails →
-`err_image_decode`. Response: empty Ok.
+Single-shot uploads (small images) set `chunk_offset = 0`,
+`is_last = true`, and put the entire payload in `data` — equivalent
+to a pre-chunked-upload `UploadImage` plus a `total_bytes` field.
 
-`DropImage` removes the entry if present; unknown ID → `err_unknown_image`.
-Live `DrawImage` references to the dropped ID degrade to magenta debug
-fills per §7.5, but the elements themselves are not modified. Response:
+The terminal responds to every chunk (single-shot included) with
+`ChunkAck`:
+
+```
+ChunkAck body:
+  string image_id
+  u32    bytes_received    ; cumulative bytes absorbed for this id;
+                           ; equals `total_bytes` on the final chunk.
+```
+
+Lifecycle:
+
+1. **First chunk** (`chunk_offset == 0`): the terminal validates id,
+   encoding, and size:
+   - `id` already in use (live or in-progress) →
+     `err_duplicate_image_id`.
+   - `encoding` not in advertised `supported_image_encodings` →
+     `err_bad_payload`.
+   - `total_bytes > max_image_bytes` → `err_image_too_large`.
+   - Image table full (live + in-progress) → `err_too_many_images`.
+
+   On success it allocates a `total_bytes`-sized buffer, copies
+   `data` at offset 0, and replies `ChunkAck { id, bytes_received =
+   data.len() }`. The slot counts against `max_images` from this
+   point on (so concurrent in-progress uploads cannot exceed the
+   budget).
+
+2. **Subsequent chunks** (`chunk_offset > 0`) MUST match the
+   in-progress slot:
+   - No slot with this `id` → `err_bad_payload`.
+   - Any of `encoding`, `width`, `height`, `total_bytes` differs
+     from the first chunk → `err_bad_payload`, slot dropped.
+   - `chunk_offset != bytes_received` (out of order or gap) →
+     `err_bad_payload`, slot dropped.
+   - `chunk_offset + data.len() > total_bytes` → `err_bad_payload`,
+     slot dropped.
+
+   On success the chunk is appended at `chunk_offset`,
+   `bytes_received` advances, and a `ChunkAck` is emitted.
+
+3. The chunk with `is_last == true` triggers **finalize**:
+   `bytes_received` must equal `total_bytes` (else
+   `err_bad_payload`); then the encoding-specific validation from
+   §8.1 runs (Raw size must equal `width * height * 4`; WebP is
+   decoded and decoded dimensions must match). On success the image
+   moves from in-progress to finalized and the final `ChunkAck`
+   carries `bytes_received == total_bytes`. On failure the slot is
+   dropped, `id` is released, and the response is `err_image_decode`
+   (decode failure) or `err_bad_payload` (length mismatch).
+
+`DropImage` removes a finalized entry; on an in-progress `id` it
+also aborts the upload. Unknown ID → `err_unknown_image`. Live
+`DrawImage` references to a dropped ID degrade to magenta debug fills
+per §7.5; the elements themselves are not modified. Drawing against
+an in-progress `id` yields `err_unknown_image` until finalize — the
+image is not addressable for rendering before that point. Response:
 empty Ok.
+
+Multiple chunked uploads can be in progress concurrently against
+distinct `id`s, bounded only by `max_images`. Clients interleaving
+chunks for different ids are responsible for ordering them within
+each id; the terminal does not buffer or reorder.
 
 Image IDs share the same namespace rules as element IDs (§6.8) but live
 in a separate table — an element ID and an image ID with the same string
@@ -815,84 +879,10 @@ Image data is held verbatim by the terminal (Raw stays Raw, WebP stays
 WebP); decoding to a renderable representation is implementation-defined
 and may be lazy or eager.
 
-### 8.3 Chunked upload: UploadImageBegin (0x10) / UploadImageChunk (0x11)
-
-A chunked upload streams a single image across many frames. The
-intended use cases are oversized images that would not fit in one
-envelope comfortably, and progress reporting on the sender side (the
-sender knows how many bytes it has flushed of `total_bytes`).
-
-```
-UploadImageBegin:
-  string id                ; non-empty, ≤ 64 UTF-8 bytes
-  u8     encoding          ; 0x01 = Raw RGBA8, 0x02 = WebP (§8.1)
-  u32    width
-  u32    height
-  u32    total_bytes       ; size of the pixel/file payload that will
-                           ; arrive across subsequent UploadImageChunk
-                           ; frames, summed; matches the `data` field
-                           ; of the equivalent single-shot UploadImage
-
-UploadImageChunk:
-  string id
-  bytes  chunk             ; raw payload bytes (varu length prefix)
-```
-
-Lifecycle:
-
-1. `UploadImageBegin` reserves `id` in the image table as an
-   **in-progress** slot, locks in the metadata, and counts against
-   `max_images` exactly like a finalized image. Pre-flight checks:
-   - `id` already in use (in-progress or finalized) →
-     `err_duplicate_image_id`.
-   - `encoding` bit not set in advertised `supported_image_encodings`
-     → `err_bad_payload`.
-   - `total_bytes > max_image_bytes` → `err_image_too_large`.
-   - Image table full → `err_too_many_images`.
-
-   On any error the slot is never created and `id` stays free.
-   Response: empty Ok.
-
-2. Each `UploadImageChunk` appends `chunk` bytes to the slot in
-   arrival order. Chunks within an envelope are processed
-   sequentially, and the spec defines no offset / out-of-order
-   semantics. Checks per chunk:
-   - No in-progress slot with this `id` (never begun, already
-     finalized, or aborted) → `err_chunk_no_upload`.
-   - `chunk.length > max_chunk_bytes` → `err_chunk_too_large`.
-   - `bytes_received + chunk.length > total_bytes` →
-     `err_chunk_overflow`.
-
-   On any error the slot is dropped and the `id` released; the
-   client must restart from `UploadImageBegin` to retry. Successful
-   chunks respond empty Ok unless the chunk triggers finalize (next
-   step).
-
-3. The chunk whose arrival brings `bytes_received` up to
-   `total_bytes` triggers **implicit finalize**: the encoding-specific
-   validation from §8.1 runs (Raw size must equal
-   `width * height * 4`; WebP file is decoded and the decoded
-   dimensions must match `width`/`height`). If finalize succeeds, the
-   image moves from in-progress to finalized and that chunk's
-   response is empty Ok. If finalize fails (Raw size mismatch, WebP
-   decode error, decoded WebP dimensions disagree) the slot is
-   dropped, `id` is released, and the chunk's response carries
-   `err_image_decode`.
-
-`DropImage` on an in-progress `id` aborts the upload: the slot is
-dropped and `id` is released. Drawing against an in-progress `id`
-yields `err_unknown_image` until finalize — the image is not
-addressable for rendering before that point.
-
-Multiple chunked uploads can be in progress concurrently against
-distinct `id`s, bounded only by `max_images`. Clients interleaving
-chunks for different ids are responsible for ordering them
-correctly; the terminal does not buffer or reorder.
-
-Reset (`RIS` / `DECSTR`, §5.6) wipes the image table and so drops
-every in-progress slot too; the screen-buffer switch (§5.4) does
-not — chunked uploads continue across an alt-screen swap exactly
-like finalized images survive it.
+Reset (`RIS` / `DECSTR`, §5.6) wipes both finalized images and
+in-progress slots; the screen-buffer switch (§5.4) does not — chunked
+uploads continue across an alt-screen swap exactly like finalized
+images survive it.
 
 ## 9. Element parenting and clipping
 
@@ -1167,20 +1157,19 @@ with the relevant error code. A non-exhaustive list:
 - `max_commands_per_element`: applies to both `CreateElement` and
   `UpdateCommands`.
 - `max_text_bytes`: per `DrawText` text field after any `UpdateText`.
-- `max_image_bytes`: byte size of a single `ImageData` payload at
-  `UploadImage`, or `total_bytes` at `UploadImageBegin`.
+- `max_image_bytes`: byte size of the full `UploadImage` payload — i.e.
+  `total_bytes` from §8.2, summed across all chunks. Not a per-chunk
+  cap.
 - `max_images`: number of concurrently-allocated entries in the
-  session image table (§8). In-progress chunked uploads (§8.3) count
+  session image table (§8). In-progress chunked uploads (§8.2) count
   toward this budget exactly like finalized images.
-- `max_chunk_bytes`: byte size of a single `UploadImageChunk` payload
-  (§8.3).
 - `max_nesting_depth`: parent-child tree depth (§9.7). 0 means
   parenting unsupported.
 
 The reference implementation in this repo SHOULD start with: 4096
 elements, 4096 commands per element, 1 MiB text per command, 32 MiB per
-image, 1024 concurrent images, 64 KiB per chunk, 16 levels of parent
-nesting. These numbers can be tuned without breaking the protocol.
+image, 1024 concurrent images, 16 levels of parent nesting. These
+numbers can be tuned without breaking the protocol.
 
 ## 12. Interaction with existing terminal state
 
