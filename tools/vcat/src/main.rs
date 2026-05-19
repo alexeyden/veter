@@ -60,8 +60,10 @@ struct Cli {
     /// `oxideav-webp` encoder so the workspace builds clean against
     /// `aarch64-unknown-linux-musl` without a C cross-compiler.
     /// Lossy quality is controlled by `--quality` (0..=100).
-    #[arg(long, value_enum, default_value_t = Mode::Raw)]
-    mode: Mode,
+    /// If unset, defaults to `webp-lossy` when an SSH session is
+    /// detected (`SSH_CONNECTION` / `SSH_TTY` set) and `raw` otherwise.
+    #[arg(long, value_enum)]
+    mode: Option<Mode>,
 
     /// Quality for `--mode webp-lossy`, in 0..=100. Ignored for the
     /// other modes.
@@ -87,6 +89,14 @@ macro_rules! trace {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let v = cli.verbose;
+    let mode = cli.mode.unwrap_or_else(|| {
+        if is_ssh_session() {
+            trace!(v, "ssh session detected, defaulting mode=webp-lossy");
+            Mode::WebpLossy
+        } else {
+            Mode::Raw
+        }
+    });
 
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -193,9 +203,9 @@ fn main() -> Result<()> {
     let pid = std::process::id();
     let img_id = format!("vcat-img-{pid}");
     let elem_id = format!("vcat-el-{pid}");
-    trace!(v, "encoding mode={:?}", cli.mode);
+    trace!(v, "encoding mode={:?}", mode);
     let raw_rgba = resized.into_raw();
-    let (encoding, payload) = match cli.mode {
+    let (encoding, payload) = match mode {
         Mode::Raw => (0x01u8, raw_rgba),
         Mode::WebpLossless => {
             // oxideav-webp's lossless path expects packed ARGB u32s.
@@ -514,6 +524,16 @@ fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     let fd = std::io::stdin().as_raw_fd();
     let n = nix::unistd::read(fd, buf).context("read(stdin)")?;
     Ok(n)
+}
+
+/// True if any of the standard sshd-set env vars are present in this
+/// process's environment. SSH_CONNECTION and SSH_CLIENT are set on
+/// interactive logins; SSH_TTY is set when a tty is allocated. Any one
+/// of them is enough to mean "this shell came in over ssh."
+fn is_ssh_session() -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
 fn winsize_cols() -> Option<u16> {
