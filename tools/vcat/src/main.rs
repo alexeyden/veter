@@ -211,23 +211,16 @@ fn main() -> Result<()> {
     let (encoding, payload) = match mode {
         Mode::Raw => (0x01u8, raw_rgba),
         Mode::WebpLossless => {
-            // oxideav-webp's lossless path expects packed ARGB u32s.
-            let argb: Vec<u32> = raw_rgba
-                .chunks_exact(4)
-                .map(|c| {
-                    ((c[3] as u32) << 24)
-                        | ((c[0] as u32) << 16)
-                        | ((c[1] as u32) << 8)
-                        | (c[2] as u32)
-                })
-                .collect();
-            let out = oxideav_webp::encode_vp8l_argb(
+            let cfg = zenwebp::LosslessConfig::new();
+            let out = zenwebp::EncodeRequest::lossless(
+                &cfg,
+                &raw_rgba,
+                zenwebp::PixelLayout::Rgba8,
                 placement.target_px_w,
                 placement.target_px_h,
-                &argb,
-                /* has_alpha */ true,
             )
-            .context("webp lossless encode")?;
+            .encode()
+            .map_err(|e| anyhow!("webp lossless encode: {e}"))?;
             trace!(v, "webp lossless: {} -> {} bytes", raw_rgba.len(), out.len());
             (0x02u8, out)
         }
@@ -235,14 +228,16 @@ fn main() -> Result<()> {
             if !cli.quality.is_finite() || !(0.0..=100.0).contains(&cli.quality) {
                 bail!("--quality must be in 0..=100, got {}", cli.quality);
             }
-            let out = oxideav_webp::encode_vp8_lossy_rgba(
+            let cfg = zenwebp::LossyConfig::new().with_quality(cli.quality);
+            let out = zenwebp::EncodeRequest::lossy(
+                &cfg,
+                &raw_rgba,
+                zenwebp::PixelLayout::Rgba8,
                 placement.target_px_w,
                 placement.target_px_h,
-                &raw_rgba,
-                cli.quality,
-                &oxideav_webp::WebpMetadata::default(),
             )
-            .context("webp lossy encode")?;
+            .encode()
+            .map_err(|e| anyhow!("webp lossy encode: {e}"))?;
             trace!(
                 v,
                 "webp lossy q={}: {} -> {} bytes",
