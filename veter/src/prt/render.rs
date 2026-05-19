@@ -32,6 +32,10 @@ pub struct PortalSelectionCtx<'a> {
     pub anchor_col: u16,
     pub head_line: i64,
     pub head_col: u16,
+    /// Mirror of `Selection::block_cols` so the per-portal render
+    /// path can resolve smart pane selections the same way the host
+    /// does (rectangle, not stream).
+    pub block_cols: Option<(u16, u16)>,
 }
 
 /// One top-level layer in the unified render order: either a host VGE
@@ -98,6 +102,7 @@ pub fn render_layers<T: Renderer>(
                         anchor_col: s.anchor_col,
                         head_line: s.head_line,
                         head_col: s.head_col,
+                        block_cols: s.block_cols,
                     })
                 });
                 render_portal_at(
@@ -202,6 +207,7 @@ fn render_portal_at<T: Renderer>(
             s.anchor_col,
             s.head_line,
             s.head_col,
+            s.block_cols,
             portal_top,
             portal_scrollback,
             portal.size_h as u16,
@@ -294,6 +300,7 @@ fn render_portal_at<T: Renderer>(
                         anchor_col: s.anchor_col,
                         head_line: s.head_line,
                         head_col: s.head_col,
+                        block_cols: s.block_cols,
                     })
                 });
                 render_portal_at(

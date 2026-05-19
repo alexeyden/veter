@@ -61,6 +61,14 @@ struct Selection {
     /// on release; the selection itself stays so Ctrl+Shift+C can
     /// re-copy it later.
     dragging: bool,
+    /// Smart pane select. When `Some((left, right))`, this is an
+    /// ordinary stream selection clipped to columns `[left, right]` —
+    /// the head still tracks the pointer, but its column is clamped to
+    /// these bounds and middle-row spans are clipped to them too, so
+    /// the highlight stays inside the pane (tmux split, opencode side
+    /// panel, …) detected at drag-start (Shift+Alt) instead of
+    /// bleeding across borders.
+    block_cols: Option<(u16, u16)>,
 }
 
 impl Selection {
@@ -189,6 +197,15 @@ fn extract_text_from_parser<CB: vt100::Callbacks>(
     let (rows, cols) = parser.screen().size();
     let saved = parser.screen().scrollback();
     let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
+    // Smart pane select replaces the "0..cols" full-row span with the
+    // detected pane bounds so middle-row content from outside the pane
+    // isn't pulled in. Wrap-joining is also disabled — the host vt100's
+    // wrap flag reflects the full host width, which is meaningless when
+    // we're slicing a narrower pane band out of it.
+    let (clip_left, clip_right_open, in_pane) = match sel.block_cols {
+        Some((l, r)) => (l, r.saturating_add(1).min(cols), true),
+        None => (0u16, cols, false),
+    };
 
     let mut text = String::new();
     for line in s_line..=e_line {
@@ -204,16 +221,16 @@ fn extract_text_from_parser<CB: vt100::Callbacks>(
         let (col_start, col_end_open) = if line == s_line && line == e_line {
             (s_col, e_col.saturating_add(1).min(cols))
         } else if line == s_line {
-            (s_col, cols)
+            (s_col, clip_right_open)
         } else if line == e_line {
-            (0, e_col.saturating_add(1).min(cols))
+            (clip_left, e_col.saturating_add(1).min(cols))
         } else {
-            (0u16, cols)
+            (clip_left, clip_right_open)
         };
         let row_text = parser
             .screen()
             .contents_between(row, col_start, row, col_end_open);
-        let wrapped = parser.screen().row_wrapped(row);
+        let wrapped = !in_pane && parser.screen().row_wrapped(row);
         let is_last = line == e_line;
         if is_last || wrapped {
             text.push_str(&row_text);
@@ -261,6 +278,102 @@ fn cell_char_at<CB: vt100::Callbacks>(
         return parser.screen().cell(row, col - 1)?.contents().chars().next();
     }
     cell.contents().chars().next()
+}
+
+/// Read the background color at (line, col), with the same scrollback
+/// trick as `cell_char_at`. Wide continuation cells inherit the lead
+/// cell's bg so the two halves don't look like a colour transition to
+/// `detect_pane_cols`.
+fn cell_bg_at<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    line: i64,
+    col: u16,
+) -> Option<vt100::Color> {
+    let (rows, _) = parser.screen().size();
+    let target = (top_of_live_screen - line).max(0) as usize;
+    parser.screen_mut().set_scrollback(target);
+    let actual = parser.screen().scrollback() as i64;
+    let viewport_top = top_of_live_screen - actual;
+    let row_in_view = line - viewport_top;
+    if row_in_view < 0 || row_in_view >= rows as i64 {
+        return None;
+    }
+    let row = row_in_view as u16;
+    let cell = parser.screen().cell(row, col)?;
+    if cell.is_wide_continuation() && col > 0 {
+        return Some(parser.screen().cell(row, col - 1)?.bgcolor());
+    }
+    Some(cell.bgcolor())
+}
+
+/// A cell counts as a pane boundary if its glyph is a box-drawing
+/// (U+2500..U+257F) or block-element (U+2580..U+259F) character. These
+/// are what tmux, vmux's own chrome, and TUIs like opencode draw their
+/// frames with, so walking until we hit one is a reliable way to find
+/// the side of the pane the click landed in.
+fn is_pane_boundary_char(c: char) -> bool {
+    let code = c as u32;
+    (0x2500..=0x257F).contains(&code) || (0x2580..=0x259F).contains(&code)
+}
+
+/// Detect the horizontal pane bounds for a smart block selection.
+/// Starting at (line, col), walk left and right along the same row,
+/// stopping on either a pane-boundary glyph or a background-colour
+/// change relative to the anchor cell. The returned `(left, right)` is
+/// an inclusive cell range that the drag's column extent will be
+/// locked to. Returns `None` if the anchor cell can't be read at all
+/// (off-screen, no cell), which leaves the caller to fall back to
+/// ordinary stream selection.
+fn detect_pane_cols<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    line: i64,
+    col: u16,
+) -> Option<(u16, u16)> {
+    let (_, cols) = parser.screen().size();
+    let saved = parser.screen().scrollback();
+    let anchor_bg = cell_bg_at(parser, top_of_live_screen, line, col)?;
+    let anchor_ch = cell_char_at(parser, top_of_live_screen, line, col);
+    // Clicking *on* a border itself: collapse to that single column so
+    // the user gets some visible feedback rather than a surprise full-
+    // row selection.
+    if anchor_ch.is_some_and(is_pane_boundary_char) {
+        parser.screen_mut().set_scrollback(saved);
+        return Some((col, col));
+    }
+
+    let stop = |parser: &mut vt100::Parser<CB>, probe_col: u16| -> bool {
+        let ch = cell_char_at(parser, top_of_live_screen, line, probe_col);
+        if ch.is_some_and(is_pane_boundary_char) {
+            return true;
+        }
+        match cell_bg_at(parser, top_of_live_screen, line, probe_col) {
+            Some(bg) => bg != anchor_bg,
+            // Unreadable cell means we've fallen off the grid: stop.
+            None => true,
+        }
+    };
+
+    let mut left = col;
+    while left > 0 {
+        let probe = left - 1;
+        if stop(parser, probe) {
+            break;
+        }
+        left = probe;
+    }
+    let mut right = col;
+    while right + 1 < cols {
+        let probe = right + 1;
+        if stop(parser, probe) {
+            break;
+        }
+        right = probe;
+    }
+
+    parser.screen_mut().set_scrollback(saved);
+    Some((left, right))
 }
 
 /// True if the row containing `line` has its wrap flag set, meaning
@@ -618,7 +731,13 @@ impl App {
             && s.dragging
         {
             s.head_line = line;
-            s.head_col = col;
+            // In a smart pane selection the head still tracks the
+            // pointer, but the column is clamped to the pane bounds
+            // detected at drag-start so the highlight can't escape.
+            s.head_col = match s.block_cols {
+                Some((left, right)) => col.clamp(left, right),
+                None => col,
+            };
         }
     }
 
@@ -743,6 +862,30 @@ impl App {
             let _ = pty.write_all(payload.as_bytes());
         }
         true
+    }
+
+    /// Detect the pane-locked column range for a smart block selection
+    /// at (line, col) on `target`. Same host/portal dispatch as
+    /// `find_word_range`.
+    fn detect_pane_cols_for(
+        &mut self,
+        target: &SelectionTarget,
+        line: i64,
+        col: u16,
+    ) -> Option<(u16, u16)> {
+        match target {
+            SelectionTarget::Host => {
+                let parser = self.parser.as_mut()?;
+                let top_live = self.prt.as_ref()?.top_of_live_screen();
+                detect_pane_cols(parser, top_live, line, col)
+            }
+            SelectionTarget::Portal(path) => {
+                let prt = self.prt.as_mut()?;
+                let portal = resolve_portal_target_mut(prt, path)?;
+                let top_live = portal.children.top_of_live_screen();
+                detect_pane_cols(&mut portal.vt, top_live, line, col)
+            }
+        }
     }
 
     /// Resolve a double-click at (line, col) on `target` to the word
@@ -1467,6 +1610,7 @@ impl ApplicationHandler for App {
                                 head_line: e_line,
                                 head_col: e_col,
                                 dragging: false,
+                                block_cols: None,
                             });
                             self.copy_selection_to_clipboard(true);
                             self.last_click = None;
@@ -1476,7 +1620,33 @@ impl ApplicationHandler for App {
                             return;
                         }
                         self.last_click = Some((now, target.clone(), pos));
-                        if shift {
+                        let alt = self.modifiers.alt_key();
+                        if shift && alt {
+                            // Smart pane-aware select: detect the column
+                            // bounds of the pane under the click and use
+                            // them as a clip range for an otherwise
+                            // ordinary stream selection — the drag flows
+                            // row-by-row like Shift+drag but never bleeds
+                            // outside the detected pane.
+                            if let Some((line, col)) = self.cursor_to_abs(pos, &target)
+                                && let Some((left, right)) =
+                                    self.detect_pane_cols_for(&target, line, col)
+                            {
+                                let c = col.clamp(left, right);
+                                self.selection = Some(Selection {
+                                    target,
+                                    anchor_line: line,
+                                    anchor_col: c,
+                                    head_line: line,
+                                    head_col: c,
+                                    dragging: true,
+                                    block_cols: Some((left, right)),
+                                });
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                            }
+                        } else if shift {
                             if let Some((line, col)) = self.cursor_to_abs(pos, &target) {
                                 self.selection = Some(Selection {
                                     target,
@@ -1485,6 +1655,7 @@ impl ApplicationHandler for App {
                                     head_line: line,
                                     head_col: col,
                                     dragging: true,
+                                    block_cols: None,
                                 });
                                 if let Some(w) = &self.window {
                                     w.request_redraw();
@@ -1692,6 +1863,7 @@ impl ApplicationHandler for App {
                             s.anchor_col,
                             s.head_line,
                             s.head_col,
+                            s.block_cols,
                             prt.top_of_live_screen(),
                             current,
                             rows,
@@ -1706,6 +1878,7 @@ impl ApplicationHandler for App {
                                 anchor_col: s.anchor_col,
                                 head_line: s.head_line,
                                 head_col: s.head_col,
+                                block_cols: s.block_cols,
                             })
                         } else {
                             None

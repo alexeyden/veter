@@ -29,12 +29,16 @@ const TEXTURE_SIZE: usize = 512;
 /// above the viewport (anchor in scrollback that's now off-screen);
 /// `end_row` may exceed `rows` for the same reason at the bottom.
 /// Half-open: `[start, end)` in lexicographic (row, col) order.
+/// `block_cols`, when `Some`, additionally clips each visible row to
+/// the pane's column band so a smart pane select can't bleed across
+/// borders.
 #[derive(Copy, Clone, Debug)]
 pub struct SelectionRange {
     pub start_row: i32,
     pub start_col: u16,
     pub end_row: i32,
     pub end_col: u16,
+    pub block_cols: Option<(u16, u16)>,
 }
 
 impl SelectionRange {
@@ -42,7 +46,15 @@ impl SelectionRange {
         let pos = (row as i32, col);
         let start = (self.start_row, self.start_col);
         let end = (self.end_row, self.end_col);
-        pos >= start && pos < end
+        if pos < start || pos >= end {
+            return false;
+        }
+        if let Some((left, right)) = self.block_cols
+            && (col < left || col > right)
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -50,13 +62,17 @@ impl SelectionRange {
 /// scrollback line coords) into a half-open `SelectionRange` in that
 /// vt100's currently-visible row coords. Used by both the host call
 /// site and per-portal render to avoid duplicating the math.
-/// Returns `None` for empty or fully off-screen selections.
+/// Returns `None` for empty or fully off-screen selections. When
+/// `block_cols` is `Some`, the lex range is the same as without
+/// (since the head's column is already clamped to the pane at drag
+/// time), but `contains` will additionally clip each row to that band.
 #[allow(clippy::too_many_arguments)]
 pub fn selection_range_from_abs(
     anchor_line: i64,
     anchor_col: u16,
     head_line: i64,
     head_col: u16,
+    block_cols: Option<(u16, u16)>,
     top_of_live_screen: i64,
     scrollback: usize,
     rows: u16,
@@ -87,6 +103,7 @@ pub fn selection_range_from_abs(
         start_col: s_col,
         end_row: e_row,
         end_col: e_col_open,
+        block_cols,
     })
 }
 
