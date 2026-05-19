@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use image::ImageReader;
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::{Point, Reader, Rect};
@@ -34,6 +34,13 @@ use vge_protocol::frame::*;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Display an image inside a VGE-aware terminal.")]
+#[command(group(
+    // The mode-selecting flags are mutually exclusive: pick one of
+    // `--mode <m>`, `-r`, `-l`, or `-L Q`, or none (auto-detect).
+    ArgGroup::new("encoding")
+        .args(["mode", "raw", "lossless", "lossy"])
+        .multiple(false)
+))]
 struct Cli {
     /// Path to a PNG, JPEG, or WebP file.
     file: PathBuf,
@@ -58,20 +65,34 @@ struct Cli {
     verbose: bool,
 
     /// Wire encoding for the uploaded image. `raw` sends straight
-    /// RGBA8 bytes (fastest to encode, biggest payload).
-    /// `webp-lossless` and `webp-lossy` both ride the pure-Rust
-    /// `oxideav-webp` encoder so the workspace builds clean against
-    /// `aarch64-unknown-linux-musl` without a C cross-compiler.
-    /// Lossy quality is controlled by `--quality` (0..=100).
-    /// If unset, defaults to `webp-lossy` when an SSH session is
-    /// detected (`SSH_CONNECTION` / `SSH_TTY` set) and `raw` otherwise.
+    /// RGBA8 bytes (fastest to encode, biggest payload). `webp-lossless`
+    /// and `webp-lossy` both ride the pure-Rust `zenwebp` encoder.
+    /// Lossy quality is controlled by `--quality` (0..=100). Shorthand
+    /// flags: `-r` (raw), `-l` (lossless), `-L Q` (lossy at quality Q).
+    /// If no mode flag is given, defaults to `webp-lossy` when an SSH
+    /// session is detected (`SSH_CONNECTION` / `SSH_TTY` set), `raw`
+    /// otherwise.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
 
     /// Quality for `--mode webp-lossy`, in 0..=100. Ignored for the
-    /// other modes.
-    #[arg(long, default_value_t = 75.0)]
+    /// other modes. Conflicts with `-L` (which packs mode + quality
+    /// into one flag).
+    #[arg(long, default_value_t = 75.0, conflicts_with = "lossy")]
     quality: f32,
+
+    /// Shorthand for `--mode raw`.
+    #[arg(short = 'r', long = "raw")]
+    raw: bool,
+
+    /// Shorthand for `--mode webp-lossless`.
+    #[arg(short = 'l', long = "lossless")]
+    lossless: bool,
+
+    /// Shorthand for `--mode webp-lossy --quality QUALITY`. QUALITY
+    /// must be in 0..=100.
+    #[arg(short = 'L', long = "lossy", value_name = "QUALITY")]
+    lossy: Option<f32>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -92,14 +113,25 @@ macro_rules! trace {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let v = cli.verbose;
-    let mode = cli.mode.unwrap_or_else(|| {
-        if is_ssh_session() {
-            trace!(v, "ssh session detected, defaulting mode=webp-lossy");
-            Mode::WebpLossy
-        } else {
-            Mode::Raw
-        }
-    });
+    // Resolve the effective (mode, quality) from the four
+    // mode-selecting flags. The ArgGroup on `Cli` already guarantees
+    // at most one of (`mode`, `raw`, `lossless`, `lossy`) is set, so
+    // the order of these branches doesn't matter for correctness — it
+    // just reads top-to-bottom in declaration order.
+    let (mode, quality) = if cli.raw {
+        (Mode::Raw, cli.quality)
+    } else if cli.lossless {
+        (Mode::WebpLossless, cli.quality)
+    } else if let Some(q) = cli.lossy {
+        (Mode::WebpLossy, q)
+    } else if let Some(m) = cli.mode {
+        (m, cli.quality)
+    } else if is_ssh_session() {
+        trace!(v, "ssh session detected, defaulting mode=webp-lossy");
+        (Mode::WebpLossy, cli.quality)
+    } else {
+        (Mode::Raw, cli.quality)
+    };
 
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -225,10 +257,10 @@ fn main() -> Result<()> {
             (0x02u8, out)
         }
         Mode::WebpLossy => {
-            if !cli.quality.is_finite() || !(0.0..=100.0).contains(&cli.quality) {
-                bail!("--quality must be in 0..=100, got {}", cli.quality);
+            if !quality.is_finite() || !(0.0..=100.0).contains(&quality) {
+                bail!("quality must be in 0..=100, got {}", quality);
             }
-            let cfg = zenwebp::LossyConfig::new().with_quality(cli.quality);
+            let cfg = zenwebp::LossyConfig::new().with_quality(quality);
             let out = zenwebp::EncodeRequest::lossy(
                 &cfg,
                 &raw_rgba,
@@ -241,7 +273,7 @@ fn main() -> Result<()> {
             trace!(
                 v,
                 "webp lossy q={}: {} -> {} bytes",
-                cli.quality,
+                quality,
                 raw_rgba.len(),
                 out.len()
             );
