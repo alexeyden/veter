@@ -725,10 +725,101 @@ const MODAL_BODY_LINES_ID: &str = "vmux-modal-body";
 const MODAL_TRACK_ID: &str = "vmux-modal-track";
 const MODAL_THUMB_ID: &str = "vmux-modal-thumb";
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
+/// Tab labels longer than this many characters are elided with `…` in
+/// the tab bar so a single long title can't crowd out every other tab.
+const TABBAR_MAX_LABEL: usize = 16;
+/// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
+/// of the tab bar.
+const TABBAR_CHEVRON_W: f32 = 2.0;
 /// Single VGE element holding all between-pane separator strokes for the
 /// active tab. Recreated on every relayout — the layout tree determines
 /// which split boundaries to draw.
 const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
+
+/// Elide `label` to at most [`TABBAR_MAX_LABEL`] characters, appending
+/// `…` when it had to be cut.
+fn elide_tab_label(label: &str) -> String {
+    if label.chars().count() <= TABBAR_MAX_LABEL {
+        return label.to_string();
+    }
+    let mut out: String = label.chars().take(TABBAR_MAX_LABEL - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Given `first` (index of the leftmost visible tab), return the
+/// inclusive index of the last tab that fits on row 0. Mirrors the
+/// budgeting used when the bar is drawn: a left chevron costs
+/// [`TABBAR_CHEVRON_W`] when `first > 0`, and a right chevron costs the
+/// same whenever some tabs still spill past the right edge.
+fn tabbar_last_visible(widths: &[f32], host_w: f32, first: usize) -> usize {
+    let n = widths.len();
+    if n == 0 {
+        return 0;
+    }
+    let left = if first > 0 { TABBAR_CHEVRON_W } else { 0.0 };
+    // First pass: assume no right chevron and check whether every
+    // remaining tab fits.
+    let full_budget = host_w - left;
+    let mut x = 0.0;
+    let mut all_fit = true;
+    for w in &widths[first..] {
+        if x + w > full_budget {
+            all_fit = false;
+            break;
+        }
+        x += w;
+    }
+    if all_fit {
+        return n - 1;
+    }
+    // Some tabs spill past the edge → a right chevron is needed, so
+    // re-pack against the reduced budget. The leftmost visible tab is
+    // always shown even if it alone overflows (degenerate narrow host).
+    let budget = full_budget - TABBAR_CHEVRON_W;
+    let mut x = widths[first];
+    let mut last = first;
+    for (i, w) in widths.iter().enumerate().skip(first + 1) {
+        if x + w > budget {
+            break;
+        }
+        x += w;
+        last = i;
+    }
+    last
+}
+
+/// Nudge `scroll` (the leftmost visible tab, carried across renders) the
+/// minimum amount needed to keep the `active` tab on screen, then return
+/// the inclusive `[first, last]` window of tabs to draw.
+///
+/// The bar jumps left when the active tab fell off the left edge,
+/// advances right until the active tab fits, then is pulled back left to
+/// reclaim empty space — so closing tabs collapses the bar instead of
+/// leaving it stuck mid-scroll.
+fn tabbar_window(
+    widths: &[f32],
+    active: usize,
+    host_w: f32,
+    scroll: &mut usize,
+) -> (usize, usize) {
+    let n = widths.len();
+    if n == 0 {
+        *scroll = 0;
+        return (0, 0);
+    }
+    *scroll = (*scroll).min(n - 1);
+    if active < *scroll {
+        *scroll = active;
+    }
+    while active > tabbar_last_visible(widths, host_w, *scroll) {
+        *scroll += 1;
+    }
+    while *scroll > 0 && tabbar_last_visible(widths, host_w, *scroll - 1) == n - 1 {
+        *scroll -= 1;
+    }
+    (*scroll, tabbar_last_visible(widths, host_w, *scroll))
+}
 
 /// Build the VGE element body that renders the host's top-row tab bar.
 /// Each tab is split into two adjacent sub-rects:
@@ -739,15 +830,42 @@ const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 ///   - **name rect** (filled with brand color only when active, top-
 ///     right corner rounded) showing the tab title.
 ///
+/// When the tabs don't all fit on row 0 the bar scrolls: `scroll` (the
+/// leftmost visible tab, carried across renders) is nudged the minimum
+/// amount needed to keep the active tab on screen, and `‹` / `›`
+/// chevrons mark tabs clipped off either edge.
+///
 /// The rule along row 1 separates the bar from the pane area below;
 /// active tab fills sit flush on top of it.
 fn build_tabbar_commands(
     labels: &[String],
     active: usize,
+    scroll: &mut usize,
     host_w: u32,
     cell_pw: f32,
     cell_ph: f32,
 ) -> CreateElementBody {
+    let host_wf = host_w as f32;
+    let n = labels.len();
+
+    // Per-tab sub-rect widths: " N " number rect + " label " name rect.
+    // Labels are elided up front so one long title can't dominate the
+    // bar and so the widths used for scrolling match what gets drawn.
+    let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l)).collect();
+    let num_widths: Vec<f32> = (0..n)
+        .map(|i| format!(" {} ", i + 1).chars().count() as f32)
+        .collect();
+    let name_widths: Vec<f32> = elided
+        .iter()
+        .map(|l| (l.chars().count() + 2) as f32)
+        .collect();
+    let tab_widths: Vec<f32> =
+        (0..n).map(|i| num_widths[i] + name_widths[i]).collect();
+
+    let (first, last) = tabbar_window(&tab_widths, active, host_wf, scroll);
+    let has_left = first > 0;
+    let has_right = n > 0 && last + 1 < n;
+
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
     // shows through, matching whatever theme the user runs veter in.
@@ -761,20 +879,28 @@ fn build_tabbar_commands(
         line_width: 0.06,
         lines: vec![(
             Point { x: 0.0, y: 1.0 },
-            Point { x: host_w as f32, y: 1.0 },
+            Point { x: host_wf, y: 1.0 },
         )],
     });
 
-    let mut x: f32 = 0.0;
-    for (i, raw) in labels.iter().enumerate() {
+    // Left overflow chevron — tabs clipped off the start of the bar.
+    if has_left {
+        cmds.push(DrawCmd::DrawText {
+            origin: Point { x: 0.0, y: 0.0 },
+            align: Align::Left,
+            fill: Style::Flat(COLOR_BRAND),
+            font_style: FontStyle(0x00),
+            text: " ‹".to_string(),
+        });
+    }
+
+    let mut x: f32 = if has_left { TABBAR_CHEVRON_W } else { 0.0 };
+    for i in first..(last + 1).min(n) {
+        let raw = &elided[i];
         let num_text = format!(" {} ", i + 1);
         let name_text = format!(" {} ", raw);
-        let num_w = num_text.chars().count() as f32;
-        let name_w = name_text.chars().count() as f32;
-        let total_w = num_w + name_w;
-        if x + total_w > host_w as f32 {
-            break;
-        }
+        let num_w = num_widths[i];
+        let name_w = name_widths[i];
         let is_active = i == active;
 
         // Number sub-rect: always filled with the dim modal background,
@@ -837,7 +963,21 @@ fn build_tabbar_commands(
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
             text: name_text,
         });
-        x += total_w;
+        x += num_w + name_w;
+    }
+
+    // Right overflow chevron — tabs clipped off the end of the bar.
+    if has_right {
+        cmds.push(DrawCmd::DrawText {
+            origin: Point {
+                x: host_wf - TABBAR_CHEVRON_W,
+                y: 0.0,
+            },
+            align: Align::Left,
+            fill: Style::Flat(COLOR_BRAND),
+            font_style: FontStyle(0x00),
+            text: "› ".to_string(),
+        });
     }
 
     CreateElementBody {
@@ -1358,6 +1498,10 @@ struct State {
     visible_panes: HashSet<String>,
     /// True once the tab bar VGE element has been created on the host.
     tabbar_created: bool,
+    /// Index of the leftmost tab currently drawn in the tab bar. When
+    /// the tabs don't all fit on row 0 the bar scrolls; this offset is
+    /// nudged so the active tab stays visible (see `build_tabbar_commands`).
+    tab_scroll: usize,
     /// True once the separators VGE element has been created on the
     /// host. Tracked so the first relayout emits a CreateElement (not a
     /// stale-DeleteElement-then-Create) and subsequent passes can
@@ -1399,6 +1543,7 @@ impl State {
             last_focus_sent: None,
             visible_panes: HashSet::new(),
             tabbar_created: false,
+            tab_scroll: 0,
             separators_created: false,
             pending_scrolls: HashMap::new(),
             next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
@@ -1918,6 +2063,7 @@ impl State {
         let tabbar_body = build_tabbar_commands(
             &tabbar_labels,
             self.active_tab,
+            &mut self.tab_scroll,
             self.host_w,
             self.cell_pw,
             self.cell_ph,
@@ -2292,6 +2438,7 @@ impl State {
         let body = build_tabbar_commands(
             &labels,
             self.active_tab,
+            &mut self.tab_scroll,
             self.host_w,
             self.cell_pw,
             self.cell_ph,
@@ -3657,4 +3804,87 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
     }
     line.push_str("|\n");
     let _ = file.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elide_keeps_short_labels() {
+        assert_eq!(elide_tab_label("zsh"), "zsh");
+        let exact: String = "x".repeat(TABBAR_MAX_LABEL);
+        assert_eq!(elide_tab_label(&exact), exact);
+    }
+
+    #[test]
+    fn elide_truncates_long_labels() {
+        let long: String = "x".repeat(TABBAR_MAX_LABEL + 8);
+        let out = elide_tab_label(&long);
+        assert_eq!(out.chars().count(), TABBAR_MAX_LABEL);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn last_visible_shows_every_tab_when_they_fit() {
+        let widths = vec![10.0, 10.0, 10.0];
+        assert_eq!(tabbar_last_visible(&widths, 100.0, 0), 2);
+    }
+
+    #[test]
+    fn last_visible_clips_and_reserves_a_right_chevron() {
+        // host 35, no left chevron: budget 35-2 (right chevron) = 33 →
+        // tabs 0,1,2 fit (30 cells), tab 3 (40) does not.
+        let widths = vec![10.0; 10];
+        assert_eq!(tabbar_last_visible(&widths, 35.0, 0), 2);
+    }
+
+    #[test]
+    fn last_visible_reserves_a_left_chevron_too() {
+        // first=2 → budget 35-2 (left) -2 (right) = 31 → tabs 2,3,4 fit.
+        let widths = vec![10.0; 10];
+        assert_eq!(tabbar_last_visible(&widths, 35.0, 2), 4);
+    }
+
+    #[test]
+    fn window_keeps_active_tab_visible_when_scrolling_right() {
+        let widths = vec![10.0; 10];
+        let mut scroll = 0;
+        let (first, last) = tabbar_window(&widths, 9, 35.0, &mut scroll);
+        assert!(
+            first <= 9 && 9 <= last,
+            "active tab 9 must land in window [{first}, {last}]"
+        );
+        assert!(first > 0, "the bar must have scrolled forward");
+    }
+
+    #[test]
+    fn window_jumps_back_when_active_tab_is_left_of_view() {
+        let widths = vec![10.0; 10];
+        let mut scroll = 7;
+        let (first, _) = tabbar_window(&widths, 0, 35.0, &mut scroll);
+        assert_eq!(first, 0, "selecting tab 0 must reveal the bar's start");
+    }
+
+    #[test]
+    fn window_collapses_left_after_tabs_close() {
+        // The bar was scrolled to tab 7, then all but 3 tabs closed:
+        // the stale offset must collapse back so no space is wasted.
+        let widths = vec![10.0; 3];
+        let mut scroll = 7;
+        let window = tabbar_window(&widths, 2, 35.0, &mut scroll);
+        assert_eq!(window, (0, 2));
+    }
+
+    #[test]
+    fn build_tabbar_does_not_drop_the_active_tab() {
+        // 30 tabs, far more than fit: the element must still be built
+        // and the scroll offset advanced to reach the active tab.
+        let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
+        let mut scroll = 0;
+        let body = build_tabbar_commands(&labels, 29, &mut scroll, 80, 8.0, 16.0);
+        assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
+        assert!(scroll > 0, "the bar must scroll to reveal the last tab");
+        assert!(!body.commands.is_empty());
+    }
 }

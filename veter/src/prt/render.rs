@@ -300,6 +300,7 @@ fn render_portal_at<T: Renderer>(
                         anchor_col: s.anchor_col,
                         head_line: s.head_line,
                         head_col: s.head_col,
+                        block_cols: s.block_cols,
                     })
                 });
                 render_portal_at(
