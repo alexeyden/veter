@@ -725,9 +725,10 @@ const MODAL_BODY_LINES_ID: &str = "vmux-modal-body";
 const MODAL_TRACK_ID: &str = "vmux-modal-track";
 const MODAL_THUMB_ID: &str = "vmux-modal-thumb";
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
-/// Tab labels longer than this many characters are elided with `…` in
-/// the tab bar so a single long title can't crowd out every other tab.
-const TABBAR_MAX_LABEL: usize = 16;
+/// Floor on the per-tab label length when the bar is crowded. Labels
+/// shrink uniformly to reclaim space but never below this many
+/// characters (one glyph + `…`); past that the bar scrolls instead.
+const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
 const TABBAR_CHEVRON_W: f32 = 2.0;
@@ -736,15 +737,58 @@ const TABBAR_CHEVRON_W: f32 = 2.0;
 /// which split boundaries to draw.
 const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 
-/// Elide `label` to at most [`TABBAR_MAX_LABEL`] characters, appending
-/// `…` when it had to be cut.
-fn elide_tab_label(label: &str) -> String {
-    if label.chars().count() <= TABBAR_MAX_LABEL {
+/// Elide `label` to at most `max` characters, appending `…` when it had
+/// to be cut. `max` is expected to be at least [`TABBAR_MIN_LABEL`].
+fn elide_tab_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
         return label.to_string();
     }
-    let mut out: String = label.chars().take(TABBAR_MAX_LABEL - 1).collect();
+    let mut out: String = label.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Largest uniform label-character cap that still lets every tab fit on
+/// row 0 at full width. Labels are only shortened to reclaim space:
+/// when they all fit, the cap covers the longest label (no truncation);
+/// when they don't, it shrinks but never below [`TABBAR_MIN_LABEL`].
+/// A cap pinned to the minimum means even minimal labels overflow and
+/// the bar will have to scroll.
+fn tabbar_label_cap(labels: &[String], num_widths: &[f32], host_w: f32) -> usize {
+    let n = labels.len();
+    if n == 0 {
+        return TABBAR_MIN_LABEL;
+    }
+    let lens: Vec<usize> = labels.iter().map(|l| l.chars().count()).collect();
+    // Fixed per-tab cost independent of the cap: the " N " number rect
+    // plus the name rect's two padding cells. What's left is the budget
+    // for label glyphs.
+    let base: f32 = num_widths.iter().sum::<f32>() + 2.0 * n as f32;
+    let budget = host_w - base;
+    // Total glyph width at a given cap: Σ min(len_i, cap). Monotonic
+    // non-decreasing in `cap`.
+    let glyph_width = |cap: usize| -> f32 {
+        lens.iter().map(|&l| l.min(cap) as f32).sum()
+    };
+    let max_len = lens.iter().copied().max().unwrap_or(0);
+    if glyph_width(TABBAR_MIN_LABEL) > budget {
+        return TABBAR_MIN_LABEL;
+    }
+    if glyph_width(max_len) <= budget {
+        return max_len.max(TABBAR_MIN_LABEL);
+    }
+    // Largest cap in [MIN, max_len] whose glyph width fits the budget.
+    let mut lo = TABBAR_MIN_LABEL;
+    let mut hi = max_len;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if glyph_width(mid) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// Given `first` (index of the leftmost visible tab), return the
@@ -830,9 +874,11 @@ fn tabbar_window(
 ///   - **name rect** (filled with brand color only when active, top-
 ///     right corner rounded) showing the tab title.
 ///
-/// When the tabs don't all fit on row 0 the bar scrolls: `scroll` (the
-/// leftmost visible tab, carried across renders) is nudged the minimum
-/// amount needed to keep the active tab on screen, and `‹` / `›`
+/// When the tabs don't all fit on row 0, labels are first shortened —
+/// uniformly, down to [`TABBAR_MIN_LABEL`] characters — to reclaim
+/// space. If even minimal labels overflow, the bar scrolls: `scroll`
+/// (the leftmost visible tab, carried across renders) is nudged the
+/// minimum amount needed to keep the active tab on screen, and `‹` / `›`
 /// chevrons mark tabs clipped off either edge.
 ///
 /// The rule along row 1 separates the bar from the pane area below;
@@ -849,12 +895,16 @@ fn build_tabbar_commands(
     let n = labels.len();
 
     // Per-tab sub-rect widths: " N " number rect + " label " name rect.
-    // Labels are elided up front so one long title can't dominate the
-    // bar and so the widths used for scrolling match what gets drawn.
-    let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l)).collect();
+    // The " N " number rect depends only on the index.
     let num_widths: Vec<f32> = (0..n)
         .map(|i| format!(" {} ", i + 1).chars().count() as f32)
         .collect();
+    // Pick the widest label cap the bar can afford, then elide to it —
+    // so labels are only shortened to reclaim space, never pre-emptively,
+    // and the widths used for scrolling match what gets drawn.
+    let cap = tabbar_label_cap(labels, &num_widths, host_wf);
+    let elided: Vec<String> =
+        labels.iter().map(|l| elide_tab_label(l, cap)).collect();
     let name_widths: Vec<f32> = elided
         .iter()
         .map(|l| (l.chars().count() + 2) as f32)
@@ -3811,18 +3861,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elide_keeps_short_labels() {
-        assert_eq!(elide_tab_label("zsh"), "zsh");
-        let exact: String = "x".repeat(TABBAR_MAX_LABEL);
-        assert_eq!(elide_tab_label(&exact), exact);
+    fn elide_keeps_labels_within_cap() {
+        assert_eq!(elide_tab_label("zsh", 10), "zsh");
+        assert_eq!(elide_tab_label("exactly-10", 10), "exactly-10");
     }
 
     #[test]
-    fn elide_truncates_long_labels() {
-        let long: String = "x".repeat(TABBAR_MAX_LABEL + 8);
-        let out = elide_tab_label(&long);
-        assert_eq!(out.chars().count(), TABBAR_MAX_LABEL);
+    fn elide_truncates_labels_over_cap() {
+        let out = elide_tab_label("a-very-long-tab-name", 6);
+        assert_eq!(out.chars().count(), 6);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn label_cap_does_not_truncate_when_there_is_room() {
+        // Three short tabs on a wide bar: the cap covers the longest
+        // label, so nothing is elided.
+        let labels = vec!["zsh".into(), "vim".into(), "htop".into()];
+        let num_widths = vec![3.0, 3.0, 3.0];
+        let cap = tabbar_label_cap(&labels, &num_widths, 200.0);
+        assert!(cap >= 4, "cap {cap} must not clip a 4-char label");
+    }
+
+    #[test]
+    fn label_cap_shrinks_to_reclaim_space() {
+        // Eight 14-char tabs on an 80-cell bar: the cap drops below the
+        // natural length but stays at or above the minimum.
+        let labels: Vec<String> =
+            (0..8).map(|_| "long-tab-title".to_string()).collect();
+        let num_widths = vec![3.0; 8];
+        let cap = tabbar_label_cap(&labels, &num_widths, 80.0);
+        assert!(cap >= TABBAR_MIN_LABEL);
+        assert!(cap < "long-tab-title".chars().count());
+    }
+
+    #[test]
+    fn label_cap_bottoms_out_at_the_minimum() {
+        // Far too many tabs to ever fit: the cap pins to the minimum
+        // and the bar is left to scroll.
+        let labels: Vec<String> = (0..50).map(|i| format!("tab-{i}")).collect();
+        let num_widths = vec![3.0; 50];
+        let cap = tabbar_label_cap(&labels, &num_widths, 80.0);
+        assert_eq!(cap, TABBAR_MIN_LABEL);
     }
 
     #[test]
