@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use veter_host::prt::PrtEngine;
+use veter_host::ses::SesEngine;
 use veter_host::vge::VgeEngine;
 
 /// Default grid size used until the renderer attaches and reports its
@@ -63,6 +64,10 @@ pub struct EngineState {
     pub parser: vt100::Parser,
     pub vge: VgeEngine,
     pub prt: PrtEngine,
+    /// SES engine carrying this session's name. Answers a `vmux` SES
+    /// probe with `in_session = true` + the name, and turns a `Detach`
+    /// command into a self-pipe wake (see `worker_main`).
+    pub ses: SesEngine,
     /// Write side of the renderer's stdout while a renderer is
     /// attached. The worker forwards every PTY-master chunk it reads
     /// into this fd verbatim (without the engine transforms) so the
@@ -81,7 +86,10 @@ pub struct EngineState {
 }
 
 impl EngineState {
-    pub fn new() -> Self {
+    /// Construct the engine set for a session named `session_name`.
+    /// The name reaches the SES engine so an inner `vmux` can learn
+    /// which session it lives in.
+    pub fn new(session_name: String) -> Self {
         let mut vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
         // veterd is a state-mirroring middleman, not the real
         // terminal. The renderer upstream (e.g. local veter) is the
@@ -105,15 +113,10 @@ impl EngineState {
                 DEFAULT_SCALE,
                 Arc::new(|| {}),
             ),
+            ses: SesEngine::with_session(session_name),
             renderer_stdout: None,
             attach_shutdown: None,
         }
-    }
-}
-
-impl Default for EngineState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -121,10 +124,13 @@ impl Default for EngineState {
 /// spawn the per-session worker. Returns the shared engine handle so
 /// the attach path can lock it to serialize a snapshot or to forward
 /// live output.
-pub fn spawn_worker(master: &OwnedFd) -> Result<Arc<Mutex<EngineState>>> {
+pub fn spawn_worker(
+    master: &OwnedFd,
+    session_name: String,
+) -> Result<Arc<Mutex<EngineState>>> {
     let reader_fd = dup_owned(master).context("dup(master) for worker reader")?;
     let writer_fd = dup_owned(master).context("dup(master) for worker writer")?;
-    let engines = Arc::new(Mutex::new(EngineState::new()));
+    let engines = Arc::new(Mutex::new(EngineState::new(session_name)));
     let engines_for_worker = Arc::clone(&engines);
     std::thread::Builder::new()
         .name("veterd-worker".into())
@@ -179,14 +185,18 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 parser,
                 vge,
                 prt,
+                ses,
                 renderer_stdout,
-                attach_shutdown: _,
+                attach_shutdown,
             } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
             let vge_passthrough = vge.process_pty_chunk(&prt_chunk.passthrough);
-            if !vge_passthrough.is_empty() {
-                parser.process(&vge_passthrough);
+            // SES sits after VGE, before vt100 — the inner vmux is the
+            // SES client; veterd is its host.
+            let ses_passthrough = ses.process_pty_chunk(&vge_passthrough);
+            if !ses_passthrough.is_empty() {
+                parser.process(&ses_passthrough);
             }
             prt.handle_terminal_events(&prt_chunk.terminal_events);
             prt.after_vt100_process(parser);
@@ -196,6 +206,21 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
 
             let mut out = prt.take_responses();
             out.extend_from_slice(&vge.take_responses());
+            out.extend_from_slice(&ses.take_responses());
+
+            // A SES `Detach` command wakes the attach handler's
+            // `splice_input` loop via the self-pipe — the exact same
+            // teardown path as the `Ctrl+\ d` hotkey. With no renderer
+            // attached `attach_shutdown` is `None` and this is a no-op.
+            if ses.take_detach_requests() > 0
+                && let Some(fd) = attach_shutdown.as_ref()
+            {
+                // SAFETY: `fd` is borrowed from the OwnedFd held in
+                // `attach_shutdown`; we only write, never close it.
+                let borrowed =
+                    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+                let _ = nix::unistd::write(borrowed, &[0u8]);
+            }
 
             // Forward verbatim to the renderer while attached. The
             // renderer parses PRT/VGE/VFT envelopes natively, so we

@@ -1,0 +1,7 @@
+[package]
+name = "ses-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "SES (Session Extension) wire format: APC envelope, frame codec, and the vmux <-> veterd control channel (session-name probe, detach command). See doc/session-extension.md."
+
+[dependencies]

@@ -161,7 +161,7 @@ bit 4  emit_clipboard_events   // OSC 52  → ClipboardOp event
 bit 5  emit_bell_events        // BEL     → Bell event
 bit 6  emit_mouse_mode_events  // DECSET 9/1000/1002/1003/1005/1006/1015
                                //         → MouseModeChange event
-bits 7..7  reserved (must be 0)
+bit 7  emit_activity_events    // meaningful scroll → PortalActivity event
 ```
 
 Hosts that also implement other terminal extensions (e.g. vector
@@ -260,6 +260,7 @@ portals is not guaranteed.
 | 0x88 | PortalEvicted            | §8.7         |
 | 0x89 | ResizeNotify             | §8.8         |
 | 0x8A | MouseModeChange          | §8.9         |
+| 0x8B | PortalActivity           | §8.10        |
 
 Events for capabilities a client did not request via the `features`
 bitmask in §2.1 MUST NOT be emitted (the host learns the client's
@@ -769,6 +770,41 @@ A multi-pane client coalesces across panes itself: it tracks the
 union of `protocol != 0` across all of its panes and writes the
 appropriate DECSET sequence to its own input source whenever the
 union changes.
+
+### 8.10 PortalActivity (0x8B)
+
+```
+string id
+```
+
+Fired when the portal produced **meaningful output** — a tmux-style
+"activity in a background window" signal. A multiplexer cannot
+compute this itself: it forwards raw bytes and has no vt100 to tell a
+log line scrolling past from a spinner redrawing one cell in place.
+The host runs the portal's vt100 and so can.
+
+The heuristic: the event fires when, during a `WritePortal`, the
+portal's *main* (non-alternate) grid committed at least one new line
+— either its content scrolled, or the cursor advanced to a lower row
+(output filling a screen that is not yet full). In-place updates
+(spinners, progress bars, clocks) rewrite a line with a carriage
+return, leaving the cursor row unchanged; full-screen TUIs run on the
+alternate screen. Neither triggers the event. It is **edge-triggered**:
+at most one per `WritePortal` regardless of how many lines scrolled;
+the client keeps its own sticky per-portal flag and clears it when
+the user next views that portal.
+
+The host SHOULD suppress the event for the currently focused portal
+(per `SetFocus`, §9.1) — the client is already looking at it, and
+this also cuts event volume for the pane most output lands in.
+Correctness does not depend on this; a client that receives activity
+for a portal it considers "in view" simply ignores it.
+
+The heuristic is host-internal and MAY be refined (e.g. a damage
+burst rule) without a protocol change — the wire contract is only
+"PortalActivity fired".
+
+Gated by `emit_activity_events` (features bit 7, §2.1).
 
 ## 9. Focus and cursor rendering
 

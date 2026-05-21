@@ -19,6 +19,7 @@ pub mod clipboard;
 pub mod prt;
 pub mod pty;
 pub mod renderer;
+pub mod ses;
 pub mod vft;
 pub mod vge;
 pub mod vss;

@@ -129,6 +129,15 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// Monotonic count of lines scrolled off the top of the *main*
+    /// (non-alternate) grid. Used by the PRT activity heuristic to
+    /// detect that a portal produced meaningful output. Runtime-only
+    /// — not preserved across a binary snapshot restore.
+    #[must_use]
+    pub fn scroll_committed(&self) -> u64 {
+        self.grid.scroll_committed()
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

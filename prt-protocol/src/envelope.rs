@@ -64,6 +64,14 @@ pub fn bell_body(id: &str) -> Vec<u8> {
     w.buf
 }
 
+/// Body for an `EVT_PORTAL_ACTIVITY` event (§8). Carries only the
+/// portal id; the activity heuristic lives host-side.
+pub fn portal_activity_body(id: &str) -> Vec<u8> {
+    let mut w = Writer::with_capacity(1 + id.len());
+    w.str(id);
+    w.buf
+}
+
 pub fn title_change_body(id: &str, title: &str) -> Vec<u8> {
     let mut w = Writer::with_capacity(2 + id.len() + title.len());
     w.str(id);
@@ -282,6 +290,14 @@ mod tests {
         assert_eq!(r.string().unwrap(), "p");
         assert_eq!(r.u32().unwrap(), 24);
         assert_eq!(r.u32().unwrap(), 80);
+        assert!(r.at_end());
+    }
+
+    #[test]
+    fn portal_activity_body_round_trip() {
+        let body = portal_activity_body("p3");
+        let mut r = Reader::new(&body);
+        assert_eq!(r.string().unwrap(), "p3");
         assert!(r.at_end());
     }
 

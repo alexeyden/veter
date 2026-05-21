@@ -3,9 +3,8 @@
 > **Status: WIP.** The architecture (§§1–3, 5–7), the **v2
 > binary-snapshot protocol** (§4 VSS), and the **v3 per-session
 > process model** (§2, §8.3) are implemented. Tracked in
-> `CONTEXT.md`. The companion `doc/session-extension.md` (vmux ↔
-> veterd integration protocol) is still deferred and will be
-> written separately.
+> `CONTEXT.md`. The companion `doc/session-extension.md` (SES — the
+> vmux ↔ veterd control channel) is now implemented.
 
 `veterd` is a persistent host-side session manager. Its role is to
 hold the state of a veter session (vt100 grids, scrollback, VGE
@@ -445,9 +444,12 @@ prefix so it never collides with a local-vmux prefix that may
 itself be running inside the session). `veterd` reads this off
 its input stream before forwarding the rest to the inner PTY.
 
-A protocol-level detach command (so local `vmux` could offer a
-"prefix-D" that talks directly to `veterd`) is the subject of the
-deferred companion document, `doc/session-extension.md`.
+A protocol-level detach command (so local `vmux` can offer a
+"prefix-D" that talks directly to `veterd`) is defined by the
+companion document `doc/session-extension.md` (SES) and is
+implemented — `vmux`'s `prefix-D` sends a SES `Detach`, which the
+session process turns into this same teardown via its
+`attach_shutdown` self-pipe.
 
 ## 7. Limitations and non-goals for v1
 
@@ -463,10 +465,10 @@ deferred companion document, `doc/session-extension.md`.
   session sharing is out.
 - **No GUI for `veterd`.** The daemon is headless and exposes
   itself only through the CLI and the upstream SSH PTY.
-- **No vmux integration.** vmux does not yet know it is talking to
-  a `veterd` and offers no "prefix-D" or session-name title
-  decoration. That integration rides on the deferred session
-  extension protocol; see §10.
+- ~~**No vmux integration.**~~ *Landed.* vmux now learns its
+  session name (shown as a tab-bar segment) and offers `prefix-D`
+  detach, via the SES control channel — `doc/session-extension.md`.
+  Was a v1 non-goal; the "second shoe" has dropped.
 
 ## 8. Staging
 
@@ -629,8 +631,9 @@ VSS-specific:
 - `doc/portal-extension.md` — PRT spec. Unchanged.
 - `doc/vector-graphics-extension.md` — VGE spec. Unchanged.
 - `doc/file-transfer-extension.md` — VFT spec. Unchanged.
-- `doc/session-extension.md` — *deferred.* Will define the
-  client-to-host control channel (vmux ↔ veterd: detach command,
-  session-name display, status events). v1 of the session
-  manager works without it; vmux integration is the second
-  shoe to drop.
+- `doc/session-extension.md` — SES. *Implemented.* The
+  client-to-host control channel (vmux ↔ veterd): a session-name
+  probe and a detach command. Note that the related per-portal
+  *activity* signal lives in PRT (`PortalActivity`, portal
+  extension §8.10), not in SES — activity is per-portal and must
+  also work under a local `veter` host with no session.

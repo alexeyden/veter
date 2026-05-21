@@ -13,6 +13,11 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    /// Monotonic count of lines scrolled off the top of the live grid
+    /// (full-screen scrolls only, not scroll-region scrolls). A
+    /// runtime-only signal for the PRT activity heuristic — never
+    /// serialized; reset to 0 on construction and snapshot restore.
+    scroll_committed: u64,
 }
 
 impl Grid {
@@ -29,7 +34,14 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            scroll_committed: 0,
         }
+    }
+
+    /// Monotonic count of lines scrolled off the top of the live grid.
+    /// See the field doc; used by the PRT activity heuristic.
+    pub fn scroll_committed(&self) -> u64 {
+        self.scroll_committed
     }
 
     pub fn allocate_rows(&mut self) {
@@ -143,6 +155,7 @@ impl Grid {
             scrollback,
             scrollback_len,
             scrollback_offset,
+            scroll_committed: 0,
         })
     }
 
@@ -659,14 +672,19 @@ impl Grid {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
-                self.scrollback.push_back(removed);
-                while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
-                }
-                if self.scrollback_offset > 0 {
-                    self.scrollback_offset =
-                        self.scrollback.len().min(self.scrollback_offset + 1);
+            if !self.scroll_region_active() {
+                // A line scrolled off the top of the live grid: the
+                // signal the PRT activity heuristic watches.
+                self.scroll_committed = self.scroll_committed.wrapping_add(1);
+                if self.scrollback_len > 0 {
+                    self.scrollback.push_back(removed);
+                    while self.scrollback.len() > self.scrollback_len {
+                        self.scrollback.pop_front();
+                    }
+                    if self.scrollback_offset > 0 {
+                        self.scrollback_offset =
+                            self.scrollback.len().min(self.scrollback_offset + 1);
+                    }
                 }
             }
         }

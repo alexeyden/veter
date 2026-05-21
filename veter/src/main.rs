@@ -1,7 +1,7 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
 // re-imports them for in-file references. veterd and other workspace
 // crates pull the same code through `veter::*`.
-use veter::{clipboard, prt, pty, renderer, vft, vge, vss};
+use veter::{clipboard, prt, pty, renderer, ses, vft, vge, vss};
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -483,6 +483,11 @@ struct App {
     prt: Option<prt::PrtEngine>,
     vft: Option<vft::VftEngine>,
     vss: Option<vss::VssEngine>,
+    /// Host-level SES engine. The local renderer is never itself a
+    /// session, so this is always a non-session engine: it answers a
+    /// `vmux` SES probe with `in_session = false` (a fast definitive
+    /// "no session" instead of a probe timeout) and refuses detach.
+    ses: Option<ses::SesEngine>,
     /// Host-level pre-attach backup: same role as the per-portal
     /// `Portal::pre_attach_backup`, but for the rare case where a
     /// `veterd attach` writes to the host's outermost vt100 / VGE /
@@ -570,6 +575,7 @@ impl App {
             prt: None,
             vft: None,
             vss: None,
+            ses: None,
             vss_pre_attach_backup: None,
             proxy,
             modifiers: ModifiersState::empty(),
@@ -1254,6 +1260,10 @@ impl App {
             Some(v) => v,
             None => return false,
         };
+        let ses = match &mut self.ses {
+            Some(s) => s,
+            None => return false,
+        };
         let vss_backup = &mut self.vss_pre_attach_backup;
         let pty = match &self.pty {
             Some(p) => p,
@@ -1278,8 +1288,13 @@ impl App {
                     let vge_passthrough = engine.process_pty_chunk(&prt_chunk.passthrough);
                     let vft_passthrough = vft.process_pty_chunk(&vge_passthrough);
                     let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
-                    if !vss_passthrough.is_empty() {
-                        parser.process(&vss_passthrough);
+                    // SES is consumed by the immediate host. The local
+                    // renderer is not a session, so this just answers a
+                    // vmux probe with "no session"; envelopes never
+                    // reach the host vt100.
+                    let ses_passthrough = ses.process_pty_chunk(&vss_passthrough);
+                    if !ses_passthrough.is_empty() {
+                        parser.process(&ses_passthrough);
                     }
                     // Apply any completed host-level VSS snapshots.
                     // A snapshot arriving at this level replaces the
@@ -1367,6 +1382,10 @@ impl App {
                     let vss_resp = vss.take_responses();
                     if !vss_resp.is_empty() {
                         let _ = pty.write_all(&vss_resp);
+                    }
+                    let ses_resp = ses.take_responses();
+                    if !ses_resp.is_empty() {
+                        let _ = pty.write_all(&ses_resp);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1525,6 +1544,7 @@ impl ApplicationHandler for App {
         self.prt = Some(prt_engine);
         self.vft = Some(vft_engine);
         self.vss = Some(vss::VssEngine::new());
+        self.ses = Some(ses::SesEngine::new());
 
         self.window.as_ref().unwrap().request_redraw();
     }

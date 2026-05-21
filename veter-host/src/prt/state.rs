@@ -23,8 +23,8 @@ use prt_protocol::command::{
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
     cursor_visibility_change_body, err_body, icon_name_change_body, mouse_mode_change_body,
-    portal_evicted_body, raw_reply_body, resize_notify_body, title_change_body,
-    working_dir_change_body, wrap_t2c_envelope, ProbeBody,
+    portal_activity_body, portal_evicted_body, raw_reply_body, resize_notify_body,
+    title_change_body, working_dir_change_body, wrap_t2c_envelope, ProbeBody,
 };
 use prt_protocol::frame::*;
 
@@ -71,7 +71,8 @@ impl Default for Limits {
                 | FEAT_EMIT_CWD_EVENTS
                 | FEAT_EMIT_CLIPBOARD_EVENTS
                 | FEAT_EMIT_BELL_EVENTS
-                | FEAT_EMIT_MOUSE_MODE_EVENTS,
+                | FEAT_EMIT_MOUSE_MODE_EVENTS
+                | FEAT_EMIT_ACTIVITY_EVENTS,
             max_nesting_depth: 8,
             vge_features: Some(FEAT_VGE_IN_PORTAL),
         }
@@ -946,6 +947,7 @@ impl PrtEngine {
             vge: portal_vge,
             vft: portal_vft,
             vss: crate::vss::VssEngine::new(),
+            ses: crate::ses::SesEngine::new(),
             pre_attach_backup: None,
             state_cache: initial_cache,
             pending_cursor_queries: 0,
@@ -1084,7 +1086,7 @@ impl PrtEngine {
         // We collect everything into locals inside a borrow scope, then
         // emit events on `self` after the borrow ends — `emit_event`
         // takes `&mut self` and would otherwise alias.
-        let (raw_events, old_cache, new_cache, reverse_bytes) = {
+        let (raw_events, old_cache, new_cache, reverse_bytes, activity) = {
             let portal = self
                 .state
                 .current_mut()
@@ -1188,10 +1190,28 @@ impl PrtEngine {
                 }
             }
 
+            // 2e. SES — extract any ESC_SES envelopes a multiplexer
+            //     client running inside this portal emitted. The
+            //     per-portal engine reports "not in a session"; its
+            //     `ses` responses join the reverse channel below.
+            let ses_passthrough = portal.ses.process_pty_chunk(&vss_passthrough);
+
             // 3. Feed the remaining bytes into the portal's vt100. The
             //    `PortalCallbacks` instance accumulates Bell / Title /
-            //    Icon / Clipboard / OSC events.
-            portal.vt.process(&vss_passthrough);
+            //    Icon / Clipboard / OSC events. The scroll counter and
+            //    cursor row are sampled around the call to derive the
+            //    activity signal (EVT_PORTAL_ACTIVITY): the portal
+            //    committed a new line iff it scrolled, or the cursor
+            //    advanced to a lower row (output filling a screen that
+            //    is not yet full). In-place redraws — spinners,
+            //    progress bars, clocks — do neither: they rewrite a
+            //    line with CR, leaving the cursor row unchanged.
+            let scroll_before = portal.vt.screen().scroll_committed();
+            let (cursor_row_before, _) = portal.vt.screen().cursor_position();
+            portal.vt.process(&ses_passthrough);
+            let (cursor_row_after, _) = portal.vt.screen().cursor_position();
+            let activity = portal.vt.screen().scroll_committed() != scroll_before
+                || cursor_row_after > cursor_row_before;
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
             // 4. Update the children engine's line tracker against the
@@ -1225,6 +1245,7 @@ impl PrtEngine {
             reverse.extend_from_slice(&portal.vge.take_responses());
             reverse.extend_from_slice(&portal.vft.take_responses());
             reverse.extend_from_slice(&portal.vss.take_responses());
+            reverse.extend_from_slice(&portal.ses.take_responses());
             if portal.pending_cursor_queries > 0 {
                 let (row, col) = portal.vt.screen().cursor_position();
                 let reply = format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
@@ -1234,7 +1255,7 @@ impl PrtEngine {
                 portal.pending_cursor_queries = 0;
             }
 
-            (raw_events, old_cache, new_cache, reverse)
+            (raw_events, old_cache, new_cache, reverse, activity)
         };
 
         // ---- emit events ---------------------------------------------
@@ -1269,6 +1290,20 @@ impl PrtEngine {
                     new_cache.focus_events,
                 ),
             );
+        }
+
+        // Activity (§8). The portal committed new line(s) on its main
+        // screen — meaningful output, as opposed to an in-place
+        // redraw. Suppressed on the alt-screen (full-screen TUIs) and
+        // for the focused portal (the client is already looking at
+        // it; this also cuts event chatter for the pane most output
+        // lands in). Edge-triggered: one event per write.
+        if activity
+            && !new_cache.on_alt
+            && self.limits.features & FEAT_EMIT_ACTIVITY_EVENTS != 0
+            && self.state.focus != FocusKind::Portal(b.id.clone())
+        {
+            self.emit_event(EVT_PORTAL_ACTIVITY, portal_activity_body(&b.id));
         }
 
         Ok(Vec::new())
@@ -2141,6 +2176,67 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_output_emits_activity() {
+        // A 3-row portal fed five newline-terminated lines scrolls
+        // twice — the scroll-based activity heuristic fires once.
+        let mut engine = PrtEngine::new();
+        let frames = create_and_write(&mut engine, "p", 20, 3, b"1\r\n2\r\n3\r\n4\r\n5\r\n");
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 1);
+        let act = first_event(&frames, EVT_PORTAL_ACTIVITY).unwrap();
+        let mut r = Reader::new(&act.body);
+        assert_eq!(r.string().unwrap(), "p");
+    }
+
+    #[test]
+    fn partial_screen_output_emits_activity() {
+        // Output into a screen that is not yet full does not scroll,
+        // but the cursor advances to a new row — still activity.
+        let mut engine = PrtEngine::new();
+        let frames =
+            create_and_write(&mut engine, "p", 20, 10, b"line one\r\nline two\r\n");
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 1);
+    }
+
+    #[test]
+    fn in_place_redraw_emits_no_activity() {
+        // Carriage returns without newlines overwrite row 0 in place —
+        // a spinner / progress-bar style update. No scroll, no event.
+        let mut engine = PrtEngine::new();
+        let frames = create_and_write(&mut engine, "p", 20, 3, b"aaaa\rbbbb\rcccc");
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
+    }
+
+    #[test]
+    fn focused_portal_scroll_emits_no_activity() {
+        // The focused portal is suppressed — the client is looking at
+        // it, so scrolling there is not "background" activity.
+        let mut engine = PrtEngine::new();
+        let create = encode::create_portal_body(&CreatePortalBody {
+            id: "p".to_string(),
+            size_w: 20,
+            size_h: 3,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 0,
+        });
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &create).frame_type,
+            RSP_OK
+        );
+        engine.state.focus = FocusKind::Portal("p".to_string());
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: b"1\r\n2\r\n3\r\n4\r\n5\r\n".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
+    }
+
+    #[test]
     fn osc_0_fires_both_title_and_icon_name() {
         let mut engine = PrtEngine::new();
         let frames = create_and_write(&mut engine, "p", 10, 2, b"\x1b]0;hello world\x07");
@@ -2851,6 +2947,54 @@ mod tests {
         let request_id = r.u32().unwrap();
         assert_eq!(frame_type, VGE_RSP_PROBE);
         assert_eq!(request_id, 99);
+    }
+
+    #[test]
+    fn per_portal_ses_probe_surfaces_as_raw_reply() {
+        // A program inside a portal sends an ESC_SES Probe. The host's
+        // per-portal SES engine answers — `in_session = false`, since a
+        // portal is an inner program and not itself session-named — and
+        // the `ses` response comes back inside the portal's RawReply.
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 80, 24),
+        );
+
+        let ses_envelope = ses_protocol::encode_command(&ses_protocol::Command::Probe, 7);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: ses_envelope,
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        assert_eq!(frames[0].frame_type, RSP_OK);
+        let raw = first_event(&frames, EVT_RAW_REPLY)
+            .expect("expected RawReply containing the SES response");
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "p");
+        let inner = r.bytes().unwrap();
+
+        let mut s =
+            ses_protocol::apc::ApcStream::with_marker(*ses_protocol::MARKER_H2C);
+        let out = s.feed(inner);
+        assert_eq!(out.payloads.len(), 1, "expected one SES response envelope");
+        let mut got = None;
+        ses_protocol::for_each_frame(&out.payloads[0], |ft, rid, b| {
+            assert_eq!(rid, 7);
+            got = Some(ses_protocol::HostFrame::parse(ft, b).map_err(|_| 0u16)?);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            got,
+            Some(ses_protocol::HostFrame::ProbeResponse {
+                in_session: false,
+                ..
+            })
+        ));
     }
 
     #[test]

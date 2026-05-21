@@ -40,6 +40,10 @@ pub const EVT_BUFFER_MODE_CHANGE: u8 = 0x87;
 pub const EVT_PORTAL_EVICTED: u8 = 0x88;
 pub const EVT_RESIZE_NOTIFY: u8 = 0x89;
 pub const EVT_MOUSE_MODE_CHANGE: u8 = 0x8A;
+/// A portal produced meaningful output (its content scrolled) while
+/// not on the alt-screen. Body is `string id`. Edge-triggered: at
+/// most one per WritePortal; the client keeps a sticky flag.
+pub const EVT_PORTAL_ACTIVITY: u8 = 0x8B;
 
 // §4.1 error codes
 pub const ERR_UNKNOWN_COMMAND: u16 = 0x0001;
@@ -61,6 +65,7 @@ pub const FEAT_EMIT_CWD_EVENTS: u8 = 1 << 3;
 pub const FEAT_EMIT_CLIPBOARD_EVENTS: u8 = 1 << 4;
 pub const FEAT_EMIT_BELL_EVENTS: u8 = 1 << 5;
 pub const FEAT_EMIT_MOUSE_MODE_EVENTS: u8 = 1 << 6;
+pub const FEAT_EMIT_ACTIVITY_EVENTS: u8 = 1 << 7;
 
 // §10 trailing capability bits (after `max_nesting_depth`).
 pub const FEAT_VGE_IN_PORTAL: u8 = 1 << 0;

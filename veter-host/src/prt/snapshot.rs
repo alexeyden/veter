@@ -340,6 +340,9 @@ fn decode_portal(
     // a snapshot loaded from outside doesn't carry an "even older"
     // state to roll back to.
     let vss = crate::vss::VssEngine::new();
+    // SES holds no persistent state — a restored portal starts with a
+    // fresh, non-session engine, same as VSS/VFT.
+    let ses = crate::ses::SesEngine::new();
 
     Ok(Portal {
         id,
@@ -356,6 +359,7 @@ fn decode_portal(
         vge,
         vft,
         vss,
+        ses,
         pre_attach_backup: None,
         state_cache,
         pending_cursor_queries,

@@ -69,7 +69,7 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
     let (master_fd, child_pid) = spawn_inner_pty(&argv)
         .with_context(|| format!("spawning inner program for session `{name}`"))?;
 
-    let engines = match spawn_worker(&master_fd) {
+    let engines = match spawn_worker(&master_fd, name.clone()) {
         Ok(e) => e,
         Err(e) => {
             // Reap the child we just spawned so it doesn't become a

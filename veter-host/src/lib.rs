@@ -15,6 +15,7 @@
 //! through to the renderer where the real picker lives.
 
 pub mod prt;
+pub mod ses;
 pub mod vft;
 pub mod vge;
 pub mod vss;

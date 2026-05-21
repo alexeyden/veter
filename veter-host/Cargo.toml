@@ -20,6 +20,7 @@ vge-protocol = { path = "../vge-protocol" }
 prt-protocol = { path = "../prt-protocol" }
 vft-protocol = { path = "../vft-protocol" }
 vss-protocol = { path = "../vss-protocol" }
+ses-protocol = { path = "../ses-protocol" }
 vt100 = { path = "../vt100" }
 rgb = "0.8"
 libc = "0.2"

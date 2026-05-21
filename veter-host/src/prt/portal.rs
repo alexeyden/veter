@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Parser, Screen};
 
 use super::state::PrtEngine;
+use crate::ses::SesEngine;
 use crate::vft::VftEngine;
 use crate::vge::VgeEngine;
 use crate::vss::VssEngine;
@@ -174,6 +175,13 @@ pub struct Portal {
     /// snapshot into this scope. See `doc/session-manager.md` §4.5
     /// (renderer-side application).
     pub vss: VssEngine,
+    /// Every portal owns its own SES engine so a multiplexer client
+    /// running inside *this* portal can probe the Session Extension.
+    /// A portal is an inner program of this host and is not itself
+    /// session-named, so this engine always reports "not in a
+    /// session" — it exists only to consume (never forward) SES
+    /// envelopes a nested client emits. See `doc/session-extension.md`.
+    pub ses: SesEngine,
     /// Snapshot of this portal's vt100 / VGE / children-PRT state
     /// taken on the first VSS `SnapshotBegin` of the current attach.
     /// Restored on `DetachNotify`. `None` between attaches.

@@ -40,8 +40,15 @@ use prt_protocol::command::{
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
-    EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_RAW_REPLY, EVT_TITLE_CHANGE,
-    MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
+    EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_RAW_REPLY,
+    EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
+};
+
+use ses_protocol::apc::ApcStream as SesApcStream;
+use ses_protocol::frame::MARKER_H2C as SES_MARKER_H2C;
+use ses_protocol::{
+    Command as SesCommand, HostFrame as SesHostFrame, encode_command as build_ses_envelope,
+    for_each_frame as ses_for_each_frame,
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
@@ -517,6 +524,12 @@ struct Pane {
     /// per-pane so two panes can sit at different offsets at the same
     /// time and tab switches don't clobber state.
     scroll: Option<PaneScroll>,
+    /// Sticky activity flag: set when the host reports the pane
+    /// produced meaningful (scrolled) output via PRT
+    /// `EVT_PORTAL_ACTIVITY` while the pane's tab was not in view.
+    /// Cleared when that tab is next activated. Drives the tab-bar
+    /// activity marker.
+    activity: bool,
 }
 
 impl Pane {
@@ -867,10 +880,11 @@ fn tabbar_window(
 
 /// Build the VGE element body that renders the host's top-row tab bar.
 /// Each tab is split into two adjacent sub-rects:
-///   - **number rect** (always present, dim modal-background fill, top-
-///     left corner rounded) showing the 1-based tab index. Color is
-///     fixed regardless of selection so the index reads as a stable
-///     anchor.
+///   - **number rect** (always present, top-left corner rounded)
+///     showing the 1-based tab index. Dim modal-background fill
+///     normally; takes the brand-color fill — the same highlight the
+///     active tab's name rect uses — when the tab has unseen
+///     background activity (`activity[i]`).
 ///   - **name rect** (filled with brand color only when active, top-
 ///     right corner rounded) showing the tab title.
 ///
@@ -890,9 +904,30 @@ fn build_tabbar_commands(
     host_w: u32,
     cell_pw: f32,
     cell_ph: f32,
+    session: Option<&str>,
+    activity: &[bool],
 ) -> CreateElementBody {
     let host_wf = host_w as f32;
     let n = labels.len();
+
+    // Optional session-name segment, pinned to the left of the bar.
+    // Capped so it never eats more than ~40% of row 0; the tabs get
+    // the remaining `bar_w` and every x-coordinate below is offset by
+    // `session_w`.
+    let session_seg: Option<(String, f32)> = session.and_then(|name| {
+        if name.is_empty() {
+            return None;
+        }
+        let max_chars = (((host_wf * 0.4) as usize).saturating_sub(2)).min(24);
+        if max_chars < TABBAR_MIN_LABEL {
+            return None;
+        }
+        let label = elide_tab_label(name, max_chars);
+        let w = (label.chars().count() + 2) as f32;
+        Some((label, w))
+    });
+    let session_w = session_seg.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
+    let bar_w = (host_wf - session_w).max(0.0);
 
     // Per-tab sub-rect widths: " N " number rect + " label " name rect.
     // The " N " number rect depends only on the index.
@@ -902,7 +937,7 @@ fn build_tabbar_commands(
     // Pick the widest label cap the bar can afford, then elide to it —
     // so labels are only shortened to reclaim space, never pre-emptively,
     // and the widths used for scrolling match what gets drawn.
-    let cap = tabbar_label_cap(labels, &num_widths, host_wf);
+    let cap = tabbar_label_cap(labels, &num_widths, bar_w);
     let elided: Vec<String> =
         labels.iter().map(|l| elide_tab_label(l, cap)).collect();
     let name_widths: Vec<f32> = elided
@@ -912,7 +947,7 @@ fn build_tabbar_commands(
     let tab_widths: Vec<f32> =
         (0..n).map(|i| num_widths[i] + name_widths[i]).collect();
 
-    let (first, last) = tabbar_window(&tab_widths, active, host_wf, scroll);
+    let (first, last) = tabbar_window(&tab_widths, active, bar_w, scroll);
     let has_left = first > 0;
     let has_right = n > 0 && last + 1 < n;
 
@@ -933,10 +968,33 @@ fn build_tabbar_commands(
         )],
     });
 
+    // Session-name segment: a dim rounded block pinned at x = 0,
+    // showing the `veterd` session this vmux lives in.
+    if let Some((label, w)) = &session_seg {
+        let (rx, ry) = chrome_corner_radii(*w, 1.0, cell_pw, cell_ph);
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(COLOR_MODAL_BG),
+            segments: rounded_rect_path_corners(
+                0.0, 0.0, *w, 1.0, rx, ry,
+                true,  // TL rounded
+                false, // TR (meets the first tab / chevron)
+                false, // BR
+                false, // BL (sits on the row-1 rule)
+            ),
+        });
+        cmds.push(DrawCmd::DrawText {
+            origin: Point { x: 0.0, y: 0.0 },
+            align: Align::Left,
+            fill: Style::Flat(COLOR_TAB_ACTIVE_TEXT),
+            font_style: FontStyle(0x01),
+            text: format!(" {label} "),
+        });
+    }
+
     // Left overflow chevron — tabs clipped off the start of the bar.
     if has_left {
         cmds.push(DrawCmd::DrawText {
-            origin: Point { x: 0.0, y: 0.0 },
+            origin: Point { x: session_w, y: 0.0 },
             align: Align::Left,
             fill: Style::Flat(COLOR_BRAND),
             font_style: FontStyle(0x00),
@@ -944,7 +1002,7 @@ fn build_tabbar_commands(
         });
     }
 
-    let mut x: f32 = if has_left { TABBAR_CHEVRON_W } else { 0.0 };
+    let mut x: f32 = session_w + if has_left { TABBAR_CHEVRON_W } else { 0.0 };
     for i in first..(last + 1).min(n) {
         let raw = &elided[i];
         let num_text = format!(" {} ", i + 1);
@@ -953,11 +1011,19 @@ fn build_tabbar_commands(
         let name_w = name_widths[i];
         let is_active = i == active;
 
-        // Number sub-rect: always filled with the dim modal background,
-        // top-left corner rounded.
+        // Number sub-rect, top-left corner rounded. Dim modal
+        // background normally; the brand fill — the same highlight the
+        // active tab's name rect uses — when the tab has unseen
+        // background activity.
+        let has_activity = activity.get(i).copied().unwrap_or(false);
+        let num_bg = if has_activity {
+            COLOR_BRAND
+        } else {
+            COLOR_MODAL_BG
+        };
         let (num_rx, num_ry) = chrome_corner_radii(num_w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_MODAL_BG),
+            fill: Style::Flat(num_bg),
             segments: rounded_rect_path_corners(
                 x,
                 0.0,
@@ -971,11 +1037,10 @@ fn build_tabbar_commands(
                 false, // BL (sits on the row-1 rule)
             ),
         });
+        // Light text — legible on both the dim and the brand fill.
         cmds.push(DrawCmd::DrawText {
             origin: Point { x, y: 0.0 },
             align: Align::Left,
-            // Number text is light regardless of selection so it stays
-            // legible on the fixed dim background.
             fill: Style::Flat(COLOR_TAB_ACTIVE_TEXT),
             font_style: FontStyle(0x00),
             text: num_text,
@@ -1565,6 +1630,10 @@ struct State {
     /// Monotonic counter for allocating scroll request ids. Starts at
     /// `SCROLL_REQUEST_ID_BASE` and increments per request.
     next_scroll_req_id: u32,
+    /// `Some(name)` when the host answered the SES probe as a `veterd`
+    /// session — drives the tab-bar session segment and enables
+    /// `prefix-D`. `None` for a plain local `veter` host.
+    session_name: Option<String>,
 }
 
 impl State {
@@ -1597,6 +1666,7 @@ impl State {
             separators_created: false,
             pending_scrolls: HashMap::new(),
             next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
+            session_name: None,
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let pty = PanePty::spawn(rows as u16, cols as u16)?;
@@ -1617,6 +1687,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
                 scroll: None,
+                activity: false,
             },
         );
         Ok(s)
@@ -1699,6 +1770,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
                 scroll: None,
+                activity: false,
             },
         );
         // New pane gets focus.
@@ -1833,6 +1905,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 inner_mouse_protocol: 0,
                 scroll: None,
+                activity: false,
             },
         );
         self.relayout_and_render()
@@ -1846,6 +1919,9 @@ impl State {
         // stay scrolled in the background and the chrome indicator
         // returns when the user tabs back to that tab.
         self.active_tab = index;
+        // The user is now looking at this tab — its panes are no
+        // longer "background", so drop their activity markers.
+        self.clear_tab_activity(index);
         self.relayout_and_render()
     }
 
@@ -2107,9 +2183,8 @@ impl State {
         // Tab bar: re-create on every relayout so tab adds/removes,
         // active-tab changes, and renames all show up. Cheap — single
         // small VGE element.
-        let tabbar_labels: Vec<String> = (0..self.tabs.len())
-            .map(|i| self.tab_effective_title(i))
-            .collect();
+        let tabbar_labels = self.tabbar_labels();
+        let tabbar_activity = self.tab_activity_flags();
         let tabbar_body = build_tabbar_commands(
             &tabbar_labels,
             self.active_tab,
@@ -2117,6 +2192,8 @@ impl State {
             self.host_w,
             self.cell_pw,
             self.cell_ph,
+            self.session_name.as_deref(),
+            &tabbar_activity,
         );
         if self.tabbar_created {
             vge_cmds.push((
@@ -2478,13 +2555,57 @@ impl State {
         tab.title.clone()
     }
 
+    /// Whether any pane in tab `tab_idx` carries the sticky activity
+    /// flag (set by PRT `EVT_PORTAL_ACTIVITY` for a background pane).
+    fn tab_activity(&self, tab_idx: usize) -> bool {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        tab.layout.collect_leaves(&mut leaves);
+        leaves
+            .iter()
+            .any(|id| self.panes.get(id).is_some_and(|p| p.activity))
+    }
+
+    /// Clear the activity flag on every pane in tab `tab_idx`. Called
+    /// when the tab is activated — the user is now looking at it.
+    fn clear_tab_activity(&mut self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        let mut leaves = Vec::new();
+        tab.layout.collect_leaves(&mut leaves);
+        for id in leaves {
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.activity = false;
+            }
+        }
+    }
+
+    /// Tab-bar labels: each tab's effective title, verbatim. The
+    /// activity indicator is rendered as a highlight on the tab number
+    /// (see `tab_activity_flags`), not baked into the label text.
+    fn tabbar_labels(&self) -> Vec<String> {
+        (0..self.tabs.len())
+            .map(|i| self.tab_effective_title(i))
+            .collect()
+    }
+
+    /// Per-tab activity flags for the tab bar — `true` when a tab
+    /// other than the active one has a pane with unseen activity.
+    fn tab_activity_flags(&self) -> Vec<bool> {
+        (0..self.tabs.len())
+            .map(|i| i != self.active_tab && self.tab_activity(i))
+            .collect()
+    }
+
     /// Re-emit just the tab bar element. Used when an OSC title or a
     /// rename changes the active pane's effective title without
     /// otherwise affecting layout.
     fn render_tabbar(&mut self) -> Vec<u8> {
-        let labels: Vec<String> = (0..self.tabs.len())
-            .map(|i| self.tab_effective_title(i))
-            .collect();
+        let labels = self.tabbar_labels();
+        let activity = self.tab_activity_flags();
         let body = build_tabbar_commands(
             &labels,
             self.active_tab,
@@ -2492,6 +2613,8 @@ impl State {
             self.host_w,
             self.cell_pw,
             self.cell_ph,
+            self.session_name.as_deref(),
+            &activity,
         );
         let mut cmds = Vec::new();
         if self.tabbar_created {
@@ -2621,81 +2744,120 @@ fn get_host_winsize() -> Result<(u16, u16)> {
 /// Run a synchronous PRT probe and return whether a probe response was
 /// observed within `timeout`. Body is otherwise ignored — vmux uses its
 /// own conservative limits.
-fn probe_prt(timeout: Duration) -> Result<bool> {
-    let env = build_prt_envelope(&[(PrtCommand::Probe, 0)]);
-    write_all_stdout(&env)?;
-    let mut apc = PrtApcStream::with_marker(*PRT_MARKER_T2C);
-    let deadline = Instant::now() + timeout;
-    let mut buf = [0u8; 4096];
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(false);
-        }
-        if !poll_stdin_for(deadline - now)? {
-            return Ok(false);
-        }
-        let n = read_stdin(&mut buf)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        let out = apc.feed(&buf[..n]);
-        for payload in out.payloads {
-            let mut r = PrtReader::new(&payload);
-            let _ = r.u8();
-            let _ = r.u32();
-            if let Ok(ft) = r.u8() {
-                if ft == PRT_RSP_PROBE {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-}
-
 struct VgeProbeData {
     cell_pw: u16,
     cell_ph: u16,
 }
 
-fn probe_vge(timeout: Duration) -> Result<Option<VgeProbeData>> {
-    let env = build_vge_envelope(&[(VgeCommand::Probe, 0)]);
+/// Outcome of the startup probe round: which extensions the host
+/// speaks, plus the session name when the host is a `veterd` session.
+struct ProbeResults {
+    /// Host advertised the Portal Extension (a hard requirement).
+    prt_ok: bool,
+    /// VGE probe answer, if any (cell pixel metrics).
+    vge: Option<VgeProbeData>,
+    /// `Some(name)` when the host answered the SES probe `in_session`.
+    session_name: Option<String>,
+}
+
+/// Parse one decoded VGE response payload, returning probe metrics if
+/// it is a ProbeResponse frame.
+fn parse_vge_probe(payload: &[u8]) -> Option<VgeProbeData> {
+    let mut r = vge_protocol::codec::Reader::new(payload);
+    let _ = r.u8();
+    let _ = r.u32();
+    let ft = r.u8().ok()?;
+    if ft != VGE_RSP_PROBE {
+        return None;
+    }
+    let _ = r.u32();
+    let _ = r.u32();
+    let _proto = r.u16().ok();
+    let cw = r.u16().unwrap_or(9);
+    let ch = r.u16().unwrap_or(20);
+    Some(VgeProbeData {
+        cell_pw: cw,
+        cell_ph: ch,
+    })
+}
+
+/// Probe PRT, VGE and SES in a single timeout window. All three probe
+/// envelopes are written up front; responses are collected until every
+/// extension has answered or the deadline passes — so a host that does
+/// not speak SES (an older `veter`/`veterd`) costs no extra latency
+/// beyond the shared window, and a missing SES answer is simply "no
+/// session", never fatal. Each APC parser ignores the other markers,
+/// so the raw stream is fed to all three independently.
+fn probe_all(timeout: Duration) -> Result<ProbeResults> {
+    let mut env = build_prt_envelope(&[(PrtCommand::Probe, 0)]);
+    env.extend(build_vge_envelope(&[(VgeCommand::Probe, 0)]));
+    env.extend(build_ses_envelope(&SesCommand::Probe, 0));
     write_all_stdout(&env)?;
-    let mut apc = VgeApcStream::with_marker(*VGE_MARKER_T2C);
+
+    let mut prt_apc = PrtApcStream::with_marker(*PRT_MARKER_T2C);
+    let mut vge_apc = VgeApcStream::with_marker(*VGE_MARKER_T2C);
+    let mut ses_apc = SesApcStream::with_marker(*SES_MARKER_H2C);
+
+    let mut res = ProbeResults {
+        prt_ok: false,
+        vge: None,
+        session_name: None,
+    };
+    let mut ses_seen = false;
+
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
     loop {
+        if res.prt_ok && res.vge.is_some() && ses_seen {
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
-            return Ok(None);
+            break;
         }
         if !poll_stdin_for(deadline - now)? {
-            return Ok(None);
+            break;
         }
         let n = read_stdin(&mut buf)?;
         if n == 0 {
-            return Ok(None);
+            break;
         }
-        let out = apc.feed(&buf[..n]);
-        for payload in out.payloads {
-            let mut r = vge_protocol::codec::Reader::new(&payload);
+
+        for payload in prt_apc.feed(&buf[..n]).payloads {
+            let mut r = PrtReader::new(&payload);
             let _ = r.u8();
             let _ = r.u32();
-            let Ok(ft) = r.u8() else { continue };
-            if ft != VGE_RSP_PROBE {
-                continue;
+            if let Ok(ft) = r.u8()
+                && ft == PRT_RSP_PROBE
+            {
+                res.prt_ok = true;
             }
-            let _ = r.u32();
-            let _ = r.u32();
-            let _proto = r.u16().ok();
-            let cw = r.u16().unwrap_or(9);
-            let ch = r.u16().unwrap_or(20);
-            return Ok(Some(VgeProbeData {
-                cell_pw: cw,
-                cell_ph: ch,
-            }));
+        }
+        for payload in vge_apc.feed(&buf[..n]).payloads {
+            if let Some(p) = parse_vge_probe(&payload) {
+                res.vge = Some(p);
+            }
+        }
+        for payload in ses_apc.feed(&buf[..n]).payloads {
+            let mut frames: Vec<(u8, Vec<u8>)> = Vec::new();
+            let _ = ses_for_each_frame(&payload, |ft, _rid, body| {
+                frames.push((ft, body.to_vec()));
+                Ok::<(), u16>(())
+            });
+            for (ft, body) in frames {
+                if let Ok(SesHostFrame::ProbeResponse {
+                    in_session, name, ..
+                }) = SesHostFrame::parse(ft, &body)
+                {
+                    ses_seen = true;
+                    if in_session && !name.is_empty() {
+                        res.session_name = Some(name);
+                    }
+                }
+            }
         }
     }
+    Ok(res)
 }
 
 fn poll_stdin_for(timeout: Duration) -> Result<bool> {
@@ -2751,13 +2913,13 @@ fn main() -> Result<()> {
     let mut tty = TtyGuard::enable()?;
     drain_stale_stdin();
 
-    if !probe_prt(PROBE_TIMEOUT)? {
+    let probe = probe_all(PROBE_TIMEOUT)?;
+    if !probe.prt_ok {
         bail!(
             "PRT probe timed out — host terminal does not advertise the Portal Extension"
         );
     }
-    let vge_probe = probe_vge(PROBE_TIMEOUT)?;
-    let (cell_pw, cell_ph) = match vge_probe {
+    let (cell_pw, cell_ph) = match &probe.vge {
         Some(p) => (p.cell_pw as f32, p.cell_ph as f32),
         None => (9.0, 20.0),
     };
@@ -2767,6 +2929,9 @@ fn main() -> Result<()> {
 
     let mut state =
         State::new(cols as u32, rows as u32, cell_pw, cell_ph)?;
+    // A `veterd` session host answers the SES probe with its name; a
+    // plain local `veter` host does not, leaving this `None`.
+    state.session_name = probe.session_name;
     // Initial render — creates portal + chrome for p1 and sets focus.
     let env = state.relayout_and_render()?;
     if !env.is_empty() {
@@ -2775,6 +2940,9 @@ fn main() -> Result<()> {
 
     let mut prt_apc = PrtApcStream::with_marker(*PRT_MARKER_T2C);
     let mut vge_apc = VgeApcStream::with_marker(*VGE_MARKER_T2C);
+    // Consumes `ses` host frames (a `prefix-D` detach Ok, or a late
+    // probe response) so they never leak into the keystroke stream.
+    let mut ses_apc = SesApcStream::with_marker(*SES_MARKER_H2C);
     let mut rd_buf = [0u8; 8192];
 
     while !state.quit {
@@ -2822,8 +2990,10 @@ fn main() -> Result<()> {
             // it through so the input handler can act on it without
             // waiting for a follow-up byte that's never coming.
             let prt_flushed = prt_apc.flush_pending_esc();
-            let mut pending = vge_apc.feed(&prt_flushed).passthrough;
-            pending.extend(vge_apc.flush_pending_esc());
+            let mut after_vge = vge_apc.feed(&prt_flushed).passthrough;
+            after_vge.extend(vge_apc.flush_pending_esc());
+            let mut pending = ses_apc.feed(&after_vge).passthrough;
+            pending.extend(ses_apc.flush_pending_esc());
             if !pending.is_empty() {
                 process_user_input(&mut state, &pending)?;
             }
@@ -2844,6 +3014,7 @@ fn main() -> Result<()> {
                 &mut state,
                 &mut prt_apc,
                 &mut vge_apc,
+                &mut ses_apc,
                 &rd_buf[..n],
             )?;
         }
@@ -3001,9 +3172,17 @@ fn handle_stdin_chunk(
     state: &mut State,
     prt_apc: &mut PrtApcStream,
     vge_apc: &mut VgeApcStream,
+    ses_apc: &mut SesApcStream,
     bytes: &[u8],
 ) -> Result<()> {
     let prt_out = prt_apc.feed(bytes);
+
+    // Pane ids in the active tab — activity events for these are
+    // ignored (the user is already looking at them).
+    let active_ids = state.active_pane_ids();
+    // Set when a background pane reported activity, so the tab bar is
+    // re-rendered once after the frame loop.
+    let mut activity_dirty = false;
 
     // PRT host frames: scan for RawReply events (forward to the matching
     // pane's PTY) and Ok responses to our scroll commands (carry the
@@ -3060,6 +3239,21 @@ fn handle_stdin_chunk(
                         }
                     }
                 }
+            } else if ft == EVT_PORTAL_ACTIVITY {
+                // §8: string id. The host already suppresses the
+                // focused portal; vmux additionally ignores any pane
+                // in the active tab and flags the rest so their tab
+                // shows the activity marker.
+                let mut br = PrtReader::new(body);
+                let id = br.string().unwrap_or("").to_string();
+                if !id.is_empty() && !active_ids.contains(&id) {
+                    if let Some(p) = state.panes.get_mut(&id) {
+                        if !p.activity {
+                            p.activity = true;
+                            activity_dirty = true;
+                        }
+                    }
+                }
             } else if ft == EVT_MOUSE_MODE_CHANGE {
                 // §8.9: id, protocol, encoding, focus_events. We only
                 // need protocol — encoding/focus is handled per-event
@@ -3093,8 +3287,9 @@ fn handle_stdin_chunk(
     }
     // Flush title changes: re-emit each affected pane's chrome and the
     // tab bar (because the active pane's effective title can drive the
-    // auto-tab-title). Cheap — small per-pane VGE elements.
-    if !titles_dirty.is_empty() {
+    // auto-tab-title). Cheap — small per-pane VGE elements. An activity
+    // change needs only the tab bar re-rendered.
+    if !titles_dirty.is_empty() || activity_dirty {
         let mut env = Vec::new();
         for id in &titles_dirty {
             env.extend(state.render_one_chrome(id));
@@ -3133,9 +3328,16 @@ fn handle_stdin_chunk(
     let vge_out = vge_apc.feed(&prt_out.passthrough);
     let _ = vge_out.payloads;
 
+    // Strip SES host frames (detach Ok / late probe responses). vmux
+    // acts on neither — `prefix-D` is fire-and-forget and the session
+    // name is captured at startup — but they must not reach the
+    // keystroke stream.
+    let ses_out = ses_apc.feed(&vge_out.passthrough);
+    let _ = ses_out.payloads;
+
     // Split mouse events out of the keystroke stream, dispatch each,
     // and forward only non-mouse bytes to the input state machine.
-    let (regular, mouse_events) = extract_mouse_events(&vge_out.passthrough);
+    let (regular, mouse_events) = extract_mouse_events(&ses_out.passthrough);
     for ev in mouse_events {
         handle_mouse_event(state, ev)?;
     }
@@ -3490,6 +3692,15 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         }
         b'<' => state.move_tab_left(),
         b'>' => state.move_tab_right(),
+        // detach the veterd session — fire-and-forget SES command.
+        // A no-op outside a session (no host to act on it).
+        b'D' => {
+            if state.session_name.is_some() {
+                Ok(build_ses_envelope(&SesCommand::Detach, 0))
+            } else {
+                Ok(Vec::new())
+            }
+        }
         // help
         b'?' => {
             state.mode = Mode::Help {
@@ -3962,9 +4173,29 @@ mod tests {
         // and the scroll offset advanced to reach the active tab.
         let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let body = build_tabbar_commands(&labels, 29, &mut scroll, 80, 8.0, 16.0);
+        let body = build_tabbar_commands(&labels, 29, &mut scroll, 80, 8.0, 16.0, None, &[]);
         assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
         assert!(scroll > 0, "the bar must scroll to reveal the last tab");
+        assert!(!body.commands.is_empty());
+    }
+
+    #[test]
+    fn build_tabbar_with_session_segment_still_packs_tabs() {
+        // With a session segment eating the left edge the bar must
+        // still build and keep the active tab visible.
+        let labels: Vec<String> = (0..12).map(|i| format!("tab{i}")).collect();
+        let mut scroll = 0;
+        let body = build_tabbar_commands(
+            &labels,
+            11,
+            &mut scroll,
+            80,
+            8.0,
+            16.0,
+            Some("session"),
+            &[],
+        );
+        assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
         assert!(!body.commands.is_empty());
     }
 }
