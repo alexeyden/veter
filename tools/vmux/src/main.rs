@@ -13,6 +13,10 @@
 //!
 //! When the last pane closes, vmux exits.
 //!
+//! Mouse reporting is on: a left click focuses the pane under the
+//! pointer or, on the top row, switches to the clicked tab; the wheel
+//! scrolls the pane it is over.
+//!
 //! Each pane is backed by a host PRT portal that receives the inner
 //! shell's output. The pane's outline (rounded rect) and title strip are
 //! drawn with VGE elements. Keystrokes go to the focused pane's PTY
@@ -878,35 +882,54 @@ fn tabbar_window(
     (*scroll, tabbar_last_visible(widths, host_w, *scroll))
 }
 
-/// Build the VGE element body that renders the host's top-row tab bar.
-/// Each tab is split into two adjacent sub-rects:
-///   - **number rect** (always present, top-left corner rounded)
-///     showing the 1-based tab index. Dim modal-background fill
-///     normally; takes the brand-color fill — the same highlight the
-///     active tab's name rect uses — when the tab has unseen
-///     background activity (`activity[i]`).
-///   - **name rect** (filled with brand color only when active, top-
-///     right corner rounded) showing the tab title.
-///
-/// When the tabs don't all fit on row 0, labels are first shortened —
-/// uniformly, down to [`TABBAR_MIN_LABEL`] characters — to reclaim
-/// space. If even minimal labels overflow, the bar scrolls: `scroll`
-/// (the leftmost visible tab, carried across renders) is nudged the
-/// minimum amount needed to keep the active tab on screen, and `‹` / `›`
-/// chevrons mark tabs clipped off either edge.
-///
-/// The rule along row 1 separates the bar from the pane area below;
-/// active tab fills sit flush on top of it.
-fn build_tabbar_commands(
+/// One visible tab's placement on row 0 of the tab bar. The number
+/// sub-rect spans `[x0, x0 + num_w)` and the name sub-rect
+/// `[x0 + num_w, x0 + num_w + name_w)`; together they form the tab's
+/// clickable extent. `index` is the tab's position in `State.tabs`.
+struct TabSlot {
+    index: usize,
+    x0: f32,
+    num_w: f32,
+    name_w: f32,
+    /// Label already elided to the bar's current per-tab character cap.
+    label: String,
+}
+
+/// Geometry of one tab-bar render: the visible tabs with their row-0
+/// placement, the optional session segment, and which overflow
+/// chevrons are shown. Computed once by [`compute_tabbar_layout`] and
+/// shared by the draw path ([`build_tabbar_commands`]) and the click
+/// hit-test ([`tabbar_hit`]) so the two can never disagree about where
+/// a tab sits.
+struct TabbarLayout {
+    slots: Vec<TabSlot>,
+    /// `(elided label, width)` of the session-name segment, or `None`
+    /// for a plain `veter` host or a bar too narrow to spare the room.
+    session_seg: Option<(String, f32)>,
+    has_left: bool,
+    has_right: bool,
+}
+
+impl TabbarLayout {
+    /// Width of the session segment (0 when absent) — also the
+    /// x-coordinate at which the left overflow chevron is drawn.
+    fn session_w(&self) -> f32 {
+        self.session_seg.as_ref().map(|(_, w)| *w).unwrap_or(0.0)
+    }
+}
+
+/// Resolve every visible tab's row-0 placement for one tab-bar render.
+/// This is the single source of truth for tab geometry — label cap,
+/// elision and scroll window are decided here once — so the drawn bar
+/// and the click hit-test always agree. `scroll` is nudged exactly as
+/// the draw path needs (see [`tabbar_window`]).
+fn compute_tabbar_layout(
     labels: &[String],
     active: usize,
     scroll: &mut usize,
     host_w: u32,
-    cell_pw: f32,
-    cell_ph: f32,
     session: Option<&str>,
-    activity: &[bool],
-) -> CreateElementBody {
+) -> TabbarLayout {
     let host_wf = host_w as f32;
     let n = labels.len();
 
@@ -951,6 +974,97 @@ fn build_tabbar_commands(
     let has_left = first > 0;
     let has_right = n > 0 && last + 1 < n;
 
+    // Walk the visible window left-to-right, mirroring the draw loop:
+    // the first tab starts past the session segment and any left
+    // chevron, and each subsequent tab abuts the previous one.
+    let mut slots: Vec<TabSlot> = Vec::new();
+    let mut x = session_w + if has_left { TABBAR_CHEVRON_W } else { 0.0 };
+    for i in first..(last + 1).min(n) {
+        slots.push(TabSlot {
+            index: i,
+            x0: x,
+            num_w: num_widths[i],
+            name_w: name_widths[i],
+            label: elided[i].clone(),
+        });
+        x += num_widths[i] + name_widths[i];
+    }
+
+    TabbarLayout {
+        slots,
+        session_seg,
+        has_left,
+        has_right,
+    }
+}
+
+/// What a row-0 (tab-bar) click landed on, resolved against a
+/// [`TabbarLayout`].
+enum TabbarHit {
+    /// A visible tab — switch to it.
+    Tab(usize),
+    /// The left overflow chevron — step to the previous tab.
+    PrevTab,
+    /// The right overflow chevron — step to the next tab.
+    NextTab,
+}
+
+/// Hit-test a row-0 click at host column `col` against a tab bar's
+/// geometry. The overflow chevrons own the bar's two edges; everything
+/// between resolves to whichever tab's extent contains `col`.
+fn tabbar_hit(layout: &TabbarLayout, host_w: u32, col: f32) -> Option<TabbarHit> {
+    if layout.has_left {
+        let x0 = layout.session_w();
+        if col >= x0 && col < x0 + TABBAR_CHEVRON_W {
+            return Some(TabbarHit::PrevTab);
+        }
+    }
+    if layout.has_right {
+        let x0 = host_w as f32 - TABBAR_CHEVRON_W;
+        if col >= x0 && col < host_w as f32 {
+            return Some(TabbarHit::NextTab);
+        }
+    }
+    for slot in &layout.slots {
+        if col >= slot.x0 && col < slot.x0 + slot.num_w + slot.name_w {
+            return Some(TabbarHit::Tab(slot.index));
+        }
+    }
+    None
+}
+
+/// Build the VGE element body that renders the host's top-row tab bar.
+/// Each tab is split into two adjacent sub-rects:
+///   - **number rect** (always present, top-left corner rounded)
+///     showing the 1-based tab index. Dim modal-background fill
+///     normally; takes the brand-color fill — the same highlight the
+///     active tab's name rect uses — when the tab has unseen
+///     background activity (`activity[i]`).
+///   - **name rect** (filled with brand color only when active, top-
+///     right corner rounded) showing the tab title.
+///
+/// When the tabs don't all fit on row 0, labels are first shortened —
+/// uniformly, down to [`TABBAR_MIN_LABEL`] characters — to reclaim
+/// space. If even minimal labels overflow, the bar scrolls: `scroll`
+/// (the leftmost visible tab, carried across renders) is nudged the
+/// minimum amount needed to keep the active tab on screen, and `‹` / `›`
+/// chevrons mark tabs clipped off either edge.
+///
+/// The rule along row 1 separates the bar from the pane area below;
+/// active tab fills sit flush on top of it.
+fn build_tabbar_commands(
+    labels: &[String],
+    active: usize,
+    scroll: &mut usize,
+    host_w: u32,
+    cell_pw: f32,
+    cell_ph: f32,
+    session: Option<&str>,
+    activity: &[bool],
+) -> CreateElementBody {
+    let host_wf = host_w as f32;
+    let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
+
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
     // shows through, matching whatever theme the user runs veter in.
@@ -970,7 +1084,7 @@ fn build_tabbar_commands(
 
     // Session-name segment: a dim rounded block pinned at x = 0,
     // showing the `veterd` session this vmux lives in.
-    if let Some((label, w)) = &session_seg {
+    if let Some((label, w)) = &layout.session_seg {
         let (rx, ry) = chrome_corner_radii(*w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
             fill: Style::Flat(COLOR_MODAL_BG),
@@ -992,9 +1106,12 @@ fn build_tabbar_commands(
     }
 
     // Left overflow chevron — tabs clipped off the start of the bar.
-    if has_left {
+    if layout.has_left {
         cmds.push(DrawCmd::DrawText {
-            origin: Point { x: session_w, y: 0.0 },
+            origin: Point {
+                x: layout.session_w(),
+                y: 0.0,
+            },
             align: Align::Left,
             fill: Style::Flat(COLOR_BRAND),
             font_style: FontStyle(0x00),
@@ -1002,13 +1119,13 @@ fn build_tabbar_commands(
         });
     }
 
-    let mut x: f32 = session_w + if has_left { TABBAR_CHEVRON_W } else { 0.0 };
-    for i in first..(last + 1).min(n) {
-        let raw = &elided[i];
+    for slot in &layout.slots {
+        let i = slot.index;
+        let x = slot.x0;
+        let num_w = slot.num_w;
+        let name_w = slot.name_w;
         let num_text = format!(" {} ", i + 1);
-        let name_text = format!(" {} ", raw);
-        let num_w = num_widths[i];
-        let name_w = name_widths[i];
+        let name_text = format!(" {} ", slot.label);
         let is_active = i == active;
 
         // Number sub-rect, top-left corner rounded. Dim modal
@@ -1078,11 +1195,10 @@ fn build_tabbar_commands(
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
             text: name_text,
         });
-        x += num_w + name_w;
     }
 
     // Right overflow chevron — tabs clipped off the end of the bar.
-    if has_right {
+    if layout.has_right {
         cmds.push(DrawCmd::DrawText {
             origin: Point {
                 x: host_wf - TABBAR_CHEVRON_W,
@@ -1319,6 +1435,11 @@ const HELP_LINES: &[&str] = &[
     "  PgUp / PgDn   full page up / down",
     "  g / Home      jump to top of scrollback",
     "  0 / End       jump back to live",
+    "",
+    "Mouse",
+    "  click pane   focus it",
+    "  click tab    switch to it",
+    "  wheel        scroll pane under cursor",
     "",
     "Misc",
     "  ?           show this help",
@@ -1874,6 +1995,17 @@ impl State {
         let next = leaves[(pos + 1) % leaves.len()].clone();
         self.set_focus(next);
         // Re-emit chrome (focused pane changes color) and SetFocus.
+        self.relayout_and_render()
+    }
+
+    /// Focus `id` directly — the pointer-driven counterpart of
+    /// `cycle_focus`. No-op when `id` is already focused or is not a
+    /// pane in the active tab. Re-emits chrome and `SetFocus`.
+    fn focus_pane(&mut self, id: &str) -> Result<Vec<u8>> {
+        if self.focus() == id || !self.active_pane_ids().contains(id) {
+            return Ok(Vec::new());
+        }
+        self.set_focus(id.to_string());
         self.relayout_and_render()
     }
 
@@ -3432,22 +3564,40 @@ fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
     })
 }
 
-/// Hit-test a mouse event against pane bounds and dispatch:
+/// Hit-test a mouse event and dispatch:
+///   - left click on row 0 → switch tabs (or step via a chevron);
+///   - left click inside a pane → focus that pane;
 ///   - wheel + inner program doesn't want mouse → drive vmux's
 ///     scrollback for that pane (auto-enter the pane's scroll state,
 ///     auto-exit at offset 0);
 ///   - any other case → forward the event to the matching pane's PTY
 ///     in SGR encoding, with coords translated to portal-relative.
 fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
+    // SGR coords are 1-indexed; PaneRect and row 0 are 0-indexed.
+    let host_col = ev.col.saturating_sub(1) as i32;
+    let host_row = ev.row.saturating_sub(1) as i32;
+
+    // A plain left-button press — no motion bit (0x20), no wheel bit
+    // (0x40), modifier bits ignored — is what drives vmux focus. Drags
+    // and releases must not retrigger it.
+    let is_left_press = ev.press && (ev.button & 0x63) == 0;
+
+    // Row 0 is the tab bar, never part of a pane rect: a left click
+    // there switches tabs and the event goes no further. Gated to
+    // `Mode::Normal` so a click can't reach through a modal.
+    if host_row == 0 {
+        if is_left_press && matches!(state.mode, Mode::Normal) {
+            handle_tabbar_click(state, host_col)?;
+        }
+        return Ok(());
+    }
+
     // Find the pane whose `last_rect` contains the event cell. Only
     // panes in the active tab are eligible — panes from inactive tabs
     // keep their `last_rect` from when they were last visible, so a
     // global scan over `state.panes` would land mouse events on hidden
     // panes whose rects overlap the active layout (and HashMap
-    // iteration order would make the choice nondeterministic). SGR
-    // coords are 1-indexed; PaneRect is 0-indexed.
-    let host_col = ev.col.saturating_sub(1) as i32;
-    let host_row = ev.row.saturating_sub(1) as i32;
+    // iteration order would make the choice nondeterministic).
     let active = state.active_pane_ids();
     let mut target: Option<String> = None;
     for (id, pane) in &state.panes {
@@ -3468,6 +3618,18 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     let Some(pane_id) = target else {
         return Ok(());
     };
+
+    // A left click anywhere in a pane focuses it — the pointer
+    // equivalent of `prefix-o`. Done before the forward logic below so
+    // that when the inner program also wants the click it both focuses
+    // the pane and receives the event. Gated to `Mode::Normal` so a
+    // stray click can't move focus out from under a modal.
+    if is_left_press && matches!(state.mode, Mode::Normal) {
+        let env = state.focus_pane(&pane_id)?;
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
 
     let is_wheel = matches!(ev.button & 0xFF, 64 | 65);
     let inner_wants_mouse = state
@@ -3523,6 +3685,37 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     );
     if let Some(p) = state.panes.get(&pane_id) {
         let _ = p.pty.write_all(payload.as_bytes());
+    }
+    Ok(())
+}
+
+/// Resolve a left click on row 0 (the tab bar) and switch tabs to
+/// match. The bar geometry is recomputed from the live tab list so the
+/// hit-test maps to exactly the tabs the user sees; the chevrons step
+/// to the neighbouring tab, mirroring `prefix-n` / `prefix-p`.
+fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
+    if host_col < 0 {
+        return Ok(());
+    }
+    let labels = state.tabbar_labels();
+    // The last render already settled `tab_scroll`; hit-test against a
+    // copy so this probe leaves the carried offset untouched.
+    let mut scroll = state.tab_scroll;
+    let layout = compute_tabbar_layout(
+        &labels,
+        state.active_tab,
+        &mut scroll,
+        state.host_w,
+        state.session_name.as_deref(),
+    );
+    let env = match tabbar_hit(&layout, state.host_w, host_col as f32) {
+        Some(TabbarHit::Tab(idx)) => state.goto_tab(idx)?,
+        Some(TabbarHit::PrevTab) => state.prev_tab()?,
+        Some(TabbarHit::NextTab) => state.next_tab()?,
+        None => return Ok(()),
+    };
+    if !env.is_empty() {
+        write_all_stdout(&env)?;
     }
     Ok(())
 }
@@ -4227,6 +4420,64 @@ mod tests {
         assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
         assert!(scroll > 0, "the bar must scroll to reveal the last tab");
         assert!(!body.commands.is_empty());
+    }
+
+    #[test]
+    fn tabbar_hit_resolves_a_click_to_the_tab_under_it() {
+        let labels: Vec<String> =
+            vec!["one".into(), "two".into(), "three".into()];
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None);
+        assert_eq!(layout.slots.len(), 3, "all three tabs fit a wide bar");
+        // Every visible tab's midpoint must hit-test back to itself.
+        for slot in &layout.slots {
+            let mid = slot.x0 + (slot.num_w + slot.name_w) / 2.0;
+            assert!(matches!(
+                tabbar_hit(&layout, 200, mid),
+                Some(TabbarHit::Tab(i)) if i == slot.index
+            ));
+        }
+    }
+
+    #[test]
+    fn tabbar_hit_misses_past_the_last_tab() {
+        let labels: Vec<String> = vec!["solo".into()];
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None);
+        let last = &layout.slots[0];
+        let past = last.x0 + last.num_w + last.name_w + 1.0;
+        assert!(tabbar_hit(&layout, 200, past).is_none());
+    }
+
+    #[test]
+    fn tabbar_hit_maps_chevrons_to_prev_next() {
+        // 30 tabs on an 80-cell bar overflow; with a mid-list active
+        // tab both chevrons show and own the bar's edges.
+        let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 15, &mut scroll, 80, None);
+        assert!(layout.has_left && layout.has_right);
+        assert!(matches!(
+            tabbar_hit(&layout, 80, 0.5),
+            Some(TabbarHit::PrevTab)
+        ));
+        assert!(matches!(
+            tabbar_hit(&layout, 80, 79.5),
+            Some(TabbarHit::NextTab)
+        ));
+    }
+
+    #[test]
+    fn tabbar_slots_stay_within_the_host_bar() {
+        // No slot may extend past the host edge, or a click would fall
+        // between a drawn tab and its hit-test extent.
+        let labels: Vec<String> = (0..6).map(|i| format!("tab{i}")).collect();
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 80, None);
+        for slot in &layout.slots {
+            assert!(slot.x0 >= 0.0);
+            assert!(slot.x0 + slot.num_w + slot.name_w <= 80.0);
+        }
     }
 
     #[test]
