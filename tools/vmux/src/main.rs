@@ -2489,6 +2489,17 @@ impl State {
 
     /// Re-emit only the chrome for one specific pane (e.g. after rename).
     fn render_one_chrome(&mut self, pane_id: &str) -> Vec<u8> {
+        // Only the active tab's panes have visible chrome. A pane in a
+        // background tab can still trigger this path — a late
+        // `SetPortalScrollback` ack or an OSC title change — and the
+        // `CreateElement` below is unconditionally `is_visible: true`,
+        // which would re-show that pane's chrome (e.g. its scroll
+        // indicator) on top of whatever tab is currently displayed.
+        // Skip it: `relayout_and_render` rebuilds the chrome from
+        // scratch when the user switches back to that tab.
+        if !self.visible_panes.contains(pane_id) {
+            return Vec::new();
+        }
         let (rect, title_raw) = match self.panes.get(pane_id) {
             Some(pane) => match pane.last_rect {
                 Some(rect) => (rect, pane.effective_title().to_string()),
