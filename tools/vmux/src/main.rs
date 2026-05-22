@@ -9,7 +9,7 @@
 //!   x  close the focused pane
 //!   r  rename the focused pane (modal edit window)
 //!   o  cycle focus to the next pane
-//!   q  quit vmux
+//!   q  quit vmux (asks for confirmation first)
 //!
 //! When the last pane closes, vmux exits.
 //!
@@ -1218,17 +1218,15 @@ fn build_modal_commands(
     host_w: u32,
     host_h: u32,
     title: &str,
-    prompt: &str,
-    buffer: &str,
+    line: &str,
     cell_pw: f32,
     cell_ph: f32,
 ) -> CreateElementBody {
     // Center a fixed-size modal box on the host grid. The 4-cell box
-    // is (title strip)(body top pad)(buffer)(body bottom pad) — title
-    // row is filled with brand color, the rest with the modal bg, and
-    // the whole box gets a rounded-edge brand outline that matches the
-    // tab and pill styling.
-    let line = format!("{prompt}{buffer}_");
+    // is (title strip)(body top pad)(body line)(body bottom pad) —
+    // title row is filled with brand color, the rest with the modal
+    // bg, and the whole box gets a rounded-edge brand outline that
+    // matches the tab and pill styling.
     let chars = line.chars().count() as f32;
     let inner_w = chars.max(20.0);
     let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
@@ -1276,7 +1274,7 @@ fn build_modal_commands(
             align: Align::Center,
             fill: Style::Flat(COLOR_MODAL_TEXT),
             font_style: FontStyle(0x00),
-            text: line,
+            text: line.into(),
         },
     ];
 
@@ -1324,7 +1322,7 @@ const HELP_LINES: &[&str] = &[
     "",
     "Misc",
     "  ?           show this help",
-    "  q           quit vmux",
+    "  q           quit vmux (asks y/n to confirm)",
     "  Ctrl+Space  send a literal Ctrl+Space",
     "",
     "j/k or ↑/↓ scroll · any other key dismisses",
@@ -1567,6 +1565,10 @@ enum Mode {
         /// dismissing the modal prematurely.
         csi_buf: Vec<u8>,
     },
+    /// Quit-confirmation modal shown by `prefix-q`. `y` confirms and
+    /// exits; `n`/Esc cancels; any other key is ignored so a stray
+    /// keystroke can neither quit nor dismiss the prompt.
+    ConfirmQuit,
 }
 
 const PREFIX_BYTE: u8 = 0x00; // Ctrl+Space
@@ -2326,8 +2328,7 @@ impl State {
                     self.host_w,
                     self.host_h,
                     title,
-                    "",
-                    buffer,
+                    &format!("{buffer}_"),
                     self.cell_pw,
                     self.cell_ph,
                 )]
@@ -2339,6 +2340,14 @@ impl State {
                 self.cell_pw,
                 self.cell_ph,
             ),
+            Mode::ConfirmQuit => vec![build_modal_commands(
+                self.host_w,
+                self.host_h,
+                "Quit vmux?",
+                "y = quit     n = cancel",
+                self.cell_pw,
+                self.cell_ph,
+            )],
             Mode::Normal | Mode::Prefix => Vec::new(),
         }
     }
@@ -3640,6 +3649,13 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 }
                 idx += 1;
             }
+            Mode::ConfirmQuit => {
+                let env = handle_confirm_byte(state, b)?;
+                if !env.is_empty() {
+                    write_all_stdout(&env)?;
+                }
+                idx += 1;
+            }
         }
     }
     Ok(())
@@ -3655,8 +3671,10 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'x' => state.close_focused(),
         b'o' => state.cycle_focus(),
         b'q' => {
-            state.quit = true;
-            Ok(Vec::new())
+            // Don't quit outright — pop a confirmation modal so an
+            // accidental prefix-q is a recoverable keystroke.
+            state.mode = Mode::ConfirmQuit;
+            Ok(state.render_modal_overlay())
         }
         b'r' => {
             let pane_id = state.focus().to_string();
@@ -3800,6 +3818,27 @@ fn handle_rename_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
             if buffer.chars().count() < 32 {
                 buffer.push(b as char);
             }
+            Ok(state.render_modal_overlay())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Process one byte while the quit-confirmation modal is up. `y`/`Y`
+/// confirms the quit; `n`/`N`/Esc cancels; any other key is ignored so
+/// a stray keystroke can neither quit nor dismiss the prompt.
+fn handle_confirm_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
+    if !matches!(state.mode, Mode::ConfirmQuit) {
+        return Ok(Vec::new());
+    }
+    match b {
+        b'y' | b'Y' => {
+            state.quit = true;
+            state.mode = Mode::Normal;
+            Ok(state.render_modal_overlay())
+        }
+        b'n' | b'N' | 0x1B => {
+            state.mode = Mode::Normal;
             Ok(state.render_modal_overlay())
         }
         _ => Ok(Vec::new()),
