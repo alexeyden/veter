@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vmux vsend vrecv veterd
+PACKAGES := veter vcat vmux vsend vrecv veterd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
@@ -40,6 +40,7 @@ BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
 .PHONY: all build install uninstall clean help install-desktop install-icon \
         dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb dist-clean \
+        dist-aarch64-manifest install-dist-maybe install-dist-share \
         install-remote-aarch64
 
 all: install
@@ -54,7 +55,10 @@ help:
 	@echo "  dist-aarch64-build  cross-compile vmux/vcat/vsend/vrecv/veterd"
 	@echo "                      for aarch64-unknown-linux-musl (static, rust-lld)"
 	@echo "  dist-aarch64-tarxz  bundle the above into a .tar.xz under dist/"
+	@echo "  dist-aarch64-manifest  write a sha256-stamped manifest beside the tarball"
 	@echo "  dist-aarch64-deb    bundle the above into veter-tools_<v>_arm64.deb"
+	@echo "  install-dist-share  stage tarball + manifest under \$$PREFIX/share/veter/dist/"
+	@echo "                      (vssh reads them from there to deploy remotely)"
 	@echo "  dist-clean          rm -rf dist/"
 	@echo
 	@echo "  install-remote-aarch64"
@@ -77,7 +81,7 @@ build:
 # is missing after the build.
 $(BINS): build
 
-install: $(BINS) install-desktop install-icon
+install: $(BINS) install-desktop install-icon install-dist-maybe
 	@$(INSTALL) -d $(BINDIR)
 	@for pkg in $(PACKAGES); do \
 	    src="$(RELEASE_DIR)/$$pkg"; \
@@ -141,6 +145,10 @@ uninstall:
 	@for pkg in $(PACKAGES); do \
 	    rm -f "$(BINDIR)/$$pkg" && echo "    removed $(BINDIR)/$$pkg"; \
 	done
+	@if [ -d "$(PREFIX)/share/veter/dist" ]; then \
+	    rm -rf "$(PREFIX)/share/veter/dist" && \
+	    echo "    removed $(PREFIX)/share/veter/dist"; \
+	fi
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
 	@for sz in $(ICON_PNG_SIZES); do \
@@ -166,7 +174,7 @@ clean:
 # target system — and ride into either a .tar.xz or a .deb.
 
 DIST_TOOLS := vmux vcat vsend vrecv veterd
-DIST_VERSION ?= 0.1.4
+DIST_VERSION ?= 0.1.5
 DIST_ARCH := aarch64-unknown-linux-musl
 
 # `install-remote-aarch64` knobs. `REMOTE` is required — it's whatever
@@ -183,7 +191,16 @@ DIST_DEB_STAGING := $(DIST_DIR)/veter-tools_$(DIST_VERSION)_$(DIST_DEB_ARCH)
 DIST_DEB_FILE := $(DIST_DIR)/veter-tools_$(DIST_VERSION)_$(DIST_DEB_ARCH).deb
 DIST_TARXZ_STAGING := $(DIST_DIR)/staging-tarxz
 DIST_TARXZ_FILE := $(DIST_DIR)/veter-tools-$(DIST_VERSION)-$(DIST_ARCH).tar.xz
+DIST_MANIFEST_FILE := $(DIST_DIR)/manifest-$(DIST_ARCH).json
 DIST_MAINTAINER := Alexey Denisov <rtgbnm@gmail.com>
+
+# vssh reads the staged tarball + manifest from this layout when
+# installing veter-tools on a remote host. `install-dist-maybe` only
+# stages them if the aarch64-musl rust-std is available; otherwise
+# vssh degrades to a thin ssh wrapper.
+SHARE_DIST_DIR := $(PREFIX)/share/veter/dist/$(DIST_ARCH)
+SHARE_DIST_TARBALL := $(SHARE_DIST_DIR)/veter-tools.tar.xz
+SHARE_DIST_MANIFEST := $(SHARE_DIST_DIR)/manifest.json
 
 dist-aarch64-build:
 	@# Linker for this target is configured in `.cargo/config.toml`:
@@ -231,6 +248,39 @@ dist-aarch64-tarxz: dist-aarch64-build
 	@rm -rf $(DIST_TARXZ_STAGING)
 	@echo "    veter-tools tarball -> $(DIST_TARXZ_FILE)"
 	@ls -l $(DIST_TARXZ_FILE)
+
+# Manifest is what vssh reads to decide whether to upload to a remote.
+# Carrying the sha256 of the tarball (not just the version string)
+# lets us treat any content change as a reason to push, including
+# rebuilds where the version number didn't move.
+dist-aarch64-manifest: dist-aarch64-tarxz
+	@sha=$$(sha256sum $(DIST_TARXZ_FILE) | cut -d' ' -f1); \
+	tools=$$(printf '"%s",' $(DIST_TOOLS) | sed 's/,$$//'); \
+	printf '{"version":"%s","arch":"%s","sha256":"%s","tools":[%s]}\n' \
+	    "$(DIST_VERSION)" "$(DIST_ARCH)" "$$sha" "$$tools" \
+	    > $(DIST_MANIFEST_FILE)
+	@echo "    manifest -> $(DIST_MANIFEST_FILE)"
+
+install-dist-share: dist-aarch64-manifest
+	@$(INSTALL) -d $(SHARE_DIST_DIR)
+	@$(INSTALL) -m 0644 $(DIST_TARXZ_FILE) $(SHARE_DIST_TARBALL)
+	@$(INSTALL) -m 0644 $(DIST_MANIFEST_FILE) $(SHARE_DIST_MANIFEST)
+	@echo "    dist tarball -> $(SHARE_DIST_TARBALL)"
+	@echo "    dist manifest -> $(SHARE_DIST_MANIFEST)"
+
+# Run as a dep of `install`. Stages the dist tarball under
+# $PREFIX/share/ when the rustup target for aarch64-musl is present,
+# otherwise drops a single note line and proceeds. The recursive
+# $(MAKE) is deliberate: it lets `install-dist-share` pull in
+# dist-aarch64-tarxz → dist-aarch64-build only when the target is
+# actually installed, keeping a vanilla `make install` toolchain-free.
+install-dist-maybe:
+	@if rustup target list --installed 2>/dev/null | grep -qx '$(DIST_ARCH)'; then \
+	    $(MAKE) --no-print-directory install-dist-share; \
+	else \
+	    echo "note: $(DIST_ARCH) rust-std not installed; vssh will run without bundled remote tools."; \
+	    echo "      run 'rustup target add $(DIST_ARCH)' to enable auto-deploy on ssh."; \
+	fi
 
 dist-aarch64-deb: dist-aarch64-build
 	@command -v dpkg-deb >/dev/null 2>&1 || { \
