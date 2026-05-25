@@ -1,7 +1,7 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
 // re-imports them for in-file references. veterd and other workspace
 // crates pull the same code through `veter::*`.
-use veter::{clipboard, prt, pty, renderer, ses, vft, vge, vss};
+use veter::{clipboard, prt, pty, renderer, search, ses, vft, vge, vss};
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -537,6 +537,59 @@ struct App {
     /// dedup so the inner program receives at most one motion event
     /// per cell. `None` means "no motion forwarded yet".
     last_motion_cell: Option<(u32, u32)>,
+    /// Active scrollback search (Some while the search bar is open).
+    /// Opened by `/` when the focused-leaf parser has scrollback > 0;
+    /// closed by Esc (restores scrollback) or once the user is done.
+    search: Option<SearchState>,
+}
+
+/// One scrollback-search session, owned by `App::search`.
+///
+/// The session captures `target_path` at open time so focus changes
+/// during the search don't redirect matches mid-session. While
+/// `editing`, typed characters edit the query and matches recompute
+/// live; after the first Enter, n/N navigate without further query
+/// edits (typing a fresh char re-enters editing with a new query).
+struct SearchState {
+    query: String,
+    /// Default true — terminal text is usually skimmed, not grepped.
+    /// Toggled by Alt+C in the search bar.
+    case_insensitive: bool,
+    /// Sub-mode: `true` = typing query, `false` = navigation (n/N).
+    editing: bool,
+    /// Portal id chain to the target leaf parser at open time. Empty
+    /// = host vt100. Resolved to a `&mut Screen` via
+    /// `with_target_leaf_screen_mut`.
+    target_path: Vec<String>,
+    /// Scrollback offset of the target parser when search opened.
+    /// Restored on Esc if the user never committed (Enter) a match.
+    saved_scrollback: usize,
+    /// Lazily-built per-row text index for the target parser. `None`
+    /// after a PTY-output invalidation; rebuilt on the next
+    /// `recompute_matches` call.
+    cache: Option<search::TextIndex>,
+    /// Matches for the current `(query, case_insensitive)` against
+    /// `cache`. Recomputed whenever query/case changes.
+    matches: Vec<search::MatchSpan>,
+    /// Index into `matches` of the active match (the one the
+    /// viewport is scrolled to). Always `< matches.len()` when
+    /// non-empty; `0` if empty.
+    current: usize,
+}
+
+impl SearchState {
+    fn new(target_path: Vec<String>, saved_scrollback: usize) -> Self {
+        Self {
+            query: String::new(),
+            case_insensitive: true,
+            editing: true,
+            target_path,
+            saved_scrollback,
+            cache: None,
+            matches: Vec::new(),
+            current: 0,
+        }
+    }
 }
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -546,6 +599,58 @@ const DOUBLE_CLICK_RADIUS_PX: f64 = 6.0;
 /// encoding uses (shift=4, alt=8, ctrl=16). Used by both button and
 /// motion forwarders. Shift is gated out of forwarding above, but the
 /// bit is encoded defensively in case that ever changes.
+/// Render the search input bar over the bottom row of the window.
+/// One-line strip: `/<query>  M/N  [Aa|aA]` left-aligned, with a
+/// trailing `(no matches)` hint when the query is non-empty but no
+/// matches exist. The bar overlays whatever was drawn below — the
+/// search session is modal, so occluding the bottom row is fine.
+fn draw_search_bar<T: femtovg::Renderer>(
+    canvas: &mut Canvas<T>,
+    tr: &mut renderer::TerminalRenderer,
+    search: &SearchState,
+    window_w_px: f32,
+    window_h_px: f32,
+) {
+    let bar_h = tr.cell_height;
+    let bar_y = window_h_px - bar_h;
+
+    let mut bg_path = femtovg::Path::new();
+    bg_path.rect(0.0, bar_y, window_w_px, bar_h);
+    canvas.fill_path(&bg_path, &femtovg::Paint::color(Color::rgb(45, 45, 55)));
+
+    let case_indicator = if search.case_insensitive { "[aA]" } else { "[Aa]" };
+    let counter = if search.matches.is_empty() {
+        if search.query.is_empty() {
+            String::new()
+        } else {
+            "(no matches)".to_string()
+        }
+    } else {
+        format!("{}/{}", search.current + 1, search.matches.len())
+    };
+    let mode_marker = if search.editing { "" } else { " " };
+    let text = if counter.is_empty() {
+        format!(" /{}{}  {}", search.query, mode_marker, case_indicator)
+    } else {
+        format!(
+            " /{}{}  {}  {}",
+            search.query, mode_marker, counter, case_indicator
+        )
+    };
+
+    let ascent = tr.ascent();
+    let text_y = bar_y + ascent + (bar_h - ascent) * 0.5;
+    tr.draw_vge_text(
+        canvas,
+        0.0,
+        text_y,
+        &text,
+        Color::rgb(230, 230, 230),
+        vge::command::Align::Left,
+        vge::command::FontStyle::default(),
+    );
+}
+
 fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
     let mut bits = 0;
     if modifiers.shift_key() {
@@ -586,7 +691,177 @@ impl App {
             last_click: None,
             mouse_buttons_held: 0,
             last_motion_cell: None,
+            search: None,
         }
+    }
+
+    /// Apply `op` to the focused-leaf parser's `Screen`. Walks
+    /// `PrtState::focus_chain()` to the deepest portal whose own focus
+    /// is `Host`; that portal's vt is the focused leaf. An empty chain
+    /// means the host vt100 is the focused leaf. The closure takes
+    /// `&mut Screen` (callback-agnostic) so the same helper works for
+    /// both host and portal parsers. Returns `None` if state isn't
+    /// ready or a chain id no longer resolves.
+    fn with_focused_leaf_screen_mut<R>(
+        &mut self,
+        op: impl FnOnce(&mut vt100::Screen) -> R,
+    ) -> Option<R> {
+        let path = self.focused_leaf_path();
+        self.with_target_leaf_screen_mut(&path, op)
+    }
+
+    /// Like [`with_focused_leaf_screen_mut`], but the target leaf is
+    /// named explicitly by `path` instead of resolved from current
+    /// focus. Used by search sessions that captured the path at open
+    /// time (so focus changes during search don't redirect the target).
+    fn with_target_leaf_screen_mut<R>(
+        &mut self,
+        path: &[String],
+        op: impl FnOnce(&mut vt100::Screen) -> R,
+    ) -> Option<R> {
+        if path.is_empty() {
+            let parser = self.parser.as_mut()?;
+            return Some(op(parser.screen_mut()));
+        }
+        let prt = self.prt.as_mut()?;
+        let portal = resolve_portal_target_mut(prt, path)?;
+        Some(op(portal.vt.screen_mut()))
+    }
+
+    /// Snapshot the focus chain as an owned `Vec<String>` so callers
+    /// can drop the borrow on `self.prt` before doing further mutation.
+    fn focused_leaf_path(&self) -> Vec<String> {
+        self.prt
+            .as_ref()
+            .map(|p| p.state.focus_chain().iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Rebuild the search text index against the target parser
+    /// named by the current `SearchState::target_path`. Returns None
+    /// if state is missing or the path no longer resolves; in that
+    /// case the caller leaves `cache` as None and `matches` empty.
+    fn rebuild_search_index(&mut self) -> Option<search::TextIndex> {
+        let path = self.search.as_ref()?.target_path.clone();
+        if path.is_empty() {
+            let top = self.prt.as_ref()?.top_of_live_screen();
+            let parser = self.parser.as_mut()?;
+            return Some(search::extract_indexed_text(parser, top));
+        }
+        let prt = self.prt.as_mut()?;
+        let portal = resolve_portal_target_mut(prt, &path)?;
+        let top = portal.children.top_of_live_screen();
+        Some(search::extract_indexed_text(&mut portal.vt, top))
+    }
+
+    /// `top_of_live_screen` of the engine that owns the target leaf
+    /// parser at `path`. Host parser: top-level `prt.top_of_live_screen()`.
+    /// Portal parser: the *containing* portal's `children` sub-engine —
+    /// i.e. `portal.children.top_of_live_screen()`, matching the
+    /// convention documented on `extract_text_from_parser`.
+    fn target_top_of_live_screen(&self, path: &[String]) -> Option<i64> {
+        let prt = self.prt.as_ref()?;
+        if path.is_empty() {
+            return Some(prt.top_of_live_screen());
+        }
+        let mut current_set = prt.state.current();
+        for id in &path[..path.len() - 1] {
+            let portal = current_set.portals.get(id.as_str())?;
+            current_set = portal.children.state.current();
+        }
+        let last = path[path.len() - 1].as_str();
+        current_set
+            .portals
+            .get(last)
+            .map(|p| p.children.top_of_live_screen())
+    }
+
+    /// Scroll the target parser so the current match is centered in
+    /// the viewport. No-op if no search session, no matches, or the
+    /// target path no longer resolves.
+    fn scroll_to_current_match(&mut self) {
+        let Some(search) = self.search.as_ref() else { return };
+        if search.matches.is_empty() {
+            return;
+        }
+        let m = search.matches[search.current];
+        let path = search.target_path.clone();
+        let Some(top) = self.target_top_of_live_screen(&path) else { return };
+        self.with_target_leaf_screen_mut(&path, |s| {
+            let rows = s.size().0 as i64;
+            let target = (top - m.line + rows / 2).max(0) as usize;
+            s.set_scrollback(target);
+        });
+    }
+
+    /// Drop the cached search index. Called after a PTY-output tick
+    /// so the next `recompute_search_matches` rebuilds against the
+    /// updated parser state. Conservative — invalidates even if the
+    /// target parser was untouched this tick, since re-extracting
+    /// at typical scrollback sizes is sub-ms. No-op when no search
+    /// session is active.
+    fn invalidate_search_cache(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.cache = None;
+        }
+        // Recompute eagerly so the match list (and `current`) reflect
+        // any new lines without waiting for the next keystroke.
+        if self.search.is_some() {
+            self.recompute_search_matches();
+        }
+    }
+
+    /// Recompute `SearchState::matches` against the cached (or freshly
+    /// rebuilt) text index. Clamps `current` to the new match count
+    /// (preserves navigation position across PTY-driven invalidations).
+    /// Cheap when the cache is warm (just runs `memmem` over each
+    /// row); rebuilds the cache only on first call after open or
+    /// invalidation.
+    fn recompute_search_matches(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        if self.search.as_ref().unwrap().cache.is_none() {
+            let idx = self.rebuild_search_index();
+            if let Some(search) = self.search.as_mut() {
+                search.cache = idx;
+            }
+        }
+        let Some(search) = self.search.as_mut() else { return };
+        let matches = match &search.cache {
+            Some(idx) => search::find_matches(idx, &search.query, search.case_insensitive),
+            None => Vec::new(),
+        };
+        search.matches = matches;
+        if search.matches.is_empty() {
+            search.current = 0;
+        } else if search.current >= search.matches.len() {
+            search.current = search.matches.len() - 1;
+        }
+    }
+
+    /// Current scrollback offset of the focused-leaf parser; 0 if no
+    /// state is loaded or a chain id no longer resolves.
+    fn focused_leaf_scrollback(&self) -> usize {
+        let Some(prt) = self.prt.as_ref() else { return 0 };
+        let chain = prt.state.focus_chain();
+        if chain.is_empty() {
+            return self
+                .parser
+                .as_ref()
+                .map(|p| p.screen().scrollback())
+                .unwrap_or(0);
+        }
+        let mut current_set = prt.state.current();
+        for id in &chain[..chain.len() - 1] {
+            let Some(portal) = current_set.portals.get(*id) else { return 0 };
+            current_set = portal.children.state.current();
+        }
+        current_set
+            .portals
+            .get(chain[chain.len() - 1])
+            .map(|p| p.vt.screen().scrollback())
+            .unwrap_or(0)
     }
 
     /// Bracketed-paste mode of the focused vt — host parser, unless a
@@ -1029,26 +1304,55 @@ impl App {
             return;
         }
 
-        // Shift+PageUp/Down for scrollback
+        // While a search session is open, swallow every key into the
+        // search handler — the search bar is modal w.r.t. the focused
+        // PTY. Returns regardless of whether the key was meaningful so
+        // typing doesn't leak through to the inner program.
+        if self.search.is_some() {
+            self.handle_search_key_input(event);
+            return;
+        }
+
+        // Open search on `/` while the focused-leaf parser is scrolled
+        // back. Checked before the "any key resets scrollback" reset
+        // below so opening search preserves the scroll position.
+        if let Key::Character(c) = &event.logical_key
+            && c.as_str() == "/"
+            && self.focused_leaf_scrollback() > 0
+            && !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+        {
+            let path = self.focused_leaf_path();
+            let saved = self.focused_leaf_scrollback();
+            self.search = Some(SearchState::new(path, saved));
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
+        // Shift+PageUp/Down for scrollback. Targets the focused-leaf
+        // parser so scrolling inside a vmux pane navigates that pane's
+        // scrollback rather than the host vt100 (which inside vmux holds
+        // only chrome paint — pane bytes are routed through PRT into
+        // per-portal vt100s).
         if self.modifiers.shift_key() {
             match &event.logical_key {
                 Key::Named(NamedKey::PageUp) => {
-                    if let Some(parser) = &mut self.parser {
-                        let rows = parser.screen().size().0 as usize;
-                        let screen = parser.screen_mut();
+                    self.with_focused_leaf_screen_mut(|screen| {
+                        let rows = screen.size().0 as usize;
                         screen.set_scrollback(screen.scrollback() + rows);
-                    }
+                    });
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
                     return;
                 }
                 Key::Named(NamedKey::PageDown) => {
-                    if let Some(parser) = &mut self.parser {
-                        let rows = parser.screen().size().0 as usize;
-                        let screen = parser.screen_mut();
+                    self.with_focused_leaf_screen_mut(|screen| {
+                        let rows = screen.size().0 as usize;
                         screen.set_scrollback(screen.scrollback().saturating_sub(rows));
-                    }
+                    });
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1058,10 +1362,8 @@ impl App {
             }
         }
 
-        // Any non-scroll key resets scrollback to bottom
-        if let Some(parser) = &mut self.parser {
-            parser.screen_mut().set_scrollback(0);
-        }
+        // Any non-scroll key resets scrollback to bottom on the focused leaf.
+        self.with_focused_leaf_screen_mut(|screen| screen.set_scrollback(0));
 
         let pty = match &self.pty {
             Some(p) => p,
@@ -1191,6 +1493,115 @@ impl App {
         if let Some(text) = &event.text {
             trace_keyboard_send(text.as_bytes());
             let _ = pty.write_all(text.as_bytes());
+        }
+    }
+
+    /// Modal key handler for the search bar. Sub-modes:
+    ///
+    /// * `editing` (just after open, or after a fresh char while
+    ///   navigating) — typed chars edit the query, Backspace pops,
+    ///   Alt+C toggles case, Enter commits and switches to
+    ///   navigation, Esc closes and restores the saved scroll.
+    /// * navigating (`!editing`, after the first Enter) — n/N step
+    ///   the current match, any printable other than n/N re-enters
+    ///   editing with a fresh query.
+    ///
+    /// Match computation and scroll-to-match are wired in steps 2/4
+    /// of the search work; this scaffold only owns the state
+    /// transitions and redraw triggers.
+    fn handle_search_key_input(&mut self, event: &winit::event::KeyEvent) {
+        let Some(search) = self.search.as_mut() else { return };
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let path = search.target_path.clone();
+                let saved = search.saved_scrollback;
+                let was_editing = search.editing;
+                self.search = None;
+                if was_editing {
+                    self.with_target_leaf_screen_mut(&path, |s| {
+                        s.set_scrollback(saved);
+                    });
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                if search.editing {
+                    search.editing = false;
+                } else if !search.matches.is_empty() {
+                    search.current = (search.current + 1) % search.matches.len();
+                }
+                self.scroll_to_current_match();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if search.editing {
+                    search.query.pop();
+                    search.current = 0;
+                    self.recompute_search_matches();
+                    self.scroll_to_current_match();
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Character(c) => {
+                let s = c.as_str();
+                if self.modifiers.alt_key() {
+                    if s.eq_ignore_ascii_case("c") {
+                        search.case_insensitive = !search.case_insensitive;
+                        search.current = 0;
+                        self.recompute_search_matches();
+                        self.scroll_to_current_match();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if !search.editing {
+                    match s {
+                        "n" => {
+                            if !search.matches.is_empty() {
+                                search.current =
+                                    (search.current + 1) % search.matches.len();
+                            }
+                            self.scroll_to_current_match();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                        "N" => {
+                            if !search.matches.is_empty() {
+                                let n = search.matches.len();
+                                search.current = (search.current + n - 1) % n;
+                            }
+                            self.scroll_to_current_match();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                        _ => {
+                            search.editing = true;
+                            search.query.clear();
+                        }
+                    }
+                }
+                search.query.push_str(s);
+                search.current = 0;
+                self.recompute_search_matches();
+                self.scroll_to_current_match();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1816,11 +2227,10 @@ impl ApplicationHandler for App {
                             (pos.y as f32 / ch) as isize
                         }
                     };
-                    if let Some(parser) = &mut self.parser {
-                        let screen = parser.screen_mut();
+                    self.with_focused_leaf_screen_mut(|screen| {
                         let current = screen.scrollback() as isize;
                         screen.set_scrollback((current + lines).max(0) as usize);
-                    }
+                    });
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1904,6 +2314,12 @@ impl ApplicationHandler for App {
                             None
                         }
                     });
+                    let search_ctx =
+                        self.search.as_ref().map(|s| prt::render::PortalSearchCtx {
+                            remaining_path: s.target_path.as_slice(),
+                            matches: s.matches.as_slice(),
+                            current: s.current,
+                        });
 
                     tr.render(
                         canvas,
@@ -1914,7 +2330,14 @@ impl ApplicationHandler for App {
                         &prt.state,
                         host_sel_range.as_ref(),
                         portal_sel_ctx.as_ref(),
+                        search_ctx.as_ref(),
                     );
+
+                    // Search input bar — drawn last so it overlays
+                    // everything (terminal grid, portals, VGE chrome).
+                    if let Some(search) = self.search.as_ref() {
+                        draw_search_bar(canvas, tr, search, size.width as f32, size.height as f32);
+                    }
                 }
 
                 canvas.flush();
@@ -1933,6 +2356,9 @@ impl ApplicationHandler for App {
         let alive = self.process_pty_output();
         self.drain_pending_clipboard();
         self.validate_selection();
+        // PTY output may have advanced the target parser's scrollback;
+        // rebuild the search index so live matches stay accurate.
+        self.invalidate_search_cache();
         if let Some(w) = &self.window {
             w.request_redraw();
         }

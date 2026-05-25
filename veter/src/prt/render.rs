@@ -38,6 +38,17 @@ pub struct PortalSelectionCtx<'a> {
     pub block_cols: Option<(u16, u16)>,
 }
 
+/// Descent context for scrollback-search highlights. Mirrors
+/// [`PortalSelectionCtx`]: at each level the `remaining_path` shrinks
+/// by one element; when empty, the current portal *is* the search
+/// target and the visible-row [`crate::renderer::HighlightSpan`]s are
+/// computed from `matches` against that portal's current viewport.
+pub struct PortalSearchCtx<'a> {
+    pub remaining_path: &'a [String],
+    pub matches: &'a [crate::search::MatchSpan],
+    pub current: usize,
+}
+
 /// One top-level layer in the unified render order: either a host VGE
 /// element or a host portal.
 enum Layer<'a> {
@@ -59,6 +70,7 @@ pub fn render_layers<T: Renderer>(
     _screen_cols: u16,
     scrollback: usize,
     portal_selection: Option<&PortalSelectionCtx>,
+    search_overlay: Option<&PortalSearchCtx>,
 ) {
     let mut layers: Vec<(i32, u64, Layer)> = Vec::new();
     for el in vge_state.top_level_sorted() {
@@ -105,6 +117,17 @@ pub fn render_layers<T: Renderer>(
                         block_cols: s.block_cols,
                     })
                 });
+                let sub_search = search_overlay.and_then(|o| {
+                    let first = o.remaining_path.first().map(|s| s.as_str())?;
+                    if first != portal.id.as_str() {
+                        return None;
+                    }
+                    Some(PortalSearchCtx {
+                        remaining_path: &o.remaining_path[1..],
+                        matches: o.matches,
+                        current: o.current,
+                    })
+                });
                 render_portal_at(
                     canvas,
                     term_renderer,
@@ -118,6 +141,7 @@ pub fn render_layers<T: Renderer>(
                     prt_state.cursor_style,
                     &focus_chain,
                     sub_sel.as_ref(),
+                    sub_search.as_ref(),
                 );
             }
         }
@@ -144,6 +168,7 @@ fn render_portal_at<T: Renderer>(
     unfocused_style: CursorStyle,
     focus_chain: &[&str],
     portal_selection: Option<&PortalSelectionCtx>,
+    search_overlay: Option<&PortalSearchCtx>,
 ) {
     if !portal.is_visible {
         return;
@@ -214,6 +239,19 @@ fn render_portal_at<T: Renderer>(
             portal.size_w as u16,
         )
     });
+    let portal_highlights: Option<Vec<crate::renderer::HighlightSpan>> =
+        search_overlay.and_then(|o| {
+            if !o.remaining_path.is_empty() {
+                return None;
+            }
+            Some(crate::renderer::search_highlights_for_viewport(
+                o.matches,
+                o.current,
+                portal.children.top_of_live_screen(),
+                portal.vt.screen().scrollback(),
+                portal.size_h as u16,
+            ))
+        });
     term_renderer.draw_screen_at(
         canvas,
         portal.vt.screen(),
@@ -221,6 +259,7 @@ fn render_portal_at<T: Renderer>(
         oy_px,
         focused_cursor,
         portal_sel_range.as_ref(),
+        portal_highlights.as_deref(),
     );
 
     // 2. Unfocused-style cursor (everyone except the focused leaf).
@@ -303,6 +342,17 @@ fn render_portal_at<T: Renderer>(
                         block_cols: s.block_cols,
                     })
                 });
+                let next_search = search_overlay.and_then(|o| {
+                    let first = o.remaining_path.first().map(|s| s.as_str())?;
+                    if first != sub.id.as_str() {
+                        return None;
+                    }
+                    Some(PortalSearchCtx {
+                        remaining_path: &o.remaining_path[1..],
+                        matches: o.matches,
+                        current: o.current,
+                    })
+                });
                 render_portal_at(
                     canvas,
                     term_renderer,
@@ -316,6 +366,7 @@ fn render_portal_at<T: Renderer>(
                     unfocused_style,
                     sub_focus_chain,
                     next_sel.as_ref(),
+                    next_search.as_ref(),
                 );
             }
         }

@@ -2829,6 +2829,7 @@ dependencies = [
  "image",
  "imgref",
  "libc",
+ "memchr",
  "nix 0.29.0",
  "parley",
  "prt-protocol",

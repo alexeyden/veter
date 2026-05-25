@@ -58,6 +58,49 @@ impl SelectionRange {
     }
 }
 
+/// One row's worth of search-match highlight, in the target screen's
+/// currently-visible row coords. Multiple spans on the same row are
+/// allowed; the renderer paints each as a background fill. The
+/// `is_current` flag marks the active match (the one the viewport
+/// is scrolled to) so the renderer can give it a stronger color.
+#[derive(Copy, Clone, Debug)]
+pub struct HighlightSpan {
+    pub row: u16,
+    pub col_start: u16,
+    /// Exclusive end column.
+    pub col_end: u16,
+    pub is_current: bool,
+}
+
+/// Project all matches in `matches` into [`HighlightSpan`]s for the
+/// currently-visible viewport of a parser at `top_of_live_screen` /
+/// `scrollback`. `current` is the index of the active match; the
+/// resulting span for that match (if visible) has `is_current = true`.
+/// Off-screen matches contribute no spans.
+pub fn search_highlights_for_viewport(
+    matches: &[crate::search::MatchSpan],
+    current: usize,
+    top_of_live_screen: i64,
+    scrollback: usize,
+    rows: u16,
+) -> Vec<HighlightSpan> {
+    let viewport_top = top_of_live_screen - scrollback as i64;
+    let mut out = Vec::new();
+    for (i, m) in matches.iter().enumerate() {
+        let row_i = m.line - viewport_top;
+        if row_i < 0 || row_i >= rows as i64 {
+            continue;
+        }
+        out.push(HighlightSpan {
+            row: row_i as u16,
+            col_start: m.col_start,
+            col_end: m.col_end,
+            is_current: i == current,
+        });
+    }
+    out
+}
+
 /// Resolve an absolute-line selection (anchor + head in some vt100's
 /// scrollback line coords) into a half-open `SelectionRange` in that
 /// vt100's currently-visible row coords. Used by both the host call
@@ -1374,10 +1417,28 @@ impl TerminalRenderer {
         oy_px: f32,
         focused_cursor: Option<(u16, u16)>,
         selection: Option<&SelectionRange>,
+        search_highlights: Option<&[HighlightSpan]>,
     ) {
         let (rows, cols) = screen.size();
         let default_bg = Color::rgb(30, 30, 30);
         let selected = |r, c| selection.map(|s| s.contains(r, c)).unwrap_or(false);
+        // Per-cell search-highlight color, or None if cell is unhit.
+        // The current match takes precedence over other matches on the
+        // same cell so n/N reliably colors the active hit even if it
+        // happens to overlap another (e.g. very short query).
+        let highlight_color = |r: u16, c: u16| -> Option<Color> {
+            let spans = search_highlights?;
+            let mut color: Option<Color> = None;
+            for span in spans {
+                if span.row == r && c >= span.col_start && c < span.col_end {
+                    if span.is_current {
+                        return Some(Color::rgb(220, 160, 0));
+                    }
+                    color = Some(Color::rgb(80, 80, 30));
+                }
+            }
+            color
+        };
 
         // Cell backgrounds.
         for row in 0..rows {
@@ -1391,11 +1452,24 @@ impl TerminalRenderer {
                 }
                 let is_cursor = focused_cursor == Some((row, col));
                 let sel = selected(row, col);
-                let (_, bg) = resolve_cell_colors(cell, is_cursor, sel);
+                let hl = highlight_color(row, col);
+                let (_, base_bg) = resolve_cell_colors(cell, is_cursor, sel);
+                // Search highlight overrides everything except cursor/selection.
+                // Selection wins over a non-current match so the user's
+                // explicit selection stays visible.
+                let bg = if let Some(hc) = hl
+                    && !sel
+                    && !is_cursor
+                {
+                    hc
+                } else {
+                    base_bg
+                };
                 let w = if cell.is_wide() { 2.0 } else { 1.0 };
-                // Selected cells need a bg fill even when the underlying
-                // cell uses the default bg, so the highlight is visible.
-                if bg != default_bg || sel {
+                // Selected / highlighted cells need a bg fill even when
+                // the underlying cell uses the default bg, so the
+                // overlay is visible.
+                if bg != default_bg || sel || hl.is_some() {
                     let x = ox_px + col as f32 * self.cell_width;
                     let y = oy_px + row as f32 * self.cell_height;
                     let mut path = Path::new();
@@ -1573,6 +1647,7 @@ impl TerminalRenderer {
         prt_state: &prt::PrtState,
         selection: Option<&SelectionRange>,
         portal_selection: Option<&prt::render::PortalSelectionCtx>,
+        search_overlay: Option<&prt::render::PortalSearchCtx>,
     ) {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
@@ -1589,7 +1664,30 @@ impl TerminalRenderer {
         } else {
             None
         };
-        self.draw_screen_at(canvas, screen, 0.0, 0.0, focused_cursor, selection);
+        // Search highlights paint on this scope only when the overlay
+        // targets the host (remaining_path empty).
+        let host_highlights: Option<Vec<HighlightSpan>> =
+            search_overlay.and_then(|o| {
+                if !o.remaining_path.is_empty() {
+                    return None;
+                }
+                Some(search_highlights_for_viewport(
+                    o.matches,
+                    o.current,
+                    top_of_live_screen,
+                    screen.scrollback(),
+                    rows,
+                ))
+            });
+        self.draw_screen_at(
+            canvas,
+            screen,
+            0.0,
+            0.0,
+            focused_cursor,
+            selection,
+            host_highlights.as_deref(),
+        );
 
         // Unified §10 layer walk: top-level VGE elements + host portals
         // sorted by (draw_order, creation_seq), each rendered in turn.
@@ -1604,6 +1702,7 @@ impl TerminalRenderer {
             cols,
             screen.scrollback(),
             portal_selection,
+            search_overlay,
         );
 
         // Draw scrollbar when scrolled back
