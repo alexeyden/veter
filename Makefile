@@ -174,7 +174,7 @@ clean:
 # target system — and ride into either a .tar.xz or a .deb.
 
 DIST_TOOLS := vmux vcat vsend vrecv veterd
-DIST_VERSION ?= 0.1.5
+DIST_VERSION ?= 0.1.6
 DIST_ARCH := aarch64-unknown-linux-musl
 
 # `install-remote-aarch64` knobs. `REMOTE` is required — it's whatever
