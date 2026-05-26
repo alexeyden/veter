@@ -44,8 +44,9 @@ use prt_protocol::command::{
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
-    EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_RAW_REPLY,
-    EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
+    EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_PORTAL_SCROLL_DELTA,
+    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C,
+    RSP_PROBE as PRT_RSP_PROBE,
 };
 
 use ses_protocol::apc::ApcStream as SesApcStream;
@@ -1419,6 +1420,7 @@ const HELP_LINES: &[&str] = &[
     "  o        cycle focus to next pane",
     "  x        close focused pane",
     "  r        rename focused pane",
+    "  z        toggle zoom (focused pane fills the tab)",
     "",
     "Tab",
     "  c        new tab",
@@ -1711,6 +1713,9 @@ struct Tab {
     manual_title: Option<String>,
     layout: Layout,
     focus: String,
+    /// `Some(pane_id)` while a pane is zoomed (filling the tab bounds and
+    /// hiding its siblings); `None` otherwise. Survives tab switches.
+    zoomed: Option<String>,
 }
 
 struct State {
@@ -1767,6 +1772,7 @@ impl State {
             manual_title: None,
             layout: Layout::Leaf(id.clone()),
             focus: id.clone(),
+            zoomed: None,
         };
         let mut s = Self {
             panes: HashMap::new(),
@@ -1863,6 +1869,9 @@ impl State {
     }
 
     fn split(&mut self, dir: SplitDir) -> Result<Vec<u8>> {
+        // Splitting while zoomed is meaningless — the user wouldn't see
+        // the new sibling. Exit zoom first; the relayout below covers it.
+        self.tabs[self.active_tab].zoomed = None;
         let target = self.focus().to_string();
         let new_id = self.allocate_pane_id();
         if !self.layout_mut().split_leaf(&target, dir, &new_id) {
@@ -1967,6 +1976,11 @@ impl State {
                 if self.tabs[tab_idx].focus == target {
                     self.tabs[tab_idx].focus = new_focus;
                 }
+                // If the closed pane was the zoomed one, drop zoom so
+                // the surviving siblings come back on the next relayout.
+                if self.tabs[tab_idx].zoomed.as_deref() == Some(target) {
+                    self.tabs[tab_idx].zoomed = None;
+                }
                 out.extend(build_prt_envelope(&[(
                     PrtCommand::DeletePortal { id: target.to_string() },
                     0,
@@ -1993,8 +2007,33 @@ impl State {
         let cur = self.focus().to_string();
         let pos = leaves.iter().position(|x| x == &cur).unwrap_or(0);
         let next = leaves[(pos + 1) % leaves.len()].clone();
+        // Cycling out of a zoomed pane exits zoom (matches tmux): the
+        // point of zoom is to see one pane fullscreen, so switching to
+        // another implies the user wants the normal layout back.
+        self.tabs[self.active_tab].zoomed = None;
         self.set_focus(next);
         // Re-emit chrome (focused pane changes color) and SetFocus.
+        self.relayout_and_render()
+    }
+
+    /// Toggle pane-zoom on the active tab. With zoom on, the focused
+    /// pane fills the whole tab and its siblings are hidden (their PTYs
+    /// keep running). No-op when the tab has fewer than two panes —
+    /// there's nothing to zoom over. Each tab carries its own zoom
+    /// state, so switching tabs and back returns to the same zoom.
+    fn toggle_zoom(&mut self) -> Result<Vec<u8>> {
+        let idx = self.active_tab;
+        if self.tabs[idx].zoomed.is_some() {
+            self.tabs[idx].zoomed = None;
+        } else {
+            let mut leaves = Vec::new();
+            self.tabs[idx].layout.collect_leaves(&mut leaves);
+            if leaves.len() < 2 {
+                return Ok(Vec::new());
+            }
+            let focus = self.focus().to_string();
+            self.tabs[idx].zoomed = Some(focus);
+        }
         self.relayout_and_render()
     }
 
@@ -2018,6 +2057,7 @@ impl State {
             manual_title: None,
             layout: Layout::Leaf(pane_id.clone()),
             focus: pane_id.clone(),
+            zoomed: None,
         };
         self.tabs.push(new_tab);
         self.active_tab = self.tabs.len() - 1;
@@ -2113,13 +2153,34 @@ impl State {
     /// VGE (chrome + tab bar) envelopes. Panes in non-active tabs are
     /// hidden. Idempotent.
     fn relayout_and_render(&mut self) -> Result<Vec<u8>> {
+        // If the tab is zoomed, override the per-pane rects: only the
+        // zoomed pane is laid out, filling the full bounds; siblings
+        // get hidden via the `to_hide` loop below. Guard against a
+        // stale `zoomed` referencing a pane that has since left the
+        // layout (defensive — callers that remove panes clear zoom).
+        let leaves_set = self.active_pane_ids();
+        let zoomed: Option<String> = self.tabs[self.active_tab]
+            .zoomed
+            .as_ref()
+            .filter(|z| leaves_set.contains(z.as_str()))
+            .cloned();
+        if zoomed.is_none() {
+            self.tabs[self.active_tab].zoomed = None;
+        }
+
         let mut rects = HashMap::new();
-        layout_rects(self.active_layout(), self.full_bounds(), &mut rects);
+        if let Some(zid) = &zoomed {
+            rects.insert(zid.clone(), self.full_bounds());
+        } else {
+            layout_rects(self.active_layout(), self.full_bounds(), &mut rects);
+        }
 
         let mut prt_cmds: Vec<(PrtCommand, u32)> = Vec::new();
         let mut vge_cmds: Vec<(VgeCommand, u32)> = Vec::new();
         let focus = self.focus().to_string();
-        let active_set = self.active_pane_ids();
+        // When zoomed, only the zoomed pane is "active" for the visibility
+        // diff — its siblings exist in the layout but are off-screen.
+        let active_set: HashSet<String> = rects.keys().cloned().collect();
 
         // Stable iteration order so the wire trace is deterministic.
         let mut ordered: Vec<String> = rects.keys().cloned().collect();
@@ -2301,8 +2362,16 @@ impl State {
 
         // Between-pane separators for the active tab. Rebuilt every
         // relayout — the layout tree determines which split boundaries
-        // need a stroke.
-        let sep_body = build_separators_body(self.active_layout(), self.full_bounds());
+        // need a stroke. While zoomed, the visible layout is a single
+        // leaf, so feed a leaf to `build_separators_body` and the
+        // emitted element has no commands.
+        let zoom_leaf = Layout::Leaf(String::new());
+        let sep_layout_ref: &Layout = if zoomed.is_some() {
+            &zoom_leaf
+        } else {
+            self.active_layout()
+        };
+        let sep_body = build_separators_body(sep_layout_ref, self.full_bounds());
         if self.separators_created {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
@@ -2490,6 +2559,9 @@ impl State {
     fn display_title_for(&self, pane_id: &str, raw_title: &str) -> String {
         if let Some(s) = self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
             return format!("[scroll: {}]", s.offset);
+        }
+        if self.tabs[self.active_tab].zoomed.as_deref() == Some(pane_id) {
+            return format!("Z  {}", raw_title);
         }
         raw_title.to_string()
     }
@@ -3416,6 +3488,37 @@ fn handle_stdin_chunk(
                 if let Some(p) = state.panes.get_mut(&id) {
                     p.inner_mouse_protocol = protocol;
                 }
+            } else if ft == EVT_PORTAL_SCROLL_DELTA {
+                // §8.11: string id, i32 delta. The host is asking us to
+                // shift this pane's scrollback by `delta` lines (positive
+                // = deeper into history). Used by veter's drag-select
+                // autoscroll on a portal-target selection, so the offset
+                // stays coherent with our `PaneScroll` instead of being
+                // mutated behind our back. We reuse `wheel_scroll`'s
+                // enter/apply/exit logic so a delta that lands at 0
+                // cleanly drops scroll mode, mirroring a manual wheel.
+                let mut br = PrtReader::new(body);
+                let id = br.string().unwrap_or("").to_string();
+                let delta = br.i32().unwrap_or(0);
+                if !id.is_empty() && state.panes.contains_key(&id) {
+                    let _ = wheel_scroll(state, &id, delta as i64);
+                }
+            } else if ft == EVT_PORTAL_SCROLL_SET {
+                // §8.12: string id, u32 offset. The host is asking us to
+                // jump this pane to an absolute scrollback offset (e.g.
+                // a scrollback-search match). `apply_scroll_set` is the
+                // absolute-value sibling of `wheel_scroll`: it enters
+                // scroll mode if needed for a non-zero target, drops
+                // scroll mode at zero, and otherwise sets the offset
+                // through the normal `scroll_set` path so the chrome
+                // thumb and `SetPortalScrollback` envelope to the host
+                // stay coherent.
+                let mut br = PrtReader::new(body);
+                let id = br.string().unwrap_or("").to_string();
+                let offset = br.u32().unwrap_or(0);
+                if !id.is_empty() && state.panes.contains_key(&id) {
+                    let _ = apply_scroll_set(state, &id, offset);
+                }
             } else if ft == prt_protocol::frame::RSP_OK
                 && body.len() >= 4
             {
@@ -3593,15 +3696,16 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     }
 
     // Find the pane whose `last_rect` contains the event cell. Only
-    // panes in the active tab are eligible — panes from inactive tabs
-    // keep their `last_rect` from when they were last visible, so a
-    // global scan over `state.panes` would land mouse events on hidden
-    // panes whose rects overlap the active layout (and HashMap
-    // iteration order would make the choice nondeterministic).
-    let active = state.active_pane_ids();
+    // currently-visible panes are eligible — panes from inactive tabs
+    // (and zoom-hidden siblings in the active tab) keep their
+    // `last_rect` from when they were last visible, so a global scan
+    // would land mouse events on hidden panes whose rects overlap the
+    // active layout (and HashMap iteration order would make the
+    // choice nondeterministic).
+    let visible = state.visible_panes.clone();
     let mut target: Option<String> = None;
     for (id, pane) in &state.panes {
-        if !active.contains(id) {
+        if !visible.contains(id) {
             continue;
         }
         if let Some(rect) = pane.last_rect {
@@ -3726,6 +3830,41 @@ fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
 /// Used when the inner program hasn't enabled mouse reporting, so
 /// wheel naturally drives vmux's scrollback for the pane under the
 /// cursor.
+/// Absolute-target sibling of `wheel_scroll`. Routes
+/// `EVT_PORTAL_SCROLL_SET` (e.g. a host-driven scrollback search jump)
+/// through the same enter/`scroll_set`/exit ladder so the chrome thumb,
+/// `[scroll: N]` indicator, and host `SetPortalScrollback` envelope all
+/// stay coherent. `offset == 0` drops scroll mode entirely.
+fn apply_scroll_set(state: &mut State, pane_id: &str, offset: u32) -> Result<()> {
+    let already_scrolling = state
+        .panes
+        .get(pane_id)
+        .map(|p| p.scroll.is_some())
+        .unwrap_or(false);
+
+    if offset == 0 {
+        if already_scrolling {
+            let env = state.exit_scroll(pane_id)?;
+            if !env.is_empty() {
+                write_all_stdout(&env)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if !already_scrolling {
+        let env = state.enter_scroll(pane_id)?;
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
+    let env = state.scroll_set(pane_id, offset)?;
+    if !env.is_empty() {
+        write_all_stdout(&env)?;
+    }
+    Ok(())
+}
+
 fn wheel_scroll(state: &mut State, pane_id: &str, delta: i64) -> Result<()> {
     let already_scrolling = state
         .panes
@@ -3874,6 +4013,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'h' => state.split(SplitDir::Horizontal),
         b'x' => state.close_focused(),
         b'o' => state.cycle_focus(),
+        b'z' => state.toggle_zoom(),
         b'q' => {
             // Don't quit outright — pop a confirmation modal so an
             // accidental prefix-q is a recoverable keystroke.
