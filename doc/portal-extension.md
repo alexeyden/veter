@@ -261,6 +261,8 @@ portals is not guaranteed.
 | 0x89 | ResizeNotify             | §8.8         |
 | 0x8A | MouseModeChange          | §8.9         |
 | 0x8B | PortalActivity           | §8.10        |
+| 0x8C | PortalScrollDelta        | §8.11        |
+| 0x8D | PortalScrollSet          | §8.12        |
 
 Events for capabilities a client did not request via the `features`
 bitmask in §2.1 MUST NOT be emitted (the host learns the client's
@@ -805,6 +807,61 @@ burst rule) without a protocol change — the wire contract is only
 "PortalActivity fired".
 
 Gated by `emit_activity_events` (features bit 7, §2.1).
+
+### 8.11 PortalScrollDelta (0x8C)
+
+```
+string id
+i32    delta              ; lines; positive = deeper into history,
+                          ; negative = toward live
+```
+
+Fired when a user gesture observed by the host implies a *relative*
+change to a portal's scrollback offset. The canonical case is a
+drag-select autoscroll whose anchor target is this portal: as the
+pointer crosses the portal's viewport edge, the host wants the view
+to follow, but the offset is owned by the client (the multiplexer's
+per-pane scroll state). Direct host-side mutation would silently
+desync the client's `[scroll: N]` indicator and any subsequent
+`SetPortalScrollback` it issues.
+
+The body is advisory: the client owns the policy and decides
+- whether to enter or exit a "scrolling" UI mode,
+- how to clamp `delta` against its scrollback ring depth,
+- and what offset to land on (typically `current + delta`,
+  clamped to `[0, history_depth]`).
+
+It typically responds with a `SetPortalScrollback` (§9.3) carrying
+the chosen absolute offset. Clients that do not implement scrollback
+(or do not wish to follow the gesture) MUST ignore the event without
+error.
+
+The host MAY emit this event at any rate (autoscroll typically
+fires every ~50 ms while a drag-select sits past the edge); clients
+SHOULD coalesce bursts before re-rendering chrome.
+
+### 8.12 PortalScrollSet (0x8D)
+
+```
+string id
+u32    offset             ; absolute scrollback offset, in lines
+```
+
+Sibling of `PortalScrollDelta`: same advisory contract, but the body
+is an *absolute* target offset rather than a relative adjustment.
+Used when the host's gesture has a natural absolute coordinate —
+canonical case is the host's scrollback-search jumping to a match's
+absolute line, or restoring a previously-saved offset on cancel.
+
+The value semantics mirror `SetPortalScrollback` (§9.3): `offset`
+lines back from the live screen, clamped client-side against the
+client's own scrollback ring and the host's `max_scrollback_lines`.
+`offset == 0` is the canonical request to drop "scrolling" mode and
+return to live — clients that surface a scroll-mode UI SHOULD treat
+this as the exit signal, not just an offset update.
+
+Clients that do not implement scrollback (or do not wish to follow
+the gesture) MUST ignore the event without error.
 
 ## 9. Focus and cursor rendering
 

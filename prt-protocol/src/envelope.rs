@@ -146,6 +146,20 @@ pub fn mouse_mode_change_body(
     w.buf
 }
 
+pub fn portal_scroll_delta_body(id: &str, delta: i32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(5 + id.len());
+    w.str(id);
+    w.i32(delta);
+    w.buf
+}
+
+pub fn portal_scroll_set_body(id: &str, offset: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(5 + id.len());
+    w.str(id);
+    w.u32(offset);
+    w.buf
+}
+
 // ---- frame + envelope wrapping ----------------------------------------
 
 /// Append a single frame to an unstuffed payload buffer.
@@ -271,6 +285,24 @@ mod tests {
         assert_eq!(r.u8().unwrap(), 2);
         assert_eq!(r.u8().unwrap(), 2);
         assert_eq!(r.u8().unwrap(), 1);
+        assert!(r.at_end());
+    }
+
+    #[test]
+    fn portal_scroll_delta_body_round_trip() {
+        let body = portal_scroll_delta_body("pane-1", -3);
+        let mut r = Reader::new(&body);
+        assert_eq!(r.string().unwrap(), "pane-1");
+        assert_eq!(r.i32().unwrap(), -3);
+        assert!(r.at_end());
+    }
+
+    #[test]
+    fn portal_scroll_set_body_round_trip() {
+        let body = portal_scroll_set_body("pane-2", 1234);
+        let mut r = Reader::new(&body);
+        assert_eq!(r.string().unwrap(), "pane-2");
+        assert_eq!(r.u32().unwrap(), 1234);
         assert!(r.at_end());
     }
 

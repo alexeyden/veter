@@ -23,8 +23,9 @@ use prt_protocol::command::{
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
     cursor_visibility_change_body, err_body, icon_name_change_body, mouse_mode_change_body,
-    portal_activity_body, portal_evicted_body, raw_reply_body, resize_notify_body,
-    title_change_body, working_dir_change_body, wrap_t2c_envelope, ProbeBody,
+    portal_activity_body, portal_evicted_body, portal_scroll_delta_body, portal_scroll_set_body,
+    raw_reply_body, resize_notify_body, title_change_body, working_dir_change_body,
+    wrap_t2c_envelope, ProbeBody,
 };
 use prt_protocol::frame::*;
 
@@ -504,6 +505,88 @@ impl PrtEngine {
     /// envelope at the end of the current command's dispatch (§1.2).
     fn emit_event(&mut self, frame_type: u8, body: Vec<u8>) {
         self.pending_events.push((frame_type, body));
+    }
+
+    /// Queue an `EVT_PORTAL_SCROLL_DELTA` (§8.11) for the leaf portal at
+    /// `path` so its owning client can apply the requested relative
+    /// change to the portal's scrollback offset. Positive `delta` =
+    /// deeper into history, negative = toward live (matches the units of
+    /// `vt100::Screen::set_scrollback` deltas). The event is queued at
+    /// whichever engine in the tree owns the leaf; for nested portals,
+    /// the inner engine's queued envelope is cascaded up as a
+    /// `RawReply` so it reaches the leaf's client (same fan-out the
+    /// regular per-portal event flow uses, §10 nested-event handling).
+    ///
+    /// Returns `true` if every segment of `path` resolved and the event
+    /// was queued; `false` if any segment was unknown. Caller is
+    /// responsible for `flush_pending_events()` + `take_responses()` to
+    /// actually surface the bytes onto the PTY.
+    pub fn emit_scroll_delta_for_path(&mut self, path: &[String], delta: i32) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let head = &path[0];
+        if path.len() == 1 {
+            if !self.state.current().portals.contains_key(head) {
+                return false;
+            }
+            self.emit_event(
+                EVT_PORTAL_SCROLL_DELTA,
+                portal_scroll_delta_body(head, delta),
+            );
+            return true;
+        }
+        let inner_bytes = {
+            let Some(portal) = self.state.current_mut().portals.get_mut(head) else {
+                return false;
+            };
+            if !portal.children.emit_scroll_delta_for_path(&path[1..], delta) {
+                return false;
+            }
+            portal.children.flush_pending_events();
+            portal.children.take_responses()
+        };
+        if !inner_bytes.is_empty() {
+            self.emit_event(EVT_RAW_REPLY, raw_reply_body(head, &inner_bytes));
+        }
+        true
+    }
+
+    /// Queue an `EVT_PORTAL_SCROLL_SET` (§8.12) for the leaf portal at
+    /// `path` so its owning client can jump that portal to the absolute
+    /// `offset`. Sibling to [`Self::emit_scroll_delta_for_path`] — same
+    /// cascade-up-as-RawReply behavior for nested portals; same
+    /// caller responsibility to follow up with `flush_pending_events()`
+    /// and `take_responses()`.
+    pub fn emit_scroll_set_for_path(&mut self, path: &[String], offset: u32) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let head = &path[0];
+        if path.len() == 1 {
+            if !self.state.current().portals.contains_key(head) {
+                return false;
+            }
+            self.emit_event(
+                EVT_PORTAL_SCROLL_SET,
+                portal_scroll_set_body(head, offset),
+            );
+            return true;
+        }
+        let inner_bytes = {
+            let Some(portal) = self.state.current_mut().portals.get_mut(head) else {
+                return false;
+            };
+            if !portal.children.emit_scroll_set_for_path(&path[1..], offset) {
+                return false;
+            }
+            portal.children.flush_pending_events();
+            portal.children.take_responses()
+        };
+        if !inner_bytes.is_empty() {
+            self.emit_event(EVT_RAW_REPLY, raw_reply_body(head, &inner_bytes));
+        }
+        true
     }
 
     /// Wrap any leftover events into a standalone t2c envelope and
@@ -3460,5 +3543,141 @@ mod tests {
         let mut b = PrtEngine::new();
         let err = b.restore_from_binary_snapshot(&bytes).unwrap_err();
         assert!(matches!(err, crate::prt::SnapshotError::TrailingBytes), "{err}");
+    }
+
+    #[test]
+    fn emit_scroll_delta_top_level_queues_event_for_existing_portal() {
+        let mut engine = PrtEngine::new();
+        let create = encode::create_portal_body(&CreatePortalBody {
+            id: "p".to_string(),
+            size_w: 20,
+            size_h: 4,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 0,
+        });
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &create).frame_type,
+            RSP_OK
+        );
+        let _ = engine.take_responses();
+
+        assert!(engine.emit_scroll_delta_for_path(&["p".to_string()], -3));
+        engine.flush_pending_events();
+        let frames = decode_all_response_frames(&engine.take_responses());
+        let ev = first_event(&frames, EVT_PORTAL_SCROLL_DELTA).unwrap();
+        let mut r = Reader::new(&ev.body);
+        assert_eq!(r.string().unwrap(), "p");
+        assert_eq!(r.i32().unwrap(), -3);
+    }
+
+    #[test]
+    fn emit_scroll_delta_unknown_path_is_silent_noop() {
+        let mut engine = PrtEngine::new();
+        assert!(!engine.emit_scroll_delta_for_path(&["missing".to_string()], 1));
+        engine.flush_pending_events();
+        assert!(engine.take_responses().is_empty());
+    }
+
+    #[test]
+    fn emit_scroll_set_top_level_queues_event_for_existing_portal() {
+        let mut engine = PrtEngine::new();
+        let create = encode::create_portal_body(&CreatePortalBody {
+            id: "p".to_string(),
+            size_w: 20,
+            size_h: 4,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 0,
+        });
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &create).frame_type,
+            RSP_OK
+        );
+        let _ = engine.take_responses();
+
+        assert!(engine.emit_scroll_set_for_path(&["p".to_string()], 42));
+        engine.flush_pending_events();
+        let frames = decode_all_response_frames(&engine.take_responses());
+        let ev = first_event(&frames, EVT_PORTAL_SCROLL_SET).unwrap();
+        let mut r = Reader::new(&ev.body);
+        assert_eq!(r.string().unwrap(), "p");
+        assert_eq!(r.u32().unwrap(), 42);
+    }
+
+    #[test]
+    fn emit_scroll_delta_nested_cascades_via_raw_reply() {
+        // Build a two-level tree: top-level portal "outer", and inside
+        // its sub-engine create "inner". Emitting a scroll delta for the
+        // inner path must surface at the root as an EVT_RAW_REPLY whose
+        // payload is a t2c envelope containing the scroll-delta event
+        // for "inner".
+        let mut engine = PrtEngine::new();
+        let outer = encode::create_portal_body(&CreatePortalBody {
+            id: "outer".to_string(),
+            size_w: 40,
+            size_h: 10,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 0,
+        });
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &outer).frame_type,
+            RSP_OK
+        );
+        // Create "inner" inside "outer" by feeding a nested
+        // CreatePortal embedded in a WritePortal payload.
+        let inner = encode::create_portal_body(&CreatePortalBody {
+            id: "inner".to_string(),
+            size_w: 20,
+            size_h: 4,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 0,
+        });
+        let mut sub_frames = Vec::new();
+        append_frame(&mut sub_frames, CMD_CREATE_PORTAL, 2, &inner);
+        let nested_env = wrap_c2t_envelope(&sub_frames);
+        let wp = encode::write_portal_body(&WritePortalBody {
+            id: "outer".to_string(),
+            data: nested_env,
+        });
+        let _ = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 3, &wp);
+        let _ = engine.take_responses();
+
+        assert!(engine.emit_scroll_delta_for_path(
+            &["outer".to_string(), "inner".to_string()],
+            5,
+        ));
+        engine.flush_pending_events();
+        let frames = decode_all_response_frames(&engine.take_responses());
+
+        // At the root, the event surfaces wrapped as a RawReply addressed
+        // to "outer" (the segment along the path).
+        let raw = first_event(&frames, EVT_RAW_REPLY).unwrap();
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "outer");
+        let inner_bytes = r.bytes().unwrap();
+        let inner_frames = decode_all_response_frames(inner_bytes);
+        let inner_ev = first_event(&inner_frames, EVT_PORTAL_SCROLL_DELTA).unwrap();
+        let mut r2 = Reader::new(&inner_ev.body);
+        assert_eq!(r2.string().unwrap(), "inner");
+        assert_eq!(r2.i32().unwrap(), 5);
     }
 }

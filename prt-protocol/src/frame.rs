@@ -44,6 +44,20 @@ pub const EVT_MOUSE_MODE_CHANGE: u8 = 0x8A;
 /// not on the alt-screen. Body is `string id`. Edge-triggered: at
 /// most one per WritePortal; the client keeps a sticky flag.
 pub const EVT_PORTAL_ACTIVITY: u8 = 0x8B;
+/// The host has detected a user gesture that implies a relative change
+/// to the portal's scrollback offset (e.g. drag-select autoscroll past
+/// the portal's viewport edge). Body is `string id, i32 delta`, where
+/// `delta` is in lines: positive means deeper into history, negative
+/// means toward live. The client owns the offset and decides how to
+/// apply it (usually a follow-up `SetPortalScrollback`).
+pub const EVT_PORTAL_SCROLL_DELTA: u8 = 0x8C;
+/// The host wants the portal scrolled to an *absolute* offset (e.g. a
+/// host-driven scrollback search jumped to a match deep in history).
+/// Body is `string id, u32 offset`. Sibling to `EVT_PORTAL_SCROLL_DELTA`:
+/// same advisory semantics, but the value replaces rather than adjusts
+/// the client's stored offset. `offset == 0` is the canonical request
+/// to drop scroll mode and return to live.
+pub const EVT_PORTAL_SCROLL_SET: u8 = 0x8D;
 
 // §4.1 error codes
 pub const ERR_UNKNOWN_COMMAND: u16 = 0x0001;
