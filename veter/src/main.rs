@@ -787,11 +787,71 @@ impl App {
         let m = search.matches[search.current];
         let path = search.target_path.clone();
         let Some(top) = self.target_top_of_live_screen(&path) else { return };
-        self.with_target_leaf_screen_mut(&path, |s| {
-            let rows = s.size().0 as i64;
-            let target = (top - m.line + rows / 2).max(0) as usize;
-            s.set_scrollback(target);
-        });
+        let rows = self
+            .with_target_leaf_screen_mut(&path, |s| s.size().0 as i64)
+            .unwrap_or(0);
+        let target = (top - m.line + rows / 2).max(0) as usize;
+        self.set_target_scrollback(&path, target);
+    }
+
+    /// Set the target leaf parser's scrollback to `offset`. For the
+    /// host parser this mutates `screen().set_scrollback` directly; for
+    /// a portal parser, the offset is owned by the portal's client
+    /// (e.g. vmux's `PaneScroll`), so we emit `EVT_PORTAL_SCROLL_SET`
+    /// and let the client round-trip back with a `SetPortalScrollback`.
+    /// Same desync-avoidance discipline as the drag-select autoscroll
+    /// path; see [`Self::autoscroll_step`].
+    fn set_target_scrollback(&mut self, path: &[String], offset: usize) {
+        if path.is_empty() {
+            if let Some(parser) = &mut self.parser {
+                parser.screen_mut().set_scrollback(offset);
+            }
+            return;
+        }
+        let offset_u32 = offset.min(u32::MAX as usize) as u32;
+        if let (Some(prt), Some(pty)) = (self.prt.as_mut(), self.pty.as_ref()) {
+            if prt.emit_scroll_set_for_path(path, offset_u32) {
+                prt.flush_pending_events();
+                let bytes = prt.take_responses();
+                if !bytes.is_empty() {
+                    let _ = pty.write_all(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Adjust the search-target parser's scrollback by `pages` *pages*
+    /// (one page = the parser's visible rows). Positive = back into
+    /// history, negative = toward live. No-op when no search session
+    /// is active. Routed through [`Self::set_target_scrollback`] so a
+    /// portal-target session stays in sync with the portal's client.
+    fn search_scroll_by_pages(&mut self, pages: isize) {
+        let Some(search) = self.search.as_ref() else { return };
+        let path = search.target_path.clone();
+        let Some((rows, current)) = self.with_target_leaf_screen_mut(&path, |s| {
+            (s.size().0 as usize, s.scrollback())
+        }) else {
+            return;
+        };
+        let signed = current as isize + pages * rows as isize;
+        let target = signed.max(0) as usize;
+        self.set_target_scrollback(&path, target);
+    }
+
+    /// Adjust the search-target parser's scrollback by raw `lines`.
+    /// Positive = back into history. Used by the wheel handler while
+    /// the search bar is open.
+    fn search_scroll_by_lines(&mut self, lines: isize) {
+        let Some(search) = self.search.as_ref() else { return };
+        let path = search.target_path.clone();
+        let Some(current) =
+            self.with_target_leaf_screen_mut(&path, |s| s.scrollback())
+        else {
+            return;
+        };
+        let signed = current as isize + lines;
+        let target = signed.max(0) as usize;
+        self.set_target_scrollback(&path, target);
     }
 
     /// Drop the cached search index. Called after a PTY-output tick
@@ -1263,11 +1323,16 @@ impl App {
         }
     }
 
-    /// Apply one auto-scroll tick: bump the *target's* vt100
-    /// scrollback by one row and re-resolve the selection head against
-    /// the new viewport. For host the host parser scrolls; for a
-    /// portal the portal's own vt100 scrolls (its scrollback ring is
-    /// independent).
+    /// Apply one auto-scroll tick. For a host-target selection the host
+    /// parser's scrollback bumps directly. For a portal-target selection
+    /// we *cannot* mutate the portal's vt100 ourselves — the portal's
+    /// scrollback offset is owned by its client (e.g. vmux's
+    /// `PaneScroll`), and a unilateral mutation here would silently
+    /// desync the client's view. Instead we emit
+    /// `EVT_PORTAL_SCROLL_DELTA` so the client applies the delta and
+    /// rounds back to us with a `SetPortalScrollback`. The selection
+    /// head re-resolves on the next PTY drain (see `user_event`), once
+    /// the client's response has been applied.
     fn autoscroll_step(&mut self) {
         let Some(direction) = self.cursor_out_of_viewport() else {
             return;
@@ -1282,18 +1347,28 @@ impl App {
                     let next = (cur - direction as isize).max(0) as usize;
                     parser.screen_mut().set_scrollback(next);
                 }
+                self.update_selection_head();
             }
             Some(SelectionTarget::Portal(path)) => {
-                if let Some(prt) = self.prt.as_mut()
-                    && let Some(portal) = resolve_portal_target_mut(prt, &path)
-                {
-                    let cur = portal.vt.screen().scrollback() as isize;
-                    let next = (cur - direction as isize).max(0) as usize;
-                    portal.vt.screen_mut().set_scrollback(next);
+                // direction == +1 (cursor below viewport) ⇒ scroll
+                // *toward live*, i.e. negative delta. Symmetric for the
+                // top edge.
+                let delta = -direction;
+                if let (Some(prt), Some(pty)) = (self.prt.as_mut(), self.pty.as_ref()) {
+                    if prt.emit_scroll_delta_for_path(&path, delta) {
+                        prt.flush_pending_events();
+                        let bytes = prt.take_responses();
+                        if !bytes.is_empty() {
+                            let _ = pty.write_all(&bytes);
+                        }
+                    }
                 }
+                // Don't `update_selection_head` here: the portal's
+                // scrollback hasn't changed yet (the client owns it).
+                // The head will refresh after the client's
+                // `SetPortalScrollback` round-trips, in `user_event`.
             }
         }
-        self.update_selection_head();
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1335,24 +1410,33 @@ impl App {
         // parser so scrolling inside a vmux pane navigates that pane's
         // scrollback rather than the host vt100 (which inside vmux holds
         // only chrome paint — pane bytes are routed through PRT into
-        // per-portal vt100s).
+        // per-portal vt100s). Routed through `set_target_scrollback` so
+        // a portal leaf stays in sync with its client's stored offset.
         if self.modifiers.shift_key() {
             match &event.logical_key {
                 Key::Named(NamedKey::PageUp) => {
-                    self.with_focused_leaf_screen_mut(|screen| {
-                        let rows = screen.size().0 as usize;
-                        screen.set_scrollback(screen.scrollback() + rows);
-                    });
+                    let path = self.focused_leaf_path();
+                    if let Some((rows, current)) =
+                        self.with_target_leaf_screen_mut(&path, |s| {
+                            (s.size().0 as usize, s.scrollback())
+                        })
+                    {
+                        self.set_target_scrollback(&path, current + rows);
+                    }
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
                     return;
                 }
                 Key::Named(NamedKey::PageDown) => {
-                    self.with_focused_leaf_screen_mut(|screen| {
-                        let rows = screen.size().0 as usize;
-                        screen.set_scrollback(screen.scrollback().saturating_sub(rows));
-                    });
+                    let path = self.focused_leaf_path();
+                    if let Some((rows, current)) =
+                        self.with_target_leaf_screen_mut(&path, |s| {
+                            (s.size().0 as usize, s.scrollback())
+                        })
+                    {
+                        self.set_target_scrollback(&path, current.saturating_sub(rows));
+                    }
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1362,8 +1446,15 @@ impl App {
             }
         }
 
-        // Any non-scroll key resets scrollback to bottom on the focused leaf.
-        self.with_focused_leaf_screen_mut(|screen| screen.set_scrollback(0));
+        // Any non-scroll key resets scrollback to bottom on the focused
+        // leaf. For a portal leaf this emits `EVT_PORTAL_SCROLL_SET` so
+        // the owning client (e.g. vmux) drops scroll mode in lockstep
+        // instead of holding a stale `[scroll: N]` indicator. Skipped
+        // when already at live to avoid a no-op event every keystroke.
+        let path = self.focused_leaf_path();
+        if self.focused_leaf_scrollback() > 0 {
+            self.set_target_scrollback(&path, 0);
+        }
 
         let pty = match &self.pty {
             Some(p) => p,
@@ -1519,10 +1610,20 @@ impl App {
                 let was_editing = search.editing;
                 self.search = None;
                 if was_editing {
-                    self.with_target_leaf_screen_mut(&path, |s| {
-                        s.set_scrollback(saved);
-                    });
+                    self.set_target_scrollback(&path, saved);
                 }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.search_scroll_by_pages(1);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::PageDown) => {
+                self.search_scroll_by_pages(-1);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -2157,6 +2258,33 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Search is modal: while the bar is open, the wheel
+                // navigates the search-target's scrollback directly
+                // (one tick = 3 lines, mirroring the standard host
+                // wheel-scroll step). Never forwards to the inner
+                // program — keeps the search session in control of the
+                // viewport so the n/N highlight follows what the user
+                // wheels to.
+                if self.search.is_some() {
+                    let cell_h = self
+                        .term_renderer
+                        .as_ref()
+                        .map(|t| t.cell_height)
+                        .unwrap_or(20.0);
+                    let lines = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            (pos.y as f32 / cell_h) as isize
+                        }
+                    };
+                    if lines != 0 {
+                        self.search_scroll_by_lines(lines);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Decide whether to forward the wheel as a mouse-button
                 // event to the PTY (when the inner program has enabled
                 // mouse reporting in SGR encoding) or use it for the
@@ -2359,6 +2487,12 @@ impl ApplicationHandler for App {
         // PTY output may have advanced the target parser's scrollback;
         // rebuild the search index so live matches stay accurate.
         self.invalidate_search_cache();
+        // A drag-select autoscroll on a portal target emits
+        // `EVT_PORTAL_SCROLL_DELTA`; the client (e.g. vmux) round-trips
+        // back with `SetPortalScrollback`, which we just applied. Refresh
+        // the head so the highlight follows the content under the cursor.
+        // No-op when no drag is active.
+        self.update_selection_head();
         if let Some(w) = &self.window {
             w.request_redraw();
         }
