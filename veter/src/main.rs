@@ -1451,8 +1451,31 @@ impl App {
         // the owning client (e.g. vmux) drops scroll mode in lockstep
         // instead of holding a stale `[scroll: N]` indicator. Skipped
         // when already at live to avoid a no-op event every keystroke.
+        // Modifier-only presses (Super/Win for KDE virtual-desktop
+        // switching, lone Shift/Ctrl/Alt while reaching for a combo)
+        // are excluded — they produce no PTY input, so dropping scroll
+        // mode on them would be surprising.
+        let is_modifier_only = matches!(
+            &event.logical_key,
+            Key::Named(
+                NamedKey::Shift
+                    | NamedKey::Control
+                    | NamedKey::Alt
+                    | NamedKey::AltGraph
+                    | NamedKey::Super
+                    | NamedKey::Meta
+                    | NamedKey::Hyper
+                    | NamedKey::Fn
+                    | NamedKey::FnLock
+                    | NamedKey::CapsLock
+                    | NamedKey::NumLock
+                    | NamedKey::ScrollLock
+                    | NamedKey::Symbol
+                    | NamedKey::SymbolLock
+            )
+        );
         let path = self.focused_leaf_path();
-        if self.focused_leaf_scrollback() > 0 {
+        if !is_modifier_only && self.focused_leaf_scrollback() > 0 {
             self.set_target_scrollback(&path, 0);
         }
 
