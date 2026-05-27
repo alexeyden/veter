@@ -39,9 +39,11 @@ RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
 .PHONY: all build install uninstall clean help install-desktop install-icon \
-        dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb dist-clean \
-        dist-aarch64-manifest install-dist-maybe install-dist-share \
-        install-remote-aarch64
+        dist-clean install-dist-maybe \
+        dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb \
+        dist-aarch64-manifest install-remote-aarch64 \
+        dist-amd64-build dist-amd64-tarxz dist-amd64-deb \
+        dist-amd64-manifest install-remote-amd64
 
 all: install
 
@@ -52,25 +54,26 @@ help:
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
-	@echo "  dist-aarch64-build  cross-compile vmux/vcat/vsend/vrecv/veterd"
-	@echo "                      for aarch64-unknown-linux-musl (static, rust-lld)"
-	@echo "  dist-aarch64-tarxz  bundle the above into a .tar.xz under dist/"
-	@echo "  dist-aarch64-manifest  write a sha256-stamped manifest beside the tarball"
-	@echo "  dist-aarch64-deb    bundle the above into veter-tools_<v>_arm64.deb"
-	@echo "  install-dist-share  stage tarball + manifest under \$$PREFIX/share/veter/dist/"
+	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vsend/vrecv/veterd"
+	@echo "                          for <arch>-unknown-linux-musl (static, rust-lld)"
+	@echo "  dist-<arch>-tarxz       bundle the above into a .tar.xz under dist/"
+	@echo "  dist-<arch>-manifest    write a sha256-stamped manifest beside the tarball"
+	@echo "  dist-<arch>-deb         bundle the above into veter-tools_<v>_<debarch>.deb"
+	@echo "  install-remote-<arch>   cross-compile and scp+install the <arch>-musl"
+	@echo "                          binaries into REMOTE_BINDIR on REMOTE (over ssh)"
+	@echo "  (<arch> ∈ aarch64, amd64; debarch ∈ arm64, amd64)"
+	@echo
+	@echo "  install-dist-maybe  stage tarball + manifest under \$$PREFIX/share/veter/dist/"
+	@echo "                      for whichever rust-std musl targets are installed"
 	@echo "                      (vssh reads them from there to deploy remotely)"
 	@echo "  dist-clean          rm -rf dist/"
-	@echo
-	@echo "  install-remote-aarch64"
-	@echo "                      cross-compile and scp+install the aarch64-musl"
-	@echo "                      binaries into REMOTE_BINDIR on REMOTE (over ssh)"
 	@echo
 	@echo "Variables (override on the command line):"
 	@echo "  PREFIX=$(PREFIX)"
 	@echo "  BINDIR=$(BINDIR)"
 	@echo "  APPDIR=$(APPDIR)"
 	@echo "  DIST_VERSION=$(DIST_VERSION)"
-	@echo "  REMOTE=$(REMOTE)  (e.g. ha@home-assistant.local — required for install-remote-aarch64)"
+	@echo "  REMOTE=$(REMOTE)  (e.g. ha@home-assistant.local — required for install-remote-<arch>)"
 	@echo "  REMOTE_BINDIR=$(REMOTE_BINDIR)"
 
 build:
@@ -165,75 +168,84 @@ uninstall:
 clean:
 	$(CARGO) clean
 
-# ---- aarch64-musl static distribution of client-side tools ----------
+# ---- musl-static distribution of client-side tools ------------------
 #
-# Cross-builds vmux, vcat, vsend, vrecv for aarch64-unknown-linux-musl
-# using rust-lld (which ships with rustup-installed rustc, so no host
-# toolchain prereq beyond `rustup target add`). The resulting binaries
-# are fully static — no dynamic loader, no libc dependency on the
-# target system — and ride into either a .tar.xz or a .deb.
+# Cross-builds vmux, vcat, vsend, vrecv, veterd for the musl-static
+# targets enumerated in DIST_ARCHES, using rust-lld (which ships with
+# rustup-installed rustc, so no host toolchain prereq beyond
+# `rustup target add`). The resulting binaries are fully static — no
+# dynamic loader, no libc dependency on the target system — and ride
+# into either a .tar.xz or a .deb. Per-arch targets are emitted by the
+# DIST_ARCH_RULES macro below.
 
 DIST_TOOLS := vmux vcat vsend vrecv veterd
 DIST_VERSION ?= 0.1.6
-DIST_ARCH := aarch64-unknown-linux-musl
 
-# `install-remote-aarch64` knobs. `REMOTE` is required — it's whatever
+# `install-remote-<arch>` knobs. `REMOTE` is required — it's whatever
 # ssh(1) would accept (`user@host`, `host`, or a `Host` alias from
 # `~/.ssh/config`). `REMOTE_BINDIR` is where the binaries land on the
 # remote; ~/.local/bin keeps things user-scoped, no sudo needed. Both
 # variables can be set on the make CLI or in the environment.
 REMOTE ?=
 REMOTE_BINDIR ?= ~/.local/bin
-DIST_DEB_ARCH := arm64
-DIST_BINDIR := $(TARGET_DIR)/$(DIST_ARCH)/release
 DIST_DIR := $(CURDIR)/dist
-DIST_DEB_STAGING := $(DIST_DIR)/veter-tools_$(DIST_VERSION)_$(DIST_DEB_ARCH)
-DIST_DEB_FILE := $(DIST_DIR)/veter-tools_$(DIST_VERSION)_$(DIST_DEB_ARCH).deb
-DIST_TARXZ_STAGING := $(DIST_DIR)/staging-tarxz
-DIST_TARXZ_FILE := $(DIST_DIR)/veter-tools-$(DIST_VERSION)-$(DIST_ARCH).tar.xz
-DIST_MANIFEST_FILE := $(DIST_DIR)/manifest-$(DIST_ARCH).json
 DIST_MAINTAINER := Alexey Denisov <rtgbnm@gmail.com>
 
-# vssh reads the staged tarball + manifest from this layout when
-# installing veter-tools on a remote host. `install-dist-maybe` only
-# stages them if the aarch64-musl rust-std is available; otherwise
-# vssh degrades to a thin ssh wrapper.
-SHARE_DIST_DIR := $(PREFIX)/share/veter/dist/$(DIST_ARCH)
-SHARE_DIST_TARBALL := $(SHARE_DIST_DIR)/veter-tools.tar.xz
-SHARE_DIST_MANIFEST := $(SHARE_DIST_DIR)/manifest.json
+# Triples we know how to cross-build. install-dist-maybe iterates this
+# list and stages whichever rust-std targets the user has installed.
+DIST_ARCHES := aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
-dist-aarch64-build:
+# DIST_ARCH_RULES(triple, deb_arch, short, uname_arch) — emit the full
+# build/tarxz/manifest/deb/install-remote/install-dist-share quintet
+# for one musl target.
+#   $(1) rust target triple             (e.g. aarch64-unknown-linux-musl)
+#   $(2) debian Architecture: token     (e.g. arm64)
+#   $(3) user-facing short suffix       (e.g. aarch64, amd64)
+#   $(4) `uname -m` value, for README   (e.g. aarch64, x86_64)
+define DIST_ARCH_RULES
+.PHONY: dist-$(3)-build dist-$(3)-tarxz dist-$(3)-manifest dist-$(3)-deb \
+        install-dist-share-$(1) install-remote-$(3)
+
+DIST_BINDIR_$(1) := $$(TARGET_DIR)/$(1)/release
+DIST_TARXZ_STAGING_$(1) := $$(DIST_DIR)/staging-tarxz-$(1)
+DIST_TARXZ_FILE_$(1) := $$(DIST_DIR)/veter-tools-$$(DIST_VERSION)-$(1).tar.xz
+DIST_MANIFEST_FILE_$(1) := $$(DIST_DIR)/manifest-$(1).json
+DIST_DEB_STAGING_$(1) := $$(DIST_DIR)/veter-tools_$$(DIST_VERSION)_$(2)
+DIST_DEB_FILE_$(1) := $$(DIST_DIR)/veter-tools_$$(DIST_VERSION)_$(2).deb
+SHARE_DIST_DIR_$(1) := $$(PREFIX)/share/veter/dist/$(1)
+
+dist-$(3)-build:
 	@# Linker for this target is configured in `.cargo/config.toml`:
 	@# `linker = "rust-lld"`. rust-lld ships inside the rustup
 	@# toolchain so no host cross-gcc is required.
-	@rustup target list --installed 2>/dev/null | grep -qx '$(DIST_ARCH)' || { \
-	    echo "Installing rust-std for $(DIST_ARCH)..."; \
-	    rustup target add $(DIST_ARCH); \
+	@rustup target list --installed 2>/dev/null | grep -qx '$(1)' || { \
+	    echo "Installing rust-std for $(1)..."; \
+	    rustup target add $(1); \
 	}
-	$(CARGO) build --release --target $(DIST_ARCH) \
-	    $(addprefix --package=,$(DIST_TOOLS))
-	@for t in $(DIST_TOOLS); do \
-	    src="$(DIST_BINDIR)/$$t"; \
-	    if [ ! -x "$$src" ]; then \
-	        echo "error: $$t binary not found at $$src" >&2; \
+	$$(CARGO) build --release --target $(1) \
+	    $$(addprefix --package=,$$(DIST_TOOLS))
+	@for t in $$(DIST_TOOLS); do \
+	    src="$$(DIST_BINDIR_$(1))/$$$$t"; \
+	    if [ ! -x "$$$$src" ]; then \
+	        echo "error: $$$$t binary not found at $$$$src" >&2; \
 	        exit 1; \
 	    fi; \
 	done
 
-dist-aarch64-tarxz: dist-aarch64-build
-	@$(INSTALL) -d $(DIST_DIR)
-	@rm -rf $(DIST_TARXZ_STAGING)
-	@$(INSTALL) -d $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)
-	@for t in $(DIST_TOOLS); do \
-	    $(INSTALL) -m 0755 $(DIST_BINDIR)/$$t \
-	        $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)/$$t; \
+dist-$(3)-tarxz: dist-$(3)-build
+	@$$(INSTALL) -d $$(DIST_DIR)
+	@rm -rf $$(DIST_TARXZ_STAGING_$(1))
+	@$$(INSTALL) -d $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)
+	@for t in $$(DIST_TOOLS); do \
+	    $$(INSTALL) -m 0755 $$(DIST_BINDIR_$(1))/$$$$t \
+	        $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/$$$$t; \
 	done
 	@printf '%s\n' \
-	    'veter-tools $(DIST_VERSION) — $(DIST_ARCH)' \
+	    'veter-tools $$(DIST_VERSION) — $(1)' \
 	    '' \
 	    'Remote-side tools for the Veter terminal emulator. Statically' \
-	    'linked against musl libc; drop the binaries anywhere on $$PATH on' \
-	    'an aarch64 Linux host and they will work without any runtime' \
+	    'linked against musl libc; drop the binaries anywhere on $$$$PATH on' \
+	    'a $(4) Linux host and they will work without any runtime' \
 	    'dependencies.' \
 	    '' \
 	    'Tools:' \
@@ -242,96 +254,106 @@ dist-aarch64-tarxz: dist-aarch64-build
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
 	    '  veterd  persistent session daemon (doc/session-manager.md)' \
-	    > $(DIST_TARXZ_STAGING)/veter-tools-$(DIST_VERSION)/README
-	@tar -cJf $(DIST_TARXZ_FILE) \
-	    -C $(DIST_TARXZ_STAGING) veter-tools-$(DIST_VERSION)
-	@rm -rf $(DIST_TARXZ_STAGING)
-	@echo "    veter-tools tarball -> $(DIST_TARXZ_FILE)"
-	@ls -l $(DIST_TARXZ_FILE)
+	    > $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/README
+	@tar -cJf $$(DIST_TARXZ_FILE_$(1)) \
+	    -C $$(DIST_TARXZ_STAGING_$(1)) veter-tools-$$(DIST_VERSION)
+	@rm -rf $$(DIST_TARXZ_STAGING_$(1))
+	@echo "    veter-tools tarball -> $$(DIST_TARXZ_FILE_$(1))"
+	@ls -l $$(DIST_TARXZ_FILE_$(1))
 
 # Manifest is what vssh reads to decide whether to upload to a remote.
 # Carrying the sha256 of the tarball (not just the version string)
 # lets us treat any content change as a reason to push, including
 # rebuilds where the version number didn't move.
-dist-aarch64-manifest: dist-aarch64-tarxz
-	@sha=$$(sha256sum $(DIST_TARXZ_FILE) | cut -d' ' -f1); \
-	tools=$$(printf '"%s",' $(DIST_TOOLS) | sed 's/,$$//'); \
+dist-$(3)-manifest: dist-$(3)-tarxz
+	@sha=$$$$(sha256sum $$(DIST_TARXZ_FILE_$(1)) | cut -d' ' -f1); \
+	tools=$$$$(printf '"%s",' $$(DIST_TOOLS) | sed 's/,$$$$//'); \
 	printf '{"version":"%s","arch":"%s","sha256":"%s","tools":[%s]}\n' \
-	    "$(DIST_VERSION)" "$(DIST_ARCH)" "$$sha" "$$tools" \
-	    > $(DIST_MANIFEST_FILE)
-	@echo "    manifest -> $(DIST_MANIFEST_FILE)"
+	    "$$(DIST_VERSION)" "$(1)" "$$$$sha" "$$$$tools" \
+	    > $$(DIST_MANIFEST_FILE_$(1))
+	@echo "    manifest -> $$(DIST_MANIFEST_FILE_$(1))"
 
-install-dist-share: dist-aarch64-manifest
-	@$(INSTALL) -d $(SHARE_DIST_DIR)
-	@$(INSTALL) -m 0644 $(DIST_TARXZ_FILE) $(SHARE_DIST_TARBALL)
-	@$(INSTALL) -m 0644 $(DIST_MANIFEST_FILE) $(SHARE_DIST_MANIFEST)
-	@echo "    dist tarball -> $(SHARE_DIST_TARBALL)"
-	@echo "    dist manifest -> $(SHARE_DIST_MANIFEST)"
+install-dist-share-$(1): dist-$(3)-manifest
+	@$$(INSTALL) -d $$(SHARE_DIST_DIR_$(1))
+	@$$(INSTALL) -m 0644 $$(DIST_TARXZ_FILE_$(1)) $$(SHARE_DIST_DIR_$(1))/veter-tools.tar.xz
+	@$$(INSTALL) -m 0644 $$(DIST_MANIFEST_FILE_$(1)) $$(SHARE_DIST_DIR_$(1))/manifest.json
+	@echo "    dist tarball -> $$(SHARE_DIST_DIR_$(1))/veter-tools.tar.xz"
+	@echo "    dist manifest -> $$(SHARE_DIST_DIR_$(1))/manifest.json"
 
-# Run as a dep of `install`. Stages the dist tarball under
-# $PREFIX/share/ when the rustup target for aarch64-musl is present,
-# otherwise drops a single note line and proceeds. The recursive
-# $(MAKE) is deliberate: it lets `install-dist-share` pull in
-# dist-aarch64-tarxz → dist-aarch64-build only when the target is
-# actually installed, keeping a vanilla `make install` toolchain-free.
-install-dist-maybe:
-	@if rustup target list --installed 2>/dev/null | grep -qx '$(DIST_ARCH)'; then \
-	    $(MAKE) --no-print-directory install-dist-share; \
-	else \
-	    echo "note: $(DIST_ARCH) rust-std not installed; vssh will run without bundled remote tools."; \
-	    echo "      run 'rustup target add $(DIST_ARCH)' to enable auto-deploy on ssh."; \
-	fi
-
-dist-aarch64-deb: dist-aarch64-build
+dist-$(3)-deb: dist-$(3)-build
 	@command -v dpkg-deb >/dev/null 2>&1 || { \
 	    echo "error: dpkg-deb required; install the 'dpkg' package" >&2; \
 	    exit 1; \
 	}
-	@$(INSTALL) -d $(DIST_DIR)
-	@rm -rf $(DIST_DEB_STAGING)
-	@$(INSTALL) -d $(DIST_DEB_STAGING)/DEBIAN $(DIST_DEB_STAGING)/usr/bin
-	@for t in $(DIST_TOOLS); do \
-	    $(INSTALL) -m 0755 $(DIST_BINDIR)/$$t $(DIST_DEB_STAGING)/usr/bin/$$t; \
+	@$$(INSTALL) -d $$(DIST_DIR)
+	@rm -rf $$(DIST_DEB_STAGING_$(1))
+	@$$(INSTALL) -d $$(DIST_DEB_STAGING_$(1))/DEBIAN $$(DIST_DEB_STAGING_$(1))/usr/bin
+	@for t in $$(DIST_TOOLS); do \
+	    $$(INSTALL) -m 0755 $$(DIST_BINDIR_$(1))/$$$$t $$(DIST_DEB_STAGING_$(1))/usr/bin/$$$$t; \
 	done
 	@printf '%s\n' \
 	    'Package: veter-tools' \
-	    'Version: $(DIST_VERSION)' \
+	    'Version: $$(DIST_VERSION)' \
 	    'Section: utils' \
 	    'Priority: optional' \
-	    'Architecture: $(DIST_DEB_ARCH)' \
-	    'Maintainer: $(DIST_MAINTAINER)' \
+	    'Architecture: $(2)' \
+	    'Maintainer: $$(DIST_MAINTAINER)' \
 	    'Description: Remote-side tools for the Veter terminal emulator' \
-	    ' Statically-linked aarch64 binaries for vmux, vcat, vsend, vrecv,' \
+	    ' Statically-linked $(4) binaries for vmux, vcat, vsend, vrecv,' \
 	    ' and veterd. The first four talk PRT/VGE/VFT to a Veter-aware' \
 	    ' terminal (or to vmux running inside one); veterd is a persistent' \
 	    ' session daemon that owns inner PTYs across renderer attach/detach' \
 	    ' cycles (see doc/session-manager.md). All binaries have no runtime' \
 	    ' dependencies on the target system.' \
-	    > $(DIST_DEB_STAGING)/DEBIAN/control
-	@dpkg-deb --root-owner-group --build $(DIST_DEB_STAGING) $(DIST_DEB_FILE) >/dev/null
-	@rm -rf $(DIST_DEB_STAGING)
-	@echo "    veter-tools deb -> $(DIST_DEB_FILE)"
-	@ls -l $(DIST_DEB_FILE)
+	    > $$(DIST_DEB_STAGING_$(1))/DEBIAN/control
+	@dpkg-deb --root-owner-group --build $$(DIST_DEB_STAGING_$(1)) $$(DIST_DEB_FILE_$(1)) >/dev/null
+	@rm -rf $$(DIST_DEB_STAGING_$(1))
+	@echo "    veter-tools deb -> $$(DIST_DEB_FILE_$(1))"
+	@ls -l $$(DIST_DEB_FILE_$(1))
 
-# One-shot deploy to a remote aarch64 host. Streams the freshly-built
+# One-shot deploy to a remote $(4) host. Streams the freshly-built
 # release binaries through a single ssh connection (no intermediate
 # tarball lands on disk), then mkdirs REMOTE_BINDIR and untars there.
 # Permissions are preserved by tar(1); the binaries land 0755.
 #
 # Usage:
-#   make install-remote-aarch64 REMOTE=ha@home-assistant.local
-#   make install-remote-aarch64 REMOTE=ha@home-assistant.local REMOTE_BINDIR=/opt/veter/bin
-#   REMOTE=ha@home-assistant.local make install-remote-aarch64
-install-remote-aarch64: dist-aarch64-build
-	@if [ -z "$(REMOTE)" ]; then \
+#   make install-remote-$(3) REMOTE=user@host
+#   make install-remote-$(3) REMOTE=user@host REMOTE_BINDIR=/opt/veter/bin
+install-remote-$(3): dist-$(3)-build
+	@if [ -z "$$(REMOTE)" ]; then \
 	    echo "error: REMOTE not set" >&2; \
-	    echo "  example: make install-remote-aarch64 REMOTE=ha@home-assistant.local" >&2; \
+	    echo "  example: make install-remote-$(3) REMOTE=user@host" >&2; \
 	    exit 1; \
 	fi
-	@echo "    veter-tools -> $(REMOTE):$(REMOTE_BINDIR)/"
-	@tar -cf - -C $(DIST_BINDIR) $(DIST_TOOLS) \
-	    | ssh $(REMOTE) "mkdir -p $(REMOTE_BINDIR) && tar -xpf - -C $(REMOTE_BINDIR)"
-	@for t in $(DIST_TOOLS); do echo "    $$t -> $(REMOTE):$(REMOTE_BINDIR)/$$t"; done
+	@echo "    veter-tools -> $$(REMOTE):$$(REMOTE_BINDIR)/"
+	@tar -cf - -C $$(DIST_BINDIR_$(1)) $$(DIST_TOOLS) \
+	    | ssh $$(REMOTE) "mkdir -p $$(REMOTE_BINDIR) && tar -xpf - -C $$(REMOTE_BINDIR)"
+	@for t in $$(DIST_TOOLS); do echo "    $$$$t -> $$(REMOTE):$$(REMOTE_BINDIR)/$$$$t"; done
+
+endef
+
+$(eval $(call DIST_ARCH_RULES,aarch64-unknown-linux-musl,arm64,aarch64,aarch64))
+$(eval $(call DIST_ARCH_RULES,x86_64-unknown-linux-musl,amd64,amd64,x86_64))
+
+# Run as a dep of `install`. For each musl target in DIST_ARCHES whose
+# rust-std is installed, stage the matching dist bundle under
+# $PREFIX/share/veter/dist/<triple>/. Targets with no rust-std are
+# skipped with a note; if none are installed, `vssh` falls back to a
+# thin ssh wrapper without auto-deploy.
+install-dist-maybe:
+	@any=0; \
+	for triple in $(DIST_ARCHES); do \
+	    if rustup target list --installed 2>/dev/null | grep -qx "$$triple"; then \
+	        $(MAKE) --no-print-directory install-dist-share-$$triple; \
+	        any=1; \
+	    else \
+	        echo "note: $$triple rust-std not installed; skipping its bundle."; \
+	    fi; \
+	done; \
+	if [ "$$any" = "0" ]; then \
+	    echo "note: no musl rust-std installed; vssh will run without bundled remote tools."; \
+	    echo "      run 'rustup target add <triple>' for any of: $(DIST_ARCHES)"; \
+	fi
 
 dist-clean:
 	@rm -rf $(DIST_DIR)

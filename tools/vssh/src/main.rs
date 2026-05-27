@@ -19,16 +19,6 @@ fn main() -> Result<()> {
     init_logging(cli.verbose);
     log::debug!("vssh args: {:?}", cli);
 
-    let bundle = dist::locate()?;
-    if let Some(b) = &bundle {
-        log::debug!(
-            "local bundle: {} (sha256={}, version={})",
-            b.tarball.display(),
-            b.manifest.sha256,
-            b.manifest.version
-        );
-    }
-
     let master = ssh::Master::open(cli.ssh_args.clone())?;
     let probe_result = probe::probe(&master)?;
     log::info!(
@@ -46,6 +36,16 @@ fn main() -> Result<()> {
             .unwrap_or("<none>"),
         probe_result.home_writable
     );
+
+    let bundle = dist::locate(&probe_result.arch)?;
+    if let Some(b) = &bundle {
+        log::debug!(
+            "local bundle: {} (sha256={}, version={})",
+            b.tarball.display(),
+            b.manifest.sha256,
+            b.manifest.version
+        );
+    }
 
     let action = install::decide(bundle.as_ref(), &probe_result, &cli);
     match &action {
