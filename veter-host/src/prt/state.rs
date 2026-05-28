@@ -212,6 +212,12 @@ pub struct PrtEngine {
     /// Nesting depth of this engine in the portal tree. Top-level host
     /// = 0; a sub-engine inside a depth-d portal is at depth d+1.
     depth: u32,
+    /// Host accent palette seeded into every per-portal VGE engine's
+    /// reserved `host.*` namespace (§7.3 of the VGE spec). Inherited by
+    /// child engines so nested portals theme consistently; each portal's
+    /// VGE engine keys its contextual `host.accent` on its own depth.
+    /// Empty = host-themed styles disabled.
+    host_palette: crate::vge::HostThemePalette,
     pending_response_bytes: Vec<u8>,
     /// Event frames produced during the *current* command's processing
     /// (e.g. WritePortal callbacks, polled state deltas, DSR replies)
@@ -265,6 +271,7 @@ impl PrtEngine {
             (8, 16),
             1.0,
             std::sync::Arc::new(|| {}),
+            crate::vge::HostThemePalette::default(),
         )
     }
 
@@ -278,14 +285,28 @@ impl PrtEngine {
         scale_factor: f32,
         vft_wakeup: crate::vft::Wakeup,
     ) -> Self {
-        Self::with_all(Limits::default(), 0, cell_px, scale_factor, vft_wakeup)
+        Self::with_all(
+            Limits::default(),
+            0,
+            cell_px,
+            scale_factor,
+            vft_wakeup,
+            crate::vge::HostThemePalette::default(),
+        )
     }
 
     /// Construct with explicit limits. Used by tests that need to pin
     /// caps; metrics default to the test-friendly values.
     #[allow(dead_code)] // tests-only
     pub fn with_limits(limits: Limits, depth: u32) -> Self {
-        Self::with_all(limits, depth, (8, 16), 1.0, std::sync::Arc::new(|| {}))
+        Self::with_all(
+            limits,
+            depth,
+            (8, 16),
+            1.0,
+            std::sync::Arc::new(|| {}),
+            crate::vge::HostThemePalette::default(),
+        )
     }
 
     fn with_all(
@@ -294,12 +315,14 @@ impl PrtEngine {
         cell_px: (u16, u16),
         scale_factor: f32,
         vft_wakeup: crate::vft::Wakeup,
+        host_palette: crate::vge::HostThemePalette,
     ) -> Self {
         Self {
             apc: ApcStream::new(),
             state: PrtState::new(),
             limits,
             depth,
+            host_palette,
             pending_response_bytes: Vec::new(),
             pending_events: Vec::new(),
             line_tracker: LineTracker::new(),
@@ -309,6 +332,13 @@ impl PrtEngine {
             pending_clipboard_writes: Vec::new(),
             vft_wakeup,
         }
+    }
+
+    /// Set the host accent palette seeded into per-portal VGE engines
+    /// spawned in this scope. Called once on the top-level engine after
+    /// construction; inherited by every child engine thereafter.
+    pub fn set_host_palette(&mut self, palette: crate::vge::HostThemePalette) {
+        self.host_palette = palette;
     }
 
     /// Update the cell pixel dimensions and scale factor this engine
@@ -341,6 +371,7 @@ impl PrtEngine {
             self.cell_px,
             self.scale_factor,
             self.vft_wakeup.clone(),
+            self.host_palette.clone(),
         )
     }
 
@@ -941,7 +972,18 @@ impl PrtEngine {
             max_write_bytes: self.limits.max_write_bytes,
             features: self.limits.features,
             max_nesting_depth: self.limits.max_nesting_depth,
-            vge_features: self.limits.vge_features,
+            // §10 — advertise host-themed styles only when a palette is
+            // actually seeded, OR'd into the existing VGE-integration byte.
+            vge_features: self.limits.vge_features.map(|f| {
+                if self.host_palette.is_empty() {
+                    f
+                } else {
+                    f | FEAT_VGE_HOST_THEMED_STYLES
+                }
+            }),
+            // The accent `host.accent` resolves to at this engine's depth,
+            // so a client can derive its own shades from it.
+            accent_rgba: self.host_palette.contextual_rgba8(self.depth),
         };
         Ok(pb.encode())
     }
@@ -1002,11 +1044,16 @@ impl PrtEngine {
             self.cell_px,
             self.scale_factor,
             self.vft_wakeup.clone(),
+            self.host_palette.clone(),
         );
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
         // §10 + §13.4 — leave PRT as the sole DSR responder inside the
         // portal so an inner `\x1b[6n` produces exactly one reply.
         portal_vge.set_auto_reply_dsr(false);
+        // §7.3 — seed the reserved `host.*` styles, keyed on this portal's
+        // depth so nested clients pick up distinct accent colors. No-op
+        // when the host palette is empty.
+        portal_vge.seed_host_styles(self.host_palette.clone(), self.depth + 1);
 
         // §10 (vft-in-portal) — every portal owns its own VFT engine.
         // Workers share the host's wakeup so async events from any
@@ -1746,9 +1793,96 @@ mod tests {
         assert!(features & FEAT_EMIT_CLIPBOARD_EVENTS != 0);
         assert!(features & FEAT_EMIT_MOUSE_MODE_EVENTS != 0);
         assert_eq!(r.u8().unwrap(), 8); // max_nesting_depth
-        // §10 trailing byte advertises FEAT_VGE_IN_PORTAL.
-        assert_eq!(r.u8().unwrap(), FEAT_VGE_IN_PORTAL);
+        // §10 trailing byte advertises FEAT_VGE_IN_PORTAL; no palette
+        // seeded by default, so the host-themed-styles bit is clear.
+        let vge_features = r.u8().unwrap();
+        assert!(vge_features & FEAT_VGE_IN_PORTAL != 0);
+        assert!(vge_features & FEAT_VGE_HOST_THEMED_STYLES == 0);
         assert!(r.at_end());
+    }
+
+    fn rgb_palette() -> crate::vge::HostThemePalette {
+        let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
+        crate::vge::HostThemePalette {
+            accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+        }
+    }
+
+    fn portal_accent_rgb(vge: &crate::vge::VgeEngine) -> (f32, f32, f32) {
+        match vge.state.shared.styles.get("host.accent").expect("host.accent seeded") {
+            crate::vge::ConcreteStyle::Flat(c) => (c.r, c.g, c.b),
+            _ => panic!("host.accent not flat"),
+        }
+    }
+
+    /// Read the trailing `vge_features` byte and (if the themed bit is
+    /// set) the accent RGBA from a ProbeResponse body.
+    fn probe_vge_features_and_accent(body: &[u8]) -> (u8, Option<[u8; 4]>) {
+        let mut r = Reader::new(body);
+        let _ = r.u16(); // protocol_version
+        for _ in 0..5 {
+            let _ = r.u32(); // 5 u32 caps
+        }
+        let _ = r.u8(); // features
+        let _ = r.u8(); // max_nesting_depth
+        let vge_features = r.u8().unwrap();
+        let accent = if vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0 {
+            Some([
+                r.u8().unwrap(),
+                r.u8().unwrap(),
+                r.u8().unwrap(),
+                r.u8().unwrap(),
+            ])
+        } else {
+            None
+        };
+        (vge_features, accent)
+    }
+
+    #[test]
+    fn probe_advertises_host_themed_styles_when_seeded() {
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        let (vge_features, accent) = probe_vge_features_and_accent(&parsed.body);
+        assert!(vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0);
+        // Top-level engine = depth 0 → accent slot 0 (red).
+        assert_eq!(accent, Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn probe_reports_depth_keyed_accent_in_nested_engine() {
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+        // The depth-1 child engine answers a nested client's probe with
+        // slot 1 (green) — matching its portal VGE's `host.accent`.
+        let child = &mut engine.state.current_mut().portals.get_mut("p").unwrap().children;
+        let parsed = dispatch_one(child, CMD_PROBE, 1, &[]);
+        let (_, accent) = probe_vge_features_and_accent(&parsed.body);
+        assert_eq!(accent, Some([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn nested_portals_get_depth_keyed_accent() {
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+
+        // Depth-1 portal: its VGE engine resolves `host.accent` to slot 1.
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+        assert_eq!(
+            portal_accent_rgb(&engine.state.current().portals["p"].vge),
+            (0.0, 1.0, 0.0),
+        );
+
+        // Depth-2 portal: created inside p's child engine (which inherited
+        // the palette) resolves `host.accent` to slot 2.
+        let child = &mut engine.state.current_mut().portals.get_mut("p").unwrap().children;
+        dispatch_one(child, CMD_CREATE_PORTAL, 1, &make_create_body("q", 40, 12));
+        assert_eq!(
+            portal_accent_rgb(&child.state.current().portals["q"].vge),
+            (0.0, 0.0, 1.0),
+        );
     }
 
     #[test]

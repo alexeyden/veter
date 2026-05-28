@@ -27,7 +27,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -45,8 +45,8 @@ use prt_protocol::command::{
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
     EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_PORTAL_SCROLL_DELTA,
-    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C,
-    RSP_PROBE as PRT_RSP_PROBE,
+    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, FEAT_VGE_HOST_THEMED_STYLES,
+    MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
 };
 
 use ses_protocol::apc::ApcStream as SesApcStream;
@@ -341,7 +341,7 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
             })
             .collect();
         cmds.push(DrawCmd::DrawLines {
-            stroke: Style::Flat(COLOR_BRAND),
+            stroke: accent_style(),
             line_width: 0.06,
             lines,
         });
@@ -584,8 +584,74 @@ const COLOR_BRAND: Color = Color {
     b: 0x73 as f32 / 255.0,
     a: 1.0,
 };
-/// Same hue as COLOR_BRAND but semi-transparent — used to fill the thumb
-/// behind a pane's title text.
+
+/// Reserved host-provided accent style id (VGE spec §7.3). Resolves to
+/// veter's configured accent for this portal's nesting depth.
+const HOST_ACCENT_STYLE_ID: &str = "host.accent";
+
+/// Set once at startup from the PRT probe (`FEAT_VGE_HOST_THEMED_STYLES`).
+/// When true, chrome accents reference the host `host.accent` style so
+/// they follow veter's theme and signal nesting depth; otherwise they
+/// use the compiled-in `COLOR_BRAND`.
+static HOST_THEMED_STYLES: AtomicBool = AtomicBool::new(false);
+
+/// Accent fill/stroke style for vmux chrome — a host `StyleRef` when the
+/// host themes `host.*`, else the compiled-in brand color.
+fn accent_style() -> Style {
+    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+        Style::Ref(HOST_ACCENT_STYLE_ID.to_string())
+    } else {
+        Style::Flat(COLOR_BRAND)
+    }
+}
+
+/// Straight RGBA8 accent the host reported for this vmux's nesting depth,
+/// packed `0xRRGGBBAA`. Valid only when `HOST_THEMED_STYLES` is set; it is
+/// the concrete value `host.accent` resolves to, so locally-derived shades
+/// match the `StyleRef` chrome exactly.
+static HOST_ACCENT_RGBA: AtomicU32 = AtomicU32::new(0);
+
+/// The accent as a concrete color — the host's reported accent when it
+/// themes `host.*`, else the compiled-in brand. Used to derive shades the
+/// host does not provide as their own styles.
+fn accent_color() -> Color {
+    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+        let [r, g, b, a] = HOST_ACCENT_RGBA.load(Ordering::Relaxed).to_be_bytes();
+        Color {
+            r: r as f32 / 255.0,
+            g: g as f32 / 255.0,
+            b: b as f32 / 255.0,
+            a: a as f32 / 255.0,
+        }
+    } else {
+        COLOR_BRAND
+    }
+}
+
+/// Translucent accent for the thumb behind a pane's title text.
+fn title_thumb_style() -> Style {
+    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+        Style::Flat(Color { a: 0.35, ..accent_color() })
+    } else {
+        Style::Flat(COLOR_TITLE_THUMB)
+    }
+}
+
+/// Dark accent-tinted surface for modal/dialog backgrounds, the tab-bar
+/// session segment, and inactive tab-number cells. Scaled toward black so
+/// light foreground text stays legible over arbitrary shell content.
+fn surface_style() -> Style {
+    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+        let c = accent_color();
+        const K: f32 = 0.20;
+        Style::Flat(Color { r: c.r * K, g: c.g * K, b: c.b * K, a: 0.96 })
+    } else {
+        Style::Flat(COLOR_MODAL_BG)
+    }
+}
+
+/// Same hue as COLOR_BRAND but semi-transparent — the fallback thumb fill
+/// behind a pane's title text when the host does not theme `host.*`.
 const COLOR_TITLE_THUMB: Color = Color {
     r: COLOR_BRAND.r,
     g: COLOR_BRAND.g,
@@ -627,9 +693,6 @@ const COLOR_MODAL_BG: Color = Color {
     b: 0.16,
     a: 0.96,
 };
-/// Modal outline uses COLOR_BRAND so the dialog edge picks up the same
-/// accent the rest of the chrome uses.
-const COLOR_MODAL_OUTLINE: Color = COLOR_BRAND;
 const COLOR_MODAL_TEXT: Color = Color {
     r: 0.96,
     g: 0.96,
@@ -1075,7 +1138,7 @@ fn build_tabbar_commands(
     // bar from the pane area at row 1. Drawn before tab fills so an
     // active tab sits flush on top of it.
     cmds.push(DrawCmd::DrawLines {
-        stroke: Style::Flat(COLOR_BRAND),
+        stroke: accent_style(),
         line_width: 0.06,
         lines: vec![(
             Point { x: 0.0, y: 1.0 },
@@ -1088,7 +1151,7 @@ fn build_tabbar_commands(
     if let Some((label, w)) = &layout.session_seg {
         let (rx, ry) = chrome_corner_radii(*w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_MODAL_BG),
+            fill: surface_style(),
             segments: rounded_rect_path_corners(
                 0.0, 0.0, *w, 1.0, rx, ry,
                 true,  // TL rounded
@@ -1114,7 +1177,7 @@ fn build_tabbar_commands(
                 y: 0.0,
             },
             align: Align::Left,
-            fill: Style::Flat(COLOR_BRAND),
+            fill: accent_style(),
             font_style: FontStyle(0x00),
             text: " ‹".to_string(),
         });
@@ -1135,13 +1198,13 @@ fn build_tabbar_commands(
         // background activity.
         let has_activity = activity.get(i).copied().unwrap_or(false);
         let num_bg = if has_activity {
-            COLOR_BRAND
+            accent_style()
         } else {
-            COLOR_MODAL_BG
+            surface_style()
         };
         let (num_rx, num_ry) = chrome_corner_radii(num_w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(num_bg),
+            fill: num_bg,
             segments: rounded_rect_path_corners(
                 x,
                 0.0,
@@ -1170,7 +1233,7 @@ fn build_tabbar_commands(
         if is_active {
             let (name_rx, name_ry) = chrome_corner_radii(name_w, 1.0, cell_pw, cell_ph);
             cmds.push(DrawCmd::FillPath {
-                fill: Style::Flat(COLOR_BRAND),
+                fill: accent_style(),
                 segments: rounded_rect_path_corners(
                     name_x0,
                     0.0,
@@ -1206,7 +1269,7 @@ fn build_tabbar_commands(
                 y: 0.0,
             },
             align: Align::Left,
-            fill: Style::Flat(COLOR_BRAND),
+            fill: accent_style(),
             font_style: FontStyle(0x00),
             text: "› ".to_string(),
         });
@@ -1277,7 +1340,7 @@ fn build_chrome_commands(
         let (rx, ry) =
             chrome_corner_radii(thumb_x1 - thumb_x0, thumb_y1 - thumb_y0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_TITLE_THUMB),
+            fill: title_thumb_style(),
             segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
         });
         cmds.push(DrawCmd::DrawText {
@@ -1357,19 +1420,19 @@ fn build_modal_commands(
         // Body fill — full rounded rect; the title strip is drawn over
         // its top region.
         DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_MODAL_BG),
+            fill: surface_style(),
             segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         },
         // Title strip — rounded only on the top corners so the seam
         // with the body fill below is straight.
         DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_BRAND),
+            fill: accent_style(),
             segments: rounded_rect_path_corners(
                 0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
             ),
         },
         DrawCmd::DrawLinePath {
-            stroke: Style::Flat(COLOR_MODAL_OUTLINE),
+            stroke: accent_style(),
             line_width: 0.1,
             segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         },
@@ -1525,7 +1588,7 @@ fn build_help_modal_elements(
         id: MODAL_ELEMENT_ID.into(),
         commands: vec![
             DrawCmd::FillPath {
-                fill: Style::Flat(COLOR_BRAND),
+                fill: accent_style(),
                 segments: rounded_rect_path_corners(
                     0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
                 ),
@@ -1541,7 +1604,7 @@ fn build_help_modal_elements(
                 text: HELP_LINES[0].to_string(),
             },
             DrawCmd::DrawLinePath {
-                stroke: Style::Flat(COLOR_MODAL_OUTLINE),
+                stroke: accent_style(),
                 line_width: 0.1,
                 segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
             },
@@ -1565,7 +1628,7 @@ fn build_help_modal_elements(
     elements.push(CreateElementBody {
         id: MODAL_BODY_FILL_ID.into(),
         commands: vec![DrawCmd::FillPath {
-            fill: Style::Flat(COLOR_MODAL_BG),
+            fill: surface_style(),
             segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
         }],
         origin: Point { x: 0.0, y: 0.0 },
@@ -1634,7 +1697,7 @@ fn build_help_modal_elements(
         elements.push(CreateElementBody {
             id: MODAL_THUMB_ID.into(),
             commands: vec![DrawCmd::FillRectangles {
-                fill: Style::Flat(COLOR_BRAND),
+                fill: accent_style(),
                 rects: vec![Rect {
                     x: box_w - 1.0,
                     y: 0.0,
@@ -2978,10 +3041,54 @@ struct VgeProbeData {
 struct ProbeResults {
     /// Host advertised the Portal Extension (a hard requirement).
     prt_ok: bool,
+    /// Host pre-populates the reserved `host.*` VGE style namespace
+    /// (PRT probe `vge_features` bit, §10). When set, chrome uses
+    /// `StyleRef("host.accent")`; otherwise it falls back to `COLOR_BRAND`.
+    host_themed_styles: bool,
+    /// The accent `host.accent` resolves to at this vmux's depth, when the
+    /// host themes `host.*`. Used to derive shades (thumb, surface).
+    accent_rgba: Option<[u8; 4]>,
     /// VGE probe answer, if any (cell pixel metrics).
     vge: Option<VgeProbeData>,
     /// `Some(name)` when the host answered the SES probe `in_session`.
     session_name: Option<String>,
+}
+
+/// Parse a PRT ProbeResponse payload. Returns `(host_themed_styles,
+/// accent_rgba)`, or `None` if the payload is not a probe response. A body
+/// too short to contain the trailing `vge_features`/accent fields reads
+/// them as absent per §2.1 (missing trailing fields = zero).
+fn parse_prt_probe(payload: &[u8]) -> Option<(bool, Option<[u8; 4]>)> {
+    let mut r = PrtReader::new(payload);
+    let _ = r.u8(); // payload protocol_version
+    let _ = r.u32(); // payload_length
+    let ft = r.u8().ok()?; // frame_type
+    if ft != PRT_RSP_PROBE {
+        return None;
+    }
+    let _ = r.u32(); // request_id
+    let _ = r.u32(); // body_length
+    // ProbeBody (§2.1).
+    let _ = r.u16(); // protocol_version
+    let _ = r.u32(); // max_portals
+    let _ = r.u32(); // max_portal_cells_w
+    let _ = r.u32(); // max_portal_cells_h
+    let _ = r.u32(); // max_scrollback_lines
+    let _ = r.u32(); // max_write_bytes
+    let _ = r.u8(); // features
+    let _ = r.u8(); // max_nesting_depth
+    let vge_features = r.u8().unwrap_or(0); // trailing §10 byte
+    let themed = vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0;
+    // The accent RGBA follows `vge_features` only when the host themes.
+    let accent = if themed {
+        match (r.u8(), r.u8(), r.u8(), r.u8()) {
+            (Ok(red), Ok(green), Ok(blue), Ok(alpha)) => Some([red, green, blue, alpha]),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Some((themed, accent))
 }
 
 /// Parse one decoded VGE response payload, returning probe metrics if
@@ -3024,6 +3131,8 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
 
     let mut res = ProbeResults {
         prt_ok: false,
+        host_themed_styles: false,
+        accent_rgba: None,
         vge: None,
         session_name: None,
     };
@@ -3048,13 +3157,10 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
         }
 
         for payload in prt_apc.feed(&buf[..n]).payloads {
-            let mut r = PrtReader::new(&payload);
-            let _ = r.u8();
-            let _ = r.u32();
-            if let Ok(ft) = r.u8()
-                && ft == PRT_RSP_PROBE
-            {
+            if let Some((themed, accent)) = parse_prt_probe(&payload) {
                 res.prt_ok = true;
+                res.host_themed_styles = themed;
+                res.accent_rgba = accent;
             }
         }
         for payload in vge_apc.feed(&buf[..n]).payloads {
@@ -3147,6 +3253,10 @@ fn main() -> Result<()> {
         Some(p) => (p.cell_pw as f32, p.cell_ph as f32),
         None => (9.0, 20.0),
     };
+    HOST_THEMED_STYLES.store(probe.host_themed_styles, Ordering::Relaxed);
+    if let Some(rgba) = probe.accent_rgba {
+        HOST_ACCENT_RGBA.store(u32::from_be_bytes(rgba), Ordering::Relaxed);
+    }
 
     let (rows, cols) = get_host_winsize()?;
     tty.enter_alt_screen()?;

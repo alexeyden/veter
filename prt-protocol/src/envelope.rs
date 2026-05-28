@@ -21,11 +21,18 @@ pub struct ProbeBody {
     pub features: u8,
     pub max_nesting_depth: u8,
     pub vge_features: Option<u8>,
+    /// §10 — when the host themes `host.*` styles
+    /// (`FEAT_VGE_HOST_THEMED_STYLES`), the RGBA8 value `host.accent`
+    /// resolves to for the probing engine's nesting depth. Lets a client
+    /// derive its own shades (translucent, darkened) from the same accent
+    /// it references by `StyleRef`. Encoded only when `Some`, and only
+    /// meaningful when the themed bit is set in `vge_features`.
+    pub accent_rgba: Option<[u8; 4]>,
 }
 
 impl ProbeBody {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(26);
+        let mut w = Writer::with_capacity(30);
         w.u16(self.protocol_version);
         w.u32(self.max_portals);
         w.u32(self.max_portal_cells_w);
@@ -34,8 +41,15 @@ impl ProbeBody {
         w.u32(self.max_write_bytes);
         w.u8(self.features);
         w.u8(self.max_nesting_depth);
+        // `accent_rgba` follows `vge_features`, so it can only be present
+        // when `vge_features` is too (no positional gap).
         if let Some(extra) = self.vge_features {
             w.u8(extra);
+            if let Some(rgba) = self.accent_rgba {
+                for b in rgba {
+                    w.u8(b);
+                }
+            }
         }
         w.buf
     }
@@ -222,6 +236,7 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: None,
+            accent_rgba: None,
         };
         assert_eq!(pb.encode().len(), 24);
 
@@ -231,6 +246,23 @@ mod tests {
             ..pb
         };
         assert_eq!(pb2.encode().len(), 25);
+
+        // With VGE byte + accent RGBA: 25 + 4 = 29.
+        let pb3 = ProbeBody {
+            vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
+            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
+            ..pb
+        };
+        assert_eq!(pb3.encode().len(), 29);
+
+        // accent_rgba without vge_features cannot be encoded (no gap):
+        // it is silently dropped, length stays at the 24-byte prefix.
+        let pb4 = ProbeBody {
+            vge_features: None,
+            accent_rgba: Some([1, 2, 3, 4]),
+            ..pb
+        };
+        assert_eq!(pb4.encode().len(), 24);
     }
 
     #[test]

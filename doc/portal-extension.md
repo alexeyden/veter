@@ -970,10 +970,41 @@ response (§2.1):
 
 ```
 bit 0  vge_in_portal           // host runs a per-portal VGE engine
+bit 1  host_themed_styles       // host pre-populates the reserved
+                                // `host.*` VGE style namespace
 ```
 
 Clients that read a probe response shorter than the field offset
 treat the bit as 0 (VGE-in-portal not supported).
+
+When `host_themed_styles` is set, the host seeds reserved `host.*`
+style ids (e.g. `host.accent`) into every per-portal VGE engine's
+global style table; clients reference them with `StyleRef` instead of
+hardcoding colors. The host keys the contextual `host.accent` on each
+portal's nesting depth, so a multiplexer nested inside another renders
+its chrome in a distinct accent. The id set and host obligations
+(re-injection after RIS, rejecting client writes with
+`err_reserved_style_id`) are normative in the VGE spec §7.3.
+
+When the bit is set, the host also appends the accent value, so a
+client can derive its own shades (a translucent variant, a darkened
+surface) from the same color it references by `StyleRef`:
+
+```
+u8  accent_r
+u8  accent_g
+u8  accent_b
+u8  accent_a                    // straight RGBA8 that `host.accent`
+                                // resolves to for the probing engine's
+                                // nesting depth
+```
+
+These four bytes follow `vge_features` and are present only when the
+`host_themed_styles` bit is set (a client that does not see the bit
+treats them as absent, per §2.1). Because each portal's per-portal
+engine answers the probe of the client running inside it, the reported
+accent already matches that client's depth — no client-side depth
+arithmetic is needed.
 
 **VGE inside a portal.** When `vge_in_portal` is set, every portal
 owns a private VGE engine that operates in the portal's cell

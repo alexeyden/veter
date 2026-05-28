@@ -455,10 +455,58 @@ struct PendingUpload {
     bytes_received: u32,
 }
 
+/// Host-provided accent palette seeded into the reserved `host.*`
+/// style namespace (`doc/vector-graphics-extension.md` §7.3). An empty
+/// palette means host-themed styles are disabled: nothing is injected
+/// and the PRT probe does not advertise `FEAT_VGE_HOST_THEMED_STYLES`.
+#[derive(Debug, Clone, Default)]
+pub struct HostThemePalette {
+    /// Ordered accent slots. `host.accent.{n}` resolves to `accents[n-1]`;
+    /// the contextual `host.accent` resolves to `accents[depth % len]`.
+    pub accents: Vec<command::Color>,
+}
+
+impl HostThemePalette {
+    pub fn is_empty(&self) -> bool {
+        self.accents.is_empty()
+    }
+
+    /// The contextual accent (`host.accent`) for a VGE engine at the given
+    /// tree depth, as a straight RGBA8 quad. `None` for an empty palette.
+    /// Clients read this from the probe to derive their own shades from
+    /// the same accent they reference by `StyleRef`.
+    pub fn contextual_rgba8(&self, depth: u32) -> Option<[u8; 4]> {
+        if self.accents.is_empty() {
+            return None;
+        }
+        let c = self.accents[(depth as usize) % self.accents.len()];
+        let q = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some([q(c.r), q(c.g), q(c.b), q(c.a)])
+    }
+
+    /// Style-table entries this palette contributes for a VGE engine at
+    /// the given tree depth (host = 0). Empty when the palette is empty.
+    fn entries(&self, depth: u32) -> Vec<(String, ConcreteStyle)> {
+        if self.accents.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.accents.len() + 1);
+        let idx = (depth as usize) % self.accents.len();
+        out.push(("host.accent".to_string(), ConcreteStyle::Flat(self.accents[idx])));
+        for (i, c) in self.accents.iter().enumerate() {
+            out.push((format!("host.accent.{}", i + 1), ConcreteStyle::Flat(*c)));
+        }
+        out
+    }
+}
+
 pub struct VgeEngine {
     apc: ApcStream,
     pub state: VgeState,
     pub limits: Limits,
+    /// Host accent palette + this engine's tree depth, if seeded. Re-applied
+    /// after RIS/DECSTR wipes the style table so `host.*` entries persist.
+    host_seed: Option<(HostThemePalette, u32)>,
     cell_px: (u16, u16),
     scale_factor: f32,
     line_tracker: LineTracker,
@@ -505,6 +553,7 @@ impl VgeEngine {
             apc: ApcStream::new(),
             state: VgeState::new(),
             limits: Limits::default(),
+            host_seed: None,
             cell_px,
             scale_factor,
             line_tracker: LineTracker::new(),
@@ -514,6 +563,28 @@ impl VgeEngine {
             pending_cursor_queries: 0,
             auto_reply_dsr: true,
             auto_reply_commands: true,
+        }
+    }
+
+    /// Seed the reserved `host.*` style namespace from a host-provided
+    /// palette, keyed on this engine's `depth` in the portal tree
+    /// (`doc/vector-graphics-extension.md` §7.3). The seed is retained so
+    /// it can be re-applied after RIS/DECSTR clears the style table.
+    /// A no-op for an empty palette.
+    pub fn seed_host_styles(&mut self, palette: HostThemePalette, depth: u32) {
+        if palette.is_empty() {
+            return;
+        }
+        self.host_seed = Some((palette, depth));
+        self.apply_host_styles();
+    }
+
+    /// (Re-)write the seeded `host.*` entries into the style table.
+    fn apply_host_styles(&mut self) {
+        if let Some((palette, depth)) = &self.host_seed {
+            for (id, style) in palette.entries(*depth) {
+                self.state.shared.styles.insert(id, style);
+            }
         }
     }
 
@@ -643,6 +714,9 @@ impl VgeEngine {
                 // Reset the line tracker too: scrollback state will be
                 // re-derived after vt100 finishes its own reset.
                 self.line_tracker = LineTracker::new();
+                // §7.3 — RIS/DECSTR wipes the style table; the host re-seeds
+                // its reserved `host.*` entries so clients' StyleRefs survive.
+                self.apply_host_styles();
             }
             CursorPositionQuery => {
                 // Queue; we reply after vt100 processes the chunk so
@@ -941,6 +1015,10 @@ impl VgeEngine {
         style: ConcreteStyle,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         // ID validation already done by the parser (non-empty, ≤64 bytes).
+        // §7.3 — the `host.*` namespace is host-owned; clients may not write it.
+        if id.starts_with("host.") {
+            return Err((ERR_RESERVED_STYLE_ID, "host.* style ids are host-owned"));
+        }
         // Upsert per §7.3 — no error on existing ID.
         self.state.shared.styles.insert(id, style);
         Ok(Vec::new())
@@ -1707,6 +1785,72 @@ mod tests {
             }
             _ => panic!("wrong concrete style kind"),
         }
+    }
+
+    fn palette_rgb() -> HostThemePalette {
+        let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
+        HostThemePalette {
+            accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+        }
+    }
+
+    fn flat_g(styles: &HashMap<String, ConcreteStyle>, id: &str) -> f32 {
+        match styles.get(id).unwrap_or_else(|| panic!("missing {id}")) {
+            ConcreteStyle::Flat(c) => c.g,
+            _ => panic!("{id} not flat"),
+        }
+    }
+
+    #[test]
+    fn set_global_style_rejects_host_namespace() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let body = set_global_style_flat("host.accent", 0x11, 0x22, 0x33, 0xFF);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_SET_GLOBAL_STYLE, 7, &body);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        let payload = unwrap_t2c_envelope(&engine.take_responses());
+        let mut r = Reader::new(&payload);
+        let _ = r.u8();
+        let _ = r.u32();
+        assert_eq!(r.u8().unwrap(), RSP_ERR);
+        assert_eq!(r.u32().unwrap(), 7);
+        let body_len = r.u32().unwrap() as usize;
+        let err_body = r.take(body_len).unwrap();
+        assert_eq!(Reader::new(err_body).u16().unwrap(), ERR_RESERVED_STYLE_ID);
+        // Table untouched.
+        assert!(!engine.state.shared.styles.contains_key("host.accent"));
+    }
+
+    #[test]
+    fn seed_host_styles_keys_accent_on_depth() {
+        // Depth 1 → `host.accent` rotates to slot 1 (green); the numbered
+        // slots are fixed regardless of depth.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(palette_rgb(), 1);
+        let styles = &engine.state.shared.styles;
+        assert!((flat_g(styles, "host.accent") - 1.0).abs() < 1e-3);
+        assert!((flat_g(styles, "host.accent.1") - 0.0).abs() < 1e-3);
+        assert!((flat_g(styles, "host.accent.2") - 1.0).abs() < 1e-3);
+        assert!((flat_g(styles, "host.accent.3") - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn seed_host_styles_reinjected_after_ris() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(palette_rgb(), 0);
+        assert!(engine.state.shared.styles.contains_key("host.accent"));
+        // RIS wipes the table; the host re-seeds its reserved entries.
+        engine.process_pty_chunk(b"\x1bc");
+        assert!((flat_g(&engine.state.shared.styles, "host.accent") - 0.0).abs() < 1e-3);
+        assert!(engine.state.shared.styles.contains_key("host.accent.3"));
+    }
+
+    #[test]
+    fn empty_palette_seeds_nothing() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(HostThemePalette::default(), 0);
+        assert!(engine.state.shared.styles.is_empty());
     }
 
     #[test]

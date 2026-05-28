@@ -53,6 +53,7 @@ pub const ERR_TOO_MANY_ELEMENTS: u16 = 0x0012;
 pub const ERR_COMMAND_INDEX: u16 = 0x0013;
 pub const ERR_TEXT_RANGE: u16 = 0x0014;
 pub const ERR_UNKNOWN_STYLE: u16 = 0x0020;
+pub const ERR_RESERVED_STYLE_ID: u16 = 0x0021;
 pub const ERR_UNKNOWN_IMAGE: u16 = 0x0030;
 pub const ERR_IMAGE_TOO_LARGE: u16 = 0x0031;
 pub const ERR_IMAGE_DECODE: u16 = 0x0032;

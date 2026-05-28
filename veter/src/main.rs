@@ -30,6 +30,32 @@ use winit::window::{Icon, Window, WindowAttributes, WindowId};
 /// which is set via the platform-Wayland `with_name` extension below.
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/128x128/veter.png");
 
+/// Host accent palette published into the reserved `host.*` VGE style
+/// namespace (`doc/vector-graphics-extension.md` §7.3). Slot N maps to
+/// `host.accent.{N+1}`; the contextual `host.accent` rotates through
+/// these by portal nesting depth, so a top-level vmux, a vmux nested
+/// inside it, and one nested again render their chrome in slots 0/1/2.
+/// Hardcoded for now; a user-facing config can replace this later.
+const HOST_ACCENT_RGB: [(u8, u8, u8); 3] = [
+    (0x4F, 0x73, 0x41), // accent.1 — deep sage
+    (0x85, 0x9F, 0x3D), // accent.2 — olive
+    (0x5A, 0x3C, 0x9E), // accent.3 — violet
+];
+
+fn host_accent_palette() -> vge::HostThemePalette {
+    vge::HostThemePalette {
+        accents: HOST_ACCENT_RGB
+            .iter()
+            .map(|&(r, g, b)| vge::Color {
+                r: r as f32 / 255.0,
+                g: g as f32 / 255.0,
+                b: b as f32 / 255.0,
+                a: 1.0,
+            })
+            .collect(),
+    }
+}
+
 fn load_window_icon() -> Option<Icon> {
     let img = image::load_from_memory(WINDOW_ICON_PNG).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -616,7 +642,8 @@ fn draw_search_bar<T: femtovg::Renderer>(
 
     let mut bg_path = femtovg::Path::new();
     bg_path.rect(0.0, bar_y, window_w_px, bar_h);
-    canvas.fill_path(&bg_path, &femtovg::Paint::color(Color::rgb(45, 45, 55)));
+    let (ar, ag, ab) = HOST_ACCENT_RGB[0];
+    canvas.fill_path(&bg_path, &femtovg::Paint::color(Color::rgb(ar, ag, ab)));
 
     let case_indicator = if search.case_insensitive { "[aA]" } else { "[Aa]" };
     let counter = if search.matches.is_empty() {
@@ -2009,7 +2036,12 @@ impl ApplicationHandler for App {
             term_renderer.cell_height.round() as u16,
         );
         let scale = window.scale_factor() as f32;
-        let vge_engine = vge::VgeEngine::new(cell_px, scale);
+        let mut vge_engine = vge::VgeEngine::new(cell_px, scale);
+        // §7.3 — publish the host accent palette into the top-level VGE
+        // engine's reserved `host.*` namespace (depth 0). vmux and other
+        // clients reference `host.accent` instead of hardcoding colors;
+        // per-portal engines get their own depth-keyed copy on creation.
+        vge_engine.seed_host_styles(host_accent_palette(), 0);
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -2026,8 +2058,12 @@ impl ApplicationHandler for App {
         });
         let vft_engine = vft::VftEngine::with_wakeup(vft_wakeup.clone());
 
-        let prt_engine =
+        let mut prt_engine =
             prt::PrtEngine::with_metrics_and_wakeup(cell_px, scale, vft_wakeup);
+        // Same palette as the top-level VGE engine, inherited by every
+        // per-portal VGE engine PRT spawns; each portal keys its
+        // contextual `host.accent` on its own nesting depth.
+        prt_engine.set_host_palette(host_accent_palette());
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a

@@ -83,6 +83,7 @@ pub const FEAT_EMIT_ACTIVITY_EVENTS: u8 = 1 << 7;
 
 // §10 trailing capability bits (after `max_nesting_depth`).
 pub const FEAT_VGE_IN_PORTAL: u8 = 1 << 0;
+pub const FEAT_VGE_HOST_THEMED_STYLES: u8 = 1 << 1;
 
 // §5.2 anchor mode discriminants
 pub const ANCHOR_LIVE: u8 = 0;

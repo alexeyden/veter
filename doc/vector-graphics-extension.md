@@ -201,6 +201,7 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x0013 | err_command_index       | UpdateCommand index out of range                 |
 | 0x0014 | err_text_range          | UpdateText byte range invalid or non-UTF-8       |
 | 0x0020 | err_unknown_style       | StyleRef does not resolve                        |
+| 0x0021 | err_reserved_style_id   | SetGlobalStyle id in the host-owned `host.*` namespace (§7.3) |
 | 0x0030 | err_unknown_image       | image ID does not resolve                        |
 | 0x0031 | err_image_too_large     | Image exceeds max_image_bytes                    |
 | 0x0032 | err_image_decode        | Image bytes failed to decode (e.g. bad WebP)     |
@@ -663,6 +664,38 @@ element renders with a 100%-magenta flat color (a deliberate eye-catcher)
 and the terminal logs (but does not respond with) an error. Render-time
 errors do not produce response frames, since rendering is decoupled from
 command processing.
+
+#### Reserved `host.*` style ids
+
+Style ids beginning with `host.` are **host-owned**. They let a host
+publish its own theme (accent colors, etc.) into the style table so
+clients can reference it by `StyleRef` instead of hardcoding colors.
+
+- A client `SetGlobalStyle` whose id starts with `host.` MUST be rejected
+  with `err_reserved_style_id`; the table is left unchanged.
+- A host MAY pre-populate any `host.*` id. It SHOULD do so when the
+  client begins a session (so the very first `StyleRef` resolves) and
+  MUST re-inject its `host.*` entries after any RIS/DECSTR that clears
+  the table (§5.4) — otherwise a client's surviving elements would render
+  magenta after a reset.
+- Whether a host populates these is advertised out-of-band. When the
+  Portal Extension is also implemented, the host signals it with the
+  `host_themed_styles` capability bit (portal-extension.md §10); a client
+  that does not see the bit MUST assume the ids are absent and fall back
+  to its own colors.
+
+Reserved ids defined in v0:
+
+| Id              | Meaning                                                       |
+|-----------------|---------------------------------------------------------------|
+| `host.accent`   | Contextual accent. In a per-portal VGE engine the host keys this on the portal's nesting depth, so nested clients get distinct accents. |
+| `host.accent.1` | Explicit accent slot 1 (does not rotate with depth).          |
+| `host.accent.2` | Explicit accent slot 2.                                       |
+| `host.accent.3` | Explicit accent slot 3.                                       |
+
+A host with fewer configured accents than slots populates only the slots
+it has; `host.accent` always resolves (it wraps around the available
+slots).
 
 ### 7.4 DrawText (0x20)
 
