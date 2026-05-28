@@ -1134,15 +1134,20 @@ fn build_tabbar_commands(
     // shows through, matching whatever theme the user runs veter in.
     let mut cmds: Vec<DrawCmd> = Vec::new();
 
-    // Solid rule along the bottom edge of the tab row, separating the
-    // bar from the pane area at row 1. Drawn before tab fills so an
-    // active tab sits flush on top of it.
+    // Solid rule separating the tab row from the pane area at row 1.
+    // A stroked line is centred on its path, so positioning it at y = 1.0
+    // would straddle the boundary and the tab fills (which span [0, 1.0])
+    // would overpaint its top half — the line then reads ~half as thick
+    // under every tab. Offset it down by half its width so its *top edge*
+    // sits at y = 1.0, flush against the fills' bottom edge with no
+    // overlap; the line stays a uniform thickness across the whole bar.
+    const RULE_W: f32 = 0.06;
     cmds.push(DrawCmd::DrawLines {
         stroke: accent_style(),
-        line_width: 0.06,
+        line_width: RULE_W,
         lines: vec![(
-            Point { x: 0.0, y: 1.0 },
-            Point { x: host_wf, y: 1.0 },
+            Point { x: 0.0, y: 1.0 + RULE_W / 2.0 },
+            Point { x: host_wf, y: 1.0 + RULE_W / 2.0 },
         )],
     });
 
