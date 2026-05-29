@@ -323,13 +323,25 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
     collect_separators(layout, full, &mut seps);
     let mut cmds: Vec<DrawCmd> = Vec::new();
     if !seps.is_empty() {
+        // veter floors the window pixels into whole cells, so a sub-cell
+        // strip is left uncovered along the bottom and right edges of the
+        // window. A separator that reaches the layout's bottom/right edge
+        // ends at the last cell boundary and so stops a few pixels short of
+        // the physical window edge. Overshoot those by one cell: VGE
+        // doesn't clip an unsized top-level element, so the surface edge
+        // trims the excess and the line runs flush to the window edge.
+        let full_bottom = (full.y + full.h as i32) as f32;
+        let full_right = (full.x + full.w as i32) as f32;
+        const OVERSHOOT: f32 = 1.0;
         let lines: Vec<(Point, Point)> = seps
             .into_iter()
             .map(|s| match s {
                 Separator::Vertical { x, y0, y1 } => {
+                    let y1 = if y1 >= full_bottom { y1 + OVERSHOOT } else { y1 };
                     (Point { x, y: y0 }, Point { x, y: y1 })
                 }
                 Separator::Horizontal { y, x0, x1 } => {
+                    let x1 = if x1 >= full_right { x1 + OVERSHOOT } else { x1 };
                     (Point { x: x0, y }, Point { x: x1, y })
                 }
             })
