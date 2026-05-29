@@ -336,7 +336,7 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
             .collect();
         cmds.push(DrawCmd::DrawLines {
             stroke: accent_style(),
-            line_width: 0.06,
+            line_width: 0.1,
             lines,
         });
     }
@@ -1247,16 +1247,23 @@ fn build_tabbar_commands(
     // A stroked line is centred on its path, so positioning it at y = 1.0
     // would straddle the boundary and the tab fills (which span [0, 1.0])
     // would overpaint its top half — the line then reads ~half as thick
-    // under every tab. Offset it down by half its width so its *top edge*
-    // sits at y = 1.0, flush against the fills' bottom edge with no
-    // overlap; the line stays a uniform thickness across the whole bar.
-    const RULE_W: f32 = 0.06;
+    // under every tab. We want `RULE_W` of *visible* rule below y = 1.0,
+    // so the bottom edge sits at 1.0 + RULE_W. Abutting the top edge
+    // exactly at y = 1.0 leaves an anti-aliasing seam where the background
+    // bleeds through between the fills and the rule, so we extend the
+    // stroke up by `SEAM_OVERLAP` into the fills (drawn after the rule, so
+    // they paint over the sliver): the overlap closes the seam without
+    // thinning the visible rule.
+    const RULE_W: f32 = 0.1;
+    const SEAM_OVERLAP: f32 = 0.04;
+    let stroke_w = RULE_W + SEAM_OVERLAP;
+    let rule_y = 1.0 + (RULE_W - SEAM_OVERLAP) / 2.0;
     cmds.push(DrawCmd::DrawLines {
         stroke: accent_style(),
-        line_width: RULE_W,
+        line_width: stroke_w,
         lines: vec![(
-            Point { x: 0.0, y: 1.0 + RULE_W / 2.0 },
-            Point { x: host_wf, y: 1.0 + RULE_W / 2.0 },
+            Point { x: 0.0, y: rule_y },
+            Point { x: host_wf, y: rule_y },
         )],
     });
 
@@ -1453,8 +1460,15 @@ fn build_chrome_commands(
         // compensated for anisotropic cells.
         let (rx, ry) =
             chrome_corner_radii(thumb_x1 - thumb_x0, thumb_y1 - thumb_y0, cell_pw, cell_ph);
+        // Focused pane gets the translucent accent thumb; inactive panes
+        // use the dim surface fill — the same color as an inactive tab's
+        // number cell — so focus reads as an accent highlight.
         cmds.push(DrawCmd::FillPath {
-            fill: title_thumb_style(),
+            fill: if focused {
+                title_thumb_style()
+            } else {
+                surface_style()
+            },
             segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
         });
         cmds.push(DrawCmd::DrawText {
