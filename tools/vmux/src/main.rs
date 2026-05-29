@@ -1515,6 +1515,7 @@ fn build_modal_commands(
     line: &str,
     cell_pw: f32,
     cell_ph: f32,
+    caret: Option<usize>,
 ) -> CreateElementBody {
     // Center a fixed-size modal box on the host grid. The 4-cell box
     // is (title strip)(body top pad)(body line)(body bottom pad) —
@@ -1530,7 +1531,7 @@ fn build_modal_commands(
     let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
 
     let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
-    let cmds = vec![
+    let mut cmds = vec![
         // Body fill — full rounded rect; the title strip is drawn over
         // its top region.
         DrawCmd::FillPath {
@@ -1571,6 +1572,21 @@ fn build_modal_commands(
             text: line.into(),
         },
     ];
+
+    // Text cursor: a thin vertical bar drawn at the insertion point rather
+    // than a literal caret glyph in the string, so it doesn't shift the
+    // text. The body line is center-aligned, so its left edge is
+    // `box_w/2 - chars/2`; the bar sits `caret` cells to the right of that
+    // (one glyph advance ≈ one cell, the same assumption the box sizing
+    // above makes).
+    if let Some(c) = caret {
+        let caret_x = box_w * 0.5 - chars * 0.5 + c.min(line.chars().count()) as f32;
+        const HALF_W: f32 = 0.07;
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(accent_color()),
+            segments: rounded_rect_path(caret_x - HALF_W, 2.1, caret_x + HALF_W, 2.9, 0.0, 0.0),
+        });
+    }
 
     CreateElementBody {
         id: MODAL_ELEMENT_ID.to_string(),
@@ -1621,6 +1637,15 @@ const HELP_LINES: &[&str] = &[
     "  click tab      switch to it",
     "  drag divider   resize adjacent panes",
     "  wheel          scroll pane under cursor",
+    "",
+    "Rename edit  (prefix-r / prefix-R; Enter commits, Esc cancels)",
+    "  Ctrl+A/E      start / end of line",
+    "  Ctrl+B/F      back / forward one char (or ←/→)",
+    "  Alt+B/F       back / forward one word",
+    "  Ctrl+W        delete word before cursor",
+    "  Alt+D         delete word after cursor",
+    "  Ctrl+U/K      delete to start / end of line",
+    "  Ctrl+D / Del  delete char under cursor",
     "",
     "Misc",
     "  ?           show this help",
@@ -1845,6 +1870,263 @@ enum RenameTarget {
     Tab(usize),
 }
 
+/// Result of feeding input bytes to a [`LineEditor`].
+enum EditOutcome {
+    /// Nothing visible changed (e.g. an unrecognised / incomplete key).
+    Noop,
+    /// Buffer or cursor moved — the modal should be re-rendered.
+    Redraw,
+    /// Enter pressed — commit the current buffer.
+    Commit,
+    /// Esc / Ctrl+G pressed — abandon the edit.
+    Cancel,
+}
+
+/// A single-line text editor with a readline-flavored keybinding set,
+/// backing the rename modal. ASCII-only for now (non-ASCII / non-printable
+/// input is dropped), so byte and char indices coincide; even so every
+/// operation routes through char positions to stay UTF-8-ready.
+#[derive(Debug)]
+struct LineEditor {
+    /// The edited text.
+    buffer: String,
+    /// Insertion point as a char index in `0..=char_count`.
+    cursor: usize,
+}
+
+/// Max title length, in chars. Mirrors the historical rename cap.
+const RENAME_MAX_CHARS: usize = 32;
+
+impl LineEditor {
+    /// Start editing `buffer` with the cursor at its end.
+    fn new(buffer: String) -> Self {
+        let cursor = buffer.chars().count();
+        LineEditor { buffer, cursor }
+    }
+
+    fn char_count(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    /// Byte offset of char index `idx` (or buffer end if past the end).
+    fn byte_offset(&self, idx: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(idx)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buffer.len())
+    }
+
+    /// Remove chars in the half-open range `[a, b)`. Caller fixes up the
+    /// cursor afterwards.
+    fn delete_range(&mut self, a: usize, b: usize) {
+        if a >= b {
+            return;
+        }
+        self.buffer = self
+            .buffer
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| *i < a || *i >= b)
+            .map(|(_, c)| c)
+            .collect();
+    }
+
+    fn insert(&mut self, c: char) {
+        if self.char_count() >= RENAME_MAX_CHARS {
+            return;
+        }
+        let at = self.byte_offset(self.cursor);
+        self.buffer.insert(at, c);
+        self.cursor += 1;
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.char_count() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Char index of the previous word start (alphanumeric-delimited).
+    fn prev_word(&self) -> usize {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Char index of the next word end (alphanumeric-delimited).
+    fn next_word(&self) -> usize {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let n = chars.len();
+        let mut i = self.cursor;
+        while i < n && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < n && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        i
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.delete_range(self.cursor - 1, self.cursor);
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        self.delete_range(self.cursor, self.cursor + 1);
+    }
+
+    fn kill_to_end(&mut self) {
+        self.delete_range(self.cursor, self.char_count());
+    }
+
+    fn kill_to_start(&mut self) {
+        self.delete_range(0, self.cursor);
+        self.cursor = 0;
+    }
+
+    fn kill_word_back(&mut self) {
+        let start = self.prev_word();
+        self.delete_range(start, self.cursor);
+        self.cursor = start;
+    }
+
+    fn kill_word_forward(&mut self) {
+        let end = self.next_word();
+        self.delete_range(self.cursor, end);
+    }
+
+    /// Consume one keystroke from the front of `bytes`, returning how many
+    /// bytes were consumed and the resulting outcome. A whole escape
+    /// sequence is consumed at once when one is present in this read, so a
+    /// lone trailing Esc still reads as an immediate cancel.
+    fn feed(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
+        let Some(&b) = bytes.first() else {
+            return (1, EditOutcome::Noop);
+        };
+        match b {
+            b'\r' | b'\n' => (1, EditOutcome::Commit),
+            0x1B => self.feed_escape(bytes),
+            0x01 => {
+                self.cursor = 0; // Ctrl+A
+                (1, EditOutcome::Redraw)
+            }
+            0x05 => {
+                self.cursor = self.char_count(); // Ctrl+E
+                (1, EditOutcome::Redraw)
+            }
+            0x02 => {
+                self.move_left(); // Ctrl+B
+                (1, EditOutcome::Redraw)
+            }
+            0x06 => {
+                self.move_right(); // Ctrl+F
+                (1, EditOutcome::Redraw)
+            }
+            0x04 => {
+                self.delete_forward(); // Ctrl+D
+                (1, EditOutcome::Redraw)
+            }
+            0x08 | 0x7F => {
+                self.backspace(); // Ctrl+H / DEL
+                (1, EditOutcome::Redraw)
+            }
+            0x0B => {
+                self.kill_to_end(); // Ctrl+K
+                (1, EditOutcome::Redraw)
+            }
+            0x15 => {
+                self.kill_to_start(); // Ctrl+U
+                (1, EditOutcome::Redraw)
+            }
+            0x17 => {
+                self.kill_word_back(); // Ctrl+W
+                (1, EditOutcome::Redraw)
+            }
+            0x07 => (1, EditOutcome::Cancel), // Ctrl+G
+            0x20..=0x7E => {
+                self.insert(b as char);
+                (1, EditOutcome::Redraw)
+            }
+            _ => (1, EditOutcome::Noop),
+        }
+    }
+
+    /// Handle an ESC-introduced sequence: Alt-<key> bindings, CSI/SS3
+    /// cursor keys, or a bare Esc (cancel). `bytes[0]` is `0x1B`.
+    fn feed_escape(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
+        // Lone Esc with nothing following in this read → cancel.
+        let Some(&next) = bytes.get(1) else {
+            return (1, EditOutcome::Cancel);
+        };
+        match next {
+            b'b' | b'B' => {
+                self.cursor = self.prev_word(); // Alt+B
+                (2, EditOutcome::Redraw)
+            }
+            b'f' | b'F' => {
+                self.cursor = self.next_word(); // Alt+F
+                (2, EditOutcome::Redraw)
+            }
+            b'd' | b'D' => {
+                self.kill_word_forward(); // Alt+D
+                (2, EditOutcome::Redraw)
+            }
+            0x7F | 0x08 => {
+                self.kill_word_back(); // Alt+Backspace
+                (2, EditOutcome::Redraw)
+            }
+            b'[' | b'O' => self.feed_csi(bytes),
+            // ESC + unrecognised byte: treat the ESC as a cancel and leave
+            // the trailing byte for the next loop iteration.
+            _ => (1, EditOutcome::Cancel),
+        }
+    }
+
+    /// Handle a CSI/SS3 cursor-key sequence. `bytes[0..2]` is `ESC [` or
+    /// `ESC O`.
+    fn feed_csi(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
+        // Scan to the final byte (0x40..=0x7E) of the sequence.
+        let mut i = 2;
+        while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            // Incomplete in this read — drop the partial prefix rather
+            // than leak raw bytes; a split sequence is rare for these.
+            return (bytes.len(), EditOutcome::Noop);
+        }
+        let params = &bytes[2..i];
+        match bytes[i] {
+            b'C' => self.move_right(),         // Right
+            b'D' => self.move_left(),          // Left
+            b'H' => self.cursor = 0,           // Home
+            b'F' => self.cursor = self.char_count(), // End
+            b'~' => match params {
+                b"1" | b"7" => self.cursor = 0,
+                b"4" | b"8" => self.cursor = self.char_count(),
+                b"3" => self.delete_forward(), // Delete
+                _ => {}
+            },
+            _ => {}
+        }
+        (i + 1, EditOutcome::Redraw)
+    }
+}
+
 #[derive(Debug)]
 enum Mode {
     Normal,
@@ -1852,10 +2134,12 @@ enum Mode {
     /// vmux command.
     Prefix,
     /// Modal text editor for `prefix-r` (pane) or `prefix-R` (tab).
-    /// Captures keystrokes until Enter (commit) or Esc (cancel).
+    /// Captures keystrokes until Enter (commit) or Esc (cancel). The
+    /// `editor` carries a readline-flavored line-editing state (cursor +
+    /// motion/kill bindings).
     Rename {
         target: RenameTarget,
-        buffer: String,
+        editor: LineEditor,
     },
     /// Help-modal display via `prefix-?`. Recognised navigation keys
     /// (`j`/`k`/Up/Down/PgUp/PgDn/`g`/`G`) scroll when the help text is
@@ -2808,7 +3092,7 @@ impl State {
     /// prompt or help — or empty if no modal should be visible.
     fn build_modal_elements(&self) -> Vec<CreateElementBody> {
         match &self.mode {
-            Mode::Rename { target, buffer } => {
+            Mode::Rename { target, editor } => {
                 let title = match target {
                     RenameTarget::Pane(_) => "Rename pane",
                     RenameTarget::Tab(_) => "Rename tab",
@@ -2817,9 +3101,10 @@ impl State {
                     self.host_w,
                     self.host_h,
                     title,
-                    &format!("{buffer}_"),
+                    &editor.buffer,
                     self.cell_pw,
                     self.cell_ph,
+                    Some(editor.cursor),
                 )]
             }
             Mode::Help { offset, .. } => build_help_modal_elements(
@@ -2836,6 +3121,7 @@ impl State {
                 "y = quit     n = cancel",
                 self.cell_pw,
                 self.cell_ph,
+                None,
             )],
             // Resize shows its cue in the focused pane's title, not a
             // center modal — a center box would hide the layout the user
@@ -4375,11 +4661,11 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 idx += 1;
             }
             Mode::Rename { .. } => {
-                let env = handle_rename_byte(state, b)?;
+                let (consumed, env) = handle_rename_input(state, &bytes[idx..])?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += 1;
+                idx += consumed.max(1);
             }
             Mode::Help { .. } => {
                 let env = handle_help_byte(state, b)?;
@@ -4435,7 +4721,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
                 .unwrap_or_default();
             state.mode = Mode::Rename {
                 target: RenameTarget::Pane(pane_id),
-                buffer,
+                editor: LineEditor::new(buffer),
             };
             Ok(state.render_modal_overlay())
         }
@@ -4448,7 +4734,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
             let buffer = state.tab_effective_title(idx);
             state.mode = Mode::Rename {
                 target: RenameTarget::Tab(idx),
-                buffer,
+                editor: LineEditor::new(buffer),
             };
             Ok(state.render_modal_overlay())
         }
@@ -4504,15 +4790,28 @@ fn handle_prefix_arrow(state: &mut State, final_byte: u8) -> Result<Vec<u8>> {
     }
 }
 
-/// Process one byte while the rename modal is up.
-fn handle_rename_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
-    let Mode::Rename { target, buffer } = &mut state.mode else {
-        return Ok(Vec::new());
+/// Process keystrokes while the rename modal is up. Feeds the front of
+/// `rest` to the [`LineEditor`] and acts on its outcome, returning the
+/// number of input bytes consumed alongside the envelope to emit.
+fn handle_rename_input(state: &mut State, rest: &[u8]) -> Result<(usize, Vec<u8>)> {
+    let (consumed, outcome) = {
+        let Mode::Rename { editor, .. } = &mut state.mode else {
+            return Ok((1, Vec::new()));
+        };
+        editor.feed(rest)
     };
-    match b {
-        // Enter — commit.
-        b'\r' | b'\n' => {
-            let new_title = std::mem::take(buffer);
+    match outcome {
+        EditOutcome::Noop => Ok((consumed, Vec::new())),
+        EditOutcome::Redraw => Ok((consumed, state.render_modal_overlay())),
+        EditOutcome::Cancel => {
+            state.mode = Mode::Normal;
+            Ok((consumed, state.render_modal_overlay()))
+        }
+        EditOutcome::Commit => {
+            let Mode::Rename { target, editor } = &mut state.mode else {
+                return Ok((consumed, Vec::new()));
+            };
+            let new_title = std::mem::take(&mut editor.buffer);
             let target = match target {
                 RenameTarget::Pane(id) => RenameTarget::Pane(id.clone()),
                 RenameTarget::Tab(idx) => RenameTarget::Tab(*idx),
@@ -4548,27 +4847,8 @@ fn handle_rename_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
                     env.extend(state.relayout_and_render()?);
                 }
             }
-            Ok(env)
+            Ok((consumed, env))
         }
-        // Escape — cancel.
-        0x1B => {
-            state.mode = Mode::Normal;
-            Ok(state.render_modal_overlay())
-        }
-        // Backspace / DEL.
-        0x7F | 0x08 => {
-            buffer.pop();
-            Ok(state.render_modal_overlay())
-        }
-        // Printable ASCII. Stay conservative for MVP — non-ASCII is
-        // forwarded through but we don't try to decode UTF-8 boundaries.
-        0x20..=0x7E => {
-            if buffer.chars().count() < 32 {
-                buffer.push(b as char);
-            }
-            Ok(state.render_modal_overlay())
-        }
-        _ => Ok(Vec::new()),
     }
 }
 
@@ -4923,6 +5203,127 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed a whole keystroke string to a fresh editor seeded with
+    /// `start`, returning the final (buffer, cursor) and last outcome.
+    fn drive(start: &str, keys: &[u8]) -> (String, usize, &'static str) {
+        let mut ed = LineEditor::new(start.to_string());
+        let mut idx = 0;
+        let mut last = "noop";
+        while idx < keys.len() {
+            let (consumed, outcome) = ed.feed(&keys[idx..]);
+            last = match outcome {
+                EditOutcome::Noop => "noop",
+                EditOutcome::Redraw => "redraw",
+                EditOutcome::Commit => "commit",
+                EditOutcome::Cancel => "cancel",
+            };
+            idx += consumed.max(1);
+        }
+        (ed.buffer, ed.cursor, last)
+    }
+
+    #[test]
+    fn line_editor_new_puts_cursor_at_end() {
+        let ed = LineEditor::new("hello".to_string());
+        assert_eq!(ed.cursor, 5);
+        assert_eq!(ed.buffer, "hello");
+    }
+
+    #[test]
+    fn line_editor_inserts_at_cursor() {
+        // Ctrl+A (home) then type "X".
+        let (buf, cur, _) = drive("bc", &[0x01, b'X']);
+        assert_eq!(buf, "Xbc");
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn line_editor_home_and_end() {
+        let (_, cur, _) = drive("hello", &[0x01]); // Ctrl+A
+        assert_eq!(cur, 0);
+        let (_, cur, _) = drive("hello", &[0x01, 0x05]); // Ctrl+A then Ctrl+E
+        assert_eq!(cur, 5);
+    }
+
+    #[test]
+    fn line_editor_char_motion_and_forward_delete() {
+        // Home, Ctrl+F twice, Ctrl+D removes the char under the cursor.
+        let (buf, cur, _) = drive("abcd", &[0x01, 0x06, 0x06, 0x04]);
+        assert_eq!(buf, "abd");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn line_editor_backspace() {
+        let (buf, cur, _) = drive("abc", &[0x7F]);
+        assert_eq!(buf, "ab");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn line_editor_kill_to_end_and_start() {
+        // Home, Ctrl+F (cursor=1), Ctrl+K kills the tail.
+        let (buf, _, _) = drive("abcd", &[0x01, 0x06, 0x0B]);
+        assert_eq!(buf, "a");
+        // Ctrl+E (end) then move left twice, Ctrl+U kills the head.
+        let (buf, cur, _) = drive("abcd", &[0x05, 0x02, 0x02, 0x15]);
+        assert_eq!(buf, "cd");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn line_editor_word_motion() {
+        // Alt+B from end jumps to the start of the last word.
+        let (_, cur, _) = drive("foo bar", &[0x1B, b'b']);
+        assert_eq!(cur, 4);
+        // Home, then Alt+F to the end of the first word.
+        let (_, cur, _) = drive("foo bar", &[0x01, 0x1B, b'f']);
+        assert_eq!(cur, 3);
+    }
+
+    #[test]
+    fn line_editor_kill_word_back_and_forward() {
+        // Ctrl+W at end deletes the last word (and its leading space).
+        let (buf, cur, _) = drive("foo bar", &[0x17]);
+        assert_eq!(buf, "foo ");
+        assert_eq!(cur, 4);
+        // Home, Alt+D deletes the first word forward.
+        let (buf, cur, _) = drive("foo bar", &[0x01, 0x1B, b'd']);
+        assert_eq!(buf, " bar");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn line_editor_arrow_keys_and_delete() {
+        // CSI Left twice from end, then CSI Delete (ESC [ 3 ~).
+        let keys = [0x1B, b'[', b'D', 0x1B, b'[', b'D', 0x1B, b'[', b'3', b'~'];
+        let (buf, cur, _) = drive("abcd", &keys);
+        assert_eq!(buf, "abd");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn line_editor_lone_esc_cancels_but_alt_does_not() {
+        let (_, _, last) = drive("abc", &[0x1B]);
+        assert_eq!(last, "cancel");
+        // ESC immediately followed by 'b' is Alt+B, not a cancel.
+        let (_, _, last) = drive("abc", &[0x1B, b'b']);
+        assert_eq!(last, "redraw");
+    }
+
+    #[test]
+    fn line_editor_enter_commits() {
+        let (_, _, last) = drive("abc", &[b'\r']);
+        assert_eq!(last, "commit");
+    }
+
+    #[test]
+    fn line_editor_respects_length_cap() {
+        let long = "x".repeat(RENAME_MAX_CHARS);
+        let (buf, _, _) = drive(&long, &[b'y']);
+        assert_eq!(buf.chars().count(), RENAME_MAX_CHARS);
+    }
 
     #[test]
     fn elide_keeps_labels_within_cap() {
