@@ -37,7 +37,7 @@ const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/128x128/veter.
 /// inside it, and one nested again render their chrome in slots 0/1/2.
 /// Hardcoded for now; a user-facing config can replace this later.
 const HOST_ACCENT_RGB: [(u8, u8, u8); 3] = [
-    (0x4F, 0x73, 0x41), // accent.1 — deep sage
+    (0x56, 0x79, 0x9F), // accent.1 — muted blue
     (0x85, 0x9F, 0x3D), // accent.2 — olive
     (0x5A, 0x3C, 0x9E), // accent.3 — violet
 ];

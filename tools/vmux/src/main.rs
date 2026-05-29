@@ -695,14 +695,14 @@ const PORTAL_SCROLLBACK_LINES: u32 = 5_000;
 /// the right pane.
 const SCROLL_REQUEST_ID_BASE: u32 = 0x5C_00_00_00;
 
-/// Brand color (#3e3b73) shared by separators, the title thumb, the
-/// active-tab gradient, and the modal outline. Muted purple — calm
-/// enough to recede into chrome but distinctive against the terminal
-/// background.
+/// Brand color (#56799f) shared by separators, the title thumb, the
+/// active-tab gradient, and the modal outline. Muted blue — distinctive
+/// against the terminal background. Only used as a fallback when the host
+/// does not theme `host.*`; otherwise the host's accent palette wins.
 const COLOR_BRAND: Color = Color {
-    r: 0x3e as f32 / 255.0,
-    g: 0x3b as f32 / 255.0,
-    b: 0x73 as f32 / 255.0,
+    r: 0x56 as f32 / 255.0,
+    g: 0x79 as f32 / 255.0,
+    b: 0x9f as f32 / 255.0,
     a: 1.0,
 };
 
