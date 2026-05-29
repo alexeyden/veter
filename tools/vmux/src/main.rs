@@ -213,6 +213,31 @@ impl Layout {
             }
         }
     }
+
+    /// True if `target` is one of the leaves under this node.
+    fn contains_leaf(&self, target: &str) -> bool {
+        match self {
+            Layout::Leaf(id) => id == target,
+            Layout::Split { a, b, .. } => {
+                a.contains_leaf(target) || b.contains_leaf(target)
+            }
+        }
+    }
+
+    /// Mutable ratio of the split reached by following `path` (true = `a`,
+    /// false = `b`) from this node. An empty path targets this node
+    /// itself. `None` if the path runs off a leaf — used by mouse-drag
+    /// resize to re-find the dragged divider each motion event.
+    fn ratio_at_path_mut(&mut self, path: &[bool]) -> Option<&mut f32> {
+        match self {
+            Layout::Leaf(_) => None,
+            Layout::Split { ratio, a, b, .. } => match path.split_first() {
+                None => Some(ratio),
+                Some((true, rest)) => a.ratio_at_path_mut(rest),
+                Some((false, rest)) => b.ratio_at_path_mut(rest),
+            },
+        }
+    }
 }
 
 enum RemoveResult {
@@ -260,64 +285,33 @@ enum Separator {
 /// little visual breathing room.
 fn collect_separators(node: &Layout, bounds: PaneRect, out: &mut Vec<Separator>) {
     if let Layout::Split { dir, ratio, a, b } = node {
+        let (rect_a, rect_b) = split_child_rects(*dir, *ratio, bounds);
         match dir {
             SplitDir::Vertical => {
-                let w_a = ((bounds.w as f32 * ratio).round() as u32).max(1);
-                let w_a = w_a.min(bounds.w.saturating_sub(1));
-                let w_b = bounds.w - w_a;
-                let rect_a = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y,
-                    w: w_a,
-                    h: bounds.h,
-                };
-                let rect_b = PaneRect {
-                    x: bounds.x + w_a as i32,
-                    y: bounds.y,
-                    w: w_b,
-                    h: bounds.h,
-                };
                 let y0 = bounds.y as f32;
                 let y1 = bounds.y as f32 + bounds.h as f32;
                 if y1 > y0 {
                     out.push(Separator::Vertical {
-                        x: bounds.x as f32 + w_a as f32,
+                        x: rect_b.x as f32,
                         y0,
                         y1,
                     });
                 }
-                collect_separators(a, rect_a, out);
-                collect_separators(b, rect_b, out);
             }
             SplitDir::Horizontal => {
-                let h_a = ((bounds.h as f32 * ratio).round() as u32).max(1);
-                let h_a = h_a.min(bounds.h.saturating_sub(1));
-                let h_b = bounds.h - h_a;
-                let rect_a = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y,
-                    w: bounds.w,
-                    h: h_a,
-                };
-                let rect_b = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y + h_a as i32,
-                    w: bounds.w,
-                    h: h_b,
-                };
                 let x0 = bounds.x as f32;
                 let x1 = bounds.x as f32 + bounds.w as f32;
                 if x1 > x0 {
                     out.push(Separator::Horizontal {
-                        y: bounds.y as f32 + h_a as f32,
+                        y: rect_b.y as f32,
                         x0,
                         x1,
                     });
                 }
-                collect_separators(a, rect_a, out);
-                collect_separators(b, rect_b, out);
             }
         }
+        collect_separators(a, rect_a, out);
+        collect_separators(b, rect_b, out);
     }
 }
 
@@ -357,51 +351,166 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
     }
 }
 
+/// Minimum / maximum split ratio. Resizing (keyboard or mouse-drag)
+/// clamps to this range so a pane can never be squeezed to zero width /
+/// height — there's always at least a sliver of each child left.
+const MIN_RATIO: f32 = 0.05;
+const MAX_RATIO: f32 = 0.95;
+
+/// Partition `bounds` into the two child rects of a split. Single source
+/// of truth for the divider position, shared by layout, separator
+/// drawing, and mouse hit-testing so they can never disagree on where a
+/// boundary sits. The `a` child takes `ratio` of the split axis (rounded
+/// to whole cells, clamped to leave `b` at least one cell), `b` takes the
+/// remainder.
+fn split_child_rects(dir: SplitDir, ratio: f32, bounds: PaneRect) -> (PaneRect, PaneRect) {
+    match dir {
+        SplitDir::Vertical => {
+            let w_a = ((bounds.w as f32 * ratio).round() as u32)
+                .max(1)
+                .min(bounds.w.saturating_sub(1));
+            let w_b = bounds.w - w_a;
+            (
+                PaneRect { x: bounds.x, y: bounds.y, w: w_a, h: bounds.h },
+                PaneRect { x: bounds.x + w_a as i32, y: bounds.y, w: w_b, h: bounds.h },
+            )
+        }
+        SplitDir::Horizontal => {
+            let h_a = ((bounds.h as f32 * ratio).round() as u32)
+                .max(1)
+                .min(bounds.h.saturating_sub(1));
+            let h_b = bounds.h - h_a;
+            (
+                PaneRect { x: bounds.x, y: bounds.y, w: bounds.w, h: h_a },
+                PaneRect { x: bounds.x, y: bounds.y + h_a as i32, w: bounds.w, h: h_b },
+            )
+        }
+    }
+}
+
 fn layout_rects(node: &Layout, bounds: PaneRect, out: &mut HashMap<String, PaneRect>) {
     match node {
         Layout::Leaf(id) => {
             out.insert(id.clone(), bounds);
         }
-        Layout::Split { dir, ratio, a, b } => match dir {
-            SplitDir::Vertical => {
-                let w_a = ((bounds.w as f32 * ratio).round() as u32).max(1);
-                let w_a = w_a.min(bounds.w.saturating_sub(1));
-                let w_b = bounds.w - w_a;
-                let rect_a = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y,
-                    w: w_a,
-                    h: bounds.h,
-                };
-                let rect_b = PaneRect {
-                    x: bounds.x + w_a as i32,
-                    y: bounds.y,
-                    w: w_b,
-                    h: bounds.h,
-                };
-                layout_rects(a, rect_a, out);
-                layout_rects(b, rect_b, out);
-            }
-            SplitDir::Horizontal => {
-                let h_a = ((bounds.h as f32 * ratio).round() as u32).max(1);
-                let h_a = h_a.min(bounds.h.saturating_sub(1));
-                let h_b = bounds.h - h_a;
-                let rect_a = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y,
-                    w: bounds.w,
-                    h: h_a,
-                };
-                let rect_b = PaneRect {
-                    x: bounds.x,
-                    y: bounds.y + h_a as i32,
-                    w: bounds.w,
-                    h: h_b,
-                };
-                layout_rects(a, rect_a, out);
-                layout_rects(b, rect_b, out);
-            }
-        },
+        Layout::Split { dir, ratio, a, b } => {
+            let (rect_a, rect_b) = split_child_rects(*dir, *ratio, bounds);
+            layout_rects(a, rect_a, out);
+            layout_rects(b, rect_b, out);
+        }
+    }
+}
+
+/// Which way a keyboard resize nudges the focused pane's nearest divider.
+#[derive(Debug, Clone, Copy)]
+enum ResizeDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Number of cells one keyboard resize step moves a divider.
+const RESIZE_STEP: i32 = 2;
+
+/// Move the divider of the nearest enclosing split of the matching
+/// orientation in the arrow's direction: `cells > 0` for Right/Down pushes
+/// it right/down (the `a` child grows), `cells < 0` for Left/Up pushes it
+/// up/left (`a` shrinks). The sign is purely the arrow direction — it does
+/// not depend on which side the focused pane is on — so the shared border
+/// always tracks the key pressed (e.g. with the bottom pane focused, Up
+/// moves the border up and grows it). `want` selects the orientation:
+/// `Vertical` for left/right (width), `Horizontal` for up/down (height).
+/// Recurses toward `target` so the *innermost* matching split — the one
+/// directly bordering the focused pane — wins. Returns true if a split was
+/// adjusted.
+fn resize_split(
+    node: &mut Layout,
+    target: &str,
+    want: SplitDir,
+    cells: i32,
+    bounds: PaneRect,
+) -> bool {
+    let Layout::Split { dir, ratio, a, b } = node else {
+        return false;
+    };
+    let in_a = a.contains_leaf(target);
+    if !in_a && !b.contains_leaf(target) {
+        return false;
+    }
+    let (rect_a, rect_b) = split_child_rects(*dir, *ratio, bounds);
+    let (child, child_bounds) = if in_a { (a.as_mut(), rect_a) } else { (b.as_mut(), rect_b) };
+    // Innermost matching split wins — try deeper before adjusting here.
+    if resize_split(child, target, want, cells, child_bounds) {
+        return true;
+    }
+    if *dir == want {
+        let region = match want {
+            SplitDir::Vertical => bounds.w,
+            SplitDir::Horizontal => bounds.h,
+        } as f32;
+        if region < 2.0 {
+            return false;
+        }
+        // `ratio` is the `a` child's fraction. The divider moves in the
+        // arrow's direction regardless of which child is focused: Right/
+        // Down (+cells) grow `a`, Left/Up (−cells) shrink it. `in_a` only
+        // selected which split to move, not the sign.
+        *ratio = (*ratio + cells as f32 / region).clamp(MIN_RATIO, MAX_RATIO);
+        return true;
+    }
+    false
+}
+
+/// Hit-test a pointer cell against every split divider in the active
+/// layout. Returns the path (a/b descent steps from the root) to the
+/// split whose divider lies under `(col, row)`, its orientation, and the
+/// bounds the split was laid out in — enough to re-find the split and
+/// recompute its ratio as the pointer drags. Children are tested first so
+/// the innermost (visually topmost) divider wins when nested boundaries
+/// overlap a cell.
+fn separator_hit(
+    node: &Layout,
+    bounds: PaneRect,
+    col: i32,
+    row: i32,
+    path: &mut Vec<bool>,
+) -> Option<(Vec<bool>, SplitDir, PaneRect)> {
+    let Layout::Split { dir, ratio, a, b } = node else {
+        return None;
+    };
+    let (rect_a, rect_b) = split_child_rects(*dir, *ratio, bounds);
+    path.push(true);
+    if let Some(hit) = separator_hit(a, rect_a, col, row, path) {
+        return Some(hit);
+    }
+    path.pop();
+    path.push(false);
+    if let Some(hit) = separator_hit(b, rect_b, col, row, path) {
+        return Some(hit);
+    }
+    path.pop();
+    // This split's own divider: the cell edge between `a` and `b`. The two
+    // cells straddling that edge count as a grab so a 1-px line stays
+    // clickable at cell granularity.
+    let on = match dir {
+        SplitDir::Vertical => {
+            let dx = rect_b.x;
+            row >= bounds.y
+                && row < bounds.y + bounds.h as i32
+                && (col == dx || col == dx - 1)
+        }
+        SplitDir::Horizontal => {
+            let dy = rect_b.y;
+            col >= bounds.x
+                && col < bounds.x + bounds.w as i32
+                && (row == dy || row == dy - 1)
+        }
+    };
+    if on {
+        Some((path.clone(), *dir, bounds))
+    } else {
+        None
     }
 }
 
@@ -1489,6 +1598,7 @@ const HELP_LINES: &[&str] = &[
     "  x        close focused pane",
     "  r        rename focused pane",
     "  z        toggle zoom (focused pane fills the tab)",
+    "  s        resize mode (hjkl/arrows; q/Esc/Enter exit)",
     "",
     "Tab",
     "  c        new tab",
@@ -1507,9 +1617,10 @@ const HELP_LINES: &[&str] = &[
     "  0 / End       jump back to live",
     "",
     "Mouse",
-    "  click pane   focus it",
-    "  click tab    switch to it",
-    "  wheel        scroll pane under cursor",
+    "  click pane     focus it",
+    "  click tab      switch to it",
+    "  drag divider   resize adjacent panes",
+    "  wheel          scroll pane under cursor",
     "",
     "Misc",
     "  ?           show this help",
@@ -1760,6 +1871,14 @@ enum Mode {
     /// exits; `n`/Esc cancels; any other key is ignored so a stray
     /// keystroke can neither quit nor dismiss the prompt.
     ConfirmQuit,
+    /// Interactive pane-resize, entered via `prefix-s`. `h`/`j`/`k`/`l`
+    /// (or arrow keys) nudge the focused pane's nearest divider; `q`/Esc/
+    /// Enter exit. The focused pane's title shows a `[resize]` cue while
+    /// active. `csi_buf` accumulates multi-byte arrow sequences so the
+    /// leading ESC doesn't read as an exit.
+    Resize {
+        csi_buf: Vec<u8>,
+    },
 }
 
 const PREFIX_BYTE: u8 = 0x00; // Ctrl+Space
@@ -1784,6 +1903,20 @@ struct Tab {
     /// `Some(pane_id)` while a pane is zoomed (filling the tab bounds and
     /// hiding its siblings); `None` otherwise. Survives tab switches.
     zoomed: Option<String>,
+}
+
+/// An in-flight mouse drag on a split divider. Captured on the left-press
+/// that grabs a divider and held until release; each motion event recomputes
+/// the dragged split's ratio from the pointer position. `bounds` is the
+/// region the split was laid out in at grab time — it stays valid for the
+/// whole drag because changing this split's own ratio never moves its
+/// enclosing bounds.
+#[derive(Debug, Clone)]
+struct ResizeDrag {
+    /// a/b descent steps from the active layout root to the dragged split.
+    path: Vec<bool>,
+    dir: SplitDir,
+    bounds: PaneRect,
 }
 
 struct State {
@@ -1830,6 +1963,9 @@ struct State {
     /// session — drives the tab-bar session segment and enables
     /// `prefix-D`. `None` for a plain local `veter` host.
     session_name: Option<String>,
+    /// `Some` while the user is dragging a split divider with the mouse.
+    /// All mouse events route to the drag until the button releases.
+    resize_drag: Option<ResizeDrag>,
 }
 
 impl State {
@@ -1864,6 +2000,7 @@ impl State {
             pending_scrolls: HashMap::new(),
             next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
             session_name: None,
+            resize_drag: None,
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let pty = PanePty::spawn(rows as u16, cols as u16)?;
@@ -2113,6 +2250,89 @@ impl State {
             return Ok(Vec::new());
         }
         self.set_focus(id.to_string());
+        self.relayout_and_render()
+    }
+
+    /// Enter interactive resize mode for the active tab. No-op when there
+    /// is nothing to resize (a single pane, or the tab is zoomed so only
+    /// one pane is visible). Re-emits the focused pane's chrome so the
+    /// `[resize]` title cue shows immediately.
+    fn enter_resize(&mut self) -> Result<Vec<u8>> {
+        if self.tabs[self.active_tab].zoomed.is_some() {
+            return Ok(Vec::new());
+        }
+        let mut leaves = Vec::new();
+        self.active_layout().collect_leaves(&mut leaves);
+        if leaves.len() < 2 {
+            return Ok(Vec::new());
+        }
+        self.mode = Mode::Resize {
+            csi_buf: Vec::new(),
+        };
+        let focus = self.focus().to_string();
+        Ok(self.render_one_chrome(&focus))
+    }
+
+    /// Leave resize mode and clear the focused pane's `[resize]` cue.
+    fn exit_resize(&mut self) -> Result<Vec<u8>> {
+        self.mode = Mode::Normal;
+        let focus = self.focus().to_string();
+        Ok(self.render_one_chrome(&focus))
+    }
+
+    /// Nudge the focused pane's nearest divider one step in `dir`, moving
+    /// the shared border the way the arrow points. Width (left/right) walks
+    /// the nearest vertical split, height (up/down) the nearest horizontal
+    /// one. So with the bottom pane focused, Up moves the border up and
+    /// grows it; Down shrinks it. No-op (empty output) when there's no
+    /// matching split to move.
+    fn resize_focus(&mut self, dir: ResizeDir) -> Result<Vec<u8>> {
+        if self.tabs[self.active_tab].zoomed.is_some() {
+            return Ok(Vec::new());
+        }
+        let (want, cells) = match dir {
+            ResizeDir::Left => (SplitDir::Vertical, -RESIZE_STEP),
+            ResizeDir::Right => (SplitDir::Vertical, RESIZE_STEP),
+            ResizeDir::Up => (SplitDir::Horizontal, -RESIZE_STEP),
+            ResizeDir::Down => (SplitDir::Horizontal, RESIZE_STEP),
+        };
+        let target = self.focus().to_string();
+        let bounds = self.full_bounds();
+        if resize_split(self.layout_mut(), &target, want, cells, bounds) {
+            self.relayout_and_render()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Recompute the dragged divider's ratio from the current pointer cell
+    /// and relayout. Called for every mouse-motion event while a divider
+    /// drag is active. Silently does nothing when the pointer hasn't moved
+    /// the divider (same ratio) so we don't spam redundant relayouts.
+    fn update_resize_drag(&mut self, col: i32, row: i32) -> Result<Vec<u8>> {
+        let Some(drag) = self.resize_drag.clone() else {
+            return Ok(Vec::new());
+        };
+        let new_ratio = match drag.dir {
+            SplitDir::Vertical => {
+                if drag.bounds.w < 2 {
+                    return Ok(Vec::new());
+                }
+                ((col - drag.bounds.x) as f32 / drag.bounds.w as f32)
+                    .clamp(MIN_RATIO, MAX_RATIO)
+            }
+            SplitDir::Horizontal => {
+                if drag.bounds.h < 2 {
+                    return Ok(Vec::new());
+                }
+                ((row - drag.bounds.y) as f32 / drag.bounds.h as f32)
+                    .clamp(MIN_RATIO, MAX_RATIO)
+            }
+        };
+        match self.layout_mut().ratio_at_path_mut(&drag.path) {
+            Some(r) if (*r - new_ratio).abs() >= f32::EPSILON => *r = new_ratio,
+            _ => return Ok(Vec::new()),
+        }
         self.relayout_and_render()
     }
 
@@ -2617,7 +2837,10 @@ impl State {
                 self.cell_pw,
                 self.cell_ph,
             )],
-            Mode::Normal | Mode::Prefix => Vec::new(),
+            // Resize shows its cue in the focused pane's title, not a
+            // center modal — a center box would hide the layout the user
+            // is adjusting.
+            Mode::Normal | Mode::Prefix | Mode::Resize { .. } => Vec::new(),
         }
     }
 
@@ -2630,6 +2853,11 @@ impl State {
         }
         if self.tabs[self.active_tab].zoomed.as_deref() == Some(pane_id) {
             return format!("Z  {}", raw_title);
+        }
+        // While resizing, mark the focused pane so the mode is visible
+        // even though no center modal is shown.
+        if matches!(self.mode, Mode::Resize { .. }) && self.focus() == pane_id {
+            return format!("[resize]  {}", raw_title);
         }
         raw_title.to_string()
     }
@@ -2977,12 +3205,15 @@ impl TtyGuard {
 
     fn enter_alt_screen(&mut self) -> Result<()> {
         // Alt screen + hide cursor + clear. Then enable SGR-encoded
-        // mouse reporting (DECSET 1000 + 1006) so veter forwards every
-        // wheel/click/drag to us; we hit-test against pane bounds in
-        // `handle_mouse_event` and either drive scrollback or
-        // re-encode and forward to the inner program's PTY.
+        // mouse reporting (DECSET 1002 + 1006) so veter forwards every
+        // wheel/click/drag to us; 1002 (button-event tracking) adds
+        // motion-while-pressed on top of 1000's press/release, which is
+        // what powers divider drag-to-resize. We hit-test against pane
+        // bounds in `handle_mouse_event` and either drive a resize drag,
+        // drive scrollback, or re-encode and forward to the inner
+        // program's PTY.
         write_all_stdout(
-            b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h",
+            b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h",
         )?;
         self.in_alt = true;
         Ok(())
@@ -2996,7 +3227,7 @@ impl Drop for TtyGuard {
             // don't leak into the outer shell, then leave alt screen
             // and re-show the cursor.
             let _ = write_all_stdout(
-                b"\x1b[?1006l\x1b[?1000l\x1b[?1049l\x1b[?25h",
+                b"\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b[?25h",
             );
         }
         if let Some(saved) = self.saved.take() {
@@ -3800,6 +4031,21 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     // and releases must not retrigger it.
     let is_left_press = ev.press && (ev.button & 0x63) == 0;
 
+    // An active divider drag captures every mouse event until the button
+    // releases — including motion that strays onto the tab bar or off a
+    // pane — so the boundary tracks the pointer smoothly.
+    if state.resize_drag.is_some() {
+        if ev.press {
+            let env = state.update_resize_drag(host_col, host_row)?;
+            if !env.is_empty() {
+                write_all_stdout(&env)?;
+            }
+        } else {
+            state.resize_drag = None;
+        }
+        return Ok(());
+    }
+
     // Row 0 is the tab bar, never part of a pane rect: a left click
     // there switches tabs and the event goes no further. Gated to
     // `Mode::Normal` so a click can't reach through a modal.
@@ -3808,6 +4054,24 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
             handle_tabbar_click(state, host_col)?;
         }
         return Ok(());
+    }
+
+    // A left-press on (or right next to) a split divider grabs it for a
+    // drag-to-resize, taking precedence over focusing the pane underneath.
+    // Skipped while zoomed — no separators are visible then. Gated to
+    // `Mode::Normal` so a stray click can't resize through a modal.
+    if is_left_press
+        && matches!(state.mode, Mode::Normal)
+        && state.tabs[state.active_tab].zoomed.is_none()
+    {
+        let bounds = state.full_bounds();
+        let mut path = Vec::new();
+        if let Some((path, dir, sbounds)) =
+            separator_hit(state.active_layout(), bounds, host_col, host_row, &mut path)
+        {
+            state.resize_drag = Some(ResizeDrag { path, dir, bounds: sbounds });
+            return Ok(());
+        }
     }
 
     // Find the pane whose `last_rect` contains the event cell. Only
@@ -3874,6 +4138,23 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         // wire-encoded escape would otherwise be echoed in a plain
         // shell. Drop it.
         return Ok(());
+    }
+
+    // Motion events (button bit 0x20) only matter to programs that asked
+    // for button-event (3) or any-event (4) tracking. We keep 1002 on for
+    // our own divider drags, so drop motion bound for a program in plain
+    // X10 (1) / normal (2) mode rather than feed it events it never
+    // requested.
+    let is_motion = ev.button & 0x20 != 0;
+    if is_motion {
+        let proto = state
+            .panes
+            .get(&pane_id)
+            .map(|p| p.inner_mouse_protocol)
+            .unwrap_or(0);
+        if proto < 3 {
+            return Ok(());
+        }
     }
 
     // Forward to the inner program. Translate host cells to
@@ -4114,6 +4395,13 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 }
                 idx += 1;
             }
+            Mode::Resize { .. } => {
+                let env = handle_resize_byte(state, b)?;
+                if !env.is_empty() {
+                    write_all_stdout(&env)?;
+                }
+                idx += 1;
+            }
         }
     }
     Ok(())
@@ -4129,6 +4417,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'x' => state.close_focused(),
         b'o' => state.cycle_focus(),
         b'z' => state.toggle_zoom(),
+        b's' => state.enter_resize(),
         b'q' => {
             // Don't quit outright — pop a confirmation modal so an
             // accidental prefix-q is a recoverable keystroke.
@@ -4301,6 +4590,72 @@ fn handle_confirm_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
             Ok(state.render_modal_overlay())
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Process one byte while interactive resize mode is up. `h`/`j`/`k`/`l`
+/// and arrow keys nudge the focused pane's nearest divider; `q`/Esc/Enter
+/// exit. Arrow keys arrive as CSI sequences, buffered (like scroll mode)
+/// so the leading ESC isn't mistaken for an exit.
+fn handle_resize_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
+    enum Action {
+        Nothing,
+        Resize(ResizeDir),
+        Exit,
+    }
+
+    let action = {
+        let Mode::Resize { csi_buf } = &mut state.mode else {
+            return Ok(Vec::new());
+        };
+        if csi_buf.is_empty() {
+            match b {
+                0x1B => {
+                    csi_buf.push(b);
+                    Action::Nothing
+                }
+                b'q' | b'\r' | b'\n' => Action::Exit,
+                b'h' => Action::Resize(ResizeDir::Left),
+                b'l' => Action::Resize(ResizeDir::Right),
+                b'k' => Action::Resize(ResizeDir::Up),
+                b'j' => Action::Resize(ResizeDir::Down),
+                _ => Action::Nothing,
+            }
+        } else if csi_buf.len() == 1 {
+            // After ESC: `[` (or SS3 `O`) continues an arrow sequence;
+            // anything else means the ESC was a bare keypress → exit.
+            if b == b'[' || b == b'O' {
+                csi_buf.push(b);
+                Action::Nothing
+            } else {
+                csi_buf.clear();
+                Action::Exit
+            }
+        } else {
+            csi_buf.push(b);
+            if (0x40..=0x7E).contains(&b) {
+                let act = match b {
+                    b'D' => Action::Resize(ResizeDir::Left),
+                    b'C' => Action::Resize(ResizeDir::Right),
+                    b'A' => Action::Resize(ResizeDir::Up),
+                    b'B' => Action::Resize(ResizeDir::Down),
+                    _ => Action::Nothing,
+                };
+                csi_buf.clear();
+                act
+            } else if csi_buf.len() > 16 {
+                csi_buf.clear();
+                Action::Nothing
+            } else {
+                Action::Nothing
+            }
+        }
+    };
+
+    match action {
+        Action::Nothing => Ok(Vec::new()),
+        Action::Resize(dir) => state.resize_focus(dir),
+        Action::Exit => state.exit_resize(),
     }
 }
 
@@ -4753,5 +5108,112 @@ mod tests {
         );
         assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
         assert!(!body.commands.is_empty());
+    }
+
+    // ── layout resize ──────────────────────────────────────────────────
+
+    /// `a | b` vertical split (a left, b right) at ratio 0.5 over a
+    /// 100×40 region rooted at (0,0).
+    fn vsplit_5050() -> (Layout, PaneRect) {
+        let layout = Layout::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(Layout::Leaf("a".into())),
+            b: Box::new(Layout::Leaf("b".into())),
+        };
+        (layout, PaneRect { x: 0, y: 0, w: 100, h: 40 })
+    }
+
+    #[test]
+    fn resize_moves_the_divider_in_the_arrow_direction_not_per_focus() {
+        // The divider follows the arrow regardless of which pane is
+        // focused: +cells (Right/Down) raises `a`'s share, −cells the
+        // mirror — so a bottom/right pane shrinks on Down/Right and grows
+        // on Up/Left, which is the intuitive "push the shared border".
+        let (mut layout, bounds) = vsplit_5050();
+        assert!(resize_split(&mut layout, "a", SplitDir::Vertical, 10, bounds));
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - 0.6).abs() < 1e-6, "focus a, +cells: ratio {ratio} should be 0.6");
+
+        // Same +cells with the *other* pane focused moves the divider the
+        // same way (ratio still rises) — sign is direction, not side.
+        let (mut layout, bounds) = vsplit_5050();
+        assert!(resize_split(&mut layout, "b", SplitDir::Vertical, 10, bounds));
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - 0.6).abs() < 1e-6, "focus b, +cells: ratio {ratio} should be 0.6");
+
+        // −cells (Up/Left) grows the bottom/right focused pane.
+        let (mut layout, bounds) = vsplit_5050();
+        assert!(resize_split(&mut layout, "b", SplitDir::Vertical, -10, bounds));
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - 0.4).abs() < 1e-6, "focus b, −cells: ratio {ratio} should be 0.4");
+    }
+
+    #[test]
+    fn resize_clamps_to_the_ratio_bounds() {
+        let (mut layout, bounds) = vsplit_5050();
+        // A huge shrink on the left pane pins ratio at the minimum.
+        assert!(resize_split(&mut layout, "a", SplitDir::Vertical, -1000, bounds));
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - MIN_RATIO).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resize_ignores_the_wrong_orientation() {
+        let (mut layout, bounds) = vsplit_5050();
+        // A vertical-only split can't satisfy a height (Horizontal) resize.
+        assert!(!resize_split(&mut layout, "a", SplitDir::Horizontal, 10, bounds));
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - 0.5).abs() < 1e-6, "ratio must be untouched");
+    }
+
+    #[test]
+    fn resize_targets_the_innermost_matching_split() {
+        // Outer vertical split; its right child is itself a vertical
+        // split of c|d. Resizing focused `c` must move the *inner* divider.
+        let mut layout = Layout::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(Layout::Leaf("a".into())),
+            b: Box::new(Layout::Split {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                a: Box::new(Layout::Leaf("c".into())),
+                b: Box::new(Layout::Leaf("d".into())),
+            }),
+        };
+        let bounds = PaneRect { x: 0, y: 0, w: 100, h: 40 };
+        assert!(resize_split(&mut layout, "c", SplitDir::Vertical, 5, bounds));
+        let Layout::Split { ratio: outer, b, .. } = &layout else { unreachable!() };
+        assert!((*outer - 0.5).abs() < 1e-6, "outer divider must not move");
+        let Layout::Split { ratio: inner, .. } = b.as_ref() else { unreachable!() };
+        // Inner region is the right half (width 50); +5 cells → +0.1.
+        assert!((*inner - 0.6).abs() < 1e-6, "inner ratio {inner} should be 0.6");
+    }
+
+    #[test]
+    fn separator_hit_grabs_the_divider_and_misses_elsewhere() {
+        let (layout, bounds) = vsplit_5050();
+        // Divider sits on the edge between cols 49 and 50; both straddling
+        // cells grab.
+        let mut p = Vec::new();
+        let hit = separator_hit(&layout, bounds, 50, 20, &mut p);
+        let (path, dir, sbounds) = hit.expect("col 50 must hit the divider");
+        assert!(path.is_empty(), "root split → empty path");
+        assert!(matches!(dir, SplitDir::Vertical));
+        assert_eq!(sbounds.w, 100);
+        // A cell deep inside the left pane is not a divider grab.
+        let mut p2 = Vec::new();
+        assert!(separator_hit(&layout, bounds, 10, 20, &mut p2).is_none());
+    }
+
+    #[test]
+    fn ratio_at_path_mut_round_trips_with_separator_hit() {
+        let (mut layout, bounds) = vsplit_5050();
+        let mut p = Vec::new();
+        let (path, _, _) = separator_hit(&layout, bounds, 50, 20, &mut p).unwrap();
+        *layout.ratio_at_path_mut(&path).unwrap() = 0.25;
+        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!((*ratio - 0.25).abs() < 1e-6);
     }
 }
