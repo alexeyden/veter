@@ -80,7 +80,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tar -xJpf - -C "$tmp"
 mkdir -p "$HOME/.local/bin"
-for t in vmux vcat vsend vrecv veterd; do
+for t in vplay vmux vcat vsend vrecv veterd; do
   src=$(ls "$tmp"/veter-tools-*/"$t" 2>/dev/null | head -n1)
   if [ -n "$src" ] && [ -f "$src" ]; then
     install -m 0755 "$src" "$HOME/.local/bin/$t"
