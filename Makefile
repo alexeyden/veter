@@ -179,7 +179,7 @@ clean:
 # DIST_ARCH_RULES macro below.
 
 DIST_TOOLS := vmux vcat vsend vrecv veterd
-DIST_VERSION ?= 0.1.6
+DIST_VERSION ?= 0.1.7
 
 # `install-remote-<arch>` knobs. `REMOTE` is required — it's whatever
 # ssh(1) would accept (`user@host`, `host`, or a `Host` alias from
