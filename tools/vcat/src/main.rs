@@ -8,29 +8,39 @@
 //!   4. Compute target cell width and height that preserves the image's
 //!      visual aspect ratio on this terminal's anisotropic cell grid.
 //!   5. Resize to exact pixel dimensions matching that cell footprint
-//!      (Lanczos), upload as a Raw RGBA8 VGE image, and create an
+//!      (Lanczos), upload as a Raw RGBA8 / WebP VGE image, and create an
 //!      element placed where the next prompt would have been.
+//!
+//! The terminal handshake, placement math, encoding, and response
+//! parsing live in the shared `vge-render` crate; this binary owns the
+//! CLI, the cursor-anchoring, and the upload progress bar.
 //!
 //! Run inside veter:
 //!     vcat ~/Downloads/photo.jpg
 //!     vcat --width 40 logo.png
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, ValueEnum};
 use image::ImageReader;
-use vge_protocol::apc::ApcStream;
-use vge_protocol::codec::{Point, Reader, Rect};
+use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
     UpdateCommandsBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
+
+use vge_render::is_ssh_session;
+use vge_render::placement::compute_placement;
+use vge_render::probe::run_probe;
+use vge_render::response::wait_for_chunk_ack;
+use vge_render::tty::{
+    RawTty, drain_stale_stdin, poll_stdin_until, read_stdin, winsize_cols, winsize_rows,
+};
+use vge_render::upload::{Encoding, choose_encoding, encode_payload};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Display an image inside a VGE-aware terminal.")]
@@ -43,7 +53,7 @@ use vge_protocol::frame::*;
 ))]
 struct Cli {
     /// Path to a PNG, JPEG, or WebP file.
-    file: PathBuf,
+    file: std::path::PathBuf,
 
     /// Force the displayed image width in cell units. Without this
     /// flag, vcat uses the image's natural pixel width divided by the
@@ -113,24 +123,23 @@ macro_rules! trace {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let v = cli.verbose;
-    // Resolve the effective (mode, quality) from the four
-    // mode-selecting flags. The ArgGroup on `Cli` already guarantees
-    // at most one of (`mode`, `raw`, `lossless`, `lossy`) is set, so
-    // the order of these branches doesn't matter for correctness — it
-    // just reads top-to-bottom in declaration order.
-    let (mode, quality) = if cli.raw {
-        (Mode::Raw, cli.quality)
+    // Resolve a forced encoding from the four mode-selecting flags. The
+    // ArgGroup on `Cli` already guarantees at most one is set, so branch
+    // order doesn't matter for correctness. `None` means auto-detect
+    // after the probe (so we can honour the terminal's advertised
+    // encodings).
+    let forced_enc: Option<Encoding> = if cli.raw {
+        Some(Encoding::Raw)
     } else if cli.lossless {
-        (Mode::WebpLossless, cli.quality)
+        Some(Encoding::WebpLossless)
     } else if let Some(q) = cli.lossy {
-        (Mode::WebpLossy, q)
-    } else if let Some(m) = cli.mode {
-        (m, cli.quality)
-    } else if is_ssh_session() {
-        trace!(v, "ssh session detected, defaulting mode=webp-lossy");
-        (Mode::WebpLossy, cli.quality)
+        Some(Encoding::WebpLossy(q))
     } else {
-        (Mode::Raw, cli.quality)
+        cli.mode.map(|m| match m {
+            Mode::Raw => Encoding::Raw,
+            Mode::WebpLossless => Encoding::WebpLossless,
+            Mode::WebpLossy => Encoding::WebpLossy(cli.quality),
+        })
     };
 
     use std::io::IsTerminal;
@@ -161,6 +170,16 @@ fn main() -> Result<()> {
     let cell_pw = probe.cell_pixel_width.max(1) as f32;
     let cell_ph = probe.cell_pixel_height.max(1) as f32;
     trace!(v, "probe ok: cells={cell_pw}x{cell_ph}");
+
+    let enc = forced_enc.unwrap_or_else(|| {
+        let e = choose_encoding(
+            probe.supported_image_encodings,
+            is_ssh_session(),
+            cli.quality,
+        );
+        trace!(v, "auto encoding: {e:?}");
+        e
+    });
 
     let term_cols = winsize_cols().unwrap_or(80) as u32;
     trace!(v, "term_cols={term_cols}");
@@ -199,14 +218,7 @@ fn main() -> Result<()> {
         None => {
             // DSR timed out. Common cause is a multi-hop chain
             // (vmux-in-vmux over ssh) where the round trip exceeds
-            // the configured timeout. Fall back to TIOCGWINSZ — the
-            // assumption is that vcat is being run interactively and
-            // the cursor scrolled to the bottom of the live screen
-            // after the h_cells newlines (which is the common case for
-            // images taller than the remaining rows). The image then
-            // ends up flush with the prompt that re-appears below it.
-            // If the chain didn't actually scroll, the image will sit
-            // a few rows higher than ideal — much better than aborting.
+            // the configured timeout. Fall back to TIOCGWINSZ.
             let rows = winsize_rows().unwrap_or(24) as u32;
             eprintln!(
                 "vcat: cursor-position query timed out at {}ms; falling \
@@ -222,71 +234,30 @@ fn main() -> Result<()> {
     // top of screen = 1). The image should occupy rows
     // [C - h_cells, C) in 1-indexed terms, which is origin.y =
     // C - h_cells - 1 in VGE 0-indexed cells from the live screen top.
-    //
-    // For tall images (h_cells > rows-from-original-cursor) vt100
-    // scrolled while we were printing newlines, so the image's correct
-    // anchor line is in the scrollback we just produced — i.e. origin.y
-    // is negative. VGE elements with negative origin.y are anchored to
-    // scrollback lines that have already passed off-screen at the top
-    // (§5.2); rendering automatically clips the image to whatever
-    // portion is currently visible. Don't clamp to 0 here — that would
-    // pin the image to the top of the live screen and shove its bottom
-    // edge past the prompt.
+    // For tall images origin.y may go negative — VGE anchors those to
+    // scrollback and clips automatically (§5.2). Don't clamp to 0.
     let origin_y = (cursor_row as i32 - placement.h_cells as i32 - 1) as f32;
 
     // Build and write the VGE envelope.
     let pid = std::process::id();
     let img_id = format!("vcat-img-{pid}");
     let elem_id = format!("vcat-el-{pid}");
-    trace!(v, "encoding mode={:?}", mode);
+    trace!(v, "encoding {enc:?}");
     let raw_rgba = resized.into_raw();
-    let (encoding, payload) = match mode {
-        Mode::Raw => (0x01u8, raw_rgba),
-        Mode::WebpLossless => {
-            let cfg = zenwebp::LosslessConfig::new();
-            let out = zenwebp::EncodeRequest::lossless(
-                &cfg,
-                &raw_rgba,
-                zenwebp::PixelLayout::Rgba8,
-                placement.target_px_w,
-                placement.target_px_h,
-            )
-            .encode()
-            .map_err(|e| anyhow!("webp lossless encode: {e}"))?;
-            trace!(v, "webp lossless: {} -> {} bytes", raw_rgba.len(), out.len());
-            (0x02u8, out)
-        }
-        Mode::WebpLossy => {
-            if !quality.is_finite() || !(0.0..=100.0).contains(&quality) {
-                bail!("quality must be in 0..=100, got {}", quality);
-            }
-            let cfg = zenwebp::LossyConfig::new().with_quality(quality);
-            let out = zenwebp::EncodeRequest::lossy(
-                &cfg,
-                &raw_rgba,
-                zenwebp::PixelLayout::Rgba8,
-                placement.target_px_w,
-                placement.target_px_h,
-            )
-            .encode()
-            .map_err(|e| anyhow!("webp lossy encode: {e}"))?;
-            trace!(
-                v,
-                "webp lossy q={}: {} -> {} bytes",
-                quality,
-                raw_rgba.len(),
-                out.len()
-            );
-            (0x02u8, out)
-        }
-    };
+    let raw_len = raw_rgba.len();
+    let (encoding, payload) =
+        encode_payload(raw_rgba, placement.target_px_w, placement.target_px_h, enc)?;
+    trace!(v, "encoded: {} -> {} bytes", raw_len, payload.len());
+
     // Chunked upload (§8.1). Over SSH we slice the payload into ~32 KB
     // chunks so vcat can drive a placeholder progress UI from the
-    // host's per-chunk acks — invaluable when a 5 MB image takes 20s
-    // to traverse the link. Local runs send a single chunk: zero
-    // benefit from chunking when round-trip is sub-millisecond.
+    // host's per-chunk acks. Local runs send a single chunk.
     let total_bytes = payload.len() as u32;
-    let target_chunk_size: u32 = if is_ssh_session() { 32 * 1024 } else { total_bytes.max(1) };
+    let target_chunk_size: u32 = if is_ssh_session() {
+        32 * 1024
+    } else {
+        total_bytes.max(1)
+    };
     let chunk_size = target_chunk_size.max(1).min(total_bytes.max(1));
     let num_chunks = total_bytes.div_ceil(chunk_size).max(1);
     let show_progress = num_chunks > 1;
@@ -308,15 +279,17 @@ fn main() -> Result<()> {
     let final_draw = DrawCmd::DrawImage {
         target_rect,
         image_id: img_id.clone(),
+        source_rect: None,
     };
-    let element_origin = Point { x: 0.0, y: origin_y };
+    let element_origin = Point {
+        x: 0.0,
+        y: origin_y,
+    };
 
-    // The placeholder + finalize sequences cross several iterations,
-    // but the element's command-index layout is fixed (see
-    // `build_placeholder_commands`): index 0 = bar track, 1 = bar
-    // fill, 2 = label. UpdateCommand / UpdateText target these.
+    // The element's command-index layout is fixed (see
+    // `build_placeholder_commands`): index 0 = bar track, 1 = bar fill,
+    // 2 = label. UpdateCommand / UpdateText target these.
     let placeholder_cmds = build_placeholder_commands(target_rect, total_bytes);
-
     let total_mb = bytes_to_mb(total_bytes);
 
     for i in 0..num_chunks {
@@ -339,10 +312,6 @@ fn main() -> Result<()> {
         let mut frames: Vec<(Command, u32)> = Vec::with_capacity(4);
 
         if i == 0 && show_progress {
-            // Carry the placeholder along with the first chunk. The
-            // host applies frames in order, so the placeholder lands
-            // before chunk[0] is even decoded — user sees the bar
-            // immediately at 0%.
             frames.push((
                 Command::CreateElement(CreateElementBody {
                     id: elem_id.clone(),
@@ -358,10 +327,6 @@ fn main() -> Result<()> {
         }
 
         if i > 0 && show_progress {
-            // Visual lags by one chunk (we redraw based on the *previous*
-            // chunk's ack, then send this chunk in the same envelope —
-            // no extra round-trip for the redraw). Worth it: dropping
-            // an envelope here would double the wall-clock per chunk.
             let acked = offset; // cumulative bytes acked so far
             frames.push((
                 Command::UpdateCommand(UpdateCommandBody {
@@ -385,10 +350,6 @@ fn main() -> Result<()> {
         frames.push((chunk_cmd, req_id));
 
         if is_last {
-            // The chunk's host-side processing finalizes the image,
-            // so the swap/create lands in the same envelope and
-            // replaces (show_progress) or creates (single-shot) the
-            // element pointing at the now-registered image.
             let final_element = if show_progress {
                 Command::UpdateCommands(UpdateCommandsBody {
                     id: elem_id.clone(),
@@ -421,29 +382,30 @@ fn main() -> Result<()> {
         stdout.write_all(&envelope)?;
         stdout.flush()?;
 
-        let bytes_received = wait_for_chunk_ack(
-            &img_id,
-            req_id,
-            Duration::from_millis(cli.timeout_ms),
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "chunk-ack timed out for chunk {}/{} (req_id {}); \
-                 try --timeout-ms <larger>",
-                i + 1,
-                num_chunks,
-                req_id
-            )
-        })?;
-        trace!(v, "chunk {} acked: bytes_received={}", i + 1, bytes_received);
+        let bytes_received =
+            wait_for_chunk_ack(&img_id, req_id, Duration::from_millis(cli.timeout_ms))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "chunk-ack timed out for chunk {}/{} (req_id {}); \
+                         try --timeout-ms <larger>",
+                        i + 1,
+                        num_chunks,
+                        req_id
+                    )
+                })?;
+        trace!(
+            v,
+            "chunk {} acked: bytes_received={}",
+            i + 1,
+            bytes_received
+        );
     }
     drop(stdout);
 
     Ok(())
 }
 
-/// Cell-units height of the progress bar inside the image rect. Bigger
-/// images get a slightly taller bar so it stays visible.
+/// Cell-units height of the progress bar inside the image rect.
 fn bar_height_cells(target_rect_h: f32) -> f32 {
     (target_rect_h * 0.12).clamp(0.4, 1.2)
 }
@@ -461,10 +423,19 @@ fn bar_track_rect(image_rect: Rect) -> Rect {
 
 fn bar_fill_cmd(image_rect: Rect, acked: u32, total: u32) -> DrawCmd {
     let track = bar_track_rect(image_rect);
-    let frac = if total == 0 { 0.0 } else { acked as f32 / total as f32 };
+    let frac = if total == 0 {
+        0.0
+    } else {
+        acked as f32 / total as f32
+    };
     let fill_w = (track.w * frac).clamp(0.0, track.w);
     DrawCmd::FillRectangles {
-        fill: Style::Flat(Color { r: 0.42, g: 0.78, b: 1.0, a: 1.0 }),
+        fill: Style::Flat(Color {
+            r: 0.42,
+            g: 0.78,
+            b: 1.0,
+            a: 1.0,
+        }),
         rects: vec![Rect {
             x: track.x,
             y: track.y,
@@ -476,20 +447,16 @@ fn bar_fill_cmd(image_rect: Rect, acked: u32, total: u32) -> DrawCmd {
 
 fn build_placeholder_commands(image_rect: Rect, total: u32) -> Vec<DrawCmd> {
     let track = bar_track_rect(image_rect);
-    // Index 0: track (dark base).
     let track_cmd = DrawCmd::FillRectangles {
-        fill: Style::Flat(Color { r: 0.20, g: 0.22, b: 0.27, a: 0.85 }),
+        fill: Style::Flat(Color {
+            r: 0.20,
+            g: 0.22,
+            b: 0.27,
+            a: 0.85,
+        }),
         rects: vec![track],
     };
-    // Index 1: fill (starts empty; mutated via UpdateCommand on each ack).
     let fill_cmd = bar_fill_cmd(image_rect, 0, total);
-    // Index 2: label, centered horizontally and sitting in the cell
-    // row immediately above the bar. DrawText.origin.y is the *top* of
-    // the text's cell row (renderer adds ascent to derive baseline),
-    // so the row spans [origin.y, origin.y + 1] in cell units. Picking
-    // `track.y - 1.0` places the row's bottom edge flush with the
-    // bar's top — clean, no overlap. Clamp so we never draw above the
-    // image rect on very-thin placements.
     let total_mb = bytes_to_mb(total);
     let label_origin = Point {
         x: image_rect.x + image_rect.w * 0.5,
@@ -498,7 +465,12 @@ fn build_placeholder_commands(image_rect: Rect, total: u32) -> Vec<DrawCmd> {
     let label_cmd = DrawCmd::DrawText {
         origin: label_origin,
         align: Align::Center,
-        fill: Style::Flat(Color { r: 0.88, g: 0.92, b: 1.0, a: 1.0 }),
+        fill: Style::Flat(Color {
+            r: 0.88,
+            g: 0.92,
+            b: 1.0,
+            a: 1.0,
+        }),
         font_style: FontStyle::default(),
         text: progress_text(0, total, total_mb),
     };
@@ -519,223 +491,6 @@ fn progress_text(acked: u32, total: u32, total_mb: f32) -> String {
         "{pct:>3.0}%  {acked_mb:.2} / {total_mb:.2} MB",
         acked_mb = bytes_to_mb(acked),
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Placement {
-    /// Width of the rendered image in cells. Used both for the
-    /// `target_rect.w` and to bound terminal-column reservation.
-    w_cells: u32,
-    /// `target_rect.h` in cells — fractional, set so the image keeps
-    /// its true visual aspect ratio on this anisotropic cell grid.
-    /// Ranges over (0, h_cells].
-    target_rect_h: f32,
-    /// Number of full rows to reserve via newlines. Equal to
-    /// `target_rect_h.ceil()`. The bottom (h_cells - target_rect_h)
-    /// fraction of a cell is empty whitespace below the image.
-    h_cells: u32,
-    /// Exact pixel target for resizing — preserves the image's pixel
-    /// aspect ratio; the renderer stretches this onto target_rect.
-    target_px_w: u32,
-    target_px_h: u32,
-}
-
-/// Compute the cell footprint and exact pixel target for an image of
-/// `w_px × h_px` displayed on a terminal with `cell_pw × cell_ph` pixel
-/// cells and `term_cols` columns. If `forced_w_cells` is set, that's the
-/// width; otherwise width is the image's natural width in cells clamped
-/// to terminal columns.
-fn compute_placement(
-    w_px: u32,
-    h_px: u32,
-    cell_pw: f32,
-    cell_ph: f32,
-    term_cols: u32,
-    forced_w_cells: Option<u32>,
-) -> Placement {
-    let cell_pw = cell_pw.max(1.0);
-    let cell_ph = cell_ph.max(1.0);
-
-    let natural_w_cells = ((w_px as f32) / cell_pw).ceil().max(1.0) as u32;
-    let max_w_cells = match forced_w_cells {
-        Some(w) if w > 0 => w,
-        _ => term_cols.max(1),
-    };
-    let w_cells = natural_w_cells.min(max_w_cells).max(1);
-
-    // Pixel target preserves the image's true aspect: we draw the
-    // image at its natural ratio, and let target_rect.h be a
-    // fractional number of cells so anisotropic cell grids don't
-    // distort it.
-    let target_px_w = (w_cells as f32 * cell_pw).round().max(1.0) as u32;
-    let target_px_h =
-        (target_px_w as f32 * h_px as f32 / w_px as f32).round().max(1.0) as u32;
-    let target_rect_h = (target_px_h as f32 / cell_ph).max(1.0 / cell_ph);
-    let h_cells = target_rect_h.ceil().max(1.0) as u32;
-
-    Placement {
-        w_cells,
-        target_rect_h,
-        h_cells,
-        target_px_w,
-        target_px_h,
-    }
-}
-
-// --- terminal I/O helpers ---
-
-/// Read response envelopes until we see a ChunkAck whose request_id
-/// matches `expected_req`, then return its `bytes_received` field.
-/// Returns `Ok(None)` on timeout. Used after each UploadImage chunk so
-/// the sender can drive a progress UI from the host's view of bytes
-/// actually committed (§4).
-fn wait_for_chunk_ack(
-    expected_image_id: &str,
-    expected_req: u32,
-    timeout: Duration,
-) -> Result<Option<u32>> {
-    let mut apc = ApcStream::with_marker(*MARKER_T2C);
-    let deadline = Instant::now() + timeout;
-    let mut buf = [0u8; 4096];
-    loop {
-        if !poll_stdin_until(deadline)? {
-            return Ok(None);
-        }
-        let n = read_stdin(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let out = apc.feed(&buf[..n]);
-        for payload in out.payloads {
-            if let Some(bytes) =
-                find_chunk_ack(&payload, expected_image_id, expected_req)?
-            {
-                return Ok(Some(bytes));
-            }
-            // Non-matching envelope (e.g. spurious responses from
-            // earlier commands, or RSP_ERR). Keep reading — the next
-            // envelope should carry the ack.
-        }
-    }
-}
-
-/// Scan a single response envelope payload for an `RSP_CHUNK_ACK`
-/// frame matching `(image_id, req_id)`. Returns its `bytes_received`
-/// if found. RSP_ERR frames matching `req_id` are surfaced as errors
-/// (the host bailed mid-stream — e.g. budget exhausted).
-fn find_chunk_ack(
-    payload: &[u8],
-    expected_image_id: &str,
-    expected_req: u32,
-) -> Result<Option<u32>> {
-    let mut r = Reader::new(payload);
-    let _version = r.u8().map_err(|_| anyhow!("chunk-ack envelope: version"))?;
-    let _payload_len = r.u32().map_err(|_| anyhow!("chunk-ack envelope: payload_len"))?;
-    while !r.at_end() {
-        let frame_type = r.u8().map_err(|_| anyhow!("chunk-ack envelope: frame_type"))?;
-        let req_id = r.u32().map_err(|_| anyhow!("chunk-ack envelope: req_id"))?;
-        let body_len = r
-            .u32()
-            .map_err(|_| anyhow!("chunk-ack envelope: body_len"))?
-            as usize;
-        let body = r.take(body_len).map_err(|_| anyhow!("chunk-ack envelope: body"))?;
-        if frame_type == RSP_CHUNK_ACK && req_id == expected_req {
-            let mut br = Reader::new(body);
-            let img_id = br.string().map_err(|_| anyhow!("chunk-ack body: id"))?;
-            let bytes = br.u32().map_err(|_| anyhow!("chunk-ack body: bytes"))?;
-            if img_id != expected_image_id {
-                bail!(
-                    "chunk-ack id mismatch: expected {expected_image_id:?}, got {img_id:?}"
-                );
-            }
-            return Ok(Some(bytes));
-        }
-        if frame_type == RSP_ERR && req_id == expected_req {
-            let mut er = Reader::new(body);
-            let code = er.u16().unwrap_or(0);
-            let msg = er.string().unwrap_or("");
-            bail!("host rejected chunk req_id={expected_req}: code=0x{code:04X} {msg}");
-        }
-    }
-    Ok(None)
-}
-
-/// Pull anything currently sitting on stdin without blocking. Used at
-/// startup as a recovery measure if a previous run left bytes
-/// unconsumed.
-fn drain_stale_stdin() {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::fd::BorrowedFd;
-    let fd = std::io::stdin().as_raw_fd();
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut buf = [0u8; 4096];
-    loop {
-        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-        match poll(&mut fds, PollTimeout::ZERO) {
-            Ok(n) if n > 0 => {
-                if read_stdin(&mut buf).unwrap_or(0) == 0 {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-}
-
-/// Probe the terminal for its cell pixel dimensions.
-fn run_probe(timeout: Duration) -> Result<Option<ProbeData>> {
-    let env = build_envelope(&[(Command::Probe, 1)]);
-    {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&env)?;
-        stdout.flush()?;
-    }
-
-    let mut apc = ApcStream::with_marker(*MARKER_T2C);
-    let deadline = Instant::now() + timeout;
-    let mut buf = [0u8; 4096];
-    loop {
-        if !poll_stdin_until(deadline)? {
-            return Ok(None);
-        }
-        let n = read_stdin(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let out = apc.feed(&buf[..n]);
-        if let Some(payload) = out.payloads.into_iter().next() {
-            return Ok(Some(parse_probe_payload(&payload)?));
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProbeData {
-    cell_pixel_width: u16,
-    cell_pixel_height: u16,
-}
-
-fn parse_probe_payload(payload: &[u8]) -> Result<ProbeData> {
-    let mut r = Reader::new(payload);
-    let _version = r.u8().map_err(|_| anyhow!("probe payload: missing version"))?;
-    let _payload_len = r.u32().map_err(|_| anyhow!("probe payload: missing length"))?;
-    let frame_type = r.u8().map_err(|_| anyhow!("probe payload: missing frame type"))?;
-    if frame_type != RSP_PROBE {
-        bail!(
-            "expected ProbeResponse (0x{:02X}), got 0x{:02X}",
-            RSP_PROBE,
-            frame_type
-        );
-    }
-    let _req_id = r.u32().map_err(|_| anyhow!("probe payload: missing request_id"))?;
-    let _body_len = r.u32().map_err(|_| anyhow!("probe payload: missing body_len"))?;
-    let _proto = r.u16().map_err(|_| anyhow!("probe body: protocol_version"))?;
-    let cw = r.u16().map_err(|_| anyhow!("probe body: cell_pixel_width"))?;
-    let ch = r.u16().map_err(|_| anyhow!("probe body: cell_pixel_height"))?;
-    Ok(ProbeData {
-        cell_pixel_width: cw,
-        cell_pixel_height: ch,
-    })
 }
 
 /// Read bytes from stdin until we see a CSI cursor-position-report
@@ -771,15 +526,14 @@ fn parse_cursor_position(buf: &[u8]) -> Result<Option<u32>> {
     if buf[esc_pos + 1] != b'[' {
         return Ok(None);
     }
-    // Look for terminating 'R' from esc_pos + 2.
     let body_start = esc_pos + 2;
     let r_off = match buf[body_start..].iter().position(|&b| b == b'R') {
         Some(off) => off,
         None => return Ok(None),
     };
     let body = &buf[body_start..body_start + r_off];
-    let body_str = std::str::from_utf8(body)
-        .map_err(|_| anyhow!("cursor-position body not valid UTF-8"))?;
+    let body_str =
+        std::str::from_utf8(body).map_err(|_| anyhow!("cursor-position body not valid UTF-8"))?;
     let (row_str, _col) = body_str
         .split_once(';')
         .ok_or_else(|| anyhow!("cursor-position body lacks ';'"))?;
@@ -790,166 +544,9 @@ fn parse_cursor_position(buf: &[u8]) -> Result<Option<u32>> {
     Ok(Some(row))
 }
 
-fn poll_stdin_until(deadline: Instant) -> Result<bool> {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::fd::BorrowedFd;
-    let now = Instant::now();
-    if now >= deadline {
-        return Ok(false);
-    }
-    let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
-    let fd = std::io::stdin().as_raw_fd();
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-    let n = poll(&mut fds, PollTimeout::from(remaining_ms)).context("poll(stdin)")?;
-    Ok(n > 0)
-}
-
-fn read_stdin(buf: &mut [u8]) -> Result<usize> {
-    let fd = std::io::stdin().as_raw_fd();
-    let n = nix::unistd::read(fd, buf).context("read(stdin)")?;
-    Ok(n)
-}
-
-/// True if any of the standard sshd-set env vars are present in this
-/// process's environment. SSH_CONNECTION and SSH_CLIENT are set on
-/// interactive logins; SSH_TTY is set when a tty is allocated. Any one
-/// of them is enough to mean "this shell came in over ssh."
-fn is_ssh_session() -> bool {
-    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
-}
-
-fn winsize_cols() -> Option<u16> {
-    winsize().map(|ws| ws.ws_col).filter(|c| *c != 0)
-}
-
-fn winsize_rows() -> Option<u16> {
-    winsize().map(|ws| ws.ws_row).filter(|r| *r != 0)
-}
-
-fn winsize() -> Option<libc::winsize> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let fd = std::io::stdout().as_raw_fd();
-    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws as *mut _) };
-    if rc != 0 {
-        None
-    } else {
-        Some(ws)
-    }
-}
-
-// --- termios raw-mode guard, mirrors vge-cli's; kept inline to keep
-// vcat self-contained ---
-
-struct RawTty {
-    fd: std::os::fd::RawFd,
-    saved: Option<nix::sys::termios::Termios>,
-}
-
-impl RawTty {
-    fn enable() -> Result<Self> {
-        use nix::sys::termios::{
-            tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg,
-        };
-        let stdin = std::io::stdin();
-        let fd = stdin.as_raw_fd();
-        let saved = tcgetattr(&stdin).context("tcgetattr")?;
-        let mut raw = saved.clone();
-        raw.local_flags &=
-            !(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ISIG);
-        raw.output_flags &= !OutputFlags::OPOST;
-        raw.input_flags &= !(InputFlags::IXON
-            | InputFlags::IXOFF
-            | InputFlags::INLCR
-            | InputFlags::ICRNL
-            | InputFlags::IGNCR);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).context("tcsetattr (raw)")?;
-        Ok(Self {
-            fd,
-            saved: Some(saved),
-        })
-    }
-}
-
-impl Drop for RawTty {
-    fn drop(&mut self) {
-        if let Some(saved) = self.saved.take() {
-            use nix::sys::termios::{tcsetattr, SetArg};
-            let _ = unsafe {
-                let borrowed = std::os::fd::BorrowedFd::borrow_raw(self.fd);
-                tcsetattr(borrowed, SetArg::TCSANOW, &saved)
-            };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn approx_eq(a: f32, b: f32) -> bool {
-        (a - b).abs() < 1e-3
-    }
-
-    #[test]
-    fn placement_natural_size_when_smaller_than_terminal() {
-        // 100×50 image on 10×20 cells. Natural width = 10 cells.
-        // Pixels: 10 cells × 10 cell_pw = 100. target_px_h = 50
-        // (preserves 2:1 aspect). target_rect_h = 50/20 = 2.5 cells,
-        // so h_cells = 3 (one row of empty space at the bottom).
-        let p = compute_placement(100, 50, 10.0, 20.0, 80, None);
-        assert_eq!(p.w_cells, 10);
-        assert!(approx_eq(p.target_rect_h, 2.5));
-        assert_eq!(p.h_cells, 3);
-        assert_eq!(p.target_px_w, 100);
-        assert_eq!(p.target_px_h, 50);
-    }
-
-    #[test]
-    fn placement_clamped_to_terminal_width() {
-        // 1000×500 image on 10×20 cells, terminal 80 cols. Natural
-        // width = 100 cells, clamped to 80. Pixels: 800 × 400.
-        // target_rect_h = 400/20 = 20.
-        let p = compute_placement(1000, 500, 10.0, 20.0, 80, None);
-        assert_eq!(p.w_cells, 80);
-        assert!(approx_eq(p.target_rect_h, 20.0));
-        assert_eq!(p.h_cells, 20);
-        assert_eq!(p.target_px_w, 800);
-        assert_eq!(p.target_px_h, 400);
-    }
-
-    #[test]
-    fn placement_forced_width_overrides_natural_and_terminal() {
-        let p = compute_placement(1000, 500, 10.0, 20.0, 80, Some(40));
-        assert_eq!(p.w_cells, 40);
-        // 400 px wide → 200 px tall → 10 cells.
-        assert!(approx_eq(p.target_rect_h, 10.0));
-        assert_eq!(p.h_cells, 10);
-    }
-
-    #[test]
-    fn placement_anisotropic_aspect_preserved() {
-        // Square image, 100×100 px, on 9×20 cells. Natural width =
-        // ceil(100/9) = 12 cells. Pixels: 108×108.
-        // target_rect_h = 108/20 = 5.4 — fractional, preserves the
-        // visual squareness despite anisotropic cells.
-        let p = compute_placement(100, 100, 9.0, 20.0, 80, None);
-        assert_eq!(p.w_cells, 12);
-        assert!(approx_eq(p.target_rect_h, 5.4));
-        assert_eq!(p.h_cells, 6);
-        assert_eq!(p.target_px_w, 108);
-        assert_eq!(p.target_px_h, 108);
-    }
-
-    #[test]
-    fn placement_minimum_one_cell() {
-        let p = compute_placement(1, 1, 10.0, 20.0, 80, None);
-        assert_eq!(p.w_cells, 1);
-        assert!(p.h_cells >= 1);
-        assert!(p.target_rect_h > 0.0);
-    }
 
     #[test]
     fn cursor_position_parses() {

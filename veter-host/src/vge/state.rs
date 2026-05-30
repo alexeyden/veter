@@ -1200,6 +1200,7 @@ impl VgeEngine {
         if let DrawCmd::DrawImage {
             image_id,
             target_rect: _,
+            source_rect: _,
         } = &mut el.commands[b.command_index]
         {
             *image_id = b.new_image_id;

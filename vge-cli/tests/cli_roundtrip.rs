@@ -8,7 +8,7 @@ use std::process::{Command as Proc, Stdio};
 
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::Reader;
-use vge_protocol::command::{parse, Command, DrawCmd, Style};
+use vge_protocol::command::{Command, DrawCmd, Style, parse};
 use vge_protocol::frame::*;
 
 use std::io::Write;
@@ -201,6 +201,7 @@ fn create_image_round_trip() {
                 DrawCmd::DrawImage {
                     target_rect,
                     image_id,
+                    source_rect: _,
                 } => {
                     assert_eq!(image_id, "demo");
                     assert_eq!(target_rect.w, 8.0);

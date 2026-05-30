@@ -503,6 +503,7 @@ fn render_cmd<T: Renderer>(
         DrawCmd::DrawImage {
             target_rect,
             image_id,
+            source_rect,
         } => {
             let target_x = ox + target_rect.x * cell_w;
             let target_y = oy + target_rect.y * cell_h;
@@ -521,6 +522,7 @@ fn render_cmd<T: Renderer>(
                 target_y,
                 target_w,
                 target_h,
+                *source_rect,
             );
             canvas.fill_path(&path, &paint);
         }
@@ -532,6 +534,7 @@ fn render_cmd<T: Renderer>(
 /// failed-to-create images. The renderer-side `GpuImageId` mapping
 /// is owned by `TerminalRenderer` so the engine state stays GUI-free
 /// (host engines store only the opaque `GpuImageId`).
+#[allow(clippy::too_many_arguments)]
 fn ensure_image_paint<T: Renderer>(
     canvas: &mut Canvas<T>,
     renderer: &mut TerminalRenderer,
@@ -541,6 +544,7 @@ fn ensure_image_paint<T: Renderer>(
     target_y: f32,
     target_w: f32,
     target_h: f32,
+    source_rect: Option<super::codec::Rect>,
 ) -> Paint {
     let img = match images.get(image_id) {
         Some(i) => i,
@@ -573,9 +577,37 @@ fn ensure_image_paint<T: Renderer>(
     // femtovg's Paint::image inherits NanoVG's nvgImagePattern: the
     // first two args are the **top-left** of the image pattern (the
     // parameter names `cx`/`cy` are misleading), and (width, height)
-    // is the size of one image tile. Anchor at the target rect's
-    // top-left so the image fills the rect exactly.
-    Paint::image(femto_id, target_x, target_y, target_w, target_h, 0.0, 1.0)
+    // is the size of one image tile.
+    //
+    // With no source rect the whole image fills the target rect exactly.
+    // With a source rect, we enlarge the pattern so that the requested
+    // source sub-rectangle (in source pixels) lands precisely on the
+    // target rect, and offset the pattern origin so the sub-rect's
+    // top-left aligns with the target's top-left. The fill path (the
+    // target rect) scissors away everything outside it, so only the
+    // sub-rect shows — stretched to fill the target.
+    let (px, py, pw, ph) = match source_rect {
+        None => (target_x, target_y, target_w, target_h),
+        Some(sr) => {
+            let iw = img.width as f32;
+            let ih = img.height as f32;
+            // Clamp the source rect to the texture so an over-large
+            // request can't sample outside it.
+            let sx = sr.x.clamp(0.0, iw);
+            let sy = sr.y.clamp(0.0, ih);
+            let sw = sr.w.min(iw - sx).max(1.0);
+            let sh = sr.h.min(ih - sy).max(1.0);
+            let scale_x = target_w / sw;
+            let scale_y = target_h / sh;
+            (
+                target_x - sx * scale_x,
+                target_y - sy * scale_y,
+                iw * scale_x,
+                ih * scale_y,
+            )
+        }
+    };
+    Paint::image(femto_id, px, py, pw, ph, 0.0, 1.0)
 }
 
 fn polygon_path(

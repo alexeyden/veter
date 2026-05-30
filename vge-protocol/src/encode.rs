@@ -344,10 +344,18 @@ pub fn write_draw_cmd(w: &mut Writer, cmd: &DrawCmd) {
         DrawCmd::DrawImage {
             target_rect,
             image_id,
+            source_rect,
         } => {
             w.u8(OP_DRAW_IMAGE);
             write_rect(w, *target_rect);
             w.str(image_id);
+            match source_rect {
+                None => w.u8(0),
+                Some(sr) => {
+                    w.u8(1);
+                    write_rect(w, *sr);
+                }
+            }
         }
     }
 }
@@ -694,6 +702,34 @@ mod tests {
                     h: 6.0,
                 },
                 image_id: "logo".into(),
+                source_rect: None,
+            }],
+            origin: Point { x: 5.0, y: 3.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: None,
+            size: None,
+        }));
+    }
+
+    #[test]
+    fn draw_image_with_source_rect_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "crop".into(),
+            commands: vec![DrawCmd::DrawImage {
+                target_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 8.0,
+                    h: 6.0,
+                },
+                image_id: "frame".into(),
+                source_rect: Some(Rect {
+                    x: 100.0,
+                    y: 50.0,
+                    w: 320.0,
+                    h: 240.0,
+                }),
             }],
             origin: Point { x: 5.0, y: 3.0 },
             is_visible: true,

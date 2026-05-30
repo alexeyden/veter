@@ -193,6 +193,12 @@ pub enum DrawCmd {
     DrawImage {
         target_rect: Rect,
         image_id: String,
+        /// Optional sub-rectangle of the source image, in **source image
+        /// pixel** coordinates, to sample and stretch into `target_rect`.
+        /// `None` draws the whole image (the original behavior). On the
+        /// wire a single flag byte after `image_id` selects presence
+        /// (0 = whole image, 1 = a `Rect` of source pixels follows).
+        source_rect: Option<Rect>,
     },
 }
 
@@ -536,9 +542,32 @@ pub fn read_draw_cmd(r: &mut Reader<'_>) -> DecodeResult<DrawCmd> {
         OP_DRAW_IMAGE => {
             let target_rect = r.rect()?;
             let image_id = read_id(r, false)?;
+            // Optional source rect (§7). One flag byte: 0 = whole image,
+            // 1 = a source-pixel Rect follows. Reject anything else so the
+            // reserved values stay open.
+            let source_rect = match r.u8()? {
+                0 => None,
+                1 => {
+                    let sr = r.rect()?;
+                    if !sr.x.is_finite()
+                        || !sr.y.is_finite()
+                        || !sr.w.is_finite()
+                        || !sr.h.is_finite()
+                        || sr.x < 0.0
+                        || sr.y < 0.0
+                        || sr.w <= 0.0
+                        || sr.h <= 0.0
+                    {
+                        return Err(DecodeError::bad_payload());
+                    }
+                    Some(sr)
+                }
+                _ => return Err(DecodeError::bad_payload()),
+            };
             Ok(DrawCmd::DrawImage {
                 target_rect,
                 image_id,
+                source_rect,
             })
         }
         _ => Err(DecodeError::bad_payload()),

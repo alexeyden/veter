@@ -2842,10 +2842,8 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
- "libc",
- "nix 0.29.0",
  "vge-protocol",
- "zenwebp",
+ "vge-render",
 ]
 
 [[package]]
@@ -2948,6 +2946,18 @@ name = "vge-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "vge-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "libc",
+ "nix 0.29.0",
+ "vge-protocol",
+ "zenwebp",
+]
+
+[[package]]
 name = "vmux"
 version = "0.1.0"
 dependencies = [
@@ -2957,6 +2967,21 @@ dependencies = [
  "prt-protocol",
  "ses-protocol",
  "vge-protocol",
+]
+
+[[package]]
+name = "vplay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "libc",
+ "nix 0.29.0",
+ "serde_json",
+ "vge-protocol",
+ "vge-render",
+ "zenwebp",
 ]
 
 [[package]]

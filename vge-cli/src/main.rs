@@ -22,7 +22,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 use vge_protocol::apc::ApcStream;
@@ -64,9 +64,7 @@ enum Cmd {
     ClearAll,
 
     /// Delete a single element by ID (§6.2).
-    Delete {
-        id: String,
-    },
+    Delete { id: String },
 
     /// Re-anchor an element's origin (§6.6).
     SetOrigin {
@@ -415,7 +413,7 @@ struct RawTty {
 impl RawTty {
     fn enable() -> Result<Self> {
         use nix::sys::termios::{
-            tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg,
+            InputFlags, LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr,
         };
         let stdin = std::io::stdin();
         let fd = stdin.as_raw_fd();
@@ -451,7 +449,7 @@ impl Drop for RawTty {
         if let Some(saved) = self.saved.take() {
             // SAFETY: stdin's fd outlives the program; tcsetattr is
             // legal on any open TTY descriptor.
-            use nix::sys::termios::{tcsetattr, SetArg};
+            use nix::sys::termios::{SetArg, tcsetattr};
             // Borrow the fd via std::io::stdin() — same descriptor.
             let stdin = std::io::stdin();
             let _ = stdin; // keep the borrow alive
@@ -479,7 +477,7 @@ struct ProbeFields {
 }
 
 fn read_response(timeout: Duration) -> Result<Option<Vec<ResponseFrame>>> {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::BorrowedFd;
 
     let stdin = std::io::stdin();
@@ -609,7 +607,10 @@ fn print_probe_body(req_id: u32, body: &[u8]) {
         println!("  max_images                 = {max_imgs}");
         println!("  supported_image_encodings  = 0x{encs:02X}");
     } else {
-        println!("Probe (request_id={req_id}): malformed body, {} bytes", body.len());
+        println!(
+            "Probe (request_id={req_id}): malformed body, {} bytes",
+            body.len()
+        );
     }
 }
 
@@ -707,8 +708,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             size: a.tree.clip_size,
         }),
         Cmd::UploadRaw(a) => {
-            let data = std::fs::read(&a.file)
-                .with_context(|| format!("reading {}", a.file.display()))?;
+            let data =
+                std::fs::read(&a.file).with_context(|| format!("reading {}", a.file.display()))?;
             let expected = (a.width as usize) * (a.height as usize) * 4;
             if data.len() != expected {
                 bail!(
@@ -730,8 +731,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             })
         }
         Cmd::UploadWebp(a) => {
-            let data = std::fs::read(&a.file)
-                .with_context(|| format!("reading {}", a.file.display()))?;
+            let data =
+                std::fs::read(&a.file).with_context(|| format!("reading {}", a.file.display()))?;
             // Peek dimensions so the user doesn't have to pass them.
             let img = image::load_from_memory_with_format(&data, image::ImageFormat::WebP)
                 .context("decoding WebP for dimension check")?;
@@ -758,6 +759,8 @@ fn build_command(cmd: Cmd) -> Result<Command> {
                     h: a.size.y,
                 },
                 image_id: a.image,
+
+                source_rect: None,
             }],
             origin: a.at,
             is_visible: true,
@@ -818,7 +821,10 @@ fn parse_segment(s: &str) -> Result<(Point, Point), String> {
 fn parse_color(s: &str) -> Result<Color, String> {
     let s = s.strip_prefix('#').unwrap_or(s);
     if s.len() != 8 {
-        return Err(format!("expected RRGGBBAA hex (8 chars), got {} chars", s.len()));
+        return Err(format!(
+            "expected RRGGBBAA hex (8 chars), got {} chars",
+            s.len()
+        ));
     }
     let parse_byte = |idx: usize| -> Result<u8, String> {
         u8::from_str_radix(&s[idx..idx + 2], 16).map_err(|e| format!("bad hex at {idx}: {e}"))
