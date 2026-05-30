@@ -34,7 +34,7 @@ use vge_render::upload::{choose_encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
-use video::{Decoder, VideoMeta, grab_one_frame, probe_video};
+use video::{VideoMeta, grab_one_frame, probe_video};
 use viewport::Viewport;
 
 const EL_BG: &str = "vplay-bg";
@@ -68,9 +68,6 @@ struct Cli {
     /// Milliseconds to wait for the terminal's VGE probe response.
     #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
-    /// Cap playback frame rate (video).
-    #[arg(long, default_value_t = 30.0)]
-    max_fps: f64,
 }
 
 fn is_video_ext(p: &std::path::Path) -> bool {
@@ -481,23 +478,20 @@ fn main() -> Result<()> {
         send(&mut out, &[np(create_seek(cols, rows, frac0))]);
     }
 
-    // --- per-mode playback state ---
+    // --- per-mode state ---
     let mut created_img = false;
     let mut cur_id = IMG_ID.to_string();
     let mut source_frame: Frame;
 
-    // Video state.
+    // Video state. There is no continuous playback: the displayed frame
+    // changes only when the user seeks.
     let fps = meta.as_ref().map(|m| m.fps).unwrap_or(30.0);
-    let interval = Duration::from_secs_f64(1.0 / cli.max_fps.min(fps).max(1.0));
-    let mut decoder: Option<Decoder> = None;
-    let mut playing = false;
     let mut cur_pts = 0.0f64;
     let mut cur_index = 0u64;
-    let mut next_due = Instant::now();
 
     if is_video {
         let m = meta.as_ref().unwrap();
-        // Grab and show the first frame, then start continuous playback.
+        // Grab and show the first frame.
         let first = grab_one_frame(&path_str, m.width, m.height, 0.0)?
             .ok_or_else(|| anyhow::anyhow!("could not decode the first video frame"))?;
         source_frame = Frame::new(m.width, m.height, first);
@@ -512,9 +506,6 @@ fn main() -> Result<()> {
             cell_pw,
             cell_ph,
         )?;
-        decoder = Some(Decoder::start(&path_str, m.width, m.height, m.fps, 0.0)?);
-        playing = true;
-        next_due = Instant::now() + interval;
     } else {
         let f = image_frame.unwrap();
         source_frame = f.clone();
@@ -564,18 +555,10 @@ fn main() -> Result<()> {
             dirty_seek = is_video;
         }
 
-        // How long to block waiting for input.
-        let wait = if is_video && playing {
-            let now = Instant::now();
-            if next_due > now {
-                (next_due - now).min(Duration::from_millis(50))
-            } else {
-                Duration::from_millis(0)
-            }
-        } else {
-            Duration::from_millis(50)
-        };
-        let deadline = Instant::now() + wait;
+        // How long to block waiting for input. With no continuous
+        // playback the loop is purely event-driven; 50 ms keeps a lone
+        // ESC responsive without busy-spinning.
+        let deadline = Instant::now() + Duration::from_millis(50);
 
         let events = if poll_stdin_until(deadline).unwrap_or(false) {
             let n = read_stdin(&mut inbuf).unwrap_or(0);
@@ -631,11 +614,8 @@ fn main() -> Result<()> {
                             &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
-                            &mut playing,
-                            &mut decoder,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut next_due,
                             &mut source_frame,
                             &mut cur_id,
                             &mut created_img,
@@ -657,26 +637,8 @@ fn main() -> Result<()> {
                         dirty_status = true;
                     }
                 }
-                Event::PlayPause => {
-                    if is_video {
-                        if playing {
-                            playing = false;
-                            decoder = None;
-                        } else {
-                            let m = meta.as_ref().unwrap();
-                            decoder = Some(Decoder::start(
-                                &path_str, m.width, m.height, m.fps, cur_pts,
-                            )?);
-                            playing = true;
-                            next_due = Instant::now();
-                        }
-                        dirty_status = true;
-                    }
-                }
                 Event::StepNext | Event::StepPrev => {
                     if is_video {
-                        playing = false;
-                        decoder = None;
                         let step = 1.0 / fps;
                         let t = if ev == Event::StepNext {
                             cur_pts + step
@@ -689,11 +651,8 @@ fn main() -> Result<()> {
                             &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
-                            &mut playing,
-                            &mut decoder,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut next_due,
                             &mut source_frame,
                             &mut cur_id,
                             &mut created_img,
@@ -709,12 +668,7 @@ fn main() -> Result<()> {
                 Event::MouseDown { col, row } => {
                     cursor = Some((col as f32 + 0.5, row as f32 + 0.5));
                     if is_video && row == rows - 2 {
-                        let was = playing;
-                        if playing {
-                            playing = false;
-                            decoder = None;
-                        }
-                        drag = Drag::Seek { was_playing: was };
+                        drag = Drag::Seek;
                         let frac =
                             ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
                         seek_to(
@@ -723,11 +677,8 @@ fn main() -> Result<()> {
                             &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
-                            &mut playing,
-                            &mut decoder,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut next_due,
                             &mut source_frame,
                             &mut cur_id,
                             &mut created_img,
@@ -746,18 +697,6 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::MouseUp { .. } => {
-                    if let Drag::Seek { was_playing } = drag
-                        && was_playing
-                        && is_video
-                    {
-                        let m = meta.as_ref().unwrap();
-                        decoder = Some(Decoder::start(
-                            &path_str, m.width, m.height, m.fps, cur_pts,
-                        )?);
-                        playing = true;
-                        next_due = Instant::now();
-                        dirty_status = true;
-                    }
                     drag = Drag::None;
                 }
                 Event::MouseMove { col, row, pressed } => {
@@ -774,7 +713,7 @@ fn main() -> Result<()> {
                             };
                             dirty_media = true;
                         }
-                        Drag::Seek { .. } if pressed && is_video => {
+                        Drag::Seek if pressed && is_video => {
                             let frac =
                                 ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
                             seek_to(
@@ -783,11 +722,8 @@ fn main() -> Result<()> {
                                 &vp,
                                 meta.as_ref().unwrap(),
                                 &path_str,
-                                &mut playing,
-                                &mut decoder,
                                 &mut cur_pts,
                                 &mut cur_index,
-                                &mut next_due,
                                 &mut source_frame,
                                 &mut cur_id,
                                 &mut created_img,
@@ -806,41 +742,6 @@ fn main() -> Result<()> {
 
         if quit {
             break;
-        }
-
-        // Advance continuous video playback.
-        if is_video && playing && Instant::now() >= next_due {
-            let frame = decoder.as_ref().and_then(|d| d.try_recv_latest());
-            if let Some(fr) = frame {
-                cur_index = fr.index;
-                cur_pts = cur_index as f64 / fps;
-                let m = meta.as_ref().unwrap();
-                source_frame = Frame::new(m.width, m.height, fr.rgba);
-                render_video_frame(
-                    &mut out,
-                    &vp,
-                    &source_frame,
-                    &mut cur_id,
-                    &mut created_img,
-                    supported,
-                    ssh,
-                    cell_pw,
-                    cell_ph,
-                )?;
-                next_due += interval;
-                let now = Instant::now();
-                if next_due < now {
-                    next_due = now + interval;
-                }
-                dirty_status = true;
-                dirty_seek = true;
-                dirty_media = false; // just drew the frame at current layout
-            } else if decoder.as_mut().map(|d| d.finished()).unwrap_or(false) {
-                playing = false;
-                dirty_status = true;
-            } else {
-                next_due = Instant::now() + Duration::from_millis(2);
-            }
         }
 
         // Coalesced redraws.
@@ -869,14 +770,13 @@ fn main() -> Result<()> {
                 .and_then(|(c, r)| vp.cursor_pixel(c, r))
                 .map(|(x, y)| (x, y, source_frame.pixel(x, y)));
             let (left, center, right) = if is_video {
-                let state = if playing { "▶" } else { "⏸" };
                 let totals = total_frames
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "?".into());
                 (
                     format!("{name}  {src_w}x{src_h}  {fps:.2}fps"),
                     format!(
-                        "{state} {}%  f {}/{}  {}",
+                        "{}%  f {}/{}  {}",
                         vp.zoom_percent(),
                         cur_index,
                         totals,
@@ -923,11 +823,12 @@ fn main() -> Result<()> {
 enum Drag {
     None,
     Pan { last_col: f32, last_row: f32 },
-    Seek { was_playing: bool },
+    Seek,
 }
 
-/// Seek to `time` seconds. While playing, restart the continuous decoder
-/// there; while paused, grab and display a single frame.
+/// Seek to `time` seconds: decode that single frame with ffmpeg and
+/// display it. There is no continuous playback — the frame only changes
+/// when the user seeks.
 #[allow(clippy::too_many_arguments)]
 fn seek_to<W: Write>(
     time: f64,
@@ -935,11 +836,8 @@ fn seek_to<W: Write>(
     vp: &Viewport,
     meta: &VideoMeta,
     path: &str,
-    playing: &mut bool,
-    decoder: &mut Option<Decoder>,
     cur_pts: &mut f64,
     cur_index: &mut u64,
-    next_due: &mut Instant,
     source_frame: &mut Frame,
     cur_id: &mut String,
     created: &mut bool,
@@ -951,16 +849,7 @@ fn seek_to<W: Write>(
     let time = time.clamp(0.0, meta.duration());
     *cur_pts = time;
     *cur_index = (time * meta.fps).round() as u64;
-    if *playing {
-        *decoder = Some(Decoder::start(
-            path,
-            meta.width,
-            meta.height,
-            meta.fps,
-            time,
-        )?);
-        *next_due = Instant::now();
-    } else if let Some(rgba) = grab_one_frame(path, meta.width, meta.height, time)? {
+    if let Some(rgba) = grab_one_frame(path, meta.width, meta.height, time)? {
         *source_frame = Frame::new(meta.width, meta.height, rgba);
         render_video_frame(
             out,

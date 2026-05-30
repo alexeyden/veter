@@ -17,7 +17,6 @@ pub enum Event {
     Fit,
     Actual,
     Arrow(Dir),
-    PlayPause,
     StepNext,
     StepPrev,
     /// Left-button press at a 0-indexed cell.
@@ -146,10 +145,6 @@ impl InputParser {
                     out.push(Event::Actual);
                     i += 1;
                 }
-                b' ' => {
-                    out.push(Event::PlayPause);
-                    i += 1;
-                }
                 b'.' => {
                     out.push(Event::StepNext);
                     i += 1;
@@ -263,7 +258,7 @@ mod tests {
     #[test]
     fn parses_keys() {
         let mut p = InputParser::new();
-        let evs = p.feed(b"+-01 .,q");
+        let evs = p.feed(b"+-01.,q");
         assert_eq!(
             evs,
             vec![
@@ -271,7 +266,6 @@ mod tests {
                 Event::ZoomOut,
                 Event::Fit,
                 Event::Actual,
-                Event::PlayPause,
                 Event::StepNext,
                 Event::StepPrev,
                 Event::Quit,
