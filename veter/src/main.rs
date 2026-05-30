@@ -601,6 +601,23 @@ struct SearchState {
     /// viewport is scrolled to). Always `< matches.len()` when
     /// non-empty; `0` if empty.
     current: usize,
+    /// Flash.nvim-style jump labels for the currently-visible matches.
+    /// Recomputed every frame in `recompute_labels`. Drives both
+    /// rendering (`draw_jump_labels`) and the label-key dispatch in
+    /// `handle_search_key_input` so the drawn labels and the keymap
+    /// always agree.
+    labels: Vec<JumpLabel>,
+}
+
+/// One flash jump label: a key, the match it acts on, and the cell the
+/// glyph is drawn at (just past the end of that match's word, in the
+/// target leaf's absolute scrollback coords).
+#[derive(Clone, Copy, Debug)]
+struct JumpLabel {
+    match_idx: usize,
+    ch: char,
+    anchor_line: i64,
+    anchor_col: u16,
 }
 
 impl SearchState {
@@ -614,8 +631,55 @@ impl SearchState {
             cache: None,
             matches: Vec::new(),
             current: 0,
+            labels: Vec::new(),
         }
     }
+}
+
+/// Home-row alphabet for flash-style jump labels, assigned in order to
+/// visible matches. Chars that could continue the current query (the
+/// cell immediately after a match) are excluded at assignment time so a
+/// keypress is unambiguous: an active label selects, anything else edits
+/// the query. `n`/`N` are reserved for match navigation and never used.
+const JUMP_LABEL_ALPHABET: &[char] =
+    &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'];
+
+/// Character starting at cell column `col` in an indexed search row, or
+/// `None` if `col` is past the row's content (e.g. the match ends at the
+/// last non-space cell). Used to build the jump-label exclusion set —
+/// the char that would *continue* a match, which must not double as a
+/// label key. `byte_to_col` is monotonic, so the first byte mapping to
+/// `col` is that cell's lead byte.
+fn char_at_col(row: &search::IndexedRow, col: u16) -> Option<char> {
+    let b = row.byte_to_col.iter().position(|&c| c == col)?;
+    if b < row.text.len() && row.text.is_char_boundary(b) {
+        row.text[b..].chars().next()
+    } else {
+        None
+    }
+}
+
+/// Assign jump labels to `visible` match indices (in reading order) from
+/// [`JUMP_LABEL_ALPHABET`], skipping any char in `excluded` (chars that
+/// could continue the query). Stops when the usable alphabet runs out,
+/// leaving surplus matches unlabelled. Pure — the I/O-free core of
+/// [`App::recompute_labels`], split out so it can be unit-tested.
+fn assign_jump_labels(
+    visible: &[usize],
+    excluded: &std::collections::HashSet<char>,
+) -> Vec<(usize, char)> {
+    let mut out = Vec::new();
+    let mut alpha = JUMP_LABEL_ALPHABET
+        .iter()
+        .copied()
+        .filter(|c| !excluded.contains(c));
+    for &idx in visible {
+        match alpha.next() {
+            Some(ch) => out.push((idx, ch)),
+            None => break,
+        }
+    }
+    out
 }
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -676,6 +740,79 @@ fn draw_search_bar<T: femtovg::Renderer>(
         vge::command::Align::Left,
         vge::command::FontStyle::default(),
     );
+}
+
+/// Draw the flash-style jump labels at the end of each labelled match's
+/// word. Runs after the grid/portals so labels sit on top, but before
+/// `draw_search_bar` so the bottom bar wins any overlap. Reuses
+/// `resolve_portal_target` for the leaf's pixel origin, so labels land
+/// correctly inside a vmux pane (portal) and not just the host grid.
+/// Label positions come from `search.labels`, which was computed this
+/// same frame in `recompute_labels`, so what's drawn here matches what
+/// the key handler will dispatch.
+fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
+    canvas: &mut Canvas<T>,
+    tr: &mut renderer::TerminalRenderer,
+    search: &SearchState,
+    prt: &prt::PrtEngine,
+    parser: &vt100::Parser<CB>,
+) {
+    if search.labels.is_empty() {
+        return;
+    }
+    let cell_w = tr.cell_width;
+    let cell_h = tr.cell_height;
+    let path = search.target_path.as_slice();
+
+    // Leaf geometry: pixel origin + the coords to project a match line
+    // into a visible row. Host grid is at (0,0); a portal leaf uses the
+    // same origin math as its search highlights.
+    let (origin_x, origin_y, top, scrollback, rows) = if path.is_empty() {
+        let (rows, _) = parser.screen().size();
+        (
+            0.0_f32,
+            0.0_f32,
+            prt.top_of_live_screen(),
+            parser.screen().scrollback(),
+            rows,
+        )
+    } else {
+        let Some(info) = resolve_portal_target(prt, parser, cell_w, cell_h, path) else {
+            return;
+        };
+        let top = info.portal.children.top_of_live_screen();
+        let sb = info.portal.vt.screen().scrollback();
+        let (rows, _) = info.portal.vt.screen().size();
+        (info.origin_x_px, info.origin_y_px, top, sb, rows)
+    };
+    let viewport_top = top - scrollback as i64;
+    let ascent = tr.ascent();
+
+    for label_info in &search.labels {
+        let row_i = label_info.anchor_line - viewport_top;
+        if row_i < 0 || row_i >= rows as i64 {
+            continue;
+        }
+        let x = origin_x + label_info.anchor_col as f32 * cell_w;
+        let y = origin_y + row_i as f32 * cell_h;
+
+        let mut bg = femtovg::Path::new();
+        bg.rect(x, y, cell_w, cell_h);
+        canvas.fill_path(&bg, &femtovg::Paint::color(Color::rgb(255, 196, 0)));
+
+        let mut buf = [0u8; 4];
+        let label = label_info.ch.encode_utf8(&mut buf);
+        let text_y = y + ascent + (cell_h - ascent) * 0.5;
+        tr.draw_vge_text(
+            canvas,
+            x,
+            text_y,
+            label,
+            Color::rgb(0, 0, 0),
+            vge::command::Align::Left,
+            vge::command::FontStyle::default(),
+        );
+    }
 }
 
 fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
@@ -924,6 +1061,107 @@ impl App {
             search.current = 0;
         } else if search.current >= search.matches.len() {
             search.current = search.matches.len() - 1;
+        }
+    }
+
+    /// Recompute the flash-style jump labels for the currently-visible
+    /// matches of the target leaf. Each visible match (in reading order)
+    /// gets a char from [`JUMP_LABEL_ALPHABET`], skipping any char that
+    /// could *continue* the query — the cell right after a match — so a
+    /// label keypress can never be mistaken for query input. Off-screen
+    /// matches get no label (still reachable via `n`/`N`); if visible
+    /// matches outnumber the usable alphabet the leftmost ones win and
+    /// the rest stay highlighted-but-unlabelled.
+    ///
+    /// Called once per frame at the top of `RedrawRequested`, so the
+    /// stored labels always equal what was last drawn — which is exactly
+    /// what the user sees when they press a label key.
+    fn recompute_labels(&mut self) {
+        let (path, has_matches) = match self.search.as_ref() {
+            Some(s) => (s.target_path.clone(), !s.matches.is_empty()),
+            None => return,
+        };
+        let clear = |app: &mut Self| {
+            if let Some(s) = app.search.as_mut() {
+                s.labels.clear();
+            }
+        };
+        if !has_matches {
+            clear(self);
+            return;
+        }
+        let Some(top) = self.target_top_of_live_screen(&path) else {
+            clear(self);
+            return;
+        };
+        let Some((rows, cols, scrollback)) = self
+            .with_target_leaf_screen_mut(&path, |s| (s.size().0, s.size().1, s.scrollback()))
+        else {
+            clear(self);
+            return;
+        };
+        let viewport_top = top - scrollback as i64;
+
+        let assigned = {
+            let Some(search) = self.search.as_ref() else { return };
+            // line -> cache row, for O(1) exclusion-char lookup.
+            let mut line_row: std::collections::HashMap<i64, usize> =
+                std::collections::HashMap::new();
+            if let Some(cache) = &search.cache {
+                for (i, r) in cache.rows.iter().enumerate() {
+                    line_row.insert(r.line, i);
+                }
+            }
+            let mut excluded: std::collections::HashSet<char> =
+                std::collections::HashSet::new();
+            let mut visible: Vec<usize> = Vec::new();
+            for (idx, m) in search.matches.iter().enumerate() {
+                let row_i = m.line - viewport_top;
+                if row_i < 0 || row_i >= rows as i64 {
+                    continue;
+                }
+                visible.push(idx);
+                if let Some(cache) = &search.cache
+                    && let Some(&ri) = line_row.get(&m.line)
+                    && let Some(c) = char_at_col(&cache.rows[ri], m.col_end)
+                {
+                    let c = if search.case_insensitive {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    };
+                    excluded.insert(c);
+                }
+            }
+            assign_jump_labels(&visible, &excluded)
+        };
+
+        // Anchor each label just past the end of its match's word, so the
+        // glyph sits on the trailing whitespace rather than over the text.
+        // The word range is the same one the copy action will grab.
+        let target = if path.is_empty() {
+            SelectionTarget::Host
+        } else {
+            SelectionTarget::Portal(path)
+        };
+        let mut jump_labels: Vec<JumpLabel> = Vec::with_capacity(assigned.len());
+        for (idx, ch) in assigned {
+            let Some(m) = self.search.as_ref().and_then(|s| s.matches.get(idx).copied())
+            else {
+                continue;
+            };
+            let (anchor_line, anchor_col) =
+                match self.find_word_range(&target, m.line, m.col_start) {
+                    Some((_, (e_line, e_col))) if e_col + 1 < cols => (e_line, e_col + 1),
+                    Some((_, (e_line, e_col))) => (e_line, e_col),
+                    // Match start isn't a word cell (e.g. query was
+                    // whitespace) — fall back to the match start.
+                    None => (m.line, m.col_start),
+                };
+            jump_labels.push(JumpLabel { match_idx: idx, ch, anchor_line, anchor_col });
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.labels = jump_labels;
         }
     }
 
@@ -1280,6 +1518,45 @@ impl App {
         }
     }
 
+    /// Flash jump-label action: select the word at match `idx` — the
+    /// same word a double-click on its first cell would — leave it
+    /// highlighted, and close the overlay. Updates PRIMARY so middle-
+    /// click paste works, like any selection. The word stays selected so
+    /// follow-up actions (copy, etc.) can act on it later; the scroll
+    /// position is left as-is since the match is already on screen.
+    fn select_word_at_match(&mut self, idx: usize) {
+        let (m, target) = match self.search.as_ref() {
+            Some(s) => {
+                let Some(m) = s.matches.get(idx).copied() else { return };
+                let target = if s.target_path.is_empty() {
+                    SelectionTarget::Host
+                } else {
+                    SelectionTarget::Portal(s.target_path.clone())
+                };
+                (m, target)
+            }
+            None => return,
+        };
+        if let Some(((s_line, s_col), (e_line, e_col))) =
+            self.find_word_range(&target, m.line, m.col_start)
+        {
+            self.selection = Some(Selection {
+                target,
+                anchor_line: s_line,
+                anchor_col: s_col,
+                head_line: e_line,
+                head_col: e_col,
+                dragging: false,
+                block_cols: None,
+            });
+            self.copy_selection_to_clipboard(true);
+        }
+        self.search = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     /// Copy the current selection to the system clipboard. When
     /// `primary_only` is true (mouse drag completion), only the Linux
     /// PRIMARY selection is updated (so middle-click paste works);
@@ -1471,6 +1748,24 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // Ctrl+Shift+Space opens the unified scrollback/search/select
+        // overlay at the current bottom *without* scrolling — the
+        // keyboard entry point. Works from live output, unlike `/` which
+        // requires being scrolled back first. Checked before the
+        // any-key-resets-scrollback block below so opening while already
+        // scrolled back preserves the position.
+        let is_space = matches!(&event.logical_key, Key::Named(NamedKey::Space))
+            || matches!(&event.logical_key, Key::Character(c) if c.as_str() == " ");
+        if self.modifiers.control_key() && self.modifiers.shift_key() && is_space {
+            let path = self.focused_leaf_path();
+            let saved = self.focused_leaf_scrollback();
+            self.search = Some(SearchState::new(path, saved));
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
         }
 
         // Any non-scroll key resets scrollback to bottom on the focused
@@ -1702,6 +1997,38 @@ impl App {
             }
             Key::Character(c) => {
                 let s = c.as_str();
+                // Flash jump label vs. query input. A label only fires
+                // when typing it would *not* keep narrowing the search —
+                // i.e. appending it to the query matches nothing (or
+                // we're in navigation mode, where there's no query to
+                // extend). This guarantees a keystroke that still refines
+                // the query always refines it: typing "Pi" to reach
+                // "Pictures" is never hijacked even if "i" labels some
+                // other match. (The exclusion set in `recompute_labels`
+                // already keeps most label chars off continuation keys;
+                // this rule makes it robust against any it misses.)
+                if !self.modifiers.alt_key()
+                    && !self.modifiers.control_key()
+                    && let Some(ch) = s.chars().next()
+                    && s.chars().count() == 1
+                    && let Some(match_idx) =
+                        search.labels.iter().find(|l| l.ch == ch).map(|l| l.match_idx)
+                {
+                    let would_narrow = search.editing
+                        && match &search.cache {
+                            Some(cache) => {
+                                let mut q = search.query.clone();
+                                q.push(ch);
+                                !search::find_matches(cache, &q, search.case_insensitive)
+                                    .is_empty()
+                            }
+                            None => false,
+                        };
+                    if !would_narrow {
+                        self.select_word_at_match(match_idx);
+                        return;
+                    }
+                }
                 if self.modifiers.alt_key() {
                     if s.eq_ignore_ascii_case("c") {
                         search.case_insensitive = !search.case_insensitive;
@@ -2433,6 +2760,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                // Refresh jump labels to match this frame's scroll/match
+                // state before drawing. Doing it here (rather than in each
+                // key/scroll handler) guarantees the stored `labels` equal
+                // what gets drawn, so a label keypress always selects the
+                // match the user is looking at. No-op when not searching.
+                self.recompute_labels();
+
                 let size = self.window.as_ref().unwrap().inner_size();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
@@ -2520,9 +2854,11 @@ impl ApplicationHandler for App {
                         search_ctx.as_ref(),
                     );
 
-                    // Search input bar — drawn last so it overlays
-                    // everything (terminal grid, portals, VGE chrome).
+                    // Jump labels, then the search input bar — both drawn
+                    // last so they overlay the grid/portals/VGE chrome.
+                    // Labels first so the bottom bar wins on the last row.
                     if let Some(search) = self.search.as_ref() {
+                        draw_jump_labels(canvas, tr, search, prt, parser);
                         draw_search_bar(canvas, tr, search, size.width as f32, size.height as f32);
                     }
                 }
@@ -2634,4 +2970,109 @@ fn trace_keyboard_send(bytes: &[u8]) {
     }
     line.push_str("|\n");
     let _ = file.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod jump_label_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn parse(bytes: &[u8], rows: u16, cols: u16) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, 100);
+        p.process(bytes);
+        p
+    }
+
+    #[test]
+    fn char_at_col_reads_next_cell() {
+        // "foo bar" — the char right after the match "foo" (col_end 3)
+        // is a space; after "bar" (col_end 7) the row ends -> None.
+        let mut p = parse(b"foo bar", 1, 20);
+        let idx = search::extract_indexed_text(&mut p, 0);
+        let row = &idx.rows[0];
+        assert_eq!(char_at_col(row, 0), Some('f'));
+        assert_eq!(char_at_col(row, 3), Some(' '));
+        assert_eq!(char_at_col(row, 4), Some('b'));
+        // Past the trailing-stripped content -> no continuation char.
+        assert_eq!(char_at_col(row, 7), None);
+    }
+
+    #[test]
+    fn char_at_col_handles_wide_chars() {
+        // "あb": あ is wide (cols 0..2), b at col 2. col 1 is the wide
+        // continuation and has no lead byte -> None; col 2 is 'b'.
+        let mut p = parse("あb".as_bytes(), 1, 10);
+        let idx = search::extract_indexed_text(&mut p, 0);
+        let row = &idx.rows[0];
+        assert_eq!(char_at_col(row, 0), Some('あ'));
+        assert_eq!(char_at_col(row, 1), None);
+        assert_eq!(char_at_col(row, 2), Some('b'));
+    }
+
+    #[test]
+    fn labels_assigned_in_order() {
+        let labels = assign_jump_labels(&[0, 1, 2], &HashSet::new());
+        let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
+        let idxs: Vec<usize> = labels.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0, 1, 2]);
+        // First three of the home-row alphabet.
+        assert_eq!(chars, vec!['a', 's', 'd']);
+    }
+
+    #[test]
+    fn excluded_chars_are_skipped() {
+        // Exclude 'a' and 'd' (chars that could continue a match): the
+        // assignment must not hand them out, falling through to 's', 'f'.
+        let excluded: HashSet<char> = ['a', 'd'].into_iter().collect();
+        let labels = assign_jump_labels(&[10, 11], &excluded);
+        let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
+        assert_eq!(chars, vec!['s', 'f']);
+        // The original match indices are preserved.
+        assert_eq!(labels[0].0, 10);
+        assert_eq!(labels[1].0, 11);
+    }
+
+    /// Replicate `recompute_labels`' exclusion + assignment for a
+    /// realistic `ls` screen, querying "p". The cell after the "P" in
+    /// "Pictures" is "i", so "i" must be excluded and never handed out
+    /// as a label — otherwise typing "Pi" to narrow would be hijacked.
+    #[test]
+    fn continuation_char_excluded_from_labels() {
+        let mut p = parse(b"Desktop Documents Pictures Public Templates Videos", 1, 60);
+        let idx = search::extract_indexed_text(&mut p, 0);
+        let matches = search::find_matches(&idx, "p", true);
+        assert!(!matches.is_empty());
+
+        let mut line_row = std::collections::HashMap::new();
+        for (i, r) in idx.rows.iter().enumerate() {
+            line_row.insert(r.line, i);
+        }
+        let mut excluded = HashSet::new();
+        let mut visible = Vec::new();
+        for (i, m) in matches.iter().enumerate() {
+            visible.push(i);
+            if let Some(&ri) = line_row.get(&m.line)
+                && let Some(c) = char_at_col(&idx.rows[ri], m.col_end)
+            {
+                excluded.insert(c.to_ascii_lowercase());
+            }
+        }
+        assert!(excluded.contains(&'i'), "expected 'i' excluded, got {excluded:?}");
+        let labels = assign_jump_labels(&visible, &excluded);
+        assert!(
+            labels.iter().all(|(_, c)| *c != 'i'),
+            "no label should be 'i': {labels:?}"
+        );
+    }
+
+    #[test]
+    fn surplus_matches_left_unlabelled() {
+        // More visible matches than usable alphabet -> the leftmost are
+        // labelled, the rest are dropped (still nav-reachable via n/N).
+        let n = JUMP_LABEL_ALPHABET.len();
+        let visible: Vec<usize> = (0..n + 5).collect();
+        let labels = assign_jump_labels(&visible, &HashSet::new());
+        assert_eq!(labels.len(), n);
+        assert_eq!(labels.last().unwrap().0, n - 1);
+    }
 }
