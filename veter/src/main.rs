@@ -84,8 +84,8 @@ struct Selection {
     head_line: i64,
     head_col: u16,
     /// True while the user is still holding the mouse button. Cleared
-    /// on release; the selection itself stays so Ctrl+Shift+C can
-    /// re-copy it later.
+    /// on release; the selection itself stays (e.g. for middle-click
+    /// paste) until a click or Ctrl+Shift+C clears it.
     dragging: bool,
     /// Smart pane select. When `Some((left, right))`, this is an
     /// ordinary stream selection clipped to columns `[left, right]` —
@@ -1853,6 +1853,13 @@ impl App {
             }
             if ch.eq_ignore_ascii_case(&'c') {
                 self.copy_selection_to_clipboard(false);
+                // Reset the selection after copying so the highlight clears.
+                if self.selection.is_some() {
+                    self.selection = None;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
                 return;
             }
         }
