@@ -940,6 +940,36 @@ impl App {
             .map(|p| p.children.top_of_live_screen())
     }
 
+    /// Set `search.current` to the first match that falls within the
+    /// currently-visible viewport rows. Returns `true` and leaves the
+    /// scroll unchanged on success; returns `false` if there is no
+    /// active search, no matches, or no match is visible right now.
+    fn select_first_visible_match(&mut self) -> bool {
+        let (path, is_empty) = match self.search.as_ref() {
+            Some(s) => (s.target_path.clone(), s.matches.is_empty()),
+            None => return false,
+        };
+        if is_empty {
+            return false;
+        }
+        let Some(top) = self.target_top_of_live_screen(&path) else { return false };
+        let Some((rows, scrollback)) = self
+            .with_target_leaf_screen_mut(&path, |s| (s.size().0 as i64, s.scrollback() as i64))
+        else {
+            return false;
+        };
+        let viewport_top = top - scrollback;
+        let viewport_bot = viewport_top + rows;
+        let Some(search) = self.search.as_mut() else { return false };
+        for (i, m) in search.matches.iter().enumerate() {
+            if m.line >= viewport_top && m.line < viewport_bot {
+                search.current = i;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Scroll the target parser so the current match is centered in
     /// the viewport. No-op if no search session, no matches, or the
     /// target path no longer resolves.
@@ -2074,7 +2104,9 @@ impl App {
                 search.query.push_str(s);
                 search.current = 0;
                 self.recompute_search_matches();
-                self.scroll_to_current_match();
+                if !self.select_first_visible_match() {
+                    self.scroll_to_current_match();
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
