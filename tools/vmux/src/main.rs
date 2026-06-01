@@ -1280,7 +1280,7 @@ fn build_tabbar_commands(
     });
 
     // Session-name segment: a dim rounded block pinned at x = 0,
-    // showing the `veterd` session this vmux lives in.
+    // showing the `vsd` session this vmux lives in.
     if let Some((label, w)) = &layout.session_seg {
         let (rx, ry) = chrome_corner_radii(*w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
@@ -2269,7 +2269,7 @@ struct State {
     /// Monotonic counter for allocating scroll request ids. Starts at
     /// `SCROLL_REQUEST_ID_BASE` and increments per request.
     next_scroll_req_id: u32,
-    /// `Some(name)` when the host answered the SES probe as a `veterd`
+    /// `Some(name)` when the host answered the SES probe as a `vsd`
     /// session — drives the tab-bar session segment and enables
     /// `prefix-D`. `None` for a plain local `veter` host.
     session_name: Option<String>,
@@ -3585,7 +3585,7 @@ struct VgeProbeData {
 }
 
 /// Outcome of the startup probe round: which extensions the host
-/// speaks, plus the session name when the host is a `veterd` session.
+/// speaks, plus the session name when the host is a `vsd` session.
 struct ProbeResults {
     /// Host advertised the Portal Extension (a hard requirement).
     prt_ok: bool,
@@ -3663,7 +3663,7 @@ fn parse_vge_probe(payload: &[u8]) -> Option<VgeProbeData> {
 /// Probe PRT, VGE and SES in a single timeout window. All three probe
 /// envelopes are written up front; responses are collected until every
 /// extension has answered or the deadline passes — so a host that does
-/// not speak SES (an older `veter`/`veterd`) costs no extra latency
+/// not speak SES (an older `veter`/`vsd`) costs no extra latency
 /// beyond the shared window, and a missing SES answer is simply "no
 /// session", never fatal. Each APC parser ignores the other markers,
 /// so the raw stream is fed to all three independently.
@@ -3811,7 +3811,7 @@ fn main() -> Result<()> {
 
     let mut state =
         State::new(cols as u32, rows as u32, cell_pw, cell_ph)?;
-    // A `veterd` session host answers the SES probe with its name; a
+    // A `vsd` session host answers the SES probe with its name; a
     // plain local `veter` host does not, leaving this `None`.
     state.session_name = probe.session_name;
     // Initial render — creates portal + chrome for p1 and sets focus.
@@ -4770,7 +4770,7 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         }
         b'<' => state.move_tab_left(),
         b'>' => state.move_tab_right(),
-        // detach the veterd session — fire-and-forget SES command.
+        // detach the vsd session — fire-and-forget SES command.
         // A no-op outside a session (no host to act on it).
         b'D' => {
             if state.session_name.is_some() {

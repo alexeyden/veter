@@ -10,7 +10,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 // Client → host command codes (marker `SES`).
 /// Ask the host whether it is a session and, if so, its name.
 pub const CMD_PROBE: u8 = 0x01;
-/// Ask the host to detach the session (same teardown as veterd's
+/// Ask the host to detach the session (same teardown as vsd's
 /// `Ctrl+\ d` hotkey). A non-session host replies `RSP_ERR`.
 pub const CMD_DETACH: u8 = 0x02;
 

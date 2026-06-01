@@ -2,7 +2,7 @@
 //! daemon over the Unix-domain socket used by the IPC layer.
 //!
 //! The session manager design (`doc/session-manager.md` §2.4) calls
-//! for the `veterd attach <name>` CLI to:
+//! for the `vsd attach <name>` CLI to:
 //!
 //! 1. Connect to the daemon socket.
 //! 2. Send `Request::Attach { name }` over it.

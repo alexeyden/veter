@@ -3,7 +3,7 @@
 //! `Status` requests until the inner PTY child exits or `Kill` is
 //! received.
 //!
-//! Invoked by `veterd new` re-execing itself with the hidden
+//! Invoked by `vsd new` re-execing itself with the hidden
 //! `--session NAME [argv...]` flag (or `--foreground-session …` in
 //! debug). The CLI front-end (`main.rs`) handles the user-facing
 //! subcommands; this module is the per-session backend.
@@ -228,7 +228,7 @@ fn accept_loop(listener: &UnixListener, session: &SessionState) -> Result<()> {
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => {
-                eprintln!("veterd: accept error on `{}`: {e}", session.name);
+                eprintln!("vsd: accept error on `{}`: {e}", session.name);
                 continue;
             }
         };
@@ -253,7 +253,7 @@ fn handle_connection(
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return;
             }
-            eprintln!("veterd: bad request on `{}`: {e}", session.name);
+            eprintln!("vsd: bad request on `{}`: {e}", session.name);
             let _ = Response::Err(format!("bad request: {e}")).write_to(&mut stream);
             return;
         }
@@ -323,7 +323,7 @@ fn spawn_inner_pty(argv: &[String]) -> Result<(OwnedFd, Pid)> {
                 .map(|s| CString::new(s.as_str()).expect("argv contained NUL"))
                 .collect();
             let err = execvp(&cmd, &cargs).err();
-            eprintln!("veterd: execvp({:?}) failed: {:?}", argv, err);
+            eprintln!("vsd: execvp({:?}) failed: {:?}", argv, err);
             std::process::exit(127);
         }
     }

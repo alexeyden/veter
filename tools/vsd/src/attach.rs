@@ -108,11 +108,11 @@ pub fn start(
     let session_name_owned = session_name.to_string();
     let flag_for_thread = Arc::clone(&attached);
     let spawn = std::thread::Builder::new()
-        .name("veterd-attach".into())
+        .name("vsd-attach".into())
         .spawn(move || {
             if let Err(e) = handler_main(stdin, stdout, master_writer, engines) {
                 eprintln!(
-                    "veterd: attach `{session_name_owned}` ended: {e:#}"
+                    "vsd: attach `{session_name_owned}` ended: {e:#}"
                 );
             }
             flag_for_thread.store(false, Ordering::Release);
@@ -205,7 +205,7 @@ fn handler_main(
         //
         // VSS binary snapshot — replaces the v1 replay-style command
         // stream. The renderer's per-portal VssEngine (or its host-
-        // level one, when veterd attaches directly without an
+        // level one, when vsd attaches directly without an
         // intervening vmux pane) reassembles the fragments and applies
         // the three sub-snapshots to its vt100 / VGE / PRT engines via
         // their `restore_from_binary_snapshot` methods. See
@@ -316,7 +316,7 @@ fn restore_tty_canonical(fd: std::os::fd::RawFd) {
     let mut t = match tcgetattr(borrowed) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("veterd: post-detach tcgetattr failed: {e}");
+            eprintln!("vsd: post-detach tcgetattr failed: {e}");
             return;
         }
     };
@@ -334,7 +334,7 @@ fn restore_tty_canonical(fd: std::os::fd::RawFd) {
             }
             Err(e) => {
                 eprintln!(
-                    "veterd: post-detach tcsetattr failed after {attempts} retries: {e}"
+                    "vsd: post-detach tcsetattr failed after {attempts} retries: {e}"
                 );
                 return;
             }
@@ -374,19 +374,19 @@ impl WinsizeWatcher {
         let stdin_dup = match dup_owned(stdin_fd) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("veterd: winsize watcher: dup(stdin) failed: {e}; resize disabled for this attach");
+                eprintln!("vsd: winsize watcher: dup(stdin) failed: {e}; resize disabled for this attach");
                 return Self { stop, handle: None };
             }
         };
         let master_dup = match dup_owned(master_fd) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("veterd: winsize watcher: dup(master) failed: {e}; resize disabled for this attach");
+                eprintln!("vsd: winsize watcher: dup(master) failed: {e}; resize disabled for this attach");
                 return Self { stop, handle: None };
             }
         };
         let handle = std::thread::Builder::new()
-            .name("veterd-winsize".into())
+            .name("vsd-winsize".into())
             .spawn(move || {
                 winsize_main(stdin_dup, master_dup, engines, initial, stop_for_thread)
             })
@@ -469,7 +469,7 @@ fn apply_probe(
     }
 }
 
-/// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 veterd
+/// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 vsd
 /// owns the trigger, not local vmux; `Ctrl+\` is distinct from
 /// vmux's default `Ctrl+Space` so the two can never collide.
 const DETACH_PREFIX: u8 = 0x1C; // Ctrl+\
@@ -577,7 +577,7 @@ fn splice_input(
     // before forwarding bytes to the inner PTY. The renderer queues
     // SnapshotAccepted / SnapshotRejected frames in response to the
     // attach-time snapshot; those bytes route back through PRT
-    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. v1 of veterd
+    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. v1 of vsd
     // doesn't act on them yet (no version-mismatch UI), but they must
     // not reach the inner shell — `ESC _` is meta-paren and the
     // payload chars get inserted as literal keystrokes.
@@ -766,7 +766,7 @@ impl RawTty {
         let saved = match tcgetattr(borrowed) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("veterd: tcgetattr on renderer stdin failed: {e}; \
+                eprintln!("vsd: tcgetattr on renderer stdin failed: {e}; \
                            attaching without raw mode");
                 return Self { fd, saved: None };
             }
@@ -787,7 +787,7 @@ impl RawTty {
             | InputFlags::ICRNL
             | InputFlags::IGNCR);
         if let Err(e) = tcsetattr(borrowed, SetArg::TCSANOW, &raw) {
-            eprintln!("veterd: tcsetattr raw on renderer stdin failed: {e}; \
+            eprintln!("vsd: tcsetattr raw on renderer stdin failed: {e}; \
                        attaching without raw mode");
             return Self { fd, saved: None };
         }

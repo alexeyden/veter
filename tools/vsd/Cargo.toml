@@ -1,5 +1,5 @@
 [package]
-name = "veterd"
+name = "vsd"
 version = "0.1.0"
 edition = "2024"
 description = "Persistent veter session daemon — holds host vt100 / PRT / VGE state across renderer disconnects (see doc/session-manager.md)."

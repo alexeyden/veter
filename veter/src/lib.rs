@@ -1,7 +1,7 @@
 //! veter — host engines + renderer, exposed as a library.
 //!
 //! The library face exists so workspace crates that don't run a GUI
-//! event loop (notably `veterd`, the persistent session manager in
+//! event loop (notably `vsd`, the persistent session manager in
 //! `doc/session-manager.md`) can link against the same vt100 / PRT /
 //! VGE / VFT state machinery the local GUI binary uses. Such consumers
 //! get an authoritative host implementation without re-deriving its
@@ -11,7 +11,7 @@
 //! (`src/main.rs`) and consumes this library directly as `veter::*`.
 //!
 //! Visibility rule of thumb: modules whose state is essential to a
-//! veterd snapshot/replay path live here as `pub mod`. Modules that
+//! vsd snapshot/replay path live here as `pub mod`. Modules that
 //! are purely about the local GUI (winit window setup, the
 //! `App` event-loop handler) stay in `src/main.rs`.
 

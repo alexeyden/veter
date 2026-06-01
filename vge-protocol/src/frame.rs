@@ -34,7 +34,7 @@ pub const RSP_CHUNK_ACK: u8 = 0x04;
 
 /// Sentinel `request_id` value that asks the host to apply the
 /// command but not emit a response frame. Used for "state push"
-/// scenarios where the sender is a stateful middleman (e.g. veterd
+/// scenarios where the sender is a stateful middleman (e.g. vsd
 /// replaying its session snapshot to a freshly attached renderer)
 /// and a response would just round-trip through the upstream chain
 /// back into the inner program's PTY, where stray bytes get

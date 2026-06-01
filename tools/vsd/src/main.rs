@@ -1,16 +1,16 @@
-//! veterd — per-session veter daemon.
+//! vsd — per-session veter daemon.
 //!
 //! Usage:
 //!
 //! ```text
-//!   veterd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
-//!   veterd attach NAME                # attach the calling terminal
-//!   veterd list                       # enumerate live sessions
-//!   veterd kill NAME                  # tear down NAME
+//!   vsd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
+//!   vsd attach NAME                # attach the calling terminal
+//!   vsd list                       # enumerate live sessions
+//!   vsd kill NAME                  # tear down NAME
 //! ```
 //!
 //! The subcommands are short-lived CLI calls that talk to per-session
-//! Unix sockets at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock`. Each
+//! Unix sockets at `$XDG_RUNTIME_DIR/vsd/<NAME>.sock`. Each
 //! session is its own process; `new` re-execs this binary with the
 //! hidden `--session NAME [argv...]` flag inside a double-forked
 //! detached child. `--foreground-session NAME [argv...]` runs the
@@ -41,7 +41,7 @@ mod session;
 use ipc::{Request, Response, SessionInfo};
 
 #[derive(Parser, Debug)]
-#[command(name = "veterd", about = "Per-session veter daemon.")]
+#[command(name = "vsd", about = "Per-session veter daemon.")]
 struct Cli {
     /// Internal: run the per-session backend in this process,
     /// detached (used by `new`). The caller is responsible for
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// `veterd new` — fork off a detached session process and (optionally)
+/// `vsd new` — fork off a detached session process and (optionally)
 /// attach to it.
 fn cmd_new(attach: bool, name: String, argv: Vec<String>) -> Result<()> {
     runtime::validate_name(&name)?;
@@ -203,7 +203,7 @@ fn spawn_detached_session(
     Ok(())
 }
 
-/// `veterd attach NAME` — connect to the session's socket, hand
+/// `vsd attach NAME` — connect to the session's socket, hand
 /// stdio over `SCM_RIGHTS`, then block on the socket until the
 /// session ends the attach.
 fn run_attach(name: &str) -> Result<()> {
@@ -248,7 +248,7 @@ fn run_attach(name: &str) -> Result<()> {
     }
 }
 
-/// `veterd list` — directory scan + parallel `Status` round-trips.
+/// `vsd list` — directory scan + parallel `Status` round-trips.
 fn cmd_list() -> Result<()> {
     let names = runtime::enumerate_sessions();
     let mut infos: Vec<SessionInfo> = Vec::with_capacity(names.len());
@@ -310,7 +310,7 @@ fn format_age(secs: u64) -> String {
     }
 }
 
-/// `veterd kill NAME` — send `Request::Kill` to the per-session
+/// `vsd kill NAME` — send `Request::Kill` to the per-session
 /// socket. Idempotent: missing socket → quiet success (matches v1
 /// `Kill` shape).
 fn cmd_kill(name: &str) -> Result<()> {

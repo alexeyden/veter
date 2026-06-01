@@ -1,16 +1,16 @@
-# Veter Session Manager (veterd)
+# Veter Session Manager (vsd)
 
 > **Status: WIP.** The architecture (§§1–3, 5–7), the **v2
 > binary-snapshot protocol** (§4 VSS), and the **v3 per-session
 > process model** (§2, §8.3) are implemented. Tracked in
 > `CONTEXT.md`. The companion `doc/session-extension.md` (SES — the
-> vmux ↔ veterd control channel) is now implemented.
+> vmux ↔ vsd control channel) is now implemented.
 
-`veterd` is a persistent host-side session manager. Its role is to
+`vsd` is a persistent host-side session manager. Its role is to
 hold the state of a veter session (vt100 grids, scrollback, VGE
 element tables, image tables, PRT portal trees, inner PTYs) across
 disconnections of the rendering client. The motivating use case is
-SSH: a user works inside a tab whose contents are owned by a `veterd`
+SSH: a user works inside a tab whose contents are owned by a `vsd`
 running on a remote machine, drops the SSH connection (or just walks
 away and closes their laptop), and on next attach sees the same
 screen, scrollback, and running programs — without the local
@@ -32,13 +32,13 @@ local: │ veter  │ ─────────▶ │ ssh server   │       
        │ tab A  │                    │                │ tab B  │                    │
        │ tab B  │                    ▼                │        │                    ▼
        └────────┘            ┌───────────────┐        └────────┘            ┌───────────────┐
-            ▲                │ veterd attach │              ▲               │ veterd attach │
+            ▲                │ vsd attach │              ▲               │ vsd attach │
             │                │ cool (CLI)    │              │               │ another (CLI) │
             │                └───────┬───────┘              │               └───────┬───────┘
             │                        │ SCM_RIGHTS           │                       │
             │                        ▼                      │                       ▼
             │            ┌──────────────────────┐           │           ┌──────────────────────┐
-            │            │ veterd --session     │           │           │ veterd --session     │
+            │            │ vsd --session     │           │           │ vsd --session     │
             │            │   cool               │           │           │   another            │
             │            │ ─ host vt100         │           │           │ ─ host vt100         │
             │            │ ─ PRT engine         │           │           │ ─ VGE engine         │
@@ -53,7 +53,7 @@ local: │ veter  │ ─────────▶ │ ssh server   │       
 ```
 
 One process per session. Multiple sessions on the same machine =
-multiple `veterd --session` processes, each with its own socket.
+multiple `vsd --session` processes, each with its own socket.
 The CLI front-end (`new` / `attach` / `list` / `kill`) is short-
 lived and talks to per-session sockets — there is no central
 daemon.
@@ -65,15 +65,15 @@ daemon.
 | `veter` | local, GUI | winit/glutin window, paint loop, host engines for *local* state (top-level vt100, PRT engine, VGE engine). Same as today. |
 | `vmux` | local, inside `veter` | Tabs and panes. Same as today. Each pane is a PRT portal in local `veter`. |
 | ssh client | local, inside a vmux pane | Unmodified. Transports stdio bytes to the remote host. |
-| `veterd` CLI (`new` / `attach` / `list` / `kill`) | remote, inside the SSH PTY | Thin, short-lived. `attach` hands its stdio over to the session process and stays blocked until detach. The others do single-shot IPC and exit. |
-| `veterd --session NAME` | remote, background | One process per session. Owns the inner PTY + host engines + a per-session socket at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock`. Spawned by `veterd new` via double-fork-and-exec. |
+| `vsd` CLI (`new` / `attach` / `list` / `kill`) | remote, inside the SSH PTY | Thin, short-lived. `attach` hands its stdio over to the session process and stays blocked until detach. The others do single-shot IPC and exit. |
+| `vsd --session NAME` | remote, background | One process per session. Owns the inner PTY + host engines + a per-session socket at `$XDG_RUNTIME_DIR/vsd/<NAME>.sock`. Spawned by `vsd new` via double-fork-and-exec. |
 | inner program | remote, inside a session | The user's shell, vim, htop, vmux-on-remote, anything. |
 
-The whole chain between local `veter` and a remote `veterd --session`
+The whole chain between local `veter` and a remote `vsd --session`
 is the plain SSH stdin/stdout pair. **No TCP socket, no port forwarding, no
 custom transport.** The bytes on the wire are exactly the existing
 PRT / VGE / VFT envelopes. Local `veter`'s portal parser already
-treats every portal as a recursive host, so a remote `veterd`
+treats every portal as a recursive host, so a remote `vsd`
 emitting envelopes inside an SSH-mediated pane is structurally
 identical to any other inner program emitting envelopes.
 
@@ -90,7 +90,7 @@ handled at the multiplexer layer. That approach was rejected:
   on every change.
 
 The host already owns this state authoritatively. Moving the
-persistent boundary to *the host process itself* (`veterd`) means:
+persistent boundary to *the host process itself* (`vsd`) means:
 
 - Engines live in exactly one place.
 - The renderer (local `veter`) stays as-is — it has no notion of
@@ -101,21 +101,21 @@ The cost is a snapshot serializer inside the host engines (§4); it
 is the only genuinely new piece of protocol-adjacent code in the
 plan.
 
-## 2. veterd
+## 2. vsd
 
 ### 2.1 Process model
 
-`veterd` runs **one process per session**, not a single daemon
+`vsd` runs **one process per session**, not a single daemon
 hosting many. Each session is a long-lived background process
 listening on its own Unix socket at
-`$XDG_RUNTIME_DIR/veterd/<NAME>.sock` (mode `0600`, owner-only).
+`$XDG_RUNTIME_DIR/vsd/<NAME>.sock` (mode `0600`, owner-only).
 The runtime dir itself is `0700`. The CLI front-end is short-lived:
 it talks to per-session sockets and never owns engine state.
 
 Each session process owns:
 
 - An inner PTY pair, with a child process (default `$SHELL`, or
-  whatever was passed to `veterd new`) running on its slave side.
+  whatever was passed to `vsd new`) running on its slave side.
 - Host engine instances:
   - vt100 (the vendored `vt100` fork) for the top-level grid.
   - PRT engine (recursive — children for any nested portals the
@@ -139,7 +139,7 @@ are unaffected.
 
 A session process:
 
-- Starts when `veterd new NAME [argv...]` re-execs the binary into
+- Starts when `vsd new NAME [argv...]` re-execs the binary into
   `--session NAME [argv...]` inside a double-forked detached child
   (stdio redirected to `<NAME>.log`).
 - Exits when:
@@ -151,15 +151,15 @@ A session process:
   runtime dir stays clean.
 
 There is no central server, no `kill-server`, no auto-spawn-on-
-attach. `veterd attach NAME` on a nonexistent session errors out.
+attach. `vsd attach NAME` on a nonexistent session errors out.
 
 ### 2.3 CLI surface
 
 ```text
-veterd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
-veterd attach NAME                # attach the calling terminal
-veterd list                       # enumerate live sessions
-veterd kill NAME                  # tear down NAME
+vsd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
+vsd attach NAME                # attach the calling terminal
+vsd list                       # enumerate live sessions
+vsd kill NAME                  # tear down NAME
 ```
 
 `new` (without `-a`) returns once the session's socket is responding
@@ -171,8 +171,8 @@ caller's stdio. `list` is a CLI-side directory scan + per-socket
 Internal modes invoked by `new`:
 
 ```text
-veterd --session NAME [argv ...]              # detached session backend
-veterd --foreground-session NAME [argv ...]   # non-detached, for debugging
+vsd --session NAME [argv ...]              # detached session backend
+vsd --foreground-session NAME [argv ...]   # non-detached, for debugging
 ```
 
 These are hidden from `--help`; users only invoke the four
@@ -180,7 +180,7 @@ subcommands above.
 
 ### 2.4 Stdio handover
 
-When `veterd attach NAME` is invoked, the CLI:
+When `vsd attach NAME` is invoked, the CLI:
 
 1. Connects to `<NAME>.sock`.
 2. Sends `Request::Attach`.
@@ -192,7 +192,7 @@ The session process now owns those fds directly. From that point
 on, the SSH PTY is glued to the session process (not to the original
 CLI process), which means:
 
-- No long-lived `veterd-attach` middleman is consuming a PTY slot.
+- No long-lived `vsd-attach` middleman is consuming a PTY slot.
 - Detaching is a matter of the session closing its end of the fds
   and going silent; ssh-side stdio falls back to whatever shell
   the user was in before the attach.
@@ -215,12 +215,12 @@ still a GUI process that:
 The only refactor that touches `veter` is an internal one: the host
 engine modules (`veter/src/prt`, `veter/src/vge`, plus the vendored
 `vt100`) become a new `veter-host` library crate that both `veter`
-and `veterd` link against. No public-API change; no protocol
+and `vsd` link against. No public-API change; no protocol
 change. See §8.
 
 ## 4. The snapshot protocol (VSS)
 
-On every `attach`, `veterd` has to bring a fresh renderer into the
+On every `attach`, `vsd` has to bring a fresh renderer into the
 session's exact current state. The chosen format is a **versioned
 binary state dump** that the renderer decodes and writes directly
 into its engine structs — no parsing of replayed commands, no side
@@ -289,10 +289,10 @@ envelopes without busting any single APC budget. Reassembly is by
 `snapshot_version` is a single monotonic `u32` baked into both
 binaries at build time. Bump on every breaking change to any
 sub-snapshot layout. **Strict match.** On mismatch the renderer
-emits `SnapshotRejected { reason = 1 }`; `veterd` writes a plain-text
+emits `SnapshotRejected { reason = 1 }`; `vsd` writes a plain-text
 banner to the renderer's alt-screen view, holds for ~2 s, and tears
 the attach down via the existing `ATTACH_LEAVE`. No replay fallback.
-The operational expectation is that `veterd` and `veter` ship in
+The operational expectation is that `vsd` and `veter` ship in
 lockstep.
 
 ### 4.3 Snapshot payload
@@ -335,9 +335,9 @@ are abandoned on reattach (same policy as the v1 replay). Lives in
 `veter-host` as `PrtEngine::binary_snapshot()` /
 `restore_from_binary_snapshot()`.
 
-### 4.4 Engine-side composition (veterd)
+### 4.4 Engine-side composition (vsd)
 
-`tools/veterd/src/attach.rs::handler_main` replaces the v1 replay
+`tools/vsd/src/attach.rs::handler_main` replaces the v1 replay
 composition (lines ~237–245). Under the engines lock:
 
 1. Grab `vt`, `vge`, `prt` binary snapshots.
@@ -354,7 +354,7 @@ composition (lines ~237–245). Under the engines lock:
 6. On reject: print a plain-text mismatch banner to the alt-screen
    view; `ATTACH_LEAVE`; tear the attach down.
 
-The per-session worker thread (`tools/veterd/src/engines.rs`) is
+The per-session worker thread (`tools/vsd/src/engines.rs`) is
 **unchanged**: it keeps forwarding inner-PTY bytes verbatim once
 the snapshot is acknowledged. Pass-through after attach is exactly
 what it is today, modulo the new VSS marker that PRT / VGE / VFT
@@ -411,16 +411,16 @@ transport:
   local `veter`. The pane is a PRT portal owned by local `veter`.
 - The SSH client transports stdio bytes verbatim between local
   `veter` (via vmux) and the remote login shell.
-- On the remote, `veterd attach foo` hijacks the SSH PTY's stdio
+- On the remote, `vsd attach foo` hijacks the SSH PTY's stdio
   and starts emitting PRT / VGE envelopes upward through SSH.
 - Local `veter`'s portal parser sees those envelopes as if they
   came from any other inner program (recursive portal hosting).
 
-VFT (file transfer, `vsend` / `vrecv`) running *inside* a veterd
-session must reach the *local* host, not be consumed by `veterd`.
+VFT (file transfer, `vsend` / `vrecv`) running *inside* a vsd
+session must reach the *local* host, not be consumed by `vsd`.
 The portal-recursive parsing already implements
 "pass-through markers I don't own" for PRT and VGE; the same rule
-applies to `veterd` for VFT. `veterd`'s host engines must declare
+applies to `vsd` for VFT. `vsd`'s host engines must declare
 which extensions they consume and forward every other extension's
 APC envelopes verbatim. This is a per-host-implementation rule,
 not a protocol change.
@@ -430,22 +430,22 @@ required.
 
 ## 6. Detach ergonomics
 
-The detach trigger is owned by `veterd`, not by local `vmux` or
+The detach trigger is owned by `vsd`, not by local `vmux` or
 local `veter`. The reason is that detach is a session-control event
-and only `veterd` can correctly act on it (cleanly close stdio,
+and only `vsd` can correctly act on it (cleanly close stdio,
 keep the inner PTY).
 
-For v1, the trigger is a configurable byte sequence on `veterd`'s
+For v1, the trigger is a configurable byte sequence on `vsd`'s
 input stream — something rare enough that the user is unlikely to
 press it accidentally, distinct from vmux's prefix
 (default `Ctrl+Space`). A reasonable default is `Ctrl+\` followed
 by `d` (analogous to tmux's `prefix-d`, but with a different
 prefix so it never collides with a local-vmux prefix that may
-itself be running inside the session). `veterd` reads this off
+itself be running inside the session). `vsd` reads this off
 its input stream before forwarding the rest to the inner PTY.
 
 A protocol-level detach command (so local `vmux` can offer a
-"prefix-D" that talks directly to `veterd`) is defined by the
+"prefix-D" that talks directly to `vsd`) is defined by the
 companion document `doc/session-extension.md` (SES) and is
 implemented — `vmux`'s `prefix-D` sends a SES `Detach`, which the
 session process turns into this same teardown via its
@@ -456,14 +456,14 @@ session process turns into this same teardown via its
 - **No shared sessions.** Exactly one renderer attached at a time
   per session. A second attach kicks the first. Multi-renderer
   (mirroring, observer mode) is a future direction.
-- **No state persistence across `veterd` restarts.** Sessions are
+- **No state persistence across `vsd` restarts.** Sessions are
   in-memory only. Daemon dying = sessions gone.
 - **No cross-host session migration.** A session is bound to the
-  machine its `veterd` runs on.
+  machine its `vsd` runs on.
 - **No automatic auth.** The Unix socket is mode-0700 in
   `$XDG_RUNTIME_DIR`; only the same UID can attach. Cross-user
   session sharing is out.
-- **No GUI for `veterd`.** The daemon is headless and exposes
+- **No GUI for `vsd`.** The daemon is headless and exposes
   itself only through the CLI and the upstream SSH PTY.
 - ~~**No vmux integration.**~~ *Landed.* vmux now learns its
   session name (shown as a tab-bar segment) and offers `prefix-D`
@@ -482,19 +482,19 @@ Tracked in `CONTEXT.md`. Summarised:
 3. vt100 redraw serializer (`Screen::full_contents_formatted`).
 4. PRT / VGE state serializers (`PrtEngine::serialize_state`,
    `VgeEngine::serialize_state`).
-5. `veterd` skeleton (`new` / `list` / `kill` / `kill-server`).
+5. `vsd` skeleton (`new` / `list` / `kill` / `kill-server`).
 6. `attach` with replay snapshot over `SCM_RIGHTS` stdio handover.
 7. Detach hotkey (`Ctrl+\ d`).
 8. Packaging (cross-compile to aarch64-musl, included in
    `dist-aarch64-deb`).
 
 These are end-to-end smoke-tested. The replay path is the current
-production code path on the `veterd` branch.
+production code path on the `vsd` branch.
 
 ### 8.2 v2 (VSS binary snapshot) — next track
 
 The replay-style serializers stay in tree while VSS lands so the
-two can be A/B-tested. The `veterd` switchover (step 7 below) is
+two can be A/B-tested. The `vsd` switchover (step 7 below) is
 the cutover moment; step 8 garbage-collects the replay path.
 
 1. **`vss-protocol` crate.** Wire-format only (envelope codec, frame
@@ -524,7 +524,7 @@ the cutover moment; step 8 garbage-collects the replay path.
    per-portal pipeline in `veter-host/src/prt/state.rs::WritePortal`.
    Manual end-to-end test by hand-rolling a VSS envelope inside a
    vmux pane.
-7. **`veterd` switches to VSS.** `attach.rs` composition rewritten;
+7. **`vsd` switches to VSS.** `attach.rs` composition rewritten;
    accept / reject upstream wired. End-to-end smoke (see §4.4 and
    §4.5). Replay serializers still in tree but unused.
 8. **Remove replay serializers.** Delete
@@ -540,15 +540,15 @@ Step 7 is the user-visible switchover; step 8 is cleanup.
 
 ### 8.3 v3 (per-session process) — landed
 
-The v1 daemon-of-many-sessions design (a single `veterd` process
+The v1 daemon-of-many-sessions design (a single `vsd` process
 holding a `HashMap<String, Session>`) was replaced with one process
 per session. CLI shape changed:
 
 ```text
-veterd new [-a] NAME [argv ...]
-veterd attach NAME
-veterd list
-veterd kill NAME
+vsd new [-a] NAME [argv ...]
+vsd attach NAME
+vsd list
+vsd kill NAME
 ```
 
 `start`, `kill-server`, and `--foreground` (daemon mode) were
@@ -562,7 +562,7 @@ What got simpler:
   no auto-spawn-the-daemon-on-first-CLI-call.
 - `Arc<Mutex<EngineState>>` still exists, but its scope is now one
   process. Crash in one session can't take down others.
-- `veterd list` is a CLI-side directory scan + per-session `Status`
+- `vsd list` is a CLI-side directory scan + per-session `Status`
   round-trip; stale sockets from crashed sessions auto-unlink on
   probe.
 
@@ -585,8 +585,8 @@ Resolved by the VSS design:
 
 Still open:
 
-- **`veterd new` versus auto-create on attach.** Should
-  `veterd attach foo` create `foo` if it doesn't exist (tmux-
+- **`vsd new` versus auto-create on attach.** Should
+  `vsd attach foo` create `foo` if it doesn't exist (tmux-
   style) or require an explicit `new`? tmux-style is friendlier;
   explicit-`new` makes typos visible. Probably tmux-style with a
   `--no-create` flag for scripts.
@@ -595,7 +595,7 @@ Still open:
   around as a "dead" session the user can still attach to (to
   read final scrollback)? tmux ends it; the alternative has
   ergonomic value but complicates the lifecycle. Default to
-  ending, with `veterd new --linger` as an opt-in later.
+  ending, with `vsd new --linger` as an opt-in later.
 - **Image table digest probe.** Mentioned in §4.6 as a deferred
   optimisation. The minimum viable version is a one-frame VGE
   capability bit ("renderer remembers image digests across
@@ -606,7 +606,7 @@ VSS-specific:
 
 - **`SnapshotAccepted` timeout.** Tentative 1 s, matching the
   existing `PROBE_TIMEOUT` (see
-  `tools/veterd/src/attach.rs`). Revisit if WAN attaches feel
+  `tools/vsd/src/attach.rs`). Revisit if WAN attaches feel
   sluggish.
 - **VFT in-flight transfer survival.** Current decision: abandon
   on reattach (matches v1). A small "live-transfer state"
@@ -614,8 +614,8 @@ VSS-specific:
 - **Reply suppression on the renderer side during an attach.**
   The renderer's per-portal engines see forwarded inner-program
   bytes and may generate CPR / DSR / title responses that
-  `veterd` has already answered locally. Correctness is fine —
-  `veterd` discards the stray PRT responses — but it's wasted
+  `vsd` has already answered locally. Correctness is fine —
+  `vsd` discards the stray PRT responses — but it's wasted
   upstream bandwidth. Defer to v1.1.
 - **Multi-attach.** Out of scope for v1. The
   `session.attached` flag stays as "exactly one renderer at a
@@ -632,7 +632,7 @@ VSS-specific:
 - `doc/vector-graphics-extension.md` — VGE spec. Unchanged.
 - `doc/file-transfer-extension.md` — VFT spec. Unchanged.
 - `doc/session-extension.md` — SES. *Implemented.* The
-  client-to-host control channel (vmux ↔ veterd): a session-name
+  client-to-host control channel (vmux ↔ vsd): a session-name
   probe and a detach command. Note that the related per-portal
   *activity* signal lives in PRT (`PortalActivity`, portal
   extension §8.10), not in SES — activity is per-portal and must

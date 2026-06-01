@@ -2,7 +2,7 @@
 //!
 //! SES is a small APC-framed control channel between a multiplexer
 //! client (`vmux`) and its immediate host. The host may be local
-//! `veter` (no session) or a `veterd --session` process (a named,
+//! `veter` (no session) or a `vsd --session` process (a named,
 //! persistent session). SES lets the client learn the session name
 //! it lives inside and ask the host to detach it. See
 //! `doc/session-extension.md` for the protocol's role; the wire

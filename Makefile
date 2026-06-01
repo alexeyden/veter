@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vplay vmux vsend vrecv veterd vssh
+PACKAGES := veter vcat vplay vmux vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
@@ -54,7 +54,7 @@ help:
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
-	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vplay/vsend/vrecv/veterd"
+	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vplay/vsend/vrecv/vsd"
 	@echo "                          for <arch>-unknown-linux-musl (static, rust-lld)"
 	@echo "  dist-<arch>-tarxz       bundle the above into a .tar.xz under dist/"
 	@echo "  dist-<arch>-manifest    write a sha256-stamped manifest beside the tarball"
@@ -170,7 +170,7 @@ clean:
 
 # ---- musl-static distribution of client-side tools ------------------
 #
-# Cross-builds vmux, vcat, vplay, vsend, vrecv, veterd for the musl-static
+# Cross-builds vmux, vcat, vplay, vsend, vrecv, vsd for the musl-static
 # targets enumerated in DIST_ARCHES, using rust-lld (which ships with
 # rustup-installed rustc, so no host toolchain prereq beyond
 # `rustup target add`). The resulting binaries are fully static — no
@@ -178,7 +178,7 @@ clean:
 # into either a .tar.xz or a .deb. Per-arch targets are emitted by the
 # DIST_ARCH_RULES macro below.
 
-DIST_TOOLS := vmux vcat vplay vsend vrecv veterd
+DIST_TOOLS := vmux vcat vplay vsend vrecv vsd
 DIST_VERSION ?= 0.1.7
 
 # `install-remote-<arch>` knobs. `REMOTE` is required — it's whatever
@@ -254,7 +254,7 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    '  vplay   interactive image/video viewer (VGE; needs ffmpeg)' \
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
-	    '  veterd  persistent session daemon (doc/session-manager.md)' \
+	    '  vsd  persistent session daemon (doc/session-manager.md)' \
 	    > $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/README
 	@tar -cJf $$(DIST_TARXZ_FILE_$(1)) \
 	    -C $$(DIST_TARXZ_STAGING_$(1)) veter-tools-$$(DIST_VERSION)
@@ -301,8 +301,8 @@ dist-$(3)-deb: dist-$(3)-build
 	    'Maintainer: $$(DIST_MAINTAINER)' \
 	    'Description: Remote-side tools for the Veter terminal emulator' \
 	    ' Statically-linked $(4) binaries for vmux, vcat, vplay, vsend,' \
-	    ' vrecv, and veterd. The first five talk PRT/VGE/VFT to a' \
-	    ' Veter-aware terminal (or to vmux running inside one); veterd is' \
+	    ' vrecv, and vsd. The first five talk PRT/VGE/VFT to a' \
+	    ' Veter-aware terminal (or to vmux running inside one); vsd is' \
 	    ' a persistent session daemon that owns inner PTYs across renderer' \
 	    ' attach/detach cycles (see doc/session-manager.md). The binaries' \
 	    ' have no runtime dependencies on the target system, except vplay' \

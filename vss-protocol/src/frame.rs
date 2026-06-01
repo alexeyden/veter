@@ -13,7 +13,7 @@
 /// extensions.
 pub const PROTOCOL_VERSION: u8 = 0;
 
-/// Monotonic engine-state snapshot version. Both `veterd` and
+/// Monotonic engine-state snapshot version. Both `vsd` and
 /// `veter` bake this constant into their binaries; the renderer
 /// rejects any incoming snapshot whose `SnapshotBegin.snapshot_version`
 /// differs. Bump on every breaking change to *any* of the three
@@ -60,7 +60,7 @@ pub const ESC: u8 = 0x1B;
 pub const APC_OPEN: u8 = 0x5F; // '_'
 pub const ST_CLOSE: u8 = 0x5C; // '\\'
 
-/// Default ceiling on a single fragment's payload, in bytes. veterd
+/// Default ceiling on a single fragment's payload, in bytes. vsd
 /// chunks `Vt/Vge/Prt` snapshots at this granularity before wrapping
 /// them in envelopes. 16 KiB stays well under any plausible per-APC
 /// budget while keeping the frame count modest for multi-megabyte

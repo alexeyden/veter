@@ -48,7 +48,7 @@ pub enum HostFrame {
     /// Command failed.
     Err { code: u16, msg: String },
     /// Answer to `Probe`. `in_session` is false for a plain `veter`
-    /// host (and for any per-portal scope); true for a `veterd`
+    /// host (and for any per-portal scope); true for a `vsd`
     /// session, in which case `name` is the session name. `features`
     /// is a reserved capability bitmask, `0` in v0.
     ProbeResponse {

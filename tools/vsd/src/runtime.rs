@@ -4,7 +4,7 @@
 //! Filesystem layout is flat:
 //!
 //! ```text
-//! $XDG_RUNTIME_DIR/veterd/
+//! $XDG_RUNTIME_DIR/vsd/
 //!   <NAME>.sock       per-session Unix-domain socket (mode 0700)
 //!   <NAME>.log        per-session stderr/stdout for detached `new`
 //! ```
@@ -50,18 +50,18 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `$XDG_RUNTIME_DIR/veterd/`. Falls back to `/tmp/veterd-<uid>/` if
+/// `$XDG_RUNTIME_DIR/vsd/`. Falls back to `/tmp/vsd-<uid>/` if
 /// the env var is unset (e.g. plain sshd without pam_systemd).
 pub fn runtime_dir() -> PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(format!(
-                "/tmp/veterd-{}",
+                "/tmp/vsd-{}",
                 nix::unistd::getuid().as_raw()
             ))
         });
-    runtime.join("veterd")
+    runtime.join("vsd")
 }
 
 /// Per-session socket path: `<runtime>/<NAME>.sock`.
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn probe_returns_missing_for_nonexistent_path() {
-        let tmp = std::env::temp_dir().join("veterd-test-missing.sock");
+        let tmp = std::env::temp_dir().join("vsd-test-missing.sock");
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(probe_socket(&tmp), SocketProbe::Missing);
     }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn probe_unlinks_stale_socket() {
         let tmp = std::env::temp_dir().join(format!(
-            "veterd-test-stale-{}.sock",
+            "vsd-test-stale-{}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn probe_returns_alive_for_listening_socket() {
         let tmp = std::env::temp_dir().join(format!(
-            "veterd-test-alive-{}.sock",
+            "vsd-test-alive-{}.sock",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);

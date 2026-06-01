@@ -39,7 +39,7 @@ terminal → client:   ESC _ v g e <payload> ESC \
 A terminal that implements VGE MUST forward APC envelopes whose marker
 is not `VGE`/`vge` (PRT, VFT, iTerm-style `ESC _ G …`, or anything
 else) verbatim to its downstream layer. This pass-through rule is what
-lets a stack of nested hosts — for example a remote `veterd`
+lets a stack of nested hosts — for example a remote `vsd`
 consuming PRT + VGE while a `vsend` running inside its session emits
 VFT bytes that must reach the local user's terminal — layer cleanly
 without each level having to understand every extension. See

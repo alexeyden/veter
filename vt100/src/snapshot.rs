@@ -4,7 +4,7 @@
 //! — so a fresh `Screen` can be reconstructed verbatim on the
 //! renderer side without re-parsing any escape sequences.
 //!
-//! Used from `tools/veterd` to compose a snapshot and from
+//! Used from `tools/vsd` to compose a snapshot and from
 //! `veter-host`'s `VssEngine` to apply one. See `doc/session-manager.md`
 //! §4 for the protocol-level role.
 //!

@@ -1,6 +1,6 @@
 //! Veter State Snapshot (VSS) wire format.
 //!
-//! VSS carries a binary engine-state dump from `veterd` to an
+//! VSS carries a binary engine-state dump from `vsd` to an
 //! attaching renderer, replacing the v1 replay-style snapshot. See
 //! `doc/session-manager.md` §4 for the protocol's role; the wire
 //! format is documented inline against the PRT/VGE/VFT §1.1–1.4
@@ -10,7 +10,7 @@
 //! This crate is wire-format only: streaming APC parser, primitive
 //! codec, typed frame bodies, envelope wrapping. Host-side state
 //! lives in `veter-host`'s `VssEngine` (snapshot reassembly, restore
-//! dispatch); session lifecycle lives in `tools/veterd`.
+//! dispatch); session lifecycle lives in `tools/vsd`.
 
 pub mod apc;
 pub mod codec;

@@ -2,6 +2,6 @@
 name = "vss-protocol"
 version = "0.1.0"
 edition = "2024"
-description = "VSS (Veter State Snapshot) wire format: APC envelope, frame codec, snapshot framing used by veterd to ship a binary engine snapshot to an attaching renderer. See doc/session-manager.md §4."
+description = "VSS (Veter State Snapshot) wire format: APC envelope, frame codec, snapshot framing used by vsd to ship a binary engine snapshot to an attaching renderer. See doc/session-manager.md §4."
 
 [dependencies]

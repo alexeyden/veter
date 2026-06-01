@@ -2,11 +2,11 @@
 name = "veter-host"
 version = "0.1.0"
 edition = "2024"
-description = "GUI-free host engines (vt100 + VGE + PRT + VFT) shared by the local veter GUI binary and the headless veterd session daemon."
+description = "GUI-free host engines (vt100 + VGE + PRT + VFT) shared by the local veter GUI binary and the headless vsd session daemon."
 
 # The `gui` feature pulls in the desktop-side dependencies that VFT
 # needs when running on a real renderer (native file pickers, OS
-# `open` for finalized downloads). Headless consumers (veterd) omit
+# `open` for finalized downloads). Headless consumers (vsd) omit
 # the feature; the file-picker and "open after finalize" hooks then
 # degrade to no-ops, which is exactly the right semantics for a
 # daemon — VFT envelopes pass through to the actual renderer where
@@ -26,7 +26,7 @@ rgb = "0.8"
 libc = "0.2"
 # VGE decodes uploaded WebP/PNG images into RGBA8 for storage; the
 # engine needs to do this without any GUI involvement so headless
-# veterd can keep state authoritative across attaches.
+# vsd can keep state authoritative across attaches.
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 rfd = { version = "0.15", default-features = false, features = ["gtk3"], optional = true }
 opener = { version = "0.8", optional = true }

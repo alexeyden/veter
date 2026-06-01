@@ -5,7 +5,7 @@
 // `Detach` requests to the caller.
 //
 // One `SesEngine` lives at the host level and one per portal — same
-// shape. Only the host-level engine of a `veterd` session carries a
+// shape. Only the host-level engine of a `vsd` session carries a
 // session name; `veter` and every per-portal scope use `new()` and
 // report "not in a session".
 
@@ -17,7 +17,7 @@ use ses_protocol::{
 /// Per-context SES engine.
 pub struct SesEngine {
     apc: ApcStream,
-    /// `Some(name)` for the host-level engine of a `veterd` session;
+    /// `Some(name)` for the host-level engine of a `vsd` session;
     /// `None` for `veter` and for every per-portal scope.
     session: Option<String>,
     /// `ses` response envelopes produced for commands seen so far.
@@ -47,7 +47,7 @@ impl SesEngine {
     }
 
     /// A session engine: `Probe` reports `in_session = true` with
-    /// `name`, and `Detach` is accepted. Used by `veterd` for the
+    /// `name`, and `Detach` is accepted. Used by `vsd` for the
     /// top-level engine of a session process.
     pub fn with_session(name: impl Into<String>) -> Self {
         Self {

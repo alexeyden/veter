@@ -5,7 +5,7 @@ edition = "2024"
 
 # Hybrid lib+bin: the lib face exposes the host engine modules
 # (vge, prt, vft) and their dependencies so other workspace crates —
-# notably `veterd` (`doc/session-manager.md`) — can link against the
+# notably `vsd` (`doc/session-manager.md`) — can link against the
 # same engine state without re-implementing it. The `[[bin]]` target
 # is the GUI veter binary itself.
 [lib]

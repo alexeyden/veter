@@ -1,5 +1,5 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
-// re-imports them for in-file references. veterd and other workspace
+// re-imports them for in-file references. vsd and other workspace
 // crates pull the same code through `veter::*`.
 use veter::{clipboard, prt, pty, renderer, search, ses, vft, vge, vss};
 
@@ -516,7 +516,7 @@ struct App {
     ses: Option<ses::SesEngine>,
     /// Host-level pre-attach backup: same role as the per-portal
     /// `Portal::pre_attach_backup`, but for the rare case where a
-    /// `veterd attach` writes to the host's outermost vt100 / VGE /
+    /// `vsd attach` writes to the host's outermost vt100 / VGE /
     /// PRT instead of into a vmux pane portal. Saved on the first
     /// VSS `SnapshotBegin` of an attach; restored on `DetachNotify`.
     vss_pre_attach_backup: Option<HostVssBackup>,
@@ -2220,7 +2220,7 @@ impl App {
                     // Apply any completed host-level VSS snapshots.
                     // A snapshot arriving at this level replaces the
                     // host's vt100 / VGE / PRT engines wholesale —
-                    // used when veterd runs directly under a veter
+                    // used when vsd runs directly under a veter
                     // host with no intervening vmux pane. The more
                     // common case is per-portal snapshots, handled
                     // by `prt::WritePortal` recursively.
@@ -2958,7 +2958,7 @@ fn main() {
 
 /// Diagnostic-only trace of keyboard bytes about to be written to the
 /// inner PTY. Enable with `VETER_DEBUG_INPUT=1`; output goes to
-/// `/tmp/veter-input.log` with the same hexdump format as veterd's
+/// `/tmp/veter-input.log` with the same hexdump format as vsd's
 /// renderer-input trace, so the two logs can be lined up
 /// timestamp-wise to find where bytes go missing or get reordered.
 fn trace_keyboard_send(bytes: &[u8]) {

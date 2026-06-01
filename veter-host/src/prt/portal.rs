@@ -170,7 +170,7 @@ pub struct Portal {
     /// host's filesystem with the host's user permissions; isolation
     /// is OS-level (containers, user accounts), not VFT-level.
     pub vft: VftEngine,
-    /// Every portal owns its own VSS engine so a `veterd attach`
+    /// Every portal owns its own VSS engine so a `vsd attach`
     /// running inside *this* portal can ship its binary engine
     /// snapshot into this scope. See `doc/session-manager.md` §4.5
     /// (renderer-side application).

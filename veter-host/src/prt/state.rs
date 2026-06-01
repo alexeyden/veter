@@ -342,7 +342,7 @@ impl PrtEngine {
     }
 
     /// Update the cell pixel dimensions and scale factor this engine
-    /// reports to inner programs. Used by veterd's attach path so that
+    /// reports to inner programs. Used by vsd's attach path so that
     /// per-portal sub-engines spawned after the renderer's probe
     /// arrives inherit the renderer's real metrics instead of the
     /// session-creation-time defaults. Existing portals keep the
@@ -1277,7 +1277,7 @@ impl PrtEngine {
             portal.vft.drive();
 
             // 2c. VSS — extract any ESC_VSS envelopes carrying a
-            //     binary engine-state snapshot from a veterd attach
+            //     binary engine-state snapshot from a vsd attach
             //     running inside this portal. Apply each completed
             //     snapshot to this portal's own engines (vt100,
             //     children PRT, per-portal VGE). See

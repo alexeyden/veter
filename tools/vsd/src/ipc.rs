@@ -1,4 +1,4 @@
-//! Length-prefixed binary IPC between the `veterd` CLI front-end and
+//! Length-prefixed binary IPC between the `vsd` CLI front-end and
 //! the per-session daemon processes.
 //!
 //! Frame layout (both directions):
@@ -10,10 +10,10 @@
 //! ```
 //!
 //! Strings are `u32 len` (LE) + UTF-8 bytes. The protocol is
-//! intentionally tiny — it evolves alongside `veterd` and lives
+//! intentionally tiny — it evolves alongside `vsd` and lives
 //! entirely within this repo, so robust evolution rules are not a
 //! v1 concern. Frames are sent over a per-session Unix-domain socket
-//! at `$XDG_RUNTIME_DIR/veterd/<NAME>.sock` (mode 0700).
+//! at `$XDG_RUNTIME_DIR/vsd/<NAME>.sock` (mode 0700).
 //!
 //! Each session is its own process listening on its own socket;
 //! `New` / `List` / `KillServer` from the v1 daemon-of-many-sessions
@@ -41,7 +41,7 @@ pub enum Request {
     /// `Kill` won't reach anyone because the socket is gone.
     Kill,
     /// Return a [`SessionInfo`] snapshot describing this session.
-    /// Used by `veterd list` to populate the table.
+    /// Used by `vsd list` to populate the table.
     Status,
 }
 

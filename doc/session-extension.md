@@ -1,7 +1,7 @@
 # Veter Session Extension (SES)
 
 > **Status: WIP.** Implemented. The companion to `doc/session-manager.md`
-> (`veterd`): the small control channel a multiplexer client (`vmux`)
+> (`vsd`): the small control channel a multiplexer client (`vmux`)
 > uses to discover the session it lives in and to detach it. Wire-format
 > crate `ses-protocol`; host engine `veter-host`'s `SesEngine`.
 
@@ -10,10 +10,10 @@ VGE (`doc/vector-graphics-extension.md`), VFT (`doc/file-transfer-extension.md`)
 and VSS (`doc/session-manager.md` §4). It carries two things between a
 multiplexer client and its **immediate host**:
 
-- the **name of the `veterd` session** the client is running inside, so
+- the **name of the `vsd` session** the client is running inside, so
   the client can show it (e.g. in a tab bar), and
 - a **detach** command, so the client can offer a key binding that
-  detaches the session — the protocol-level equivalent of `veterd`'s
+  detaches the session — the protocol-level equivalent of `vsd`'s
   `Ctrl+\ d` hotkey (`doc/session-manager.md` §6).
 
 ## 1. Why a separate extension
@@ -61,11 +61,11 @@ Empty body. The client sends this once, alongside its PRT/VGE probes.
 ```
 u8     protocol_version
 u8     features          ; reserved capability bitmask, 0 in v0
-u8     in_session        ; 0 = not a session, 1 = a veterd session
+u8     in_session        ; 0 = not a session, 1 = a vsd session
 string name              ; session name when in_session, else empty
 ```
 
-`in_session = 1` only for the top-level engine of a `veterd --session`
+`in_session = 1` only for the top-level engine of a `vsd --session`
 process; local `veter` and every per-portal scope (§5) answer `0` with
 an empty `name`. The body length is the source of truth: a client
 reading a shorter body treats missing trailing fields as zero.
@@ -102,7 +102,7 @@ Every command produces exactly one response, with the command's
 ## 6. Detach semantics
 
 `Detach` asks the host to end the current attach. On a session host it
-triggers the **same teardown** as `veterd`'s `Ctrl+\ d` hotkey
+triggers the **same teardown** as `vsd`'s `Ctrl+\ d` hotkey
 (`doc/session-manager.md` §6): the renderer's stdio is released, the
 inner PTY and all engine state are kept, and the session keeps running
 detached. The host replies `Ok`.
@@ -135,7 +135,7 @@ SES is consumed by the client's **immediate host** and is **never
 forwarded** upward (unlike VFT, which must reach the local machine).
 Each host scope runs its own `SesEngine`:
 
-- A `veterd --session` process runs a session engine at its top level
+- A `vsd --session` process runs a session engine at its top level
   (the inner program — typically `vmux` — is its SES client).
 - Local `veter` runs a non-session engine at its top level.
 - Every PRT portal owns a per-portal engine. A portal is an inner
@@ -145,7 +145,7 @@ Each host scope runs its own `SesEngine`:
   right scope rather than leaking to a vt100.
 
 Consequently a `vmux` running as the top-level inner program of a
-`veterd` session sees the session name; a `vmux` running inside a pane
+`vsd` session sees the session name; a `vmux` running inside a pane
 of another `vmux` sees `in_session = false`.
 
 ## 9. Relationship to the other extensions
@@ -156,5 +156,5 @@ of another `vmux` sees `in_session = false`.
   event, not a SES one, because activity is per-portal and must work in
   a local `veter` host that has no session.
 - `doc/vector-graphics-extension.md` (VGE) — unchanged.
-- `doc/session-manager.md` (`veterd`, VSS) — SES is its vmux-facing
+- `doc/session-manager.md` (`vsd`, VSS) — SES is its vmux-facing
   control channel; VSS remains the renderer-facing snapshot channel.

@@ -1,5 +1,5 @@
 // Envelope wrapping (§4.1) and the high-level `encode_snapshot`
-// helper used by veterd. Mirrors the shape of vft-protocol/envelope.rs.
+// helper used by vsd. Mirrors the shape of vft-protocol/envelope.rs.
 
 use super::codec::stuff;
 use super::frame::*;
@@ -122,7 +122,7 @@ pub fn encode_snapshot(
 }
 
 /// Convenience for a single `DetachNotify` frame in its own
-/// envelope. Used by the engine (veterd) at attach teardown to ask
+/// envelope. Used by the engine (vsd) at attach teardown to ask
 /// the renderer to restore its pre-attach state.
 pub fn encode_detach_notify() -> Vec<u8> {
     let mut frames = Vec::new();

@@ -2901,21 +2901,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "veterd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "nix 0.29.0",
- "prt-protocol",
- "veter-host",
- "vge-protocol",
- "vss-protocol",
- "vt100",
-]
-
-[[package]]
 name = "vft-client"
 version = "0.1.0"
 dependencies = [
@@ -2994,6 +2979,21 @@ dependencies = [
  "nix 0.29.0",
  "vft-client",
  "vft-protocol",
+]
+
+[[package]]
+name = "vsd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "nix 0.29.0",
+ "prt-protocol",
+ "veter-host",
+ "vge-protocol",
+ "vss-protocol",
+ "vt100",
 ]
 
 [[package]]

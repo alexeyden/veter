@@ -91,10 +91,10 @@ impl EngineState {
     /// which session it lives in.
     pub fn new(session_name: String) -> Self {
         let mut vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
-        // veterd is a state-mirroring middleman, not the real
+        // vsd is a state-mirroring middleman, not the real
         // terminal. The renderer upstream (e.g. local veter) is the
         // authoritative VGE host and the sole command responder.
-        // veterd still parses every VGE command and updates its own
+        // vsd still parses every VGE command and updates its own
         // engine state for snapshot replay, but it must not generate
         // response frames — otherwise the inner program (e.g. vcat)
         // gets two response envelopes per command, consumes one,
@@ -133,7 +133,7 @@ pub fn spawn_worker(
     let engines = Arc::new(Mutex::new(EngineState::new(session_name)));
     let engines_for_worker = Arc::clone(&engines);
     std::thread::Builder::new()
-        .name("veterd-worker".into())
+        .name("vsd-worker".into())
         .spawn(move || worker_main(reader_fd, writer_fd, engines_for_worker))
         .context("spawn worker thread")?;
     Ok(engines)
@@ -152,7 +152,7 @@ fn dup_owned(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
 /// whatever remains. After every chunk we run both engines'
 /// `after_vt100_process` hooks and write back any pending responses.
 ///
-/// VFT is intentionally **not** instantiated host-side in veterd: per
+/// VFT is intentionally **not** instantiated host-side in vsd: per
 /// the architecture sketch in `doc/session-manager.md`, VFT envelopes
 /// ride through the daemon verbatim (the pass-through contract in
 /// `doc/file-transfer-extension.md` §1.1 makes this normative). The
@@ -171,7 +171,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 if e.raw_os_error() == Some(libc::EIO) {
                     break;
                 }
-                eprintln!("veterd: worker read error: {e}");
+                eprintln!("vsd: worker read error: {e}");
                 break;
             }
         };
@@ -193,7 +193,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
             let vge_passthrough = vge.process_pty_chunk(&prt_chunk.passthrough);
             // SES sits after VGE, before vt100 — the inner vmux is the
-            // SES client; veterd is its host.
+            // SES client; vsd is its host.
             let ses_passthrough = ses.process_pty_chunk(&vge_passthrough);
             if !ses_passthrough.is_empty() {
                 parser.process(&ses_passthrough);
@@ -235,7 +235,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             // means it has gone away; the next read will EOF and we'll
             // exit the loop.
             if let Err(e) = writer.write_all(&to_write) {
-                eprintln!("veterd: worker write error: {e}");
+                eprintln!("vsd: worker write error: {e}");
                 break;
             }
         }

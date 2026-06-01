@@ -2,7 +2,7 @@
 //! extension's `VgeFragment` payload). Captures shared image / style
 //! tables, both main and alternate element sets, the active-screen
 //! flag, and engine-level cell dimensions / scale factor. Designed to
-//! round-trip byte-equal so veterd can ship snapshots and the renderer
+//! round-trip byte-equal so vsd can ship snapshots and the renderer
 //! can rebuild engine state without re-parsing any VGE commands.
 //!
 //! See `doc/session-manager.md` §4.3 for the protocol-level role.

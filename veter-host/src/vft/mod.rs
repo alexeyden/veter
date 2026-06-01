@@ -4,7 +4,7 @@
 //
 // The file-picker (`pick_open_path`) and post-finalize "open in
 // default app" hooks are gated behind the `gui` feature. Headless
-// consumers (veterd) leave the feature off; the picker returns
+// consumers (vsd) leave the feature off; the picker returns
 // `Cancelled` and the open-after step is a no-op, which is the
 // right semantics for a daemon — the real picker lives on the
 // renderer side.

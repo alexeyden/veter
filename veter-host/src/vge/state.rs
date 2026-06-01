@@ -53,7 +53,7 @@ impl Default for Limits {
 ///
 /// Decoupling from any particular renderer type keeps the host
 /// engines GUI-free so the same code can run inside a headless
-/// `veterd` process (see `doc/session-manager.md`).
+/// `vsd` process (see `doc/session-manager.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GpuImageId(pub u64);
 
@@ -532,8 +532,8 @@ pub struct VgeEngine {
     auto_reply_dsr: bool,
     /// When `false`, every VGE command is still parsed and applied
     /// (so engine state stays consistent — for snapshot replay etc.)
-    /// but **no** response frame is generated. Used by veterd's
-    /// session VGE engine: veterd is a state-mirroring middleman, not
+    /// but **no** response frame is generated. Used by vsd's
+    /// session VGE engine: vsd is a state-mirroring middleman, not
     /// the authoritative host, so it must not double-answer Probe,
     /// UploadImage, CreateElement, etc. The real host upstream
     /// (e.g. local veter's per-portal VGE for the SSH pane) is the
@@ -595,7 +595,7 @@ impl VgeEngine {
     }
 
     /// Toggle VGE command auto-replies. See the field doc on
-    /// `auto_reply_commands` — veterd uses this so the upstream real
+    /// `auto_reply_commands` — vsd uses this so the upstream real
     /// host is the sole responder and the inner program doesn't get
     /// two response envelopes per command.
     pub fn set_auto_reply_commands(&mut self, enabled: bool) {
@@ -1590,7 +1590,7 @@ mod tests {
 
     #[test]
     fn auto_reply_commands_disabled_suppresses_responses() {
-        // veterd disables command auto-reply on its session VGE
+        // vsd disables command auto-reply on its session VGE
         // engine so the upstream real host (e.g. local veter) is the
         // sole responder. Envelopes must still be consumed (not
         // leaked to vt100) and state changes still applied — only

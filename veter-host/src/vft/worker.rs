@@ -31,7 +31,7 @@ pub enum PickerResult {
 /// drain / response-slot plumbing without blocking on a real UI.
 pub fn run_picker(title: String, tx: Sender<PickerResult>, wakeup: Wakeup) {
     // Suppressed under cfg(test) so unit tests don't spawn real UI;
-    // suppressed when the `gui` feature is off (headless veterd) so
+    // suppressed when the `gui` feature is off (headless vsd) so
     // the picker becomes a deterministic Cancelled and the renderer's
     // own picker handles the real interaction.
     #[cfg(any(test, not(feature = "gui")))]
@@ -283,7 +283,7 @@ fn classify_io_error(e: &std::io::Error) -> u8 {
 /// abort the transfer; the file is already durable.
 ///
 /// Disabled under `cfg(test)` (don't spawn real apps from unit tests)
-/// and when the `gui` feature is off (headless veterd: the renderer
+/// and when the `gui` feature is off (headless vsd: the renderer
 /// has the real default-app launcher; opening from the daemon would
 /// happen on the wrong machine anyway).
 #[cfg(all(not(test), feature = "gui"))]
