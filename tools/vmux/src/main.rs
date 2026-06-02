@@ -27,7 +27,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -719,7 +719,9 @@ static HOST_THEMED_STYLES: AtomicBool = AtomicBool::new(false);
 /// Accent fill/stroke style for vmux chrome — a host `StyleRef` when the
 /// host themes `host.*`, else the compiled-in brand color.
 fn accent_style() -> Style {
-    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+    if CLI_ACCENT_SET.load(Ordering::Relaxed) {
+        Style::Flat(accent_color())
+    } else if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
         Style::Ref(HOST_ACCENT_STYLE_ID.to_string())
     } else {
         Style::Flat(COLOR_BRAND)
@@ -732,18 +734,32 @@ fn accent_style() -> Style {
 /// match the `StyleRef` chrome exactly.
 static HOST_ACCENT_RGBA: AtomicU32 = AtomicU32::new(0);
 
+/// CLI accent override (`--accent`/`-A`), packed `0xRRGGBBAA`. When
+/// `CLI_ACCENT_SET` is true this wins over both the host's reported accent
+/// and the compiled-in brand, letting an outer `ssh`/`vmux` give a nested
+/// session a distinct chrome color. Set once at startup.
+static CLI_ACCENT_SET: AtomicBool = AtomicBool::new(false);
+static CLI_ACCENT_RGBA: AtomicU32 = AtomicU32::new(0);
+
+/// Unpack a `0xRRGGBBAA` value into a normalized `Color`.
+fn color_from_rgba(rgba: u32) -> Color {
+    let [r, g, b, a] = rgba.to_be_bytes();
+    Color {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: a as f32 / 255.0,
+    }
+}
+
 /// The accent as a concrete color — the host's reported accent when it
 /// themes `host.*`, else the compiled-in brand. Used to derive shades the
 /// host does not provide as their own styles.
 fn accent_color() -> Color {
-    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
-        let [r, g, b, a] = HOST_ACCENT_RGBA.load(Ordering::Relaxed).to_be_bytes();
-        Color {
-            r: r as f32 / 255.0,
-            g: g as f32 / 255.0,
-            b: b as f32 / 255.0,
-            a: a as f32 / 255.0,
-        }
+    if CLI_ACCENT_SET.load(Ordering::Relaxed) {
+        color_from_rgba(CLI_ACCENT_RGBA.load(Ordering::Relaxed))
+    } else if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+        color_from_rgba(HOST_ACCENT_RGBA.load(Ordering::Relaxed))
     } else {
         COLOR_BRAND
     }
@@ -751,7 +767,7 @@ fn accent_color() -> Color {
 
 /// Translucent accent for the thumb behind a pane's title text.
 fn title_thumb_style() -> Style {
-    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+    if CLI_ACCENT_SET.load(Ordering::Relaxed) || HOST_THEMED_STYLES.load(Ordering::Relaxed) {
         Style::Flat(Color { a: 0.35, ..accent_color() })
     } else {
         Style::Flat(COLOR_TITLE_THUMB)
@@ -762,7 +778,7 @@ fn title_thumb_style() -> Style {
 /// session segment, and inactive tab-number cells. Scaled toward black so
 /// light foreground text stays legible over arbitrary shell content.
 fn surface_style() -> Style {
-    if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
+    if CLI_ACCENT_SET.load(Ordering::Relaxed) || HOST_THEMED_STYLES.load(Ordering::Relaxed) {
         let c = accent_color();
         const K: f32 = 0.20;
         Style::Flat(Color { r: c.r * K, g: c.g * K, b: c.b * K, a: 0.96 })
@@ -1629,57 +1645,65 @@ fn build_modal_commands(
 }
 
 /// Help-modal contents: list of every prefix keybinding. Activated via
-/// `prefix-?`, dismissed by any keystroke.
-const HELP_LINES: &[&str] = &[
-    "vmux keybindings  —  prefix is Ctrl+Space",
-    "",
-    "Pane",
-    "  v        split focused pane vertically",
-    "  h        split focused pane horizontally",
-    "  o        cycle focus to next pane",
-    "  x        close focused pane",
-    "  r        rename focused pane",
-    "  z        toggle zoom (focused pane fills the tab)",
-    "  s        resize mode (hjkl/arrows; q/Esc/Enter exit)",
-    "",
-    "Tab",
-    "  c        new tab",
-    "  n / →    next tab",
-    "  p / ←    previous tab",
-    "  1..9     jump to tab N",
-    "  < / >    move current tab left / right",
-    "  R        rename current tab",
-    "",
-    "Scroll  (prefix-[ enters; q/Esc/G exits)",
-    "  k / Up        scroll up one line",
-    "  j / Down      scroll down one line",
-    "  u / d         half page up / down",
-    "  PgUp / PgDn   full page up / down",
-    "  g / Home      jump to top of scrollback",
-    "  0 / End       jump back to live",
-    "",
-    "Mouse",
-    "  click pane     focus it",
-    "  click tab      switch to it",
-    "  drag divider   resize adjacent panes",
-    "  wheel          scroll pane under cursor",
-    "",
-    "Rename edit  (prefix-r / prefix-R; Enter commits, Esc cancels)",
-    "  Ctrl+A/E      start / end of line",
-    "  Ctrl+B/F      back / forward one char (or ←/→)",
-    "  Alt+B/F       back / forward one word",
-    "  Ctrl+W        delete word before cursor",
-    "  Alt+D         delete word after cursor",
-    "  Ctrl+U/K      delete to start / end of line",
-    "  Ctrl+D / Del  delete char under cursor",
-    "",
-    "Misc",
-    "  ?           show this help",
-    "  q           quit vmux (asks y/n to confirm)",
-    "  Ctrl+Space  send a literal Ctrl+Space",
-    "",
-    "j/k or ↑/↓ scroll · any other key dismisses",
-];
+/// `prefix-?`, dismissed by any keystroke. Built once on first use so the
+/// prefix-key lines reflect `--prefix`; the layout/sizing helpers read the
+/// resulting slice exactly as they did the former `const`.
+fn help_lines() -> &'static [String] {
+    static LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| {
+        let p = prefix_name();
+        vec![
+            format!("vmux keybindings  —  prefix is {p}"),
+            "".into(),
+            "Pane".into(),
+            "  v        split focused pane vertically".into(),
+            "  h        split focused pane horizontally".into(),
+            "  o        cycle focus to next pane".into(),
+            "  x        close focused pane".into(),
+            "  r        rename focused pane".into(),
+            "  z        toggle zoom (focused pane fills the tab)".into(),
+            "  s        resize mode (hjkl/arrows; q/Esc/Enter exit)".into(),
+            "".into(),
+            "Tab".into(),
+            "  c        new tab".into(),
+            "  n / →    next tab".into(),
+            "  p / ←    previous tab".into(),
+            "  1..9     jump to tab N".into(),
+            "  < / >    move current tab left / right".into(),
+            "  R        rename current tab".into(),
+            "".into(),
+            "Scroll  (prefix-[ enters; q/Esc/G exits)".into(),
+            "  k / Up        scroll up one line".into(),
+            "  j / Down      scroll down one line".into(),
+            "  u / d         half page up / down".into(),
+            "  PgUp / PgDn   full page up / down".into(),
+            "  g / Home      jump to top of scrollback".into(),
+            "  0 / End       jump back to live".into(),
+            "".into(),
+            "Mouse".into(),
+            "  click pane     focus it".into(),
+            "  click tab      switch to it".into(),
+            "  drag divider   resize adjacent panes".into(),
+            "  wheel          scroll pane under cursor".into(),
+            "".into(),
+            "Rename edit  (prefix-r / prefix-R; Enter commits, Esc cancels)".into(),
+            "  Ctrl+A/E      start / end of line".into(),
+            "  Ctrl+B/F      back / forward one char (or ←/→)".into(),
+            "  Alt+B/F       back / forward one word".into(),
+            "  Ctrl+W        delete word before cursor".into(),
+            "  Alt+D         delete word after cursor".into(),
+            "  Ctrl+U/K      delete to start / end of line".into(),
+            "  Ctrl+D / Del  delete char under cursor".into(),
+            "".into(),
+            "Misc".into(),
+            "  ?           show this help".into(),
+            "  q           quit vmux (asks y/n to confirm)".into(),
+            format!("  {p}  send a literal {p}"),
+            "".into(),
+            "j/k or ↑/↓ scroll · any other key dismisses".into(),
+        ]
+    })
+}
 
 /// Number of body lines a half-page jump moves through.
 const HELP_HALF_PAGE: i64 = 6;
@@ -1691,7 +1715,7 @@ const HELP_HALF_PAGE: i64 = 6;
 /// fills whatever is left.
 fn help_body_window(box_h: f32) -> (usize, u32) {
     let body_rows = (box_h as i32 - 3).max(1) as usize;
-    let body_lines = HELP_LINES.len().saturating_sub(1);
+    let body_lines = help_lines().len().saturating_sub(1);
     let max_offset = body_lines.saturating_sub(body_rows) as u32;
     (body_rows, max_offset)
 }
@@ -1701,7 +1725,7 @@ fn help_body_window(box_h: f32) -> (usize, u32) {
 /// `UpdateOrigin`-driven scroll updates compute identical values.
 fn help_thumb_origin_y(box_h: f32, offset: u32) -> f32 {
     let (body_rows, max_offset) = help_body_window(box_h);
-    let body_lines = HELP_LINES.len().saturating_sub(1);
+    let body_lines = help_lines().len().saturating_sub(1);
     if body_lines <= body_rows || max_offset == 0 {
         return 2.0;
     }
@@ -1724,14 +1748,14 @@ fn build_help_modal_elements(
     cell_pw: f32,
     cell_ph: f32,
 ) -> Vec<CreateElementBody> {
-    let max_line = HELP_LINES
+    let max_line = help_lines()
         .iter()
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(20) as f32;
     let inner_w = max_line.max(30.0);
     let box_w = (inner_w + 6.0).min(host_w.saturating_sub(2) as f32);
-    let inner_h = HELP_LINES.len() as f32;
+    let inner_h = help_lines().len() as f32;
     let box_h = (inner_h + 2.0).min(host_h.saturating_sub(2) as f32);
 
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
@@ -1739,7 +1763,7 @@ fn build_help_modal_elements(
 
     let (body_rows, max_offset) = help_body_window(box_h);
     let offset = offset.min(max_offset);
-    let body_lines = HELP_LINES.len().saturating_sub(1);
+    let body_lines = help_lines().len().saturating_sub(1);
     let scrollable = body_lines > body_rows;
 
     let mut elements: Vec<CreateElementBody> = Vec::new();
@@ -1768,7 +1792,7 @@ fn build_help_modal_elements(
                 align: Align::Center,
                 fill: Style::Flat(COLOR_MODAL_TEXT),
                 font_style: FontStyle(0x01),
-                text: HELP_LINES[0].to_string(),
+                text: help_lines()[0].to_string(),
             },
             DrawCmd::DrawLinePath {
                 stroke: accent_style(),
@@ -1809,8 +1833,8 @@ fn build_help_modal_elements(
     // element's origin shifts the whole stack up to scroll, and the
     // parent's clip rect hides what goes out of view.
     let mut body_cmds = Vec::with_capacity(body_lines);
-    for i in 1..HELP_LINES.len() {
-        let line = HELP_LINES[i];
+    for i in 1..help_lines().len() {
+        let line = &help_lines()[i];
         let bold = !line.is_empty() && !line.starts_with(' ');
         body_cmds.push(DrawCmd::DrawText {
             origin: Point {
@@ -2191,7 +2215,30 @@ enum Mode {
     },
 }
 
-const PREFIX_BYTE: u8 = 0x00; // Ctrl+Space
+/// The prefix key byte. Defaults to Ctrl+Space (`0x00`); overridable via
+/// `--prefix`/`-P`. Set once at startup, before the input loop runs, so a
+/// relaxed atomic load is sufficient on the keystroke path.
+static PREFIX_BYTE: AtomicU8 = AtomicU8::new(0x00);
+
+/// Current prefix key byte.
+fn prefix_byte() -> u8 {
+    PREFIX_BYTE.load(Ordering::Relaxed)
+}
+
+/// Human-readable name for the current prefix key (e.g. `Ctrl+Space`,
+/// `Ctrl+A`). Used in the help modal so it reflects `--prefix`.
+fn prefix_name() -> String {
+    match prefix_byte() {
+        0x00 => "Ctrl+Space".to_string(),
+        b @ 0x01..=0x1a => format!("Ctrl+{}", (b'A' + b - 1) as char),
+        0x1b => "Ctrl+[".to_string(),
+        0x1c => "Ctrl+\\".to_string(),
+        0x1d => "Ctrl+]".to_string(),
+        0x1e => "Ctrl+^".to_string(),
+        0x1f => "Ctrl+_".to_string(),
+        b => format!("0x{b:02x}"),
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Multiplexer state
@@ -3080,10 +3127,10 @@ impl State {
         let Mode::Help { offset, .. } = &self.mode else {
             return Vec::new();
         };
-        let inner_h = HELP_LINES.len() as f32;
+        let inner_h = help_lines().len() as f32;
         let box_h = (inner_h + 2.0).min(self.host_h.saturating_sub(2) as f32);
         let (body_rows, max_offset) = help_body_window(box_h);
-        let body_lines = HELP_LINES.len().saturating_sub(1);
+        let body_lines = help_lines().len().saturating_sub(1);
         if body_lines <= body_rows {
             return Vec::new();
         }
@@ -3779,8 +3826,142 @@ fn drain_stale_stdin() {
 // Main loop
 // ─────────────────────────────────────────────────────────────────────────
 
+const USAGE: &str = "\
+vmux — terminal multiplexer for veter
+
+Usage: vmux [OPTIONS]
+
+Options:
+  -A, --accent <COLOR>   chrome accent color: a name (red, green, blue,
+                         yellow, orange, magenta, cyan, purple, white) or
+                         hex (#rgb, #rrggbb, #rrggbbaa)
+  -P, --prefix <KEY>     prefix key (default Ctrl+Space). Accepts C-a,
+                         ctrl+a, ^a, or a bare letter; 'space' for Ctrl+Space
+  -h, --help             print this help and exit
+
+The accent and prefix options give nested sessions (e.g. over ssh) a
+distinct color and prefix so they are easy to tell apart.
+";
+
+/// Parsed command-line options. `accent` is a packed `0xRRGGBBAA`.
+struct CliOptions {
+    accent: Option<u32>,
+    prefix: Option<u8>,
+}
+
+/// Parse vmux's command-line arguments. `--accent`/`-A` and `--prefix`/`-P`
+/// each take a value (also accepted as `--flag=value`); `--help`/`-h` prints
+/// usage and exits. Unknown flags are errors so typos surface loudly.
+fn parse_cli_args() -> Result<CliOptions> {
+    let mut opts = CliOptions { accent: None, prefix: None };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let take = |args: &mut std::iter::Skip<std::env::Args>| {
+            args.next().ok_or_else(|| anyhow!("{arg} requires a value"))
+        };
+        match arg.as_str() {
+            "--accent" | "-A" => opts.accent = Some(parse_accent_color(&take(&mut args)?)?),
+            "--prefix" | "-P" => opts.prefix = Some(parse_prefix_key(&take(&mut args)?)?),
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--accent=") => {
+                opts.accent = Some(parse_accent_color(&other["--accent=".len()..])?);
+            }
+            other if other.starts_with("--prefix=") => {
+                opts.prefix = Some(parse_prefix_key(&other["--prefix=".len()..])?);
+            }
+            other => bail!("unknown argument: {other} (try --help)"),
+        }
+    }
+    Ok(opts)
+}
+
+/// Named accent palette, packed `0xRRGGBBAA`. Muted shades that stay legible
+/// behind light foreground text. `blue` matches the compiled-in brand.
+fn named_color(name: &str) -> Option<u32> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "red" => 0xd0_5c_5c_ff,
+        "green" => 0x5c_a0_5c_ff,
+        "blue" => 0x56_79_9f_ff,
+        "yellow" => 0xc9_a8_4c_ff,
+        "orange" => 0xcf_7d_3c_ff,
+        "magenta" | "pink" => 0xb0_5c_9f_ff,
+        "cyan" | "teal" => 0x4c_9f_9f_ff,
+        "purple" | "violet" => 0x8c_6c_c0_ff,
+        "white" | "gray" | "grey" => 0x9a_9a_9a_ff,
+        _ => return None,
+    })
+}
+
+/// Parse an accent color into packed `0xRRGGBBAA`. Accepts a name from
+/// `named_color`, or hex `#rgb` / `#rrggbb` / `#rrggbbaa` (the leading `#`
+/// is optional). Missing alpha defaults to opaque.
+fn parse_accent_color(s: &str) -> Result<u32> {
+    let t = s.trim();
+    if let Some(rgba) = named_color(t) {
+        return Ok(rgba);
+    }
+    let hex = t.strip_prefix('#').unwrap_or(t);
+    let bad = || anyhow!("invalid color '{s}' (expected a name or #rgb/#rrggbb/#rrggbbaa)");
+    let bytes: [u8; 4] = match hex.len() {
+        3 => {
+            let mut rgb = [0u8; 3];
+            for (i, c) in hex.chars().enumerate() {
+                let d = c.to_digit(16).ok_or_else(bad)? as u8;
+                rgb[i] = d * 0x11; // expand nibble: 0xF → 0xFF
+            }
+            [rgb[0], rgb[1], rgb[2], 0xff]
+        }
+        6 => {
+            let v = u32::from_str_radix(hex, 16).map_err(|_| bad())?;
+            let [_, r, g, b] = v.to_be_bytes();
+            [r, g, b, 0xff]
+        }
+        8 => u32::from_str_radix(hex, 16).map_err(|_| bad())?.to_be_bytes(),
+        _ => return Err(bad()),
+    };
+    Ok(u32::from_be_bytes(bytes))
+}
+
+/// Parse a prefix-key spec into its control byte. vmux's prefix is always a
+/// control character; an optional `Ctrl`/`C-`/`^` modifier is accepted and
+/// stripped. `space`/`@` map to Ctrl+Space (`0x00`); a bare letter maps to
+/// its control code (e.g. `a` → Ctrl+A `0x01`).
+fn parse_prefix_key(s: &str) -> Result<u8> {
+    let lower = s.trim().to_ascii_lowercase();
+    let key = lower
+        .strip_prefix("ctrl-")
+        .or_else(|| lower.strip_prefix("ctrl+"))
+        .or_else(|| lower.strip_prefix("c-"))
+        .or_else(|| lower.strip_prefix('^'))
+        .unwrap_or(lower.as_str());
+    let byte = match key {
+        "space" | "spc" | "" | "@" => 0x00,
+        "[" => 0x1b,
+        "\\" => 0x1c,
+        "]" => 0x1d,
+        "^" => 0x1e,
+        "_" => 0x1f,
+        k if k.chars().count() == 1 && k.chars().next().unwrap().is_ascii_alphabetic() => {
+            (k.chars().next().unwrap().to_ascii_uppercase() as u8) & 0x1f
+        }
+        _ => bail!("unsupported prefix key '{s}' (try e.g. C-a, ^b, or space)"),
+    };
+    Ok(byte)
+}
+
 fn main() -> Result<()> {
     use std::io::IsTerminal;
+    let opts = parse_cli_args()?;
+    if let Some(rgba) = opts.accent {
+        CLI_ACCENT_RGBA.store(rgba, Ordering::Relaxed);
+        CLI_ACCENT_SET.store(true, Ordering::Relaxed);
+    }
+    if let Some(prefix) = opts.prefix {
+        PREFIX_BYTE.store(prefix, Ordering::Relaxed);
+    }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("vmux must run with stdin/stdout connected to a terminal");
     }
@@ -4622,7 +4803,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
         let b = bytes[idx];
         match &state.mode {
             Mode::Normal => {
-                if b == PREFIX_BYTE {
+                if b == prefix_byte() {
                     state.mode = Mode::Prefix;
                     idx += 1;
                     continue;
@@ -4649,7 +4830,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 // sequences (CSI, UTF-8) intact.
                 let stop = bytes[idx..]
                     .iter()
-                    .position(|c| *c == PREFIX_BYTE)
+                    .position(|c| *c == prefix_byte())
                     .map(|p| idx + p)
                     .unwrap_or(bytes.len());
                 if let Some(pane) = state.panes.get(&focus_id) {
@@ -4792,11 +4973,11 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
             let pane_id = state.focus().to_string();
             state.enter_scroll(&pane_id)
         }
-        PREFIX_BYTE => {
-            // Double-tap: forward a literal Ctrl+Space to the focused pane.
+        _ if b == prefix_byte() => {
+            // Double-tap: forward a literal prefix byte to the focused pane.
             let focus_id = state.focus().to_string();
             if let Some(pane) = state.panes.get(&focus_id) {
-                pane.pty.write_all(&[PREFIX_BYTE])?;
+                pane.pty.write_all(&[prefix_byte()])?;
             }
             Ok(Vec::new())
         }
@@ -4979,7 +5160,7 @@ fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
     }
 
     let max_offset = {
-        let inner_h = HELP_LINES.len() as f32;
+        let inner_h = help_lines().len() as f32;
         let box_h = (inner_h + 2.0).min(state.host_h.saturating_sub(2) as f32);
         help_body_window(box_h).1
     };
@@ -5102,7 +5283,7 @@ fn handle_scroll_byte(state: &mut State, pane_id: &str, b: u8) -> Result<Vec<u8>
                 // switches, splits, help, …) are reachable while
                 // scrolling. Coming back to the focused pane resumes
                 // scroll-key dispatch automatically.
-                PREFIX_BYTE => Action::ToPrefix,
+                _ if b == prefix_byte() => Action::ToPrefix,
                 b'q' | b'G' => Action::Exit,
                 b'k' => Action::Delta(1),
                 b'j' => Action::Delta(-1),
@@ -5229,6 +5410,46 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_prefix_key_variants() {
+        // Ctrl+Space — the default — via several spellings.
+        for s in ["space", "C-space", "ctrl+space", "@", "C-@", "^@"] {
+            assert_eq!(parse_prefix_key(s).unwrap(), 0x00, "{s}");
+        }
+        // Letters map to their control code, modifier optional, case-insensitive.
+        assert_eq!(parse_prefix_key("a").unwrap(), 0x01);
+        assert_eq!(parse_prefix_key("C-a").unwrap(), 0x01);
+        assert_eq!(parse_prefix_key("ctrl-A").unwrap(), 0x01);
+        assert_eq!(parse_prefix_key("^b").unwrap(), 0x02);
+        assert_eq!(parse_prefix_key("Z").unwrap(), 0x1a);
+        // Non-letter control keys.
+        assert_eq!(parse_prefix_key("]").unwrap(), 0x1d);
+        // Unsupported keys are rejected.
+        assert!(parse_prefix_key("f1").is_err());
+        assert!(parse_prefix_key("ab").is_err());
+    }
+
+    #[test]
+    fn parse_prefix_name_roundtrips() {
+        PREFIX_BYTE.store(0x00, Ordering::Relaxed);
+        assert_eq!(prefix_name(), "Ctrl+Space");
+        PREFIX_BYTE.store(0x01, Ordering::Relaxed);
+        assert_eq!(prefix_name(), "Ctrl+A");
+        PREFIX_BYTE.store(0x00, Ordering::Relaxed); // restore default
+    }
+
+    #[test]
+    fn parse_accent_color_variants() {
+        assert_eq!(parse_accent_color("blue").unwrap(), 0x56_79_9f_ff);
+        assert_eq!(parse_accent_color("#ff8800").unwrap(), 0xff_88_00_ff);
+        assert_eq!(parse_accent_color("ff8800").unwrap(), 0xff_88_00_ff);
+        assert_eq!(parse_accent_color("#f80").unwrap(), 0xff_88_00_ff);
+        assert_eq!(parse_accent_color("#11223344").unwrap(), 0x11_22_33_44);
+        assert!(parse_accent_color("nope").is_err());
+        assert!(parse_accent_color("#12345").is_err());
+        assert!(parse_accent_color("#zz0000").is_err());
+    }
 
     /// Feed a whole keystroke string to a fresh editor seeded with
     /// `start`, returning the final (buffer, cursor) and last outcome.
