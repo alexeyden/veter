@@ -1798,15 +1798,20 @@ impl App {
             return;
         }
 
-        // Any non-scroll key resets scrollback to bottom on the focused
-        // leaf. For a portal leaf this emits `EVT_PORTAL_SCROLL_SET` so
-        // the owning client (e.g. vmux) drops scroll mode in lockstep
-        // instead of holding a stale `[scroll: N]` indicator. Skipped
-        // when already at live to avoid a no-op event every keystroke.
-        // Modifier-only presses (Super/Win for KDE virtual-desktop
-        // switching, lone Shift/Ctrl/Alt while reaching for a combo)
-        // are excluded — they produce no PTY input, so dropping scroll
-        // mode on them would be surprising.
+        // Any non-scroll key resets scrollback to bottom on the *host*
+        // leaf (a plain `veter` shell with no multiplexer), so typing
+        // jumps back to live. Skipped when already at live to avoid a
+        // no-op every keystroke. Modifier-only presses (Super/Win for
+        // KDE virtual-desktop switching, lone Shift/Ctrl/Alt while
+        // reaching for a combo) are excluded — they produce no PTY
+        // input, so dropping scroll mode on them would be surprising.
+        //
+        // Portal leaves are deliberately left alone: the owning client
+        // (e.g. vmux) owns its scroll mode and decides when to exit it
+        // — it keeps the pane scrolled across the prefix key (so tab
+        // switches etc. work mid-scroll) and exits only on its own
+        // keys (q/Esc/G). Force-resetting here would yank scroll out
+        // from under the client and defeat that, so we don't.
         let is_modifier_only = matches!(
             &event.logical_key,
             Key::Named(
@@ -1826,8 +1831,18 @@ impl App {
                     | NamedKey::SymbolLock
             )
         );
+        // Ctrl+Shift+C copies / clears the selection but sends nothing to
+        // the PTY, so — like modifier-only presses — it must not drop
+        // scroll mode: the user expects to keep reading scrollback after
+        // grabbing a snippet.
+        let is_copy = self.modifiers.control_key()
+            && self.modifiers.shift_key()
+            && matches!(
+                &event.logical_key,
+                Key::Character(c) if c.eq_ignore_ascii_case("c")
+            );
         let path = self.focused_leaf_path();
-        if !is_modifier_only && self.focused_leaf_scrollback() > 0 {
+        if path.is_empty() && !is_modifier_only && !is_copy && self.focused_leaf_scrollback() > 0 {
             self.set_target_scrollback(&path, 0);
         }
 
