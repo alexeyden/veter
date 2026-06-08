@@ -67,7 +67,7 @@ use vge_protocol::encode::build_envelope as build_vge_envelope;
 use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PROBE};
 use vge_protocol::path::{PathNode, PathSegment};
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Shell to spawn for each pane. Falls back to `/bin/sh` if `$SHELL` is
 /// unset — same convention tmux uses.
