@@ -22,6 +22,7 @@
 //! drawn with VGE elements. Keystrokes go to the focused pane's PTY
 //! master directly — no input crosses the PRT wire (§9.1).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -31,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -3599,10 +3601,117 @@ impl Drop for TtyGuard {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Buffered, non-blocking stdout
+//
+// Output to the host (PRT/VGE envelopes) used to be written with a blocking
+// `write_all` + `flush` on every call. Over a slow ssh link that flush stalls
+// until the ssh upload window accepts the bytes, and because vmux's event loop
+// is single-threaded the stall freezes input handling too — the prefix key and
+// pane switches stop responding while a chatty pane floods output. To avoid
+// that, all stdout goes through `OutQueue`: writes are appended to an in-memory
+// buffer and drained opportunistically; the main loop polls the stdout fd for
+// `POLLOUT` whenever the buffer is non-empty and keeps servicing input in the
+// meantime. See doc note in `main()` for the matching backpressure cap.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Compact the queue (drop already-written bytes from the front) once the
+/// written prefix grows past this, so sustained partial draining can't leak.
+const OUT_COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Once this many bytes are queued for the host, stop reading pane PTYs so the
+/// inner shells block instead of vmux buffering without bound (backpressure).
+const OUT_HIGH_WATER: usize = 512 * 1024;
+
+struct OutQueue {
+    fd: RawFd,
+    buf: Vec<u8>,
+    head: usize,
+}
+
+impl OutQueue {
+    fn new() -> Self {
+        OutQueue {
+            fd: std::io::stdout().as_raw_fd(),
+            buf: Vec::new(),
+            head: 0,
+        }
+    }
+
+    fn enqueue(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Try to drain the queue to the fd. On a non-blocking fd this stops at
+    /// the first `EAGAIN`, leaving the remainder queued for the next
+    /// `POLLOUT`; on a blocking fd (probe + teardown phases) it writes
+    /// everything. Returns `Err` only on a real write error.
+    fn flush(&mut self) -> Result<()> {
+        while self.head < self.buf.len() {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            match nix::unistd::write(borrowed, &self.buf[self.head..]) {
+                Ok(0) => break,
+                Ok(n) => self.head += n,
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => return Err(anyhow!("stdout write: {e}")),
+            }
+        }
+        if self.head == self.buf.len() {
+            self.buf.clear();
+            self.head = 0;
+        } else if self.head >= OUT_COMPACT_THRESHOLD {
+            self.buf.drain(..self.head);
+            self.head = 0;
+        }
+        Ok(())
+    }
+
+    fn pending(&self) -> usize {
+        self.buf.len() - self.head
+    }
+}
+
+thread_local! {
+    static OUT: RefCell<OutQueue> = RefCell::new(OutQueue::new());
+}
+
+/// Queue `bytes` for the host and attempt an immediate (non-blocking) drain.
+/// Replaces the former blocking `write_all`+`flush`; the main loop finishes
+/// draining via `POLLOUT`. During the blocking probe/teardown phases the fd is
+/// blocking, so the drain here completes the write in full just like before.
 fn write_all_stdout(bytes: &[u8]) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(bytes).context("stdout write")?;
-    stdout.flush().context("stdout flush")?;
+    OUT.with(|q| {
+        let mut q = q.borrow_mut();
+        q.enqueue(bytes);
+        q.flush()
+    })
+}
+
+/// Bytes still buffered for the host (0 once fully drained).
+fn out_pending() -> usize {
+    OUT.with(|q| q.borrow().pending())
+}
+
+/// Drain whatever the `POLLOUT` poll says is writable.
+fn out_flush() -> Result<()> {
+    OUT.with(|q| q.borrow_mut().flush())
+}
+
+fn set_stdout_nonblocking(nonblocking: bool) -> Result<()> {
+    let fd = std::io::stdout().as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        bail!("fcntl(F_GETFL): {}", std::io::Error::last_os_error());
+    }
+    let new = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, new) } < 0 {
+        bail!("fcntl(F_SETFL): {}", std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -3805,6 +3914,23 @@ fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     }
 }
 
+/// Non-blocking read of stdin for the main loop. Once stdout is switched to
+/// non-blocking, stdin shares the same open file description (fd 0/1/2 are dups
+/// of the host PTY slave), so reads can return `EAGAIN` even after `POLLIN`
+/// reported readable (a spurious wakeup or a racing drain). `Ok(None)` means
+/// "would block, nothing read" — distinct from `Ok(Some(0))`, which is EOF.
+fn read_stdin_nb(buf: &mut [u8]) -> Result<Option<usize>> {
+    let fd = std::io::stdin().as_raw_fd();
+    loop {
+        match nix::unistd::read(fd, buf) {
+            Ok(n) => return Ok(Some(n)),
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => return Ok(None),
+            Err(e) => return Err(anyhow!("read(stdin): {e}")),
+        }
+    }
+}
+
 fn drain_stale_stdin() {
     let fd = std::io::stdin().as_raw_fd();
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -3996,10 +4122,17 @@ fn main() -> Result<()> {
     // plain local `veter` host does not, leaving this `None`.
     state.session_name = probe.session_name;
     // Initial render — creates portal + chrome for p1 and sets focus.
+    // Still on a blocking fd, so this small burst is sent in full.
     let env = state.relayout_and_render()?;
     if !env.is_empty() {
         write_all_stdout(&env)?;
     }
+
+    // From here on, stdout is non-blocking and drained via `POLLOUT` in the
+    // loop below, so a slow host can never stall input handling. Note this
+    // also makes stdin non-blocking (fd 0/1 are dups of the same PTY slave
+    // file description) — hence `read_stdin_nb`. Reverted before teardown.
+    set_stdout_nonblocking(true)?;
 
     let mut prt_apc = PrtApcStream::with_marker(*PRT_MARKER_T2C);
     let mut vge_apc = VgeApcStream::with_marker(*VGE_MARKER_T2C);
@@ -4022,14 +4155,33 @@ fn main() -> Result<()> {
             }
         }
 
-        // Build the poll set: stdin + every pane's PTY master.
+        // Build the poll set: stdin, then (when buffered output is waiting)
+        // stdout for POLLOUT, then every pane's PTY master.
         let stdin_fd = std::io::stdin().as_raw_fd();
         let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+        let mut fds: Vec<PollFd<'_>> =
+            vec![PollFd::new(stdin_borrowed, PollFlags::POLLIN)];
+
+        // Watch stdout for writability only while bytes are queued, otherwise
+        // POLLOUT would fire continuously and spin the loop.
+        let pending = out_pending();
+        let stdout_borrowed = unsafe { BorrowedFd::borrow_raw(std::io::stdout().as_raw_fd()) };
+        let stdout_idx = if pending > 0 {
+            fds.push(PollFd::new(stdout_borrowed, PollFlags::POLLOUT));
+            Some(fds.len() - 1)
+        } else {
+            None
+        };
+
+        // Backpressure: once too much output is already queued for a slow
+        // host, stop reading pane PTYs. Their kernel buffers fill, the inner
+        // shells block on write, and memory stays bounded — while stdin and
+        // the POLLOUT drain keep running so the UI stays responsive.
+        let read_panes = pending < OUT_HIGH_WATER;
         // Snapshot the pane fd ordering so we can map back to ids after
         // poll returns. (HashMap iteration is unstable; we capture once.)
         let pane_ids: Vec<String> = state.panes.keys().cloned().collect();
-        let mut fds: Vec<PollFd<'_>> =
-            vec![PollFd::new(stdin_borrowed, PollFlags::POLLIN)];
+        let pane_base = fds.len();
         let pane_borroweds: Vec<BorrowedFd<'_>> = pane_ids
             .iter()
             .map(|id| {
@@ -4037,8 +4189,10 @@ fn main() -> Result<()> {
                 unsafe { BorrowedFd::borrow_raw(raw) }
             })
             .collect();
-        for bf in &pane_borroweds {
-            fds.push(PollFd::new(*bf, PollFlags::POLLIN));
+        if read_panes {
+            for bf in &pane_borroweds {
+                fds.push(PollFd::new(*bf, PollFlags::POLLIN));
+            }
         }
 
         let n = match poll(&mut fds, PollTimeout::from(50u16)) {
@@ -4046,6 +4200,15 @@ fn main() -> Result<()> {
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("poll: {e}")),
         };
+
+        // Drain whatever the host is now ready to accept.
+        if let Some(idx) = stdout_idx {
+            let revents = fds[idx].revents().unwrap_or(PollFlags::empty());
+            if revents.contains(PollFlags::POLLOUT) {
+                out_flush()?;
+            }
+        }
+
         if n == 0 {
             // Poll idle: nothing arrived for the full 50ms window, so any
             // ESC byte still buffered in the APC parsers' EscPending state
@@ -4066,26 +4229,35 @@ fn main() -> Result<()> {
         // Stdin: host responses + user keystrokes.
         let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
         if stdin_revents.contains(PollFlags::POLLIN) {
-            let n = read_stdin(&mut rd_buf)?;
-            if n == 0 {
-                state.quit = true;
-                break;
+            match read_stdin_nb(&mut rd_buf)? {
+                Some(0) => {
+                    state.quit = true;
+                    break;
+                }
+                Some(n) => {
+                    dlog("stdin", &rd_buf[..n]);
+                    trace_vmux_stdin(&rd_buf[..n]);
+                    handle_stdin_chunk(
+                        &mut state,
+                        &mut prt_apc,
+                        &mut vge_apc,
+                        &mut ses_apc,
+                        &rd_buf[..n],
+                    )?;
+                }
+                // EAGAIN: POLLIN raced a drain; nothing to read this round.
+                None => {}
             }
-            dlog("stdin", &rd_buf[..n]);
-            trace_vmux_stdin(&rd_buf[..n]);
-            handle_stdin_chunk(
-                &mut state,
-                &mut prt_apc,
-                &mut vge_apc,
-                &mut ses_apc,
-                &rd_buf[..n],
-            )?;
         }
 
-        // Pane PTYs: shell output → WritePortal display path.
+        // Pane PTYs: shell output → WritePortal display path. Skipped entirely
+        // while backpressured (their fds aren't in the poll set then).
         for (i, pid) in pane_ids.iter().enumerate() {
+            if !read_panes {
+                break;
+            }
             let revents =
-                fds[i + 1].revents().unwrap_or(PollFlags::empty());
+                fds[pane_base + i].revents().unwrap_or(PollFlags::empty());
             if revents.contains(PollFlags::POLLIN) {
                 let raw = state.panes[pid].pty.raw_fd();
                 let n = match nix::unistd::read(raw, &mut rd_buf) {
@@ -4121,6 +4293,12 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    // Back to a blocking fd for teardown and drain anything still queued, so
+    // the cleanup envelopes below (and the alt-screen exit in `RawTty::drop`)
+    // are written in full rather than left half-sent.
+    set_stdout_nonblocking(false)?;
+    out_flush()?;
 
     // Hand focus back to the host BEFORE wiping its portal table —
     // otherwise the host would keep "focus on a portal" state with no
