@@ -212,8 +212,14 @@ fn render_portal_at<T: Renderer>(
     //    host cursor renders. Non-leaf portals pass `None` and draw
     //    their unfocused-style cursor below.
     let cursor_pos = portal.vt.screen().cursor_position();
-    let cursor_visible =
-        portal.state_cache.cursor_visible && !portal.vt.screen().hide_cursor();
+    // Mirror the host text grid (§9.1): the cursor is anchored to the
+    // live screen, but `draw_screen_at` paints scrollback-adjusted
+    // cells. When this portal is scrolled back, the live cursor row is
+    // off-viewport, so suppress it rather than letting it float over
+    // scrollback content at its fixed logical row.
+    let cursor_visible = portal.state_cache.cursor_visible
+        && !portal.vt.screen().hide_cursor()
+        && portal.vt.screen().scrollback() == 0;
     let focused_cursor = if is_focused_leaf && cursor_visible {
         Some(cursor_pos)
     } else {
