@@ -2178,6 +2178,7 @@ mod tests {
         w.f32(4.0);
         w.f32(2.0);
         w.str(image_id);
+        w.u8(0); // source_rect flag: 0 = whole image (§7.5)
         // origin
         w.f32(0.0);
         w.f32(0.0);

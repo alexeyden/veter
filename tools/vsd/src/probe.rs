@@ -380,6 +380,7 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: None,
+            accent_rgba: None,
         };
         let mut frames = Vec::new();
         append_frame(&mut frames, RSP_PROBE, 1, &body.encode());

@@ -148,13 +148,19 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> 
 // ---- SharedTables -----------------------------------------------------
 
 fn encode_shared(shared: &SharedTables, w: &mut Writer) {
+    // Both tables are HashMaps; iterate sorted by id so the encoding is
+    // deterministic (same state → byte-identical snapshot).
     w.varu(shared.images.len() as u64);
-    for (id, img) in &shared.images {
+    let mut images: Vec<_> = shared.images.iter().collect();
+    images.sort_by_key(|(id, _)| *id);
+    for (id, img) in images {
         w.str(id);
         encode_uploaded_image(img, w);
     }
     w.varu(shared.styles.len() as u64);
-    for (id, style) in &shared.styles {
+    let mut styles: Vec<_> = shared.styles.iter().collect();
+    styles.sort_by_key(|(id, _)| *id);
+    for (id, style) in styles {
         w.str(id);
         write_concrete_style(w, style);
     }
@@ -219,7 +225,11 @@ fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError>
 
 fn encode_element_set(set: &ElementSet, w: &mut Writer) {
     w.varu(set.elements.len() as u64);
-    for (key, elem) in &set.elements {
+    // The element table is a HashMap; iterate in creation order so the
+    // encoding is deterministic (same state → byte-identical snapshot).
+    let mut entries: Vec<(&String, &Element)> = set.elements.iter().collect();
+    entries.sort_by_key(|(_, elem)| elem.creation_seq);
+    for (key, elem) in entries {
         w.str(key);
         encode_element(elem, w);
     }
