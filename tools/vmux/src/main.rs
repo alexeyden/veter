@@ -129,6 +129,17 @@ enum SplitDir {
     Horizontal,
 }
 
+impl SplitDir {
+    /// The perpendicular orientation. Used by `toggle_dir_of_parent` to
+    /// rotate a divider 90°.
+    fn flipped(self) -> Self {
+        match self {
+            SplitDir::Vertical => SplitDir::Horizontal,
+            SplitDir::Horizontal => SplitDir::Vertical,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Layout {
     Leaf(String),
@@ -238,6 +249,76 @@ impl Layout {
                 Some((true, rest)) => a.ratio_at_path_mut(rest),
                 Some((false, rest)) => b.ratio_at_path_mut(rest),
             },
+        }
+    }
+
+    /// Visit every leaf id in in-order (a before b), mutably. The
+    /// traversal order matches `collect_leaves`, so the two stay in sync
+    /// for index-based reassignment (see `rotate`).
+    fn for_each_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        match self {
+            Layout::Leaf(id) => f(id),
+            Layout::Split { a, b, .. } => {
+                a.for_each_leaf_mut(f);
+                b.for_each_leaf_mut(f);
+            }
+        }
+    }
+
+    /// Swap which cells two panes occupy. Structure-preserving: the tree
+    /// geometry (split dirs, ratios) is untouched — only the ids sitting
+    /// in the two leaves trade places. `x` and `y` must be distinct.
+    /// Returns true only if *both* were found. One pass is safe because
+    /// pane ids are unique and `x != y`, so no leaf matches both branches.
+    fn swap_leaves(&mut self, x: &str, y: &str) -> bool {
+        debug_assert_ne!(x, y);
+        let (mut found_x, mut found_y) = (false, false);
+        self.for_each_leaf_mut(&mut |id| {
+            if id == x {
+                *id = y.to_string();
+                found_x = true;
+            } else if id == y {
+                *id = x.to_string();
+                found_y = true;
+            }
+        });
+        found_x && found_y
+    }
+
+    /// Cycle every pane through the leaf positions in in-order sequence.
+    /// `step > 0` shifts each pane toward earlier slots (tmux `C-o`);
+    /// `step < 0` reverses. Geometry is preserved. No-op below two panes.
+    fn rotate(&mut self, step: isize) {
+        let mut ids = Vec::new();
+        self.collect_leaves(&mut ids);
+        let n = ids.len();
+        if n < 2 {
+            return;
+        }
+        let k = step.rem_euclid(n as isize) as usize;
+        ids.rotate_left(k);
+        let mut it = ids.into_iter();
+        self.for_each_leaf_mut(&mut |id| *id = it.next().unwrap());
+    }
+
+    /// Flip the orientation (V↔H) of the split that directly contains
+    /// `target` — i.e. rotate the focused pane's own divider 90°. Only the
+    /// immediate parent is affected; a non-leaf sibling subtree is carried
+    /// along under the new orientation. Returns false if `target` is the
+    /// lone root leaf (no parent split).
+    fn toggle_dir_of_parent(&mut self, target: &str) -> bool {
+        match self {
+            Layout::Leaf(_) => false,
+            Layout::Split { dir, a, b, .. } => {
+                let here = matches!(a.as_ref(), Layout::Leaf(id) if id == target)
+                    || matches!(b.as_ref(), Layout::Leaf(id) if id == target);
+                if here {
+                    *dir = dir.flipped();
+                    true
+                } else {
+                    a.toggle_dir_of_parent(target) || b.toggle_dir_of_parent(target)
+                }
+            }
         }
     }
 }
@@ -1665,6 +1746,9 @@ fn help_lines() -> &'static [String] {
             "  r        rename focused pane".into(),
             "  z        toggle zoom (focused pane fills the tab)".into(),
             "  s        resize mode (hjkl/arrows; q/Esc/Enter exit)".into(),
+            "  { / }    swap focused pane with previous / next".into(),
+            "  O        rotate all panes through the cells".into(),
+            "  e        rotate focused pane's divider 90°".into(),
             "".into(),
             "Tab".into(),
             "  c        new tab".into(),
@@ -1673,6 +1757,12 @@ fn help_lines() -> &'static [String] {
             "  1..9     jump to tab N".into(),
             "  < / >    move current tab left / right".into(),
             "  R        rename current tab".into(),
+            "".into(),
+            "Command palette".into(),
+            "  :        open the command palette".into(),
+            "  t        pick a tab from a list".into(),
+            "  w        pick a pane from all tabs".into(),
+            "  (type to filter · ↑/↓ or Ctrl+P/N move · Tab completes · Enter runs · Esc cancels)".into(),
             "".into(),
             "Scroll  (prefix-[ enters; q/Esc/G exits)".into(),
             "  k / Up        scroll up one line".into(),
@@ -1912,6 +2002,165 @@ fn build_help_modal_elements(
     elements
 }
 
+/// Build the picker modal as a single VGE element (rebuilt on every
+/// keystroke — cheap, and the content changes with each filter edit).
+/// Layout top to bottom: title strip (row 0), the filter / command input
+/// with a caret (row 1), then the filtered list rows with the selected row
+/// highlighted. A scrollbar appears when matches overflow the visible rows.
+fn build_picker_elements(
+    host_w: u32,
+    host_h: u32,
+    picker: &Picker,
+    cell_pw: f32,
+    cell_ph: f32,
+) -> Vec<CreateElementBody> {
+    // Rows available for the list (everything but the title + input rows and
+    // a little vertical margin), capped so a huge list stays compact.
+    let avail = (host_h.saturating_sub(4)).max(1) as usize;
+    let visible_rows = picker.matches.len().max(1).min(avail).min(14);
+
+    // Window the matches so the selection stays on screen.
+    let total = picker.matches.len();
+    let max_scroll = total.saturating_sub(visible_rows);
+    let scroll = (if picker.selected >= visible_rows {
+        picker.selected - visible_rows + 1
+    } else {
+        0
+    })
+    .min(max_scroll);
+
+    // Width: widest of the title, the input line, and every match row
+    // (label + gap + hint), within the host.
+    // Width is taken over *all* items (not just current matches) so the box
+    // keeps a stable width while filtering; the input line can still widen
+    // it when a long command line is typed.
+    let input_line = format!("> {}", picker.editor.buffer);
+    let mut max_w = picker.title.chars().count().max(input_line.chars().count());
+    for it in &picker.items {
+        max_w = max_w.max(it.label.chars().count() + 3 + it.hint.chars().count());
+    }
+    let inner_w = (max_w as f32).max(26.0);
+    let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
+    let box_h = (2 + visible_rows) as f32;
+
+    // Anchor the top edge using the box's *maximum* height (the full item
+    // count, which is stable across filtering) so the input row never moves
+    // as matches shrink — the box only grows/shrinks downward.
+    let max_rows = picker.items.len().max(1).min(avail).min(14);
+    let max_box_h = (2 + max_rows) as f32;
+    let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
+    let origin_y = ((host_h as f32 - max_box_h) * 0.5).floor();
+    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
+
+    let mut cmds: Vec<DrawCmd> = vec![
+        // Body fill.
+        DrawCmd::FillPath {
+            fill: surface_style(),
+            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
+        },
+        // Title strip (top corners rounded only).
+        DrawCmd::FillPath {
+            fill: accent_style(),
+            segments: rounded_rect_path_corners(
+                0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
+            ),
+        },
+        DrawCmd::DrawText {
+            origin: Point { x: box_w * 0.5, y: 0.0 },
+            align: Align::Center,
+            fill: Style::Flat(COLOR_MODAL_TEXT),
+            font_style: FontStyle(0x01),
+            text: picker.title.clone(),
+        },
+        // Filter / command input.
+        DrawCmd::DrawText {
+            origin: Point { x: 1.0, y: 1.0 },
+            align: Align::Left,
+            fill: Style::Flat(COLOR_MODAL_TEXT),
+            font_style: FontStyle(0x00),
+            text: input_line,
+        },
+    ];
+    // Caret bar — "> " is 2 cells, then `cursor` glyphs in.
+    let caret_x = 1.0 + 2.0 + picker.editor.cursor.min(picker.editor.char_count()) as f32;
+    const HALF_W: f32 = 0.07;
+    cmds.push(DrawCmd::FillPath {
+        fill: Style::Flat(accent_color()),
+        segments: rounded_rect_path(caret_x - HALF_W, 1.1, caret_x + HALF_W, 1.9, 0.0, 0.0),
+    });
+
+    // List rows.
+    for j in 0..visible_rows {
+        let m = scroll + j;
+        if m >= total {
+            break;
+        }
+        let it = &picker.items[picker.matches[m]];
+        let y = 2.0 + j as f32;
+        let selected = m == picker.selected;
+        if selected {
+            cmds.push(DrawCmd::FillRectangles {
+                fill: title_thumb_style(),
+                rects: vec![Rect { x: 0.5, y: y + 0.05, w: box_w - 1.0, h: 0.9 }],
+            });
+        }
+        cmds.push(DrawCmd::DrawText {
+            origin: Point { x: 1.5, y },
+            align: Align::Left,
+            fill: Style::Flat(if selected { COLOR_TAB_ACTIVE_TEXT } else { COLOR_MODAL_TEXT }),
+            font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
+            text: it.label.clone(),
+        });
+        if !it.hint.is_empty() {
+            cmds.push(DrawCmd::DrawText {
+                origin: Point { x: box_w - 1.5, y },
+                align: Align::Right,
+                fill: Style::Flat(COLOR_TAB_INACTIVE_TEXT),
+                font_style: FontStyle(0x00),
+                text: it.hint.clone(),
+            });
+        }
+    }
+
+    // Scrollbar when the list overflows.
+    if total > visible_rows {
+        let track_h = visible_rows as f32;
+        let thumb_h = (track_h * visible_rows as f32 / total as f32).max(0.5);
+        let thumb_max = (track_h - thumb_h).max(0.0);
+        let thumb_y = 2.0
+            + if max_scroll == 0 {
+                0.0
+            } else {
+                thumb_max * scroll as f32 / max_scroll as f32
+            };
+        cmds.push(DrawCmd::FillRectangles {
+            fill: Style::Flat(COLOR_SCROLLBAR),
+            rects: vec![Rect { x: box_w - 0.7, y: 2.0, w: 0.4, h: track_h }],
+        });
+        cmds.push(DrawCmd::FillRectangles {
+            fill: accent_style(),
+            rects: vec![Rect { x: box_w - 0.7, y: thumb_y, w: 0.4, h: thumb_h }],
+        });
+    }
+
+    // Outline last, above the fills.
+    cmds.push(DrawCmd::DrawLinePath {
+        stroke: accent_style(),
+        line_width: 0.1,
+        segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
+    });
+
+    vec![CreateElementBody {
+        id: MODAL_ELEMENT_ID.to_string(),
+        commands: cmds,
+        origin: Point { x: origin_x, y: origin_y },
+        is_visible: true,
+        draw_order: MODAL_DRAW_ORDER,
+        parent: None,
+        size: None,
+    }]
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Input mode state machine
 // ─────────────────────────────────────────────────────────────────────────
@@ -1944,16 +2193,28 @@ struct LineEditor {
     buffer: String,
     /// Insertion point as a char index in `0..=char_count`.
     cursor: usize,
+    /// Max length, in chars. Inserts past this are dropped.
+    max: usize,
 }
 
 /// Max title length, in chars. Mirrors the historical rename cap.
 const RENAME_MAX_CHARS: usize = 32;
 
+/// Max command-line length, in chars. Roomier than the rename cap so a
+/// full `rename-tab 2 some longer name` fits in the command palette.
+const COMMAND_MAX_CHARS: usize = 256;
+
 impl LineEditor {
-    /// Start editing `buffer` with the cursor at its end.
+    /// Start editing `buffer` with the cursor at its end, capped at the
+    /// historical rename length.
     fn new(buffer: String) -> Self {
+        Self::with_max(buffer, RENAME_MAX_CHARS)
+    }
+
+    /// Start editing `buffer` with an explicit max length.
+    fn with_max(buffer: String, max: usize) -> Self {
         let cursor = buffer.chars().count();
-        LineEditor { buffer, cursor }
+        LineEditor { buffer, cursor, max }
     }
 
     fn char_count(&self) -> usize {
@@ -1985,7 +2246,7 @@ impl LineEditor {
     }
 
     fn insert(&mut self, c: char) {
-        if self.char_count() >= RENAME_MAX_CHARS {
+        if self.char_count() >= self.max {
             return;
         }
         let at = self.byte_offset(self.cursor);
@@ -2179,6 +2440,517 @@ impl LineEditor {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Reusable list picker
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What a picker is choosing — drives how a committed selection is acted
+/// on and whether the input line is a filter or a full command line.
+#[derive(Debug, Clone)]
+enum PickerKind {
+    /// Command palette: the input is a command line. Its first whitespace
+    /// token filters the list; the remaining tokens are parsed as args
+    /// when the selected command commits.
+    Command,
+    /// Choose a tab to focus.
+    Tab,
+    /// Choose any pane (across all tabs) to focus.
+    Pane,
+    /// Choose a destination tab to move `pane` into.
+    MovePaneTarget { pane: String },
+}
+
+/// The action a committed [`PickerItem`] stands for.
+#[derive(Debug, Clone)]
+enum PickerPayload {
+    /// Index into [`COMMANDS`].
+    Command(usize),
+    /// Tab index.
+    Tab(usize),
+    /// Pane id.
+    Pane(String),
+}
+
+/// One row in a picker list.
+#[derive(Debug, Clone)]
+struct PickerItem {
+    /// Primary text, left-aligned.
+    label: String,
+    /// Secondary text, right-aligned and dimmed (key, args, tab name).
+    hint: String,
+    /// Lowercased haystack the filter matches against.
+    filter_key: String,
+    payload: PickerPayload,
+}
+
+/// Result of feeding input to a [`Picker`].
+enum PickerOutcome {
+    Noop,
+    Redraw,
+    Commit,
+    Cancel,
+}
+
+/// A filterable, selectable modal list. Reused by the command palette and
+/// the tab / pane / move-pane pickers; the modal chrome is shared with the
+/// other overlays via [`MODAL_ELEMENT_ID`].
+#[derive(Debug)]
+struct Picker {
+    kind: PickerKind,
+    title: String,
+    /// Filter / command input (the same line editor the rename modal uses).
+    editor: LineEditor,
+    /// Full, unfiltered item list.
+    items: Vec<PickerItem>,
+    /// Indices into `items` passing the current filter, in item order.
+    matches: Vec<usize>,
+    /// Selection as an index into `matches`.
+    selected: usize,
+}
+
+/// Rows a PgUp / PgDn jump moves the selection through.
+const PICKER_PAGE: usize = 8;
+
+impl Picker {
+    fn new(kind: PickerKind, title: String, items: Vec<PickerItem>) -> Self {
+        let mut p = Picker {
+            kind,
+            title,
+            editor: LineEditor::with_max(String::new(), COMMAND_MAX_CHARS),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    /// The substring the list filters on: the first token for a command
+    /// line, the whole trimmed buffer otherwise.
+    fn filter_text(&self) -> String {
+        let buf = self.editor.buffer.trim_start();
+        match self.kind {
+            PickerKind::Command => buf.split_whitespace().next().unwrap_or("").to_string(),
+            _ => buf.trim_end().to_string(),
+        }
+    }
+
+    /// Recompute `matches` for the current filter, keeping the previously
+    /// selected item selected when it survives, else clamping to the top.
+    fn refilter(&mut self) {
+        let prev = self.matches.get(self.selected).copied();
+        let needle = self.filter_text().to_lowercase();
+        self.matches = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| needle.is_empty() || it.filter_key.contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = prev
+            .and_then(|p| self.matches.iter().position(|&m| m == p))
+            .unwrap_or(0);
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
+    }
+
+    /// Move the selection by `delta`, clamped to the match list.
+    fn move_sel(&mut self, delta: i64) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let last = self.matches.len() as i64 - 1;
+        self.selected = (self.selected as i64 + delta).clamp(0, last) as usize;
+    }
+
+    /// The selected item's index into `items`, if any.
+    fn current(&self) -> Option<usize> {
+        self.matches.get(self.selected).copied()
+    }
+
+    /// Tab-complete the input line to the current selection without
+    /// running it. For a command, replace the first token with the
+    /// selected command's name and leave a trailing space (preserving any
+    /// args already typed) so the user can fill in arguments. For the other
+    /// pickers, fill the filter with the selected item's label.
+    fn complete(&mut self) {
+        let Some(item) = self.current() else {
+            return;
+        };
+        let newbuf = match (&self.kind, &self.items[item].payload) {
+            (PickerKind::Command, PickerPayload::Command(ci)) => {
+                let rest: Vec<&str> = self.editor.buffer.split_whitespace().skip(1).collect();
+                let mut b = String::from(COMMANDS[*ci].name);
+                b.push(' ');
+                b.push_str(&rest.join(" "));
+                b
+            }
+            _ => self.items[item].label.clone(),
+        };
+        self.editor = LineEditor::with_max(newbuf, COMMAND_MAX_CHARS);
+        self.refilter();
+    }
+
+    /// Consume one keystroke from the front of `bytes`, returning how many
+    /// bytes were consumed and the resulting outcome. Navigation keys the
+    /// line editor doesn't use are intercepted here; everything else (text
+    /// edits, cursor motion) routes to the editor and triggers a refilter.
+    fn picker_feed(&mut self, bytes: &[u8]) -> (usize, PickerOutcome) {
+        let Some(&b) = bytes.first() else {
+            return (1, PickerOutcome::Noop);
+        };
+        match b {
+            b'\r' | b'\n' => (1, PickerOutcome::Commit),
+            0x07 => (1, PickerOutcome::Cancel), // Ctrl+G
+            0x09 => {
+                self.complete(); // Tab: fill the input with the selection
+                (1, PickerOutcome::Redraw)
+            }
+            0x0E => {
+                self.move_sel(1); // Ctrl+N
+                (1, PickerOutcome::Redraw)
+            }
+            0x10 => {
+                self.move_sel(-1); // Ctrl+P
+                (1, PickerOutcome::Redraw)
+            }
+            // In move-pane, a digit jumps to (and commits) that tab number,
+            // matching the "press the tab number" cue. Other pickers treat
+            // digits as filter text.
+            b'1'..=b'9' if matches!(self.kind, PickerKind::MovePaneTarget { .. }) => {
+                let item = (b - b'1') as usize;
+                if let Some(pos) = self.matches.iter().position(|&m| m == item) {
+                    self.selected = pos;
+                    (1, PickerOutcome::Commit)
+                } else {
+                    (1, PickerOutcome::Noop)
+                }
+            }
+            0x1B => self.feed_escape(bytes),
+            _ => {
+                let (consumed, outcome) = self.editor.feed(bytes);
+                self.after_editor(consumed, outcome)
+            }
+        }
+    }
+
+    /// Handle an ESC-introduced sequence: Up/Down/PgUp/PgDn/BackTab drive
+    /// the selection, everything else (cursor motion, Alt-word, bare Esc)
+    /// routes to the editor.
+    fn feed_escape(&mut self, bytes: &[u8]) -> (usize, PickerOutcome) {
+        let Some(&next) = bytes.get(1) else {
+            return (1, PickerOutcome::Cancel); // lone Esc cancels
+        };
+        if next == b'[' || next == b'O' {
+            let mut i = 2;
+            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return (bytes.len(), PickerOutcome::Noop); // incomplete
+            }
+            let params = &bytes[2..i];
+            let nav = match (bytes[i], params) {
+                (b'A', _) => Some(-1),                       // Up
+                (b'B', _) => Some(1),                        // Down
+                (b'Z', _) => Some(-1),                       // BackTab
+                (b'~', b"5") => Some(-(PICKER_PAGE as i64)), // PgUp
+                (b'~', b"6") => Some(PICKER_PAGE as i64),    // PgDn
+                _ => None,
+            };
+            if let Some(delta) = nav {
+                self.move_sel(delta);
+                return (i + 1, PickerOutcome::Redraw);
+            }
+            // Cursor motion (Left/Right/Home/End/Delete) → editor.
+            let (consumed, outcome) = self.editor.feed(bytes);
+            return self.after_editor(consumed, outcome);
+        }
+        // Alt-<key> word motions etc.
+        let (consumed, outcome) = self.editor.feed(bytes);
+        self.after_editor(consumed, outcome)
+    }
+
+    /// Map a line-editor outcome to a picker outcome, refiltering on edits.
+    fn after_editor(&mut self, consumed: usize, outcome: EditOutcome) -> (usize, PickerOutcome) {
+        match outcome {
+            EditOutcome::Commit => (consumed, PickerOutcome::Commit),
+            EditOutcome::Cancel => (consumed, PickerOutcome::Cancel),
+            EditOutcome::Redraw => {
+                self.refilter();
+                (consumed, PickerOutcome::Redraw)
+            }
+            EditOutcome::Noop => (consumed, PickerOutcome::Noop),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Command table
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A palette command. `name` is canonical; `aliases` and `summary` widen
+/// the filter haystack; `args` is the usage hint shown on the right.
+struct CommandSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    args: &'static str,
+    summary: &'static str,
+}
+
+/// Every command reachable from the palette. Order is the display order.
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "resize", aliases: &[], args: "[PANE#] [SIZE]", summary: "resize pane or enter resize mode" },
+    CommandSpec { name: "rename-pane", aliases: &["rename"], args: "[PANE#] [NAME]", summary: "rename a pane" },
+    CommandSpec { name: "rename-tab", aliases: &[], args: "[TAB#] [NAME]", summary: "rename a tab" },
+    CommandSpec { name: "new-pane", aliases: &["split"], args: "[NAME]", summary: "split the focused pane" },
+    CommandSpec { name: "new-tab", aliases: &[], args: "[NAME]", summary: "open a new tab" },
+    CommandSpec { name: "delete-pane", aliases: &["close-pane", "kill-pane"], args: "[PANE#]", summary: "close a pane" },
+    CommandSpec { name: "delete-tab", aliases: &["close-tab", "kill-tab"], args: "[TAB#]", summary: "close a tab and its panes" },
+    CommandSpec { name: "move-pane", aliases: &[], args: "[TAB#] [PANE#]", summary: "move a pane to another tab" },
+    CommandSpec { name: "split-v", aliases: &[], args: "", summary: "split focused pane vertically" },
+    CommandSpec { name: "split-h", aliases: &[], args: "", summary: "split focused pane horizontally" },
+    CommandSpec { name: "zoom", aliases: &[], args: "", summary: "toggle zoom on the focused pane" },
+    CommandSpec { name: "swap-prev", aliases: &["swap-pane-prev"], args: "", summary: "swap focused pane with the previous one" },
+    CommandSpec { name: "swap-next", aliases: &["swap-pane-next"], args: "", summary: "swap focused pane with the next one" },
+    CommandSpec { name: "rotate", aliases: &["rotate-window"], args: "", summary: "cycle all panes through the cells" },
+    CommandSpec { name: "toggle-split", aliases: &["rotate-split"], args: "", summary: "rotate the focused pane's divider 90°" },
+    CommandSpec { name: "focus-pane", aliases: &["select-pane"], args: "[PANE#]", summary: "focus a pane (or cycle)" },
+    CommandSpec { name: "focus-tab", aliases: &["select-tab", "goto-tab"], args: "[TAB#]", summary: "switch to a tab" },
+    CommandSpec { name: "tabs", aliases: &["tab-list"], args: "", summary: "pick a tab from a list" },
+    CommandSpec { name: "panes", aliases: &["pane-list", "windows"], args: "", summary: "pick a pane from all tabs" },
+    CommandSpec { name: "next-tab", aliases: &[], args: "", summary: "switch to the next tab" },
+    CommandSpec { name: "prev-tab", aliases: &["previous-tab"], args: "", summary: "switch to the previous tab" },
+    CommandSpec { name: "move-tab-left", aliases: &[], args: "", summary: "move the current tab left" },
+    CommandSpec { name: "move-tab-right", aliases: &[], args: "", summary: "move the current tab right" },
+    CommandSpec { name: "detach", aliases: &[], args: "", summary: "detach the vsd session" },
+    CommandSpec { name: "help", aliases: &["keys"], args: "", summary: "show the keybinding help" },
+    CommandSpec { name: "quit", aliases: &["exit"], args: "", summary: "quit vmux (confirms first)" },
+];
+
+/// Build the command-palette item list from [`COMMANDS`].
+fn command_items() -> Vec<PickerItem> {
+    COMMANDS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut key = String::from(c.name);
+            for a in c.aliases {
+                key.push(' ');
+                key.push_str(a);
+            }
+            key.push(' ');
+            key.push_str(c.summary);
+            PickerItem {
+                label: c.name.to_string(),
+                hint: c.args.to_string(),
+                filter_key: key.to_lowercase(),
+                payload: PickerPayload::Command(i),
+            }
+        })
+        .collect()
+}
+
+/// A `SIZE` argument: a relative cell delta (`+3` / `-1`) or an absolute
+/// cell count (`30`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SizeArg {
+    Rel(i32),
+    Abs(u32),
+}
+
+/// Parse a `SIZE` token. A leading `+`/`-` means relative; a bare number
+/// is absolute.
+fn parse_size(s: &str) -> Option<SizeArg> {
+    if let Some(rest) = s.strip_prefix('+') {
+        rest.parse::<i32>().ok().map(SizeArg::Rel)
+    } else if s.starts_with('-') {
+        s.parse::<i32>().ok().map(SizeArg::Rel)
+    } else {
+        s.parse::<u32>().ok().map(SizeArg::Abs)
+    }
+}
+
+/// Resolve a 1-based pane number (active-tab layout order) to a pane id.
+fn pane_id_for_n(state: &State, n: usize) -> Option<String> {
+    let mut leaves = Vec::new();
+    state.active_layout().collect_leaves(&mut leaves);
+    if n == 0 || n > leaves.len() {
+        None
+    } else {
+        Some(leaves[n - 1].clone())
+    }
+}
+
+/// Resolve a 1-based tab number to a tab index.
+fn tab_index_for_n(state: &State, n: usize) -> Option<usize> {
+    if n == 0 || n > state.tabs.len() {
+        None
+    } else {
+        Some(n - 1)
+    }
+}
+
+/// Run a palette command by canonical `name` with already-tokenised args.
+/// Each command maps to an existing `State` operation; argument parsing
+/// (PANE#/TAB#/SIZE/NAME) happens here.
+fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>> {
+    // PANE# resolver: an explicit 1-based number, else the focused pane.
+    let pane_or_focus = |state: &State, tok: Option<&String>| -> Option<String> {
+        match tok {
+            Some(s) => s.parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n)),
+            None => Some(state.focus().to_string()),
+        }
+    };
+
+    match name {
+        "resize" => match args.len() {
+            0 => state.enter_resize(),
+            1 => {
+                let Some(size) = parse_size(&args[0]) else {
+                    return Ok(Vec::new());
+                };
+                let target = state.focus().to_string();
+                state.resize_pane(&target, size)
+            }
+            _ => {
+                let Some(target) = args[0].parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n))
+                else {
+                    return Ok(Vec::new());
+                };
+                let Some(size) = parse_size(&args[1]) else {
+                    return Ok(Vec::new());
+                };
+                state.resize_pane(&target, size)
+            }
+        },
+        "rename-pane" => {
+            if args.is_empty() {
+                let pane = state.focus().to_string();
+                return Ok(state.open_rename_pane(pane));
+            }
+            // A leading number is PANE#; otherwise the whole arg list is the
+            // new name for the focused pane.
+            let (pane, name_tokens): (String, &[String]) = match args[0].parse::<usize>() {
+                Ok(n) => match pane_id_for_n(state, n) {
+                    Some(p) => (p, &args[1..]),
+                    None => return Ok(Vec::new()),
+                },
+                Err(_) => (state.focus().to_string(), &args[..]),
+            };
+            if name_tokens.is_empty() {
+                Ok(state.open_rename_pane(pane))
+            } else {
+                Ok(state.set_pane_title(&pane, Some(name_tokens.join(" "))))
+            }
+        }
+        "rename-tab" => {
+            if args.is_empty() {
+                return Ok(state.open_rename_tab(state.active_tab));
+            }
+            let (idx, name_tokens): (usize, &[String]) = match args[0].parse::<usize>() {
+                Ok(n) => match tab_index_for_n(state, n) {
+                    Some(i) => (i, &args[1..]),
+                    None => return Ok(Vec::new()),
+                },
+                Err(_) => (state.active_tab, &args[..]),
+            };
+            if name_tokens.is_empty() {
+                Ok(state.open_rename_tab(idx))
+            } else {
+                state.set_tab_title(idx, Some(name_tokens.join(" ")))
+            }
+        }
+        "delete-pane" => match pane_or_focus(state, args.first()) {
+            Some(p) => state.close_pane(&p),
+            None => Ok(Vec::new()),
+        },
+        "delete-tab" => {
+            let idx = match args.first() {
+                Some(s) => match s.parse::<usize>().ok().and_then(|n| tab_index_for_n(state, n)) {
+                    Some(i) => i,
+                    None => return Ok(Vec::new()),
+                },
+                None => state.active_tab,
+            };
+            state.close_tab(idx)
+        }
+        "new-pane" | "split-v" => {
+            let mut out = state.split(SplitDir::Vertical)?;
+            if name == "new-pane" && !args.is_empty() {
+                let pane = state.focus().to_string();
+                out.extend(state.set_pane_title(&pane, Some(args.join(" "))));
+            }
+            Ok(out)
+        }
+        "split-h" => state.split(SplitDir::Horizontal),
+        "new-tab" => {
+            let mut out = state.new_tab()?;
+            if !args.is_empty() {
+                let idx = state.active_tab;
+                out.extend(state.set_tab_title(idx, Some(args.join(" ")))?);
+            }
+            Ok(out)
+        }
+        "move-pane" => {
+            if args.is_empty() {
+                let pane = state.focus().to_string();
+                return Ok(state.open_move_pane_picker(pane));
+            }
+            let Some(dest) = args[0].parse::<usize>().ok().and_then(|n| tab_index_for_n(state, n))
+            else {
+                return Ok(Vec::new());
+            };
+            match pane_or_focus(state, args.get(1)) {
+                Some(pane) => state.move_pane_to_tab(&pane, dest),
+                None => Ok(Vec::new()),
+            }
+        }
+        "zoom" => state.toggle_zoom(),
+        "swap-prev" => state.swap_focus(-1),
+        "swap-next" => state.swap_focus(1),
+        "rotate" => state.rotate_panes(1),
+        "toggle-split" => state.toggle_split_dir(),
+        "focus-pane" => match args.first() {
+            Some(s) => match s.parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n)) {
+                Some(p) => state.focus_pane(&p),
+                None => Ok(Vec::new()),
+            },
+            None => state.cycle_focus(),
+        },
+        "focus-tab" => match args.first().and_then(|s| s.parse::<usize>().ok()).and_then(|n| tab_index_for_n(state, n)) {
+            Some(idx) => state.goto_tab(idx),
+            None => Ok(Vec::new()),
+        },
+        "tabs" => Ok(state.open_tab_picker()),
+        "panes" => Ok(state.open_pane_picker()),
+        "next-tab" => state.next_tab(),
+        "prev-tab" => state.prev_tab(),
+        "move-tab-left" => state.move_tab_left(),
+        "move-tab-right" => state.move_tab_right(),
+        "detach" => {
+            if state.session_name.is_some() {
+                Ok(build_ses_envelope(&SesCommand::Detach, 0))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        "help" => {
+            state.mode = Mode::Help {
+                offset: 0,
+                csi_buf: Vec::new(),
+            };
+            Ok(state.render_modal_overlay())
+        }
+        "quit" => {
+            state.mode = Mode::ConfirmQuit;
+            Ok(state.render_modal_overlay())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 #[derive(Debug)]
 enum Mode {
     Normal,
@@ -2215,6 +2987,10 @@ enum Mode {
     Resize {
         csi_buf: Vec<u8>,
     },
+    /// Command palette or a tab / pane / move-pane list picker. Captures
+    /// keystrokes until Enter (run the selection) or Esc (cancel). See
+    /// [`Picker`].
+    Picker(Picker),
 }
 
 /// The prefix key byte. Defaults to Ctrl+Space (`0x00`); overridable via
@@ -2471,6 +3247,43 @@ impl State {
         );
         // New pane gets focus.
         self.set_focus(new_id);
+        self.relayout_and_render()
+    }
+
+    /// Swap the focused pane with its in-order neighbour `step` slots away
+    /// (wrapping). Structure-preserving — only the two cells' contents
+    /// trade places. Focus is stored as a pane id, so it follows the
+    /// focused pane to its new cell automatically; no `set_focus` needed.
+    fn swap_focus(&mut self, step: isize) -> Result<Vec<u8>> {
+        self.tabs[self.active_tab].zoomed = None;
+        let mut ids = Vec::new();
+        self.active_layout().collect_leaves(&mut ids);
+        if ids.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let focus = self.focus().to_string();
+        let cur = ids.iter().position(|id| *id == focus).unwrap_or(0);
+        let other = ids[(cur as isize + step).rem_euclid(ids.len() as isize) as usize].clone();
+        self.layout_mut().swap_leaves(&focus, &other);
+        self.relayout_and_render()
+    }
+
+    /// Cycle every pane through the cell positions (tmux `rotate-window`).
+    /// Focus follows its pane by id, so the same pane stays focused.
+    fn rotate_panes(&mut self, step: isize) -> Result<Vec<u8>> {
+        self.tabs[self.active_tab].zoomed = None;
+        self.layout_mut().rotate(step);
+        self.relayout_and_render()
+    }
+
+    /// Rotate the focused pane's own divider 90° (flip its parent split's
+    /// orientation). No-op when the focused pane is the only one.
+    fn toggle_split_dir(&mut self) -> Result<Vec<u8>> {
+        self.tabs[self.active_tab].zoomed = None;
+        let focus = self.focus().to_string();
+        if !self.layout_mut().toggle_dir_of_parent(&focus) {
+            return Ok(Vec::new());
+        }
         self.relayout_and_render()
     }
 
@@ -2792,6 +3605,255 @@ impl State {
         let dst = (self.active_tab + 1) % self.tabs.len();
         self.tabs.swap(self.active_tab, dst);
         self.active_tab = dst;
+        self.relayout_and_render()
+    }
+
+    // ── Command palette / pickers ──────────────────────────────────────
+
+    /// Open the command palette (full command list, command-line input).
+    fn open_command_palette(&mut self) -> Vec<u8> {
+        let picker = Picker::new(PickerKind::Command, "Command".to_string(), command_items());
+        self.mode = Mode::Picker(picker);
+        self.render_modal_overlay()
+    }
+
+    /// Items for a tab list: one row per tab, labelled by effective title.
+    fn tab_picker_items(&self) -> Vec<PickerItem> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let label = self.tab_effective_title(i);
+                let hint = format!("tab {}", i + 1);
+                let filter_key = format!("{label} {hint}").to_lowercase();
+                PickerItem { label, hint, filter_key, payload: PickerPayload::Tab(i) }
+            })
+            .collect()
+    }
+
+    /// Open the tab picker (Enter focuses the chosen tab).
+    fn open_tab_picker(&mut self) -> Vec<u8> {
+        let items = self.tab_picker_items();
+        let picker = Picker::new(PickerKind::Tab, "Tabs".to_string(), items);
+        self.mode = Mode::Picker(picker);
+        self.render_modal_overlay()
+    }
+
+    /// Open the global pane picker (Enter switches to that pane's tab and
+    /// focuses it).
+    fn open_pane_picker(&mut self) -> Vec<u8> {
+        let mut items = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let tab_label = self.tab_effective_title(i);
+            let mut leaves = Vec::new();
+            tab.layout.collect_leaves(&mut leaves);
+            for pane_id in leaves {
+                let label = self
+                    .panes
+                    .get(&pane_id)
+                    .map(|p| p.effective_title().to_string())
+                    .unwrap_or_else(|| pane_id.clone());
+                let hint = format!("{tab_label} · {pane_id}");
+                let filter_key = format!("{label} {hint}").to_lowercase();
+                items.push(PickerItem { label, hint, filter_key, payload: PickerPayload::Pane(pane_id) });
+            }
+        }
+        let picker = Picker::new(PickerKind::Pane, "Panes".to_string(), items);
+        self.mode = Mode::Picker(picker);
+        self.render_modal_overlay()
+    }
+
+    /// Open the destination-tab picker for moving `pane` (Enter / a digit
+    /// key moves it to the chosen tab).
+    fn open_move_pane_picker(&mut self, pane: String) -> Vec<u8> {
+        let items = self.tab_picker_items();
+        let picker = Picker::new(
+            PickerKind::MovePaneTarget { pane },
+            "Move pane → tab".to_string(),
+            items,
+        );
+        self.mode = Mode::Picker(picker);
+        self.render_modal_overlay()
+    }
+
+    /// Open the rename modal pre-filled with `pane_id`'s effective title.
+    fn open_rename_pane(&mut self, pane_id: String) -> Vec<u8> {
+        let buffer = self
+            .panes
+            .get(&pane_id)
+            .map(|p| p.effective_title().to_string())
+            .unwrap_or_default();
+        self.mode = Mode::Rename {
+            target: RenameTarget::Pane(pane_id),
+            editor: LineEditor::new(buffer),
+        };
+        self.render_modal_overlay()
+    }
+
+    /// Open the rename modal pre-filled with tab `idx`'s effective title.
+    fn open_rename_tab(&mut self, idx: usize) -> Vec<u8> {
+        let buffer = self.tab_effective_title(idx);
+        self.mode = Mode::Rename {
+            target: RenameTarget::Tab(idx),
+            editor: LineEditor::new(buffer),
+        };
+        self.render_modal_overlay()
+    }
+
+    /// Set (or, with an empty `name`, clear) a pane's manual title and
+    /// re-render its chrome plus the tab bar (the pane title can bubble up
+    /// as the tab's auto-title).
+    fn set_pane_title(&mut self, pane_id: &str, name: Option<String>) -> Vec<u8> {
+        if let Some(p) = self.panes.get_mut(pane_id) {
+            p.manual_title = name.filter(|s| !s.is_empty());
+        }
+        let mut out = self.render_one_chrome(pane_id);
+        out.extend(self.render_tabbar());
+        out
+    }
+
+    /// Set (or clear) a tab's manual title and relayout so the tab bar
+    /// reflects it.
+    fn set_tab_title(&mut self, idx: usize, name: Option<String>) -> Result<Vec<u8>> {
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.manual_title = name.filter(|s| !s.is_empty());
+        }
+        self.relayout_and_render()
+    }
+
+    /// Non-interactive resize of `target` to an absolute or relative cell
+    /// size. Adjusts the pane's nearest vertical divider (width); if it has
+    /// none, falls back to the nearest horizontal one (height).
+    fn resize_pane(&mut self, target: &str, size: SizeArg) -> Result<Vec<u8>> {
+        if self.tabs[self.active_tab].zoomed.is_some() {
+            return Ok(Vec::new());
+        }
+        let bounds = self.full_bounds();
+        let mut rects = HashMap::new();
+        layout_rects(self.active_layout(), bounds, &mut rects);
+        let Some(rect) = rects.get(target).copied() else {
+            return Ok(Vec::new());
+        };
+        let cells_w = match size {
+            SizeArg::Rel(d) => d,
+            SizeArg::Abs(n) => n as i32 - rect.w as i32,
+        };
+        if resize_split(self.layout_mut(), target, SplitDir::Vertical, cells_w, bounds) {
+            return self.relayout_and_render();
+        }
+        let cells_h = match size {
+            SizeArg::Rel(d) => d,
+            SizeArg::Abs(n) => n as i32 - rect.h as i32,
+        };
+        if resize_split(self.layout_mut(), target, SplitDir::Horizontal, cells_h, bounds) {
+            self.relayout_and_render()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Close every pane in tab `idx` and remove the tab. Mirrors the
+    /// teardown in [`State::close_pane`]; quits vmux if the last tab goes.
+    fn close_tab(&mut self, idx: usize) -> Result<Vec<u8>> {
+        if idx >= self.tabs.len() {
+            return Ok(Vec::new());
+        }
+        let mut leaves = Vec::new();
+        self.tabs[idx].layout.collect_leaves(&mut leaves);
+        let mut out = Vec::new();
+        for pane in &leaves {
+            self.pending_scrolls.retain(|_, pid| pid != pane);
+            self.panes.remove(pane);
+            self.visible_panes.remove(pane);
+            out.extend(build_prt_envelope(&[(
+                PrtCommand::DeletePortal { id: pane.clone() },
+                0,
+            )]));
+            out.extend(build_vge_envelope(&[(
+                VgeCommand::DeleteElement { id: chrome_element_id(pane) },
+                0,
+            )]));
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.quit = true;
+            return Ok(out);
+        }
+        if self.active_tab == idx {
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+        } else if self.active_tab > idx {
+            self.active_tab -= 1;
+        }
+        out.extend(self.relayout_and_render()?);
+        Ok(out)
+    }
+
+    /// Move `pane_id` out of its current tab and into `dest`, splitting
+    /// `dest`'s focused leaf. The portal is shared and persists, so no
+    /// DeletePortal/CreatePortal is emitted — only a relayout. Switches to
+    /// `dest` and focuses the moved pane.
+    fn move_pane_to_tab(&mut self, pane_id: &str, dest: usize) -> Result<Vec<u8>> {
+        if dest >= self.tabs.len() {
+            return Ok(Vec::new());
+        }
+        let Some(src) = self.tabs.iter().position(|t| t.layout.contains_leaf(pane_id)) else {
+            return Ok(Vec::new());
+        };
+        if src == dest {
+            return Ok(Vec::new());
+        }
+        let mut dest = dest;
+        match self.tabs[src].layout.remove_leaf(pane_id) {
+            RemoveResult::Empty => {
+                // Source tab held only this pane — it disappears with the move.
+                self.tabs.remove(src);
+                if src < dest {
+                    dest -= 1;
+                }
+            }
+            RemoveResult::Removed { new_focus } => {
+                if self.tabs[src].focus == pane_id {
+                    self.tabs[src].focus = new_focus;
+                }
+                if self.tabs[src].zoomed.as_deref() == Some(pane_id) {
+                    self.tabs[src].zoomed = None;
+                }
+            }
+            RemoveResult::NotFound => return Ok(Vec::new()),
+        }
+        self.splice_into_tab(dest, pane_id);
+        self.active_tab = dest;
+        self.tabs[dest].focus = pane_id.to_string();
+        self.clear_tab_activity(dest);
+        self.relayout_and_render()
+    }
+
+    /// Insert `pane_id` into tab `dest` by splitting its focused leaf
+    /// (falling back to the first leaf). Drops `dest`'s zoom so the new
+    /// pane is visible.
+    fn splice_into_tab(&mut self, dest: usize, pane_id: &str) {
+        self.tabs[dest].zoomed = None;
+        let focus = self.tabs[dest].focus.clone();
+        if !self.tabs[dest].layout.split_leaf(&focus, SplitDir::Vertical, pane_id) {
+            let first = self.tabs[dest].layout.first_leaf().to_string();
+            self.tabs[dest].layout.split_leaf(&first, SplitDir::Vertical, pane_id);
+        }
+    }
+
+    /// Focus `pane_id` wherever it lives — switching to its tab first if it
+    /// is not in the active one. Used by the global pane picker.
+    fn focus_pane_global(&mut self, pane_id: &str) -> Result<Vec<u8>> {
+        let Some(tab) = self.tabs.iter().position(|t| t.layout.contains_leaf(pane_id)) else {
+            return Ok(Vec::new());
+        };
+        if tab != self.active_tab {
+            self.active_tab = tab;
+            self.clear_tab_activity(tab);
+        }
+        self.tabs[tab].zoomed = None;
+        self.tabs[tab].focus = pane_id.to_string();
         self.relayout_and_render()
     }
 
@@ -3198,6 +4260,9 @@ impl State {
                 self.cell_ph,
                 None,
             )],
+            Mode::Picker(picker) => {
+                build_picker_elements(self.host_w, self.host_h, picker, self.cell_pw, self.cell_ph)
+            }
             // Resize shows its cue in the focused pane's title, not a
             // center modal — a center box would hide the layout the user
             // is adjusting.
@@ -5073,6 +6138,13 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 }
                 idx += 1;
             }
+            Mode::Picker(_) => {
+                let (consumed, env) = handle_picker_input(state, &bytes[idx..])?;
+                if !env.is_empty() {
+                    write_all_stdout(&env)?;
+                }
+                idx += consumed.max(1);
+            }
         }
     }
     Ok(())
@@ -5089,6 +6161,11 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'o' => state.cycle_focus(),
         b'z' => state.toggle_zoom(),
         b's' => state.enter_resize(),
+        // layout restructuring (structure-preserving)
+        b'{' => state.swap_focus(-1),
+        b'}' => state.swap_focus(1),
+        b'O' => state.rotate_panes(1),
+        b'e' => state.toggle_split_dir(),
         b'q' => {
             // Don't quit outright — pop a confirmation modal so an
             // accidental prefix-q is a recoverable keystroke.
@@ -5097,31 +6174,19 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         }
         b'r' => {
             let pane_id = state.focus().to_string();
-            // Pre-fill with the current effective title so backspacing
-            // to empty cleanly drops the manual override.
-            let buffer = state
-                .panes
-                .get(&pane_id)
-                .map(|p| p.effective_title().to_string())
-                .unwrap_or_default();
-            state.mode = Mode::Rename {
-                target: RenameTarget::Pane(pane_id),
-                editor: LineEditor::new(buffer),
-            };
-            Ok(state.render_modal_overlay())
+            Ok(state.open_rename_pane(pane_id))
         }
+        // command palette + pickers
+        b':' => Ok(state.open_command_palette()),
+        b't' => Ok(state.open_tab_picker()),
+        b'w' => Ok(state.open_pane_picker()),
         // tab controls
         b'c' => state.new_tab(),
         b'n' => state.next_tab(),
         b'p' => state.prev_tab(),
         b'R' => {
             let idx = state.active_tab;
-            let buffer = state.tab_effective_title(idx);
-            state.mode = Mode::Rename {
-                target: RenameTarget::Tab(idx),
-                editor: LineEditor::new(buffer),
-            };
-            Ok(state.render_modal_overlay())
+            Ok(state.open_rename_tab(idx))
         }
         b'1'..=b'9' => {
             let idx = (b - b'1') as usize;
@@ -5233,6 +6298,80 @@ fn handle_rename_input(state: &mut State, rest: &[u8]) -> Result<(usize, Vec<u8>
                 }
             }
             Ok((consumed, env))
+        }
+    }
+}
+
+/// The action a committed picker selection stands for, extracted before
+/// the picker mode is torn down.
+enum PickerCommit {
+    /// Run command index with the trailing command-line args.
+    Command(usize, Vec<String>),
+    FocusTab(usize),
+    FocusPane(String),
+    MovePane(String, usize),
+}
+
+/// Process keystrokes while a picker (command palette / tab / pane /
+/// move-pane) is up. Feeds the front of `rest` to the [`Picker`] and acts
+/// on its outcome, returning the bytes consumed and the envelope to emit.
+fn handle_picker_input(state: &mut State, rest: &[u8]) -> Result<(usize, Vec<u8>)> {
+    let (consumed, outcome) = {
+        let Mode::Picker(p) = &mut state.mode else {
+            return Ok((1, Vec::new()));
+        };
+        p.picker_feed(rest)
+    };
+    match outcome {
+        PickerOutcome::Noop => Ok((consumed, Vec::new())),
+        PickerOutcome::Redraw => Ok((consumed, state.render_modal_overlay())),
+        PickerOutcome::Cancel => {
+            state.mode = Mode::Normal;
+            Ok((consumed, state.render_modal_overlay()))
+        }
+        PickerOutcome::Commit => {
+            // Resolve the selection into a concrete action under the picker
+            // borrow, then drop the picker before acting on it.
+            let commit = {
+                let Mode::Picker(p) = &state.mode else {
+                    return Ok((consumed, Vec::new()));
+                };
+                p.current().map(|item_idx| match &p.items[item_idx].payload {
+                    PickerPayload::Command(ci) => {
+                        let args = p
+                            .editor
+                            .buffer
+                            .split_whitespace()
+                            .skip(1)
+                            .map(|s| s.to_string())
+                            .collect();
+                        PickerCommit::Command(*ci, args)
+                    }
+                    PickerPayload::Tab(idx) => match &p.kind {
+                        PickerKind::MovePaneTarget { pane } => {
+                            PickerCommit::MovePane(pane.clone(), *idx)
+                        }
+                        _ => PickerCommit::FocusTab(*idx),
+                    },
+                    PickerPayload::Pane(id) => PickerCommit::FocusPane(id.clone()),
+                })
+            };
+            // Tear the picker down first; the action may open another modal.
+            state.mode = Mode::Normal;
+            let mut out = state.render_modal_overlay();
+            if let Some(commit) = commit {
+                match commit {
+                    PickerCommit::Command(ci, args) => {
+                        out.extend(run_command(state, COMMANDS[ci].name, &args)?);
+                    }
+                    PickerCommit::FocusTab(idx) => out.extend(state.goto_tab(idx)?),
+                    PickerCommit::FocusPane(id) => out.extend(state.focus_pane_global(&id)?),
+                    PickerCommit::MovePane(pane, dest) => {
+                        out.extend(state.move_pane_to_tab(&pane, dest)?)
+                    }
+                }
+            }
+            Ok((consumed, out))
         }
     }
 }
@@ -6041,5 +7180,149 @@ mod tests {
         *layout.ratio_at_path_mut(&path).unwrap() = 0.25;
         let Layout::Split { ratio, .. } = &layout else { unreachable!() };
         assert!((*ratio - 0.25).abs() < 1e-6);
+    }
+
+    // ── Command palette / picker ───────────────────────────────────────
+
+    /// Feed a whole keystroke string to a picker, returning the last
+    /// outcome as a label (matches the `drive` helper's style).
+    fn feed_picker(p: &mut Picker, keys: &[u8]) -> &'static str {
+        let mut idx = 0;
+        let mut last = "noop";
+        while idx < keys.len() {
+            let (consumed, outcome) = p.picker_feed(&keys[idx..]);
+            last = match outcome {
+                PickerOutcome::Noop => "noop",
+                PickerOutcome::Redraw => "redraw",
+                PickerOutcome::Commit => "commit",
+                PickerOutcome::Cancel => "cancel",
+            };
+            idx += consumed.max(1);
+        }
+        last
+    }
+
+    #[test]
+    fn parse_size_forms() {
+        assert_eq!(parse_size("+3"), Some(SizeArg::Rel(3)));
+        assert_eq!(parse_size("-1"), Some(SizeArg::Rel(-1)));
+        assert_eq!(parse_size("30"), Some(SizeArg::Abs(30)));
+        assert_eq!(parse_size("0"), Some(SizeArg::Abs(0)));
+        assert_eq!(parse_size("x"), None);
+        assert_eq!(parse_size("+"), None);
+        assert_eq!(parse_size("3.5"), None);
+    }
+
+    #[test]
+    fn command_table_unique_and_filterable() {
+        let items = command_items();
+        assert_eq!(items.len(), COMMANDS.len());
+        // Canonical names are unique.
+        let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        names.sort_unstable();
+        let mut dedup = names.clone();
+        dedup.dedup();
+        assert_eq!(names, dedup, "command names must be unique");
+        // Every item's label must be a real command name.
+        for it in &items {
+            assert!(COMMANDS.iter().any(|c| c.name == it.label));
+        }
+        let matching = |needle: &str| -> Vec<String> {
+            items
+                .iter()
+                .filter(|i| i.filter_key.contains(needle))
+                .map(|i| i.label.clone())
+                .collect()
+        };
+        let ren = matching("rename");
+        assert!(ren.contains(&"rename-pane".to_string()));
+        assert!(ren.contains(&"rename-tab".to_string()));
+        // The "split" alias on new-pane widens its haystack.
+        assert!(matching("split").contains(&"new-pane".to_string()));
+    }
+
+    #[test]
+    fn picker_filters_and_navigates() {
+        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
+        let n_all = p.matches.len();
+        assert_eq!(n_all, COMMANDS.len());
+        assert_eq!(p.selected, 0);
+        // Down arrow advances the selection.
+        feed_picker(&mut p, b"\x1b[B");
+        assert_eq!(p.selected, 1);
+        // Up arrows clamp at the top.
+        feed_picker(&mut p, b"\x1b[A\x1b[A");
+        assert_eq!(p.selected, 0);
+        // Ctrl+N / Ctrl+P also move.
+        feed_picker(&mut p, b"\x0e\x0e");
+        assert_eq!(p.selected, 2);
+        feed_picker(&mut p, b"\x10");
+        assert_eq!(p.selected, 1);
+        // Typing filters the list to a strict subset.
+        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
+        feed_picker(&mut p, b"rename");
+        assert!(p.matches.len() < n_all);
+        assert!(p
+            .matches
+            .iter()
+            .all(|&m| p.items[m].filter_key.contains("rename")));
+        assert_eq!(p.editor.buffer, "rename");
+    }
+
+    #[test]
+    fn picker_refilter_clamps_selection() {
+        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
+        for _ in 0..6 {
+            feed_picker(&mut p, b"\x1b[B");
+        }
+        assert!(p.selected >= 1);
+        // Narrow to a tiny match set — selection must stay in range.
+        feed_picker(&mut p, b"quit");
+        assert!(!p.matches.is_empty());
+        assert!(p.selected < p.matches.len());
+    }
+
+    #[test]
+    fn picker_tab_completes_without_running() {
+        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
+        feed_picker(&mut p, b"rena");
+        let sel = p.current().expect("a match");
+        let PickerPayload::Command(ci) = &p.items[sel].payload else {
+            unreachable!()
+        };
+        let name = COMMANDS[*ci].name;
+        // Tab fills the input but does not commit.
+        assert_eq!(feed_picker(&mut p, b"\t"), "redraw");
+        assert_eq!(p.editor.buffer, format!("{name} "));
+        // The trailing space keeps the same command selected for args.
+        assert_eq!(p.current(), Some(sel));
+    }
+
+    #[test]
+    fn picker_commit_and_cancel() {
+        let items = vec![
+            PickerItem { label: "a".into(), hint: "".into(), filter_key: "a".into(), payload: PickerPayload::Tab(0) },
+            PickerItem { label: "b".into(), hint: "".into(), filter_key: "b".into(), payload: PickerPayload::Tab(1) },
+        ];
+        let mut p = Picker::new(PickerKind::Tab, "Tabs".into(), items);
+        assert_eq!(feed_picker(&mut p, b"\r"), "commit");
+        assert_eq!(feed_picker(&mut p, b"\x1b"), "cancel");
+    }
+
+    #[test]
+    fn picker_move_pane_digit_jumps_and_commits() {
+        let items: Vec<PickerItem> = (0..3)
+            .map(|i| PickerItem {
+                label: format!("t{i}"),
+                hint: format!("tab {}", i + 1),
+                filter_key: format!("t{i}"),
+                payload: PickerPayload::Tab(i),
+            })
+            .collect();
+        let mut p =
+            Picker::new(PickerKind::MovePaneTarget { pane: "p1".into() }, "Move".into(), items);
+        // Pressing '2' selects the second tab and commits immediately.
+        assert_eq!(feed_picker(&mut p, b"2"), "commit");
+        assert_eq!(p.current(), Some(1));
     }
 }
