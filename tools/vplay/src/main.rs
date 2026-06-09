@@ -34,7 +34,7 @@ use vge_render::upload::{choose_encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
-use video::{VideoMeta, grab_one_frame, probe_video};
+use video::{VideoMeta, grab_one_frame, probe_frame_times, probe_video};
 use viewport::Viewport;
 
 const EL_BG: &str = "vplay-bg";
@@ -527,7 +527,22 @@ fn main() -> Result<()> {
     let mut dirty_seek = is_video;
     let mut quit = false;
 
-    let total_frames = meta.as_ref().and_then(|m| m.nb_frames);
+    // Exact per-frame presentation times (display order). When available
+    // they are the source of truth for the frame count and for mapping a
+    // frame index to the timestamp ffmpeg should decode — this makes
+    // seeking frame-exact even for variable-frame-rate streams. Empty for
+    // images, or videos whose container yields no usable packet index; the
+    // seek path then falls back to the `index / fps` grid.
+    let frame_times = if is_video {
+        probe_frame_times(&path_str)
+    } else {
+        Vec::new()
+    };
+    let total_frames = if !frame_times.is_empty() {
+        Some(frame_times.len() as u64)
+    } else {
+        meta.as_ref().and_then(|m| m.total_frames())
+    };
     let duration = meta.as_ref().map(|m| m.duration()).unwrap_or(0.0);
 
     while !quit {
@@ -608,8 +623,11 @@ fn main() -> Result<()> {
                     const PAN: f32 = 3.0;
                     if is_video && matches!(dir, Dir::Left | Dir::Right) {
                         let dt = if dir == Dir::Right { 5.0 } else { -5.0 };
-                        seek_to(
-                            cur_pts + dt,
+                        let target = frame_at_time(cur_pts + dt, &frame_times, fps);
+                        seek_to_frame(
+                            target,
+                            total_frames,
+                            &frame_times,
                             &mut out,
                             &vp,
                             meta.as_ref().unwrap(),
@@ -639,14 +657,12 @@ fn main() -> Result<()> {
                 }
                 Event::StepNext | Event::StepPrev => {
                     if is_video {
-                        let step = 1.0 / fps;
-                        let t = if ev == Event::StepNext {
-                            cur_pts + step
-                        } else {
-                            cur_pts - step
-                        };
-                        seek_to(
-                            t,
+                        let target =
+                            cur_index as i64 + if ev == Event::StepNext { 1 } else { -1 };
+                        seek_to_frame(
+                            target,
+                            total_frames,
+                            &frame_times,
                             &mut out,
                             &vp,
                             meta.as_ref().unwrap(),
@@ -671,8 +687,10 @@ fn main() -> Result<()> {
                         drag = Drag::Seek;
                         let frac =
                             ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
-                        seek_to(
-                            frac as f64 * duration,
+                        seek_to_frame(
+                            frame_at_time(frac as f64 * duration, &frame_times, fps),
+                            total_frames,
+                            &frame_times,
                             &mut out,
                             &vp,
                             meta.as_ref().unwrap(),
@@ -716,8 +734,10 @@ fn main() -> Result<()> {
                         Drag::Seek if pressed && is_video => {
                             let frac =
                                 ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
-                            seek_to(
-                                frac as f64 * duration,
+                            seek_to_frame(
+                                frame_at_time(frac as f64 * duration, &frame_times, fps),
+                                total_frames,
+                                &frame_times,
                                 &mut out,
                                 &vp,
                                 meta.as_ref().unwrap(),
@@ -826,12 +846,36 @@ enum Drag {
     Seek,
 }
 
-/// Seek to `time` seconds: decode that single frame with ffmpeg and
-/// display it. There is no continuous playback — the frame only changes
-/// when the user seeks.
+/// Map a timeline position in seconds to the index of the frame visible at
+/// that instant: the last frame whose presentation time is `<= time`. Uses
+/// the exact PTS table when present (correct for variable-frame-rate
+/// streams), else the `round(time * fps)` grid.
+fn frame_at_time(time: f64, frame_times: &[f64], fps: f64) -> i64 {
+    if frame_times.is_empty() {
+        return (time * fps.max(1.0)).round() as i64;
+    }
+    match frame_times.partition_point(|&t| t <= time) {
+        0 => 0,
+        n => (n - 1) as i64,
+    }
+}
+
+/// Seek to a specific frame `index` (clamped to the valid range), decode
+/// it with ffmpeg and display it. There is no continuous playback — the
+/// frame only changes when the user seeks.
+///
+/// Seeking is frame-exact. With a PTS table the frame's real presentation
+/// time is known, so ffmpeg is aimed at the *middle* of the target frame
+/// (halfway to the next frame's PTS) — robust against float slop and
+/// variable frame spacing. Without one it falls back to the CFR grid,
+/// aiming at `(index + 0.5) / fps`. Either way `cur_index` ends up equal to
+/// the frame actually shown, and callers address frames by index so every
+/// path snaps to the same grid and never drifts.
 #[allow(clippy::too_many_arguments)]
-fn seek_to<W: Write>(
-    time: f64,
+fn seek_to_frame<W: Write>(
+    index: i64,
+    total_frames: Option<u64>,
+    frame_times: &[f64],
     out: &mut W,
     vp: &Viewport,
     meta: &VideoMeta,
@@ -846,10 +890,31 @@ fn seek_to<W: Write>(
     cell_pw: f32,
     cell_ph: f32,
 ) -> Result<()> {
-    let time = time.clamp(0.0, meta.duration());
-    *cur_pts = time;
-    *cur_index = (time * meta.fps).round() as u64;
-    if let Some(rgba) = grab_one_frame(path, meta.width, meta.height, time)? {
+    let fps = meta.fps.max(1.0);
+    let mut idx = index.max(0) as u64;
+    if let Some(last) = total_frames.map(|t| t.saturating_sub(1)) {
+        idx = idx.min(last);
+    }
+    *cur_index = idx;
+    let i = idx as usize;
+    let (pts, aim) = if let Some(&t0) = frame_times.get(i) {
+        let aim = if let Some(&t1) = frame_times.get(i + 1) {
+            // Centre of frame `i`: between its PTS and the next frame's.
+            (t0 + t1) * 0.5
+        } else if i > 0 {
+            // Last frame: nudge just past its PTS by half the prior gap.
+            t0 + (t0 - frame_times[i - 1]).max(0.0) * 0.5
+        } else {
+            t0
+        };
+        (t0, aim)
+    } else {
+        // No PTS table — assume constant frame rate.
+        (idx as f64 / fps, (idx as f64 + 0.5) / fps)
+    };
+    *cur_pts = pts.clamp(0.0, meta.duration());
+    let aim = aim.clamp(0.0, meta.duration());
+    if let Some(rgba) = grab_one_frame(path, meta.width, meta.height, aim)? {
         *source_frame = Frame::new(meta.width, meta.height, rgba);
         render_video_frame(
             out,
@@ -877,5 +942,33 @@ impl Drop for TermExit {
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_at_time;
+
+    #[test]
+    fn frame_at_time_uses_pts_table() {
+        // Variable spacing: frame 2 is long (1.0..2.5).
+        let times = [0.0, 0.5, 1.0, 2.5, 3.0];
+        // Exact boundaries select that frame.
+        assert_eq!(frame_at_time(0.0, &times, 25.0), 0);
+        assert_eq!(frame_at_time(1.0, &times, 25.0), 2);
+        // Mid-frame stays on the frame whose PTS it's past.
+        assert_eq!(frame_at_time(2.0, &times, 25.0), 2);
+        assert_eq!(frame_at_time(2.5, &times, 25.0), 3);
+        // Before the start clamps to 0; past the end clamps to the last.
+        assert_eq!(frame_at_time(-1.0, &times, 25.0), 0);
+        assert_eq!(frame_at_time(99.0, &times, 25.0), 4);
+    }
+
+    #[test]
+    fn frame_at_time_falls_back_to_grid() {
+        // No PTS table: round(time * fps).
+        assert_eq!(frame_at_time(0.0, &[], 25.0), 0);
+        assert_eq!(frame_at_time(1.0, &[], 25.0), 25);
+        assert_eq!(frame_at_time(0.5, &[], 25.0), 13); // round(12.5) -> 13
     }
 }
