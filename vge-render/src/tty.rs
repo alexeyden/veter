@@ -25,6 +25,39 @@ pub fn poll_stdin_until(deadline: Instant) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Block until stdin or `extra` has data ready (or hangs up), or until
+/// `deadline` elapses. Returns `(stdin_ready, extra_ready)`. Lets an event
+/// loop stay responsive to input while also waiting on a background pipe
+/// (e.g. an in-flight ffmpeg decode).
+pub fn poll_stdin_and(
+    extra: std::os::fd::RawFd,
+    deadline: Instant,
+) -> Result<(bool, bool)> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::BorrowedFd;
+    let now = Instant::now();
+    if now >= deadline {
+        return Ok((false, false));
+    }
+    let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let in_b = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+    let ex_b = unsafe { BorrowedFd::borrow_raw(extra) };
+    let wake = PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR;
+    let mut fds = [
+        PollFd::new(in_b, PollFlags::POLLIN),
+        PollFd::new(ex_b, PollFlags::POLLIN),
+    ];
+    poll(&mut fds, PollTimeout::from(remaining_ms)).context("poll(stdin+fd)")?;
+    let ready = |i: usize| {
+        fds[i]
+            .revents()
+            .map(|r| r.intersects(wake))
+            .unwrap_or(false)
+    };
+    Ok((ready(0), ready(1)))
+}
+
 /// Single read off stdin; returns the byte count (0 on EOF).
 pub fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     let fd = std::io::stdin().as_raw_fd();

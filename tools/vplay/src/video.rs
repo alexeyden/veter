@@ -3,7 +3,8 @@
 //! processes. Audio is ignored.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::os::fd::{AsRawFd, RawFd};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -187,6 +188,105 @@ pub fn grab_one_frame(path: &str, w: u32, h: u32, time: f64) -> Result<Option<Ve
     match r {
         Ok(()) => Ok(Some(buf)),
         Err(_) => Ok(None),
+    }
+}
+
+/// An ffmpeg single-frame decode running in the background. The event loop
+/// drains it incrementally with [`Decode::poll`] so it can animate a
+/// spinner (and stay responsive to input / newer seeks) while ffmpeg seeks
+/// and decodes. Dropping the handle kills ffmpeg — that is how a superseded
+/// seek (e.g. mid-drag) cancels the decode it replaced.
+pub struct Decode {
+    child: Child,
+    stdout: ChildStdout,
+    buf: Vec<u8>,
+    filled: usize,
+}
+
+/// Result of draining a [`Decode`] without blocking.
+pub enum DecodeState {
+    /// ffmpeg is still working / the frame is only partly transferred.
+    Pending,
+    /// The full RGBA frame is ready.
+    Done(Vec<u8>),
+    /// ffmpeg exited before producing a frame (e.g. seek past the end) or
+    /// the pipe errored.
+    Failed,
+}
+
+impl Decode {
+    /// The stdout pipe fd, for inclusion in the event loop's poll set so a
+    /// finished decode wakes the loop promptly.
+    pub fn fd(&self) -> RawFd {
+        self.stdout.as_raw_fd()
+    }
+
+    /// Drain whatever ffmpeg has written so far without blocking. The pipe
+    /// is non-blocking, so a read returns `EAGAIN` when momentarily empty.
+    pub fn poll(&mut self) -> DecodeState {
+        loop {
+            if self.filled == self.buf.len() {
+                let _ = self.child.wait();
+                return DecodeState::Done(std::mem::take(&mut self.buf));
+            }
+            match nix::unistd::read(self.stdout.as_raw_fd(), &mut self.buf[self.filled..]) {
+                Ok(0) => {
+                    let _ = self.child.wait();
+                    return DecodeState::Failed;
+                }
+                Ok(n) => self.filled += n,
+                Err(nix::errno::Errno::EAGAIN) => return DecodeState::Pending,
+                Err(_) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return DecodeState::Failed;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Decode {
+    fn drop(&mut self) {
+        // Superseded or abandoned: stop ffmpeg rather than leak it.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Like [`grab_one_frame`], but non-blocking: spawn the ffmpeg decode of the
+/// frame at `time` and return a [`Decode`] the event loop can poll.
+pub fn start_decode(path: &str, w: u32, h: u32, time: f64) -> Result<Decode> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").args(["-loglevel", "error"]);
+    if time > 0.0 {
+        cmd.args(["-ss", &format!("{time}")]);
+    }
+    cmd.args(["-i", path]).args([
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-an", "-sn", "-",
+    ]);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    let mut child = cmd.spawn().context("spawning ffmpeg")?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    set_nonblocking(stdout.as_raw_fd());
+    Ok(Decode {
+        child,
+        stdout,
+        buf: vec![0u8; (w as usize) * (h as usize) * 4],
+        filled: 0,
+    })
+}
+
+/// Flip a fd to non-blocking. Best-effort: on the off chance fcntl fails the
+/// decode still works, it just blocks the loop briefly instead of spinning.
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 

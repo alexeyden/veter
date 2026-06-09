@@ -27,25 +27,32 @@ use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_render::is_ssh_session;
 use vge_render::probe::run_probe;
 use vge_render::tty::{
-    RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_until, read_stdin, take_sigwinch,
-    winsize,
+    RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_and, poll_stdin_until, read_stdin,
+    take_sigwinch, winsize,
 };
 use vge_render::upload::{choose_encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
-use video::{VideoMeta, grab_one_frame, probe_frame_times, probe_video};
+use video::{Decode, DecodeState, VideoMeta, grab_one_frame, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
 
 const EL_BG: &str = "vplay-bg";
 const EL_IMG: &str = "vplay-img";
 const EL_STATUS: &str = "vplay-status";
 const EL_SEEK: &str = "vplay-seek";
+const EL_SPINNER: &str = "vplay-spin";
 const IMG_ID: &str = "vplay-tex";
 const IMG_ID_A: &str = "vplay-fa";
 const IMG_ID_B: &str = "vplay-fb";
 
 const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
+
+/// Braille spinner frames, shown while a seek's frame is still decoding.
+const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Poll cycles a decode must outlive before its spinner appears, so quick
+/// seeks/steps don't flash an indicator.
+const SPIN_DELAY_TICKS: u32 = 2;
 
 fn flat(r: f32, g: f32, b: f32, a: f32) -> Style {
     Style::Flat(Color { r, g, b, a })
@@ -294,6 +301,66 @@ fn update_seek(cols: u16, rows: u16, frac: f32) -> Vec<Command> {
     ]
 }
 
+/// A centred, initially-hidden spinner: a translucent backdrop (index 0)
+/// behind an animated braille glyph (index 1).
+///
+/// The backdrop is sized in cells to be pixel-square given the font's cell
+/// aspect (`cell_ph / cell_pw`, ~2 for typical monospace). The glyph renders
+/// in the row `[origin.y, origin.y + 1)` — visually centred at
+/// `origin.y + 0.5` — so its origin is placed half a row above the box
+/// centre to sit in the middle of the badge rather than its lower edge.
+fn create_spinner(cols: u16, media_rows: u16, cell_pw: f32, cell_ph: f32) -> Command {
+    let cx = cols as f32 / 2.0;
+    let cy = media_rows as f32 / 2.0;
+    let box_h = 1.6_f32;
+    let box_w = box_h * (cell_ph / cell_pw).max(0.5); // pixel-square
+    Command::CreateElement(CreateElementBody {
+        id: EL_SPINNER.into(),
+        commands: vec![
+            DrawCmd::FillRectangles {
+                fill: flat(0.06, 0.07, 0.09, 0.62),
+                rects: vec![Rect {
+                    x: cx - box_w / 2.0,
+                    y: cy - box_h / 2.0,
+                    w: box_w,
+                    h: box_h,
+                }],
+            },
+            DrawCmd::DrawText {
+                origin: Point {
+                    x: cx,
+                    y: cy - 0.5,
+                },
+                align: Align::Center,
+                fill: flat(0.85, 0.90, 0.97, 1.0),
+                font_style: FontStyle::default(),
+                text: SPIN_FRAMES[0].into(),
+            },
+        ],
+        origin: Point { x: 0.0, y: 0.0 },
+        is_visible: false,
+        draw_order: 20,
+        parent: None,
+        size: None,
+    })
+}
+
+fn spinner_glyph(phase: usize) -> Command {
+    Command::UpdateText(UpdateTextBody {
+        id: EL_SPINNER.into(),
+        command_index: 1,
+        range: UpdateTextRange::Whole,
+        replacement: SPIN_FRAMES[phase % SPIN_FRAMES.len()].into(),
+    })
+}
+
+fn spinner_show(visible: bool) -> Command {
+    Command::UpdateVisibility {
+        id: EL_SPINNER.into(),
+        is_visible: visible,
+    }
+}
+
 fn fmt_pts(s: f64) -> String {
     let s = s.max(0.0);
     let m = (s / 60.0) as u64;
@@ -475,7 +542,13 @@ fn main() -> Result<()> {
         ],
     );
     if is_video {
-        send(&mut out, &[np(create_seek(cols, rows, frac0))]);
+        send(
+            &mut out,
+            &[
+                np(create_seek(cols, rows, frac0)),
+                np(create_spinner(cols, media_rows, cell_pw, cell_ph)),
+            ],
+        );
     }
 
     // --- per-mode state ---
@@ -527,6 +600,14 @@ fn main() -> Result<()> {
     let mut dirty_seek = is_video;
     let mut quit = false;
 
+    // Background decode of the frame the user just seeked to. While one is
+    // in flight the loop animates a spinner and stays responsive; a newer
+    // seek replaces it (killing the superseded ffmpeg).
+    let mut pending: Option<Decode> = None;
+    let mut pending_ticks: u32 = 0;
+    let mut spin_phase: usize = 0;
+    let mut spinner_visible = false;
+
     // Exact per-frame presentation times (display order). When available
     // they are the source of truth for the frame count and for mapping a
     // frame index to the timestamp ffmpeg should decode — this makes
@@ -563,19 +644,34 @@ fn main() -> Result<()> {
                 ],
             );
             if is_video {
-                send(&mut out, &[np(create_seek(cols, rows, frac0))]);
+                send(
+                    &mut out,
+                    &[
+                        np(create_seek(cols, rows, frac0)),
+                        np(create_spinner(cols, media_rows, cell_pw, cell_ph)),
+                    ],
+                );
+                // ClearAll wiped the spinner; let the loop re-show it if a
+                // decode is still pending.
+                spinner_visible = false;
             }
             dirty_media = true;
             dirty_status = true;
             dirty_seek = is_video;
         }
 
-        // How long to block waiting for input. With no continuous
-        // playback the loop is purely event-driven; 50 ms keeps a lone
-        // ESC responsive without busy-spinning.
-        let deadline = Instant::now() + Duration::from_millis(50);
+        // How long to block waiting for input. With no continuous playback
+        // the loop is event-driven; 50 ms keeps a lone ESC responsive. While
+        // a decode is pending, wake more often (and on the decode's pipe) to
+        // animate the spinner and apply the frame the moment it lands.
+        let tick = if pending.is_some() { 80 } else { 50 };
+        let deadline = Instant::now() + Duration::from_millis(tick);
 
-        let events = if poll_stdin_until(deadline).unwrap_or(false) {
+        let stdin_ready = match pending.as_ref() {
+            Some(d) => poll_stdin_and(d.fd(), deadline).unwrap_or((false, false)).0,
+            None => poll_stdin_until(deadline).unwrap_or(false),
+        };
+        let events = if stdin_ready {
             let n = read_stdin(&mut inbuf).unwrap_or(0);
             if n == 0 {
                 break;
@@ -624,23 +720,15 @@ fn main() -> Result<()> {
                     if is_video && matches!(dir, Dir::Left | Dir::Right) {
                         let dt = if dir == Dir::Right { 5.0 } else { -5.0 };
                         let target = frame_at_time(cur_pts + dt, &frame_times, fps);
-                        seek_to_frame(
+                        request_seek(
                             target,
                             total_frames,
                             &frame_times,
-                            &mut out,
-                            &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut source_frame,
-                            &mut cur_id,
-                            &mut created_img,
-                            supported,
-                            ssh,
-                            cell_pw,
-                            cell_ph,
+                            &mut pending,
                         )?;
                         dirty_status = true;
                         dirty_seek = true;
@@ -659,23 +747,15 @@ fn main() -> Result<()> {
                     if is_video {
                         let target =
                             cur_index as i64 + if ev == Event::StepNext { 1 } else { -1 };
-                        seek_to_frame(
+                        request_seek(
                             target,
                             total_frames,
                             &frame_times,
-                            &mut out,
-                            &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut source_frame,
-                            &mut cur_id,
-                            &mut created_img,
-                            supported,
-                            ssh,
-                            cell_pw,
-                            cell_ph,
+                            &mut pending,
                         )?;
                         dirty_status = true;
                         dirty_seek = true;
@@ -687,23 +767,15 @@ fn main() -> Result<()> {
                         drag = Drag::Seek;
                         let frac =
                             ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
-                        seek_to_frame(
+                        request_seek(
                             frame_at_time(frac as f64 * duration, &frame_times, fps),
                             total_frames,
                             &frame_times,
-                            &mut out,
-                            &vp,
                             meta.as_ref().unwrap(),
                             &path_str,
                             &mut cur_pts,
                             &mut cur_index,
-                            &mut source_frame,
-                            &mut cur_id,
-                            &mut created_img,
-                            supported,
-                            ssh,
-                            cell_pw,
-                            cell_ph,
+                            &mut pending,
                         )?;
                         dirty_status = true;
                         dirty_seek = true;
@@ -734,24 +806,17 @@ fn main() -> Result<()> {
                         Drag::Seek if pressed && is_video => {
                             let frac =
                                 ((col as f32 - 1.0) / (cols as f32 - 2.0).max(1.0)).clamp(0.0, 1.0);
-                            seek_to_frame(
+                            request_seek(
                                 frame_at_time(frac as f64 * duration, &frame_times, fps),
                                 total_frames,
                                 &frame_times,
-                                &mut out,
-                                &vp,
                                 meta.as_ref().unwrap(),
                                 &path_str,
                                 &mut cur_pts,
                                 &mut cur_index,
-                                &mut source_frame,
-                                &mut cur_id,
-                                &mut created_img,
-                                supported,
-                                ssh,
-                                cell_pw,
-                                cell_ph,
+                                &mut pending,
                             )?;
+                            dirty_status = true;
                             dirty_seek = true;
                         }
                         _ => {}
@@ -762,6 +827,21 @@ fn main() -> Result<()> {
 
         if quit {
             break;
+        }
+
+        // Apply a finished background decode (or discard a failed one). On
+        // EAGAIN it stays pending and the spinner keeps animating.
+        if pending.is_some() {
+            match pending.as_mut().unwrap().poll() {
+                DecodeState::Pending => {}
+                DecodeState::Done(rgba) => {
+                    let m = meta.as_ref().unwrap();
+                    source_frame = Frame::new(m.width, m.height, rgba);
+                    pending = None;
+                    dirty_media = true;
+                }
+                DecodeState::Failed => pending = None,
+            }
         }
 
         // Coalesced redraws.
@@ -834,6 +914,29 @@ fn main() -> Result<()> {
             send(&mut out, &cmds);
             dirty_seek = false;
         }
+
+        // Spinner: reveal only once a decode has outlived a couple of poll
+        // cycles (so quick seeks/steps don't flash it) and animate while it
+        // persists; hide it the moment the picture catches up.
+        if pending.is_some() {
+            pending_ticks += 1;
+            if pending_ticks >= SPIN_DELAY_TICKS {
+                let mut cmds: Vec<(Command, u32)> = Vec::new();
+                if !spinner_visible {
+                    spinner_visible = true;
+                    cmds.push(np(spinner_show(true)));
+                }
+                spin_phase = spin_phase.wrapping_add(1);
+                cmds.push(np(spinner_glyph(spin_phase)));
+                send(&mut out, &cmds);
+            }
+        } else {
+            pending_ticks = 0;
+            if spinner_visible {
+                spinner_visible = false;
+                send(&mut out, &[np(spinner_show(false))]);
+            }
+        }
     }
 
     Ok(())
@@ -860,9 +963,8 @@ fn frame_at_time(time: f64, frame_times: &[f64], fps: f64) -> i64 {
     }
 }
 
-/// Seek to a specific frame `index` (clamped to the valid range), decode
-/// it with ffmpeg and display it. There is no continuous playback — the
-/// frame only changes when the user seeks.
+/// Resolve a frame `index` (clamped to the valid range) to the frame's
+/// presentation time and the timestamp ffmpeg should decode.
 ///
 /// Seeking is frame-exact. With a PTS table the frame's real presentation
 /// time is known, so ffmpeg is aimed at the *middle* of the target frame
@@ -870,32 +972,14 @@ fn frame_at_time(time: f64, frame_times: &[f64], fps: f64) -> i64 {
 /// variable frame spacing. Without one it falls back to the CFR grid,
 /// aiming at `(index + 0.5) / fps`. Either way `cur_index` ends up equal to
 /// the frame actually shown, and callers address frames by index so every
-/// path snaps to the same grid and never drifts.
-#[allow(clippy::too_many_arguments)]
-fn seek_to_frame<W: Write>(
-    index: i64,
-    total_frames: Option<u64>,
-    frame_times: &[f64],
-    out: &mut W,
-    vp: &Viewport,
-    meta: &VideoMeta,
-    path: &str,
-    cur_pts: &mut f64,
-    cur_index: &mut u64,
-    source_frame: &mut Frame,
-    cur_id: &mut String,
-    created: &mut bool,
-    supported: u8,
-    ssh: bool,
-    cell_pw: f32,
-    cell_ph: f32,
-) -> Result<()> {
+/// path snaps to the same grid and never drifts. Returns
+/// `(clamped_index, frame_pts, aim_time)`.
+fn frame_aim(index: i64, total_frames: Option<u64>, frame_times: &[f64], meta: &VideoMeta) -> (u64, f64, f64) {
     let fps = meta.fps.max(1.0);
     let mut idx = index.max(0) as u64;
     if let Some(last) = total_frames.map(|t| t.saturating_sub(1)) {
         idx = idx.min(last);
     }
-    *cur_index = idx;
     let i = idx as usize;
     let (pts, aim) = if let Some(&t0) = frame_times.get(i) {
         let aim = if let Some(&t1) = frame_times.get(i + 1) {
@@ -912,22 +996,33 @@ fn seek_to_frame<W: Write>(
         // No PTS table — assume constant frame rate.
         (idx as f64 / fps, (idx as f64 + 0.5) / fps)
     };
-    *cur_pts = pts.clamp(0.0, meta.duration());
-    let aim = aim.clamp(0.0, meta.duration());
-    if let Some(rgba) = grab_one_frame(path, meta.width, meta.height, aim)? {
-        *source_frame = Frame::new(meta.width, meta.height, rgba);
-        render_video_frame(
-            out,
-            vp,
-            source_frame,
-            cur_id,
-            created,
-            supported,
-            ssh,
-            cell_pw,
-            cell_ph,
-        )?;
-    }
+    (
+        idx,
+        pts.clamp(0.0, meta.duration()),
+        aim.clamp(0.0, meta.duration()),
+    )
+}
+
+/// Kick off the decode of frame `index` in the background, replacing any
+/// decode already in flight (its ffmpeg is killed when the old [`Decode`] is
+/// dropped). `cur_index` / `cur_pts` are updated immediately so the status
+/// bar and seek knob track the target while the picture catches up; the
+/// decoded frame is applied later by the event loop when the decode lands.
+#[allow(clippy::too_many_arguments)]
+fn request_seek(
+    index: i64,
+    total_frames: Option<u64>,
+    frame_times: &[f64],
+    meta: &VideoMeta,
+    path: &str,
+    cur_pts: &mut f64,
+    cur_index: &mut u64,
+    pending: &mut Option<Decode>,
+) -> Result<()> {
+    let (idx, pts, aim) = frame_aim(index, total_frames, frame_times, meta);
+    *cur_index = idx;
+    *cur_pts = pts;
+    *pending = Some(start_decode(path, meta.width, meta.height, aim)?);
     Ok(())
 }
 
