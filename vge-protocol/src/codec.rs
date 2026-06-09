@@ -16,6 +16,70 @@ pub struct Rect {
     pub h: f32,
 }
 
+/// Affine transform (§9.11), SVG / Canvas2D `matrix(a,b,c,d,e,f)`
+/// convention: `x' = a·x + c·y + e; y' = b·x + d·y + f`. The linear
+/// part acts on the element's rendered pixel geometry; the
+/// translation `(e, f)` is in cell units.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Transform {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Transform {
+    pub const IDENTITY: Transform = Transform {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub fn is_finite(&self) -> bool {
+        self.a.is_finite()
+            && self.b.is_finite()
+            && self.c.is_finite()
+            && self.d.is_finite()
+            && self.e.is_finite()
+            && self.f.is_finite()
+    }
+
+    /// Visual rotation by `theta` radians about the element-local cell
+    /// point `(cx, cy)` (§9.13 cookbook). Needs the terminal's cell
+    /// pixel size because the linear part acts in pixel space while
+    /// the translation is in cell units: `t = S⁻¹·(I − R)·S·c`.
+    pub fn rotate_about(theta: f32, cx: f32, cy: f32, cell_w_px: f32, cell_h_px: f32) -> Self {
+        let (sin, cos) = theta.sin_cos();
+        Transform {
+            a: cos,
+            b: sin,
+            c: -sin,
+            d: cos,
+            e: cx * (1.0 - cos) + cy * sin * (cell_h_px / cell_w_px),
+            f: cy * (1.0 - cos) - cx * sin * (cell_w_px / cell_h_px),
+        }
+    }
+
+    /// Axis-aligned scale about the element-local cell point
+    /// `(cx, cy)`. Cell-size independent (axis-aligned scales commute
+    /// with the cell scaling, §9.11).
+    pub fn scale_about(sx: f32, sy: f32, cx: f32, cy: f32) -> Self {
+        Transform {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: cx * (1.0 - sx),
+            f: cy * (1.0 - sy),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct DecodeError(pub u16);
 
@@ -149,6 +213,16 @@ impl<'a> Reader<'a> {
         let h = self.f32()?;
         Ok(Rect { x, y, w, h })
     }
+
+    pub fn transform(&mut self) -> DecodeResult<Transform> {
+        let a = self.f32()?;
+        let b = self.f32()?;
+        let c = self.f32()?;
+        let d = self.f32()?;
+        let e = self.f32()?;
+        let f = self.f32()?;
+        Ok(Transform { a, b, c, d, e, f })
+    }
 }
 
 pub struct Writer {
@@ -225,6 +299,15 @@ impl Writer {
 
     pub fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
+    }
+
+    pub fn transform(&mut self, t: &Transform) {
+        self.f32(t.a);
+        self.f32(t.b);
+        self.f32(t.c);
+        self.f32(t.d);
+        self.f32(t.e);
+        self.f32(t.f);
     }
 }
 

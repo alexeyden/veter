@@ -25,6 +25,7 @@ pub const CMD_UPLOAD_IMAGE: u8 = 0x0C;
 pub const CMD_DROP_IMAGE: u8 = 0x0D;
 pub const CMD_CLEAR_ALL: u8 = 0x0E;
 pub const CMD_UPDATE_SIZE: u8 = 0x0F;
+pub const CMD_UPDATE_TRANSFORM: u8 = 0x10;
 
 // §4 response codes
 pub const RSP_OK: u8 = 0x01;

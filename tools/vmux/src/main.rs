@@ -443,6 +443,7 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
         draw_order: CHROME_DRAW_ORDER,
         parent: None,
         size: None,
+        transform: None,
     }
 }
 
@@ -1517,6 +1518,7 @@ fn build_tabbar_commands(
         draw_order: CHROME_DRAW_ORDER,
         parent: None,
         size: None,
+        transform: None,
     }
 }
 
@@ -1724,6 +1726,7 @@ fn build_modal_commands(
         draw_order: MODAL_DRAW_ORDER,
         parent: None,
         size: None,
+        transform: None,
     }
 }
 
@@ -1903,6 +1906,7 @@ fn build_help_modal_elements(
             x: box_w,
             y: box_h,
         }),
+        transform: None,
     });
 
     // Body fill — full rounded rect underneath the scrolling body lines.
@@ -1919,6 +1923,7 @@ fn build_help_modal_elements(
         draw_order: 0,
         parent: Some(MODAL_ELEMENT_ID.into()),
         size: None,
+        transform: None,
     });
 
     // Body lines — every line drawn at its natural y position; the
@@ -1950,6 +1955,7 @@ fn build_help_modal_elements(
         draw_order: 1,
         parent: Some(MODAL_ELEMENT_ID.into()),
         size: None,
+        transform: None,
     });
 
     if scrollable {
@@ -1972,6 +1978,7 @@ fn build_help_modal_elements(
             draw_order: 2,
             parent: Some(MODAL_ELEMENT_ID.into()),
             size: None,
+            transform: None,
         });
 
         // Thumb command is anchored at local (box_w-1, 0); the
@@ -1996,6 +2003,7 @@ fn build_help_modal_elements(
             draw_order: 3,
             parent: Some(MODAL_ELEMENT_ID.into()),
             size: None,
+            transform: None,
         });
     }
 
@@ -2158,6 +2166,7 @@ fn build_picker_elements(
         draw_order: MODAL_DRAW_ORDER,
         parent: None,
         size: None,
+        transform: None,
     }]
 }
 
@@ -4013,6 +4022,7 @@ impl State {
                     draw_order: CHROME_DRAW_ORDER,
                     parent: None,
                     size: None,
+                    transform: None,
                 }),
                 0,
             ));
@@ -4471,6 +4481,7 @@ impl State {
                     draw_order: CHROME_DRAW_ORDER,
                     parent: None,
                     size: None,
+                    transform: None,
                 }),
                 0,
             ),

@@ -1,0 +1,10 @@
+[package]
+name = "spinner"
+version = "0.1.0"
+edition = "2024"
+description = "VGE transform demo: a complex shape created once, rotated with one UpdateTransform per frame."
+
+[dependencies]
+vge-protocol = { path = "../../vge-protocol" }
+vge-render = { path = "../../vge-render" }
+anyhow = "1"

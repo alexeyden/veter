@@ -25,10 +25,11 @@ use super::state::{Element, ElementSet, SharedTables, UploadedImage, VgeState};
 /// match — see [`super::state::VgeEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v3: per-element affine transform (§9.11).
 /// - v2: include `top_of_live_screen` so element `anchor_line` values
 ///   stay aligned with the receiving engine's `LineTracker`.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 2;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
 
 /// Error returned when a VGE binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -276,6 +277,13 @@ fn encode_element(elem: &Element, w: &mut Writer) {
         }
         None => w.bool(false),
     }
+    match &elem.transform {
+        Some(t) => {
+            w.bool(true);
+            w.transform(t);
+        }
+        None => w.bool(false),
+    }
     w.i64(elem.anchor_line);
     w.f32(elem.sub_row);
     w.f32(elem.origin_x);
@@ -314,6 +322,11 @@ fn decode_element(r: &mut Reader) -> Result<Element, SnapshotError> {
     } else {
         None
     };
+    let transform = if r.bool()? {
+        Some(r.transform()?)
+    } else {
+        None
+    };
     let anchor_line = r.i64()?;
     let sub_row = r.f32()?;
     let origin_x = r.f32()?;
@@ -327,6 +340,7 @@ fn decode_element(r: &mut Reader) -> Result<Element, SnapshotError> {
         parent,
         children,
         clip_size,
+        transform,
         anchor_line,
         sub_row,
         origin_x,

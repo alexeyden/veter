@@ -200,6 +200,7 @@ impl ProgressUI for VgeProgress {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         });
         let env = build_envelope(&[(create, 0)]);
         self.write_envelope(&env)?;

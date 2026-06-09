@@ -32,6 +32,7 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::DropImage { .. } => CMD_DROP_IMAGE,
         Command::UpdateImage(_) => CMD_UPDATE_IMAGE,
         Command::UpdateSize { .. } => CMD_UPDATE_SIZE,
+        Command::UpdateTransform { .. } => CMD_UPDATE_TRANSFORM,
     }
 }
 
@@ -70,6 +71,10 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::UpdateSize { id, new_size } => {
             w.str(id);
             write_point(&mut w, *new_size);
+        }
+        Command::UpdateTransform { id, transform } => {
+            w.str(id);
+            w.transform(transform);
         }
     }
     w.buf
@@ -392,13 +397,17 @@ fn write_create_element(w: &mut Writer, b: &CreateElementBody) {
     // present, so v1-style bodies stay backwards-compatible on the wire.
     let has_parent = b.parent.is_some();
     let has_size = b.size.is_some();
-    if has_parent || has_size {
+    let has_transform = b.transform.is_some();
+    if has_parent || has_size || has_transform {
         let mut flags: u8 = 0;
         if has_parent {
-            flags |= 0b01;
+            flags |= 0b001;
         }
         if has_size {
-            flags |= 0b10;
+            flags |= 0b010;
+        }
+        if has_transform {
+            flags |= 0b100;
         }
         w.u8(flags);
         if let Some(p) = &b.parent {
@@ -406,6 +415,9 @@ fn write_create_element(w: &mut Writer, b: &CreateElementBody) {
         }
         if let Some(sz) = &b.size {
             write_point(w, *sz);
+        }
+        if let Some(t) = &b.transform {
+            w.transform(t);
         }
     }
 }
@@ -443,7 +455,7 @@ fn write_update_text(w: &mut Writer, b: &UpdateTextBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::Rect;
+    use crate::codec::{Rect, Transform};
     use crate::command::{parse, FontStyle};
 
     fn roundtrip(cmd: Command) {
@@ -490,6 +502,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 
@@ -509,6 +522,7 @@ mod tests {
             draw_order: 1,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 
@@ -539,6 +553,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 
@@ -568,6 +583,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 
@@ -653,6 +669,7 @@ mod tests {
             draw_order: 0,
             parent: Some("root".into()),
             size: Some(Point { x: 40.0, y: 12.0 }),
+            transform: None,
         }));
     }
 
@@ -666,6 +683,7 @@ mod tests {
             draw_order: 0,
             parent: Some("parent".into()),
             size: None,
+            transform: None,
         }));
     }
 
@@ -679,6 +697,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: Some(Point { x: 80.0, y: 24.0 }),
+            transform: None,
         }));
     }
 
@@ -688,6 +707,70 @@ mod tests {
             id: "viewport".into(),
             new_size: Point { x: 50.0, y: 10.0 },
         });
+    }
+
+    #[test]
+    fn update_transform_roundtrip() {
+        roundtrip(Command::UpdateTransform {
+            id: "spinner".into(),
+            transform: Transform {
+                a: 0.5,
+                b: 0.866,
+                c: -0.866,
+                d: 0.5,
+                e: 1.25,
+                f: -2.5,
+            },
+        });
+    }
+
+    #[test]
+    fn create_element_transform_only_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "rot".into(),
+            commands: vec![],
+            origin: Point { x: 1.0, y: 2.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: None,
+            size: None,
+            transform: Some(Transform::IDENTITY),
+        }));
+    }
+
+    #[test]
+    fn create_element_parent_and_transform_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "child".into(),
+            commands: vec![],
+            origin: Point { x: 0.0, y: 0.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: Some("root".into()),
+            size: None,
+            transform: Some(Transform::scale_about(2.0, 0.5, 1.0, 1.0)),
+        }));
+    }
+
+    #[test]
+    fn create_element_all_extras_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "full".into(),
+            commands: vec![],
+            origin: Point { x: 3.0, y: 4.0 },
+            is_visible: false,
+            draw_order: 7,
+            parent: Some("root".into()),
+            size: Some(Point { x: 10.0, y: 5.0 }),
+            transform: Some(Transform {
+                a: 1.0,
+                b: 0.5,
+                c: -0.5,
+                d: 1.0,
+                e: 0.0,
+                f: 3.0,
+            }),
+        }));
     }
 
     #[test]
@@ -709,6 +792,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 
@@ -736,6 +820,7 @@ mod tests {
             draw_order: 0,
             parent: None,
             size: None,
+            transform: None,
         }));
     }
 

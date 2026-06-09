@@ -110,6 +110,7 @@ Used throughout the rest of the spec.
 | `rect`   | `f32 x, f32 y, f32 w, f32 h`                        |
 | `string` | `varu length` followed by `length` UTF-8 bytes      |
 | `bytes`  | `varu length` followed by `length` raw bytes        |
+| `transform` | `f32 a, b, c, d, e, f` — affine matrix, see §9.11 |
 
 Strings are not NUL-terminated. Empty strings encode as a single `0x00`.
 
@@ -172,6 +173,7 @@ later sections.
 | 0x0D | DropImage          | §8.2         |
 | 0x0E | ClearAll           | §6.7         |
 | 0x0F | UpdateSize         | §9.5         |
+| 0x10 | UpdateTransform    | §9.12        |
 
 All other frame_type values are reserved and MUST be rejected with
 `err_unknown_command`.
@@ -1008,7 +1010,8 @@ CreateElement (with parent / clip):
   i32           draw_order
   u8            extra_flags          ; bit0 = has_parent
                                      ; bit1 = has_size
-                                     ; bits 2..7 reserved (must be 0)
+                                     ; bit2 = has_transform
+                                     ; bits 3..7 reserved (must be 0)
   ; if bit0 (has_parent):
   string        parent_id
   ; if bit1 (has_size):
@@ -1017,6 +1020,8 @@ CreateElement (with parent / clip):
                                      ; (origin.x, origin.y, w, h) in
                                      ; parent's coords (or the screen
                                      ; for top-level)
+  ; if bit2 (has_transform):
+  transform     transform            ; 6×f32, see §9.11
 ```
 
 Validation:
@@ -1027,6 +1032,9 @@ Validation:
   else `err_bad_payload`. A `size` of `(0, 0)` is permitted and clips
   every descendant pixel; clients use it for "collapse without
   delete".
+- If `bit2` is set, all six `transform` components MUST be finite,
+  else `err_bad_payload`. Singular matrices (determinant 0) are
+  permitted and render degenerate (collapsed) geometry.
 - If the resulting tree depth would exceed advertised
   `max_nesting_depth` (§9.7), → `err_max_nesting_depth`, atomic.
 - Any reserved bit set in `extra_flags` → `err_bad_payload`.
@@ -1072,6 +1080,9 @@ Response: empty Ok.
   preserved.
 - `UpdateSize` only affects the element's own clip rect; it does not
   cascade.
+- `UpdateTransform` (§9.12) replaces only the element's own matrix;
+  descendants keep theirs (their on-screen rendering is composed
+  through the ancestor's matrix, §9.11).
 
 ### 9.7 Nesting limits
 
@@ -1094,17 +1105,22 @@ The reference renderer (femtovg) implements clipping via
 Pixel-level filtering / anti-aliasing at the clip boundary is
 implementation-defined.
 
-Femtovg's scissor is axis-aligned rectangular only (potentially
-rotated by the current transform stack). Non-rectangular clip shapes
-are out of scope for v1.
+Femtovg's scissor is axis-aligned rectangular only. Non-rectangular
+clip shapes are out of scope for v1. The reference renderer sets an
+element's scissor *before* applying that element's own transform
+(§9.11), so the clip rect is exact and never rotates with the element.
+Under a rotating *ancestor* transform, femtovg intersects scissors via
+an axis-aligned approximation in the ancestor-transformed space —
+nested clips inside rotated subtrees are approximate.
 
 Render order at each level:
 
-1. Push the parent's translate (and scissor if it has a clip rect).
+1. Push the parent's translate (and scissor if it has a clip rect),
+   then the parent's transform (§9.11) if it has one.
 2. Render each child recursively, sorted by
    `(child.draw_order, child.creation_order)` ascending.
 3. Render the parent's own `commands` (its `DrawCmd[]`) on top.
-4. Pop the scissor / translate.
+4. Pop the transform / scissor / translate.
 
 Across different parents, the parents' own draw orders take
 precedence — the entire subtree of a lower-draw-order parent renders
@@ -1151,7 +1167,122 @@ keeps the protocol stateless on input and lets the client own all
 interaction policy (scroll acceleration, kinetic scrolling, focus,
 etc.).
 
-### 9.11 Future work (deferred)
+### 9.11 Element transforms
+
+Every element carries an optional affine transform, default identity.
+On the wire it is the `transform` primitive (§1.4): six `f32`s
+`a, b, c, d, e, f` in the SVG / Canvas2D `matrix(a,b,c,d,e,f)`
+convention — conceptually the 3×3 matrix
+
+```
+      | a  c  e |
+M  =  | b  d  f |        x' = a·x + c·y + e
+      | 0  0  1 |        y' = b·x + d·y + f
+```
+
+with the bottom row implied (no perspective). It is set at create time
+via `extra_flags` bit2 (§9.4) or replaced later with `UpdateTransform`
+(§9.12).
+
+**Semantics.** The transform applies to the element's own draw
+commands *and its entire descendant subtree*, pivoting about the
+element's origin. Because cells are not square, the two parts of the
+matrix act in different spaces, chosen so that a rotation matrix
+produces a visually true (circular) rotation:
+
+- the linear part `L = [[a, c], [b, d]]` acts on the element's
+  *rendered pixel geometry* relative to its origin;
+- the translation `t = (e, f)` is in *cell units*, like every other
+  coordinate in this spec.
+
+Formally, with `S = diag(cell_pixel_width, cell_pixel_height)`, `O`
+the element's effective on-screen origin in pixels, and `p` a point in
+element-local cell coordinates:
+
+```
+pixel = O + L·(S·p) + S·t
+```
+
+Consequences of this split: axis-aligned scales and pure translations
+behave identically to the naive cell-space interpretation (`L·S` and
+`S·diag(sx, sy)` commute), but `rotate(θ)` spins a shape rigidly on
+screen instead of shearing it through the cell aspect ratio.
+
+**Composition.** Transforms nest multiplicatively down the element
+tree (a matrix stack). A child's transform pivots about the child's
+own origin *in the parent's untransformed space*; the parent's
+transform then applies to the combined result. There is no way to
+opt a child out of an ancestor's transform.
+
+**Interactions.**
+
+- `UpdateOrigin` moves the pivot: the transform is independent state
+  and `O` is evaluated at render time.
+- Scrollback anchoring, eviction (§5.2) and renderer culling use the
+  *untransformed* anchor. Translating an element far off-screen via
+  `f` does not re-anchor it, and the reference renderer may mis-cull
+  elements translated by more than ~1024 rows. Use `UpdateOrigin` for
+  large moves.
+- **Clip rects do not transform.** The element's own clip rect (§9.2)
+  stays axis-aligned at `(origin, origin + size)` in the element's
+  *untransformed* coordinate space; transformed content is still
+  clipped by it, but the rect itself never rotates or scales with the
+  element's matrix. (See §9.8 for the nested-ancestor caveat.)
+- Strokes, gradients, images and text all transform with the geometry:
+  a stroke under a 2× scale renders twice as wide, text rotates with
+  its element.
+- `draw_order` comparisons are unaffected.
+
+There is no pivot field; clients bake pivots into the matrix (§9.13).
+"Clearing" a transform = sending the identity `(1, 0, 0, 1, 0, 0)`.
+
+### 9.12 UpdateTransform (0x10)
+
+Body:
+
+```
+string    id
+transform transform        ; 6×f32 a, b, c, d, e, f
+```
+
+Replaces the named element's transform unconditionally.
+
+Errors:
+
+- Empty id → `err_bad_payload`.
+- Unknown id → `err_unknown_element`.
+- Any non-finite component → `err_bad_payload`.
+
+Response: empty Ok. No new error codes are introduced; the §4 table is
+unchanged.
+
+### 9.13 Cookbook: rotate-about-center spinner
+
+The motivating use case: create a complex shape once, then animate it
+with one small envelope per frame instead of re-sending geometry.
+
+To rotate visually by `θ` about the element-local cell point
+`(cx, cy)` on a terminal whose probe reported cell pixel size
+`(cw, ch)`:
+
+```
+a = cos θ      c = −sin θ
+b = sin θ      d =  cos θ
+e = cx·(1 − cos θ) + cy·sin θ·(ch/cw)
+f = cy·(1 − cos θ) − cx·sin θ·(cw/ch)
+```
+
+(Derivation: `t = S⁻¹·(I − R)·S·c` — the translation must round-trip
+through pixel space because `L` acts there while `t` is in cell
+units.)
+
+Tip: build the geometry centered on the element origin so that
+`cx = cy = 0` and the matrix is a pure rotation (`e = f = 0`) — then
+the per-frame update needs no cell-size math at all. One
+`UpdateTransform` envelope is ~40 bytes regardless of how complex the
+shape is.
+
+### 9.14 Future work (deferred)
 
 Possible additions for later versions:
 

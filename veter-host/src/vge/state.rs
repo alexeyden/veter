@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 
 use rgb::RGBA8;
 use vge_protocol::apc::ApcStream;
-use vge_protocol::codec::{Point, Reader};
+use vge_protocol::codec::{Point, Reader, Transform};
 use vge_protocol::command::{
     self, Command, ConcreteStyle, CreateElementBody, DrawCmd, UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
@@ -104,6 +104,11 @@ pub struct Element {
     /// own commands are clipped to the rect at
     /// `(origin, origin + size)` in the element's coordinate space.
     pub clip_size: Option<ProtoPoint>,
+    /// Affine transform (§9.11). Applies to the element's own commands
+    /// and its entire subtree, about the element's origin. `None` =
+    /// identity. The clip rect is exempt (stays axis-aligned in the
+    /// untransformed space).
+    pub transform: Option<Transform>,
     pub anchor_line: i64, // absolute scrollback line (top-level only)
     pub sub_row: f32,     // top-level only
     pub origin_x: f32,
@@ -984,6 +989,9 @@ impl VgeEngine {
             Command::DropImage { id } => self.cmd_drop_image(&id),
             Command::UpdateImage(b) => self.cmd_update_image(b),
             Command::UpdateSize { id, new_size } => self.cmd_update_size(&id, new_size),
+            Command::UpdateTransform { id, transform } => {
+                self.cmd_update_transform(&id, transform)
+            }
         }
     }
 
@@ -1006,6 +1014,26 @@ impl VgeEngine {
             .get_mut(id)
             .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
         el.clip_size = Some(new_size);
+        Ok(Vec::new())
+    }
+
+    fn cmd_update_transform(
+        &mut self,
+        id: &str,
+        transform: Transform,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        if id.is_empty() {
+            return Err((ERR_BAD_PAYLOAD, "empty id"));
+        }
+        if !transform.is_finite() {
+            return Err((ERR_BAD_PAYLOAD, "transform must be finite"));
+        }
+        let el = self
+            .state
+            .elements_mut()
+            .get_mut(id)
+            .ok_or((ERR_UNKNOWN_ELEMENT, "id not found"))?;
+        el.transform = Some(transform);
         Ok(Vec::new())
     }
 
@@ -1277,6 +1305,7 @@ impl VgeEngine {
                 parent: b.parent.clone(),
                 children: Vec::new(),
                 clip_size: b.size,
+                transform: b.transform,
                 anchor_line: anchor,
                 sub_row: sub,
                 origin_x: b.origin.x,
@@ -2467,6 +2496,106 @@ mod tests {
         assert_eq!(sz.y, 10.0);
     }
 
+    // --- §9.11 / §9.12 transform tests ---
+
+    fn update_transform_body(id: &str, t: [f32; 6]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        for v in t {
+            w.f32(v);
+        }
+        w.buf
+    }
+
+    #[test]
+    fn update_transform_sets_field() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("widget", (0.0, 0.0), None, None),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements()["widget"].transform.is_none());
+
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_UPDATE_TRANSFORM,
+            2,
+            &update_transform_body("widget", [0.0, 1.0, -1.0, 0.0, 2.5, -3.0]),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let t = engine.state.elements()["widget"].transform.unwrap();
+        assert_eq!((t.a, t.b, t.c, t.d, t.e, t.f), (0.0, 1.0, -1.0, 0.0, 2.5, -3.0));
+    }
+
+    #[test]
+    fn update_transform_unknown_element_errors() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_UPDATE_TRANSFORM,
+            1,
+            &update_transform_body("ghost", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let response = engine.take_responses();
+        let payload = unwrap_t2c_envelope(&response);
+        let mut r = Reader::new(&payload);
+        let _ = r.u8();
+        let _ = r.u32();
+        assert_eq!(r.u8().unwrap(), RSP_ERR);
+        let _ = r.u32();
+        let body_len = r.u32().unwrap() as usize;
+        let err_body = r.take(body_len).unwrap();
+        let mut er = Reader::new(err_body);
+        assert_eq!(er.u16().unwrap(), ERR_UNKNOWN_ELEMENT);
+    }
+
+    #[test]
+    fn update_transform_non_finite_rejected_state_unchanged() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            1,
+            &create_with_tree("widget", (0.0, 0.0), None, None),
+        );
+        append_command(
+            &mut frames,
+            CMD_UPDATE_TRANSFORM,
+            2,
+            &update_transform_body("widget", [f32::NAN, 0.0, 0.0, 1.0, 0.0, 0.0]),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        // Atomic failure: transform stays unset. (The parser rejects the
+        // frame, so the engine never sees a typed command.)
+        assert!(engine.state.elements()["widget"].transform.is_none());
+    }
+
+    #[test]
+    fn create_element_with_transform_flag_sets_field() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // create_with_tree without extras, then append the §9.4 trailing
+        // block by hand: extra_flags bit2 + 6 floats.
+        let mut body = create_with_tree("rot", (1.0, 2.0), None, None);
+        body.push(0b100);
+        for v in [0.5f32, 0.866, -0.866, 0.5, 0.0, 0.0] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_CREATE_ELEMENT, 1, &body);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let t = engine.state.elements()["rot"].transform.unwrap();
+        assert_eq!(t.a, 0.5);
+        assert_eq!(t.c, -0.866);
+    }
+
     // --- §5.4 alt-screen tests ---
 
     #[test]
@@ -2927,6 +3056,23 @@ mod tests {
         append_command(&mut frames, CMD_CREATE_ELEMENT, 3, &body.buf);
         drive_with_envelope(&mut e, &frames);
 
+        // A second element carrying a transform (§9.11), so snapshot
+        // roundtrips cover the v3 field.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            4,
+            &create_with_tree("el2", (3.0, 1.0), None, None),
+        );
+        append_command(
+            &mut frames,
+            CMD_UPDATE_TRANSFORM,
+            5,
+            &update_transform_body("el2", [0.0, 1.0, -1.0, 0.0, 0.5, 1.5]),
+        );
+        drive_with_envelope(&mut e, &frames);
+
         e
     }
 
@@ -2941,7 +3087,10 @@ mod tests {
         // Sanity checks on restored state.
         assert!(e2.state.shared.images.contains_key("pic"));
         assert!(e2.state.shared.styles.contains_key("accent"));
-        assert_eq!(e2.state.elements().len(), 1);
+        assert_eq!(e2.state.elements().len(), 2);
+        let t = e2.state.elements()["el2"].transform.unwrap();
+        assert_eq!((t.a, t.b, t.c, t.d, t.e, t.f), (0.0, 1.0, -1.0, 0.0, 0.5, 1.5));
+        assert!(e2.state.elements()["el1"].transform.is_none());
     }
 
     #[test]

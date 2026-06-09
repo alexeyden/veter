@@ -2537,6 +2537,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spinner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "vge-protocol",
+ "vge-render",
+]
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

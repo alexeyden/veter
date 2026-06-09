@@ -321,6 +321,7 @@ fn main() -> Result<()> {
                     draw_order: 0,
                     parent: None,
                     size: None,
+                    transform: None,
                 }),
                 REQ_ID_NO_RESPONSE,
             ));
@@ -364,6 +365,7 @@ fn main() -> Result<()> {
                     draw_order: 0,
                     parent: None,
                     size: None,
+                    transform: None,
                 })
             };
             frames.push((final_element, REQ_ID_NO_RESPONSE));

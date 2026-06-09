@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use femtovg::{Canvas, Color as FemtoColor, ImageFlags, ImageSource, LineCap, LineJoin, Paint, Path, Renderer};
+use femtovg::{Canvas, Color as FemtoColor, ImageFlags, ImageSource, LineCap, LineJoin, Paint, Path, Renderer, Transform2D};
 use imgref::ImgRef;
 
 use vge_protocol::command::{Color, ConcreteStyle, DrawCmd, Style};
@@ -254,8 +254,22 @@ fn render_element<T: Renderer>(
         return;
     }
     canvas.save();
+    // Clip rect first: it is exempt from the element's own transform
+    // (§9.11) — always axis-aligned in the untransformed space.
     if let Some(size) = el.clip_size {
         canvas.intersect_scissor(ox, oy, size.x * cell_w, size.y * cell_h);
+    }
+    // Element transform (§9.11): premultiplied into the canvas state, so
+    // it composes with every ancestor transform already on the stack and
+    // is inherited by the subtree below. Downstream code keeps baking
+    // untransformed pixel coordinates; the composed canvas matrix is
+    // translate(ox, oy) · M_px · translate(−ox, −oy) with
+    // M_px = [a, b, c, d, e·cell_w, f·cell_h] — the linear part acts on
+    // pixel geometry about the origin, the translation is in cell units.
+    if let Some(t) = &el.transform {
+        let tx = ox - t.a * ox - t.c * oy + t.e * cell_w;
+        let ty = oy - t.b * ox - t.d * oy + t.f * cell_h;
+        canvas.set_transform(&Transform2D::new(t.a, t.b, t.c, t.d, tx, ty));
     }
 
     // Children first, in (draw_order, creation_seq) order.

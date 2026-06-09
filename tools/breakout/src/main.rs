@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use vge_protocol::apc::ApcStream;
-use vge_protocol::codec::{Point, Reader, Rect};
+use vge_protocol::codec::{Point, Reader, Rect, Transform};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
     UpdateTextBody, UpdateTextRange,
@@ -50,6 +50,13 @@ const BRICK_TOP: f32 = 2.0;
 
 const SPARK_LIFE: u32 = 18;
 const SPARKS_PER_BRICK: usize = 10;
+/// Max per-frame spark rotation, radians (§9.11 transform tumble).
+const SPARK_MAX_SPIN: f32 = 0.45;
+
+/// Paddle squash-on-impact animation (§9.11): frames it lasts and the
+/// peak scale deviation (x grows by k while y shrinks by k).
+const PADDLE_SQUASH_FRAMES: u8 = 6;
+const PADDLE_SQUASH_K: f32 = 0.28;
 
 fn main() -> Result<()> {
     use std::io::IsTerminal;
@@ -122,6 +129,8 @@ struct Game {
     state: GameState,
     quit: bool,
     paddle_dirty: bool,
+    /// Frames left in the squash-on-impact animation; 0 = at rest.
+    paddle_squash: u8,
     msg_visible: bool,
     msg_text: String,
     /// Cell pixel width / height used to compensate the ball's
@@ -164,6 +173,10 @@ struct Spark {
     color: Color,
     life: u32,
     just_spawned: bool,
+    /// Current rotation (radians) and per-frame spin, rendered via
+    /// UpdateTransform — the spark square tumbles as it flies.
+    angle: f32,
+    spin: f32,
 }
 
 impl Game {
@@ -183,6 +196,7 @@ impl Game {
             state: GameState::Playing,
             quit: false,
             paddle_dirty: true,
+            paddle_squash: 0,
             msg_visible: false,
             msg_text: String::new(),
             cell_pw: cell_pw.max(1.0),
@@ -240,6 +254,7 @@ impl Game {
                 draw_order: -10,
                 parent: None,
                 size: None,
+                transform: None,
             }),
             0,
         ));
@@ -256,6 +271,7 @@ impl Game {
                     draw_order: 0,
                     parent: None,
                     size: None,
+                    transform: None,
                 }),
                 0,
             ));
@@ -274,6 +290,7 @@ impl Game {
                 draw_order: 5,
                 parent: None,
                 size: None,
+                transform: None,
             }),
             0,
         ));
@@ -291,6 +308,7 @@ impl Game {
                 draw_order: 10,
                 parent: None,
                 size: None,
+                transform: None,
             }),
             0,
         ));
@@ -314,6 +332,7 @@ impl Game {
                 draw_order: 20,
                 parent: None,
                 size: None,
+                transform: None,
             }),
             0,
         ));
@@ -337,6 +356,7 @@ impl Game {
                 draw_order: 30,
                 parent: None,
                 size: None,
+                transform: None,
             }),
             0,
         ));
@@ -423,10 +443,14 @@ impl Game {
                 s.y += s.vy;
                 s.vx *= 0.92;
                 s.vy = s.vy * 0.92 + 0.04; // tiny gravity
+                s.angle += s.spin;
                 if s.life > 0 {
                     s.life -= 1;
                 }
             }
+            // Spark squares are origin-centered, so the tumble is a pure
+            // rotation about the element origin (§9.13).
+            let tumble = Transform::rotate_about(s.angle, 0.0, 0.0, self.cell_pw, self.cell_ph);
             if s.just_spawned {
                 cmds.push((
                     Command::CreateElement(CreateElementBody {
@@ -437,6 +461,7 @@ impl Game {
                         draw_order: 15,
                         parent: None,
                         size: None,
+                        transform: Some(tumble),
                     }),
                     0,
                 ));
@@ -449,6 +474,13 @@ impl Game {
                     Command::UpdateOrigin {
                         id: s.id.clone(),
                         origin: Point { x: s.x, y: s.y },
+                    },
+                    0,
+                ));
+                cmds.push((
+                    Command::UpdateTransform {
+                        id: s.id.clone(),
+                        transform: tumble,
                     },
                     0,
                 ));
@@ -483,6 +515,25 @@ impl Game {
                 0,
             ));
             self.paddle_dirty = false;
+        }
+
+        // Squash-on-impact: scale about the paddle's center, easing back
+        // to identity over PADDLE_SQUASH_FRAMES (§9.11).
+        if self.paddle_squash > 0 && matches!(self.state, GameState::Playing) {
+            self.paddle_squash -= 1;
+            let k = PADDLE_SQUASH_K * self.paddle_squash as f32 / PADDLE_SQUASH_FRAMES as f32;
+            let t = if self.paddle_squash == 0 {
+                Transform::IDENTITY
+            } else {
+                Transform::scale_about(1.0 + k, 1.0 - k, PADDLE_W * 0.5, PADDLE_H * 0.5)
+            };
+            cmds.push((
+                Command::UpdateTransform {
+                    id: "paddle".into(),
+                    transform: t,
+                },
+                0,
+            ));
         }
 
         if self.score_dirty {
@@ -592,6 +643,7 @@ impl Game {
             let angle = off * std::f32::consts::FRAC_PI_4;
             self.ball_vx = self.speed * angle.sin();
             self.ball_vy = -self.speed * angle.cos();
+            self.paddle_squash = PADDLE_SQUASH_FRAMES;
         }
 
         // Bricks.
@@ -665,6 +717,10 @@ impl Game {
                 color: brick.color,
                 life: SPARK_LIFE,
                 just_spawned: true,
+                angle: pseudo_rand(self.next_spark_id as u32 ^ 0xA5A5) * std::f32::consts::TAU,
+                spin: (pseudo_rand(self.next_spark_id as u32 ^ 0x5A5A) - 0.5)
+                    * 2.0
+                    * SPARK_MAX_SPIN,
             });
         }
     }

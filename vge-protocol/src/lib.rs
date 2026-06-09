@@ -18,7 +18,7 @@ pub mod frame;
 pub mod path;
 
 pub use apc::TerminalEvent;
-pub use codec::{Point, Reader, Rect, Writer};
+pub use codec::{Point, Reader, Rect, Transform, Writer};
 pub use command::{
     Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FontStyle, Style,
     UpdateCommandBody, UpdateCommandsBody, UpdateTextBody, UpdateTextRange,

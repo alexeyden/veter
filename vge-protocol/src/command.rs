@@ -5,7 +5,7 @@
 // gradient and ref styles, and SetGlobalStyle. Image opcodes remain
 // rejected.
 
-use super::codec::{DecodeError, DecodeResult, Point, Reader, Rect};
+use super::codec::{DecodeError, DecodeResult, Point, Reader, Rect, Transform};
 use super::frame::*;
 use super::path::{read_path_segments, PathSegment};
 
@@ -213,6 +213,8 @@ pub struct CreateElementBody {
     pub parent: Option<String>,
     /// If `Some`, this element has a clip rect (§9.2) of this size.
     pub size: Option<Point>,
+    /// If `Some`, this element's affine transform (§9.11).
+    pub transform: Option<Transform>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +296,7 @@ pub enum Command {
     DropImage { id: String },
     UpdateImage(UpdateImageBody),
     UpdateSize { id: String, new_size: Point },
+    UpdateTransform { id: String, transform: Transform },
 }
 
 const MAX_ID_BYTES: usize = 64;
@@ -604,21 +607,29 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             // by remaining body bytes — old/v1 clients omit this entirely.
             let mut parent: Option<String> = None;
             let mut size: Option<Point> = None;
+            let mut transform: Option<Transform> = None;
             if !r.at_end() {
                 let extra_flags = r.u8()?;
                 // Reserved bits must be zero.
-                if extra_flags & !0b11 != 0 {
+                if extra_flags & !0b111 != 0 {
                     return Err(ERR_BAD_PAYLOAD);
                 }
-                if extra_flags & 0b01 != 0 {
+                if extra_flags & 0b001 != 0 {
                     parent = Some(read_id(&mut r, false)?);
                 }
-                if extra_flags & 0b10 != 0 {
+                if extra_flags & 0b010 != 0 {
                     let p = r.point()?;
                     if !p.x.is_finite() || !p.y.is_finite() || p.x < 0.0 || p.y < 0.0 {
                         return Err(ERR_BAD_PAYLOAD);
                     }
                     size = Some(p);
+                }
+                if extra_flags & 0b100 != 0 {
+                    let t = r.transform()?;
+                    if !t.is_finite() {
+                        return Err(ERR_BAD_PAYLOAD);
+                    }
+                    transform = Some(t);
                 }
             }
             if !r.at_end() {
@@ -632,6 +643,7 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 draw_order,
                 parent,
                 size,
+                transform,
             }))
         }
         CMD_DELETE_ELEMENT => {
@@ -780,6 +792,17 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             }
             Ok(Command::UpdateSize { id, new_size })
         }
+        CMD_UPDATE_TRANSFORM => {
+            let id = read_id(&mut r, false)?;
+            let transform = r.transform()?;
+            if !transform.is_finite() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            if !r.at_end() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            Ok(Command::UpdateTransform { id, transform })
+        }
         _ => Err(ERR_UNKNOWN_COMMAND),
     }
 }
@@ -853,6 +876,117 @@ mod tests {
     #[test]
     fn unknown_command_returns_error() {
         assert!(matches!(parse(0x77, &[]), Err(ERR_UNKNOWN_COMMAND)));
+    }
+
+    fn empty_element_prefix(id: &str) -> Writer {
+        let mut w = Writer::new();
+        w.str(id);
+        w.varu(0); // n_commands
+        w.f32(0.0); // origin
+        w.f32(0.0);
+        w.u8(1); // is_visible
+        for b in 0i32.to_le_bytes() {
+            w.u8(b);
+        }
+        w
+    }
+
+    fn write_transform_floats(w: &mut Writer, t: [f32; 6]) {
+        for v in t {
+            w.f32(v);
+        }
+    }
+
+    #[test]
+    fn create_element_with_transform_flag() {
+        let mut w = empty_element_prefix("rot");
+        w.u8(0b100); // extra_flags: has_transform
+        write_transform_floats(&mut w, [0.0, 1.0, -1.0, 0.0, 2.0, 3.0]);
+        match parse(CMD_CREATE_ELEMENT, &w.buf).unwrap() {
+            Command::CreateElement(b) => {
+                let t = b.transform.unwrap();
+                assert_eq!((t.a, t.b, t.c, t.d, t.e, t.f), (0.0, 1.0, -1.0, 0.0, 2.0, 3.0));
+                assert!(b.parent.is_none());
+                assert!(b.size.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_element_all_extra_flags() {
+        let mut w = empty_element_prefix("full");
+        w.u8(0b111); // parent + size + transform
+        w.str("root");
+        w.f32(10.0); // size
+        w.f32(5.0);
+        write_transform_floats(&mut w, [1.0, 0.0, 0.0, 1.0, 0.5, 0.5]);
+        match parse(CMD_CREATE_ELEMENT, &w.buf).unwrap() {
+            Command::CreateElement(b) => {
+                assert_eq!(b.parent.as_deref(), Some("root"));
+                assert_eq!(b.size, Some(Point { x: 10.0, y: 5.0 }));
+                assert!(b.transform.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_element_non_finite_transform_rejected() {
+        let mut w = empty_element_prefix("bad");
+        w.u8(0b100);
+        write_transform_floats(&mut w, [1.0, 0.0, 0.0, 1.0, f32::NAN, 0.0]);
+        assert!(matches!(parse(CMD_CREATE_ELEMENT, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn create_element_truncated_transform_rejected() {
+        let mut w = empty_element_prefix("trunc");
+        w.u8(0b100);
+        // Only 4 of the 6 floats.
+        w.f32(1.0);
+        w.f32(0.0);
+        w.f32(0.0);
+        w.f32(1.0);
+        assert!(matches!(parse(CMD_CREATE_ELEMENT, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn create_element_reserved_extra_flag_rejected() {
+        let mut w = empty_element_prefix("resv");
+        w.u8(0b1000); // bit3 is reserved
+        assert!(matches!(parse(CMD_CREATE_ELEMENT, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn update_transform_parses() {
+        let mut w = Writer::new();
+        w.str("el");
+        write_transform_floats(&mut w, [0.5, 0.0, 0.0, 0.5, -1.0, 1.0]);
+        match parse(CMD_UPDATE_TRANSFORM, &w.buf).unwrap() {
+            Command::UpdateTransform { id, transform } => {
+                assert_eq!(id, "el");
+                assert_eq!(transform.a, 0.5);
+                assert_eq!(transform.e, -1.0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn update_transform_empty_id_rejected() {
+        let mut w = Writer::new();
+        w.str("");
+        write_transform_floats(&mut w, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert!(matches!(parse(CMD_UPDATE_TRANSFORM, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn update_transform_non_finite_rejected() {
+        let mut w = Writer::new();
+        w.str("el");
+        write_transform_floats(&mut w, [f32::INFINITY, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert!(matches!(parse(CMD_UPDATE_TRANSFORM, &w.buf), Err(ERR_BAD_PAYLOAD)));
     }
 
     fn linear_grad_bytes() -> Vec<u8> {

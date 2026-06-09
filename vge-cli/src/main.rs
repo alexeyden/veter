@@ -653,6 +653,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::CreateText(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -668,6 +669,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::FillPolygon(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -680,6 +682,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::DrawLines(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -693,6 +696,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::DrawLineStrip(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -706,6 +710,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::UploadRaw(a) => {
             let data =
@@ -767,6 +772,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order: a.draw_order,
             parent: a.tree.parent,
             size: a.tree.clip_size,
+            transform: None,
         }),
         Cmd::UpdateImage { id, index, image } => Command::UpdateImage(UpdateImageBody {
             id,
@@ -786,6 +792,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             draw_order,
             parent: tree.parent,
             size: tree.clip_size,
+            transform: None,
         }),
         Cmd::UpdateSize { id, size } => Command::UpdateSize { id, new_size: size },
     })

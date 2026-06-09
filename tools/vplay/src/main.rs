@@ -132,6 +132,7 @@ fn create_image_el(target: Rect, id: &str, source: Option<Rect>) -> Command {
         draw_order: 1,
         parent: None,
         size: None,
+        transform: None,
     })
 }
 
@@ -182,6 +183,7 @@ fn create_bg(cols: u16, media_rows: u16) -> Command {
         draw_order: 0,
         parent: None,
         size: None,
+        transform: None,
     })
 }
 
@@ -215,6 +217,7 @@ fn create_status(cols: u16, rows: u16) -> Command {
         draw_order: 10,
         parent: None,
         size: None,
+        transform: None,
     })
 }
 
@@ -276,6 +279,7 @@ fn create_seek(cols: u16, rows: u16, frac: f32) -> Command {
         draw_order: 11,
         parent: None,
         size: None,
+        transform: None,
     })
 }
 
@@ -342,6 +346,7 @@ fn create_spinner(cols: u16, media_rows: u16, cell_pw: f32, cell_ph: f32) -> Com
         draw_order: 20,
         parent: None,
         size: None,
+        transform: None,
     })
 }
 
