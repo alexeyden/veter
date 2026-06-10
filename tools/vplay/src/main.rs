@@ -1,10 +1,11 @@
 //! vplay — interactive image and video viewer for VGE-aware terminals.
 //!
-//! Draws media via a single VGE `DrawImage`: in image mode the texture is
-//! uploaded once and pan/zoom is just a `source_rect` update (no
-//! re-upload); in video mode each frame is cropped+resized to the visible
-//! footprint and swapped in. A status bar and (for video) a draggable
-//! seek bar overlay the media. Video frames come from an external ffmpeg.
+//! Draws media via a single VGE `DrawImage` with a `source_rect` ROI:
+//! the full-resolution texture is uploaded once per picture (once total
+//! for images, once per seek for video, ping-ponged between two ids) and
+//! pan/zoom is a pure host-side `source_rect` update — no pixels travel.
+//! A status bar and (for video) a draggable seek bar overlay the media.
+//! Video frames come from an external ffmpeg.
 
 mod image_src;
 mod input;
@@ -16,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use image::{RgbaImage, imageops, imageops::FilterType};
 use vge_protocol::codec::{Point, Rect, Transform};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
@@ -30,7 +30,7 @@ use vge_render::tty::{
     RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_and, poll_stdin_until, read_stdin,
     take_sigwinch, winsize,
 };
-use vge_render::upload::{choose_encoding, encode_payload};
+use vge_render::upload::{Encoding, choose_encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
@@ -175,9 +175,11 @@ fn upload_cmd(
 
 /// A video-frame upload streamed chunk-by-chunk from the event loop
 /// (§8.2), so the loop — and the seek spinner — stays live during a
-/// multi-megabyte transfer. `follow_up` (the element retarget and the
-/// old texture's `DropImage`) rides in the same envelope as the final
-/// chunk, making the frame swap atomic with the upload's completion.
+/// multi-megabyte transfer. The element retarget is *not* baked in at
+/// queue time: the user may pan/zoom while the frame streams, so the
+/// caller builds the follow-up from the live viewport when the final
+/// chunk goes out, keeping the frame swap atomic with the upload's
+/// completion.
 struct ChunkedUpload {
     id: String,
     encoding: u8,
@@ -185,17 +187,17 @@ struct ChunkedUpload {
     height: u32,
     payload: Vec<u8>,
     offset: usize,
-    follow_up: Vec<Command>,
-    /// True if `follow_up` contains the `CreateElement` for the image
-    /// element (first frame) — used to roll back `created_img` if this
-    /// upload is superseded before it completes.
-    creates_element: bool,
 }
 
 impl ChunkedUpload {
-    /// Send the next chunk (plus `follow_up` on the last one). Returns
-    /// `true` when the upload has fully streamed.
-    fn pump<W: Write>(&mut self, out: &mut W) -> bool {
+    /// True if the next `pump` call sends the final chunk.
+    fn next_is_last(&self) -> bool {
+        self.offset + UPLOAD_CHUNK_BYTES >= self.payload.len()
+    }
+
+    /// Send the next chunk; `follow_up` rides in the final chunk's
+    /// envelope. Returns `true` when the upload has fully streamed.
+    fn pump<W: Write>(&mut self, out: &mut W, follow_up: Vec<Command>) -> bool {
         let end = (self.offset + UPLOAD_CHUNK_BYTES).min(self.payload.len());
         let is_last = end == self.payload.len();
         let mut cmds = vec![np(Command::UploadImage(UploadImageBody {
@@ -209,7 +211,7 @@ impl ChunkedUpload {
             data: self.payload[self.offset..end].to_vec(),
         }))];
         if is_last {
-            cmds.extend(self.follow_up.drain(..).map(np));
+            cmds.extend(follow_up.into_iter().map(np));
         }
         send(out, &cmds);
         self.offset = end;
@@ -449,92 +451,68 @@ fn render_image_mode<W: Write>(out: &mut W, vp: &Viewport, created: &mut bool) {
     send(out, &[np(cmd)]);
 }
 
-/// Crop the visible source window of `full` and resize it to the display
-/// footprint, upload it under the next ping-pong id, and point EL_IMG at
-/// it (source_rect = None, since the texture is already the exact crop).
-#[allow(clippy::too_many_arguments)]
-/// Crop+resize the current frame to the visible footprint and queue it
-/// as a [`ChunkedUpload`]. The event loop pumps the chunks; `cur_id`
-/// flips to the new texture only when the final chunk (and its
-/// element-retarget follow-up) has been sent.
-#[allow(clippy::too_many_arguments)]
-fn render_video_frame<W: Write>(
+/// Queue the full decoded frame for upload under the next ping-pong id
+/// as a [`ChunkedUpload`]. The event loop pumps the chunks and builds
+/// the element retarget (with the viewport's then-current `source_rect`)
+/// when the final chunk goes out; `cur_id` flips to the new texture only
+/// then. Pan/zoom never re-enters this path — it is a host-side
+/// `source_rect` update on the already-uploaded texture.
+fn queue_frame_upload<W: Write>(
     out: &mut W,
-    vp: &Viewport,
     full: &Frame,
     cur_id: &str,
-    created: &mut bool,
     upload: &mut Option<ChunkedUpload>,
     supported: u8,
     ssh: bool,
-    cell_pw: f32,
-    cell_ph: f32,
+    max_image_bytes: u32,
 ) -> Result<()> {
-    let l = vp.layout();
-    let sx = (l.source.x.max(0.0) as u32).min(full.w.saturating_sub(1));
-    let sy = (l.source.y.max(0.0) as u32).min(full.h.saturating_sub(1));
-    let sw = (l.source.w.round() as u32).clamp(1, full.w - sx);
-    let sh = (l.source.h.round() as u32).clamp(1, full.h - sy);
-    let tw = (l.target.w * cell_pw).round().max(1.0) as u32;
-    let th = (l.target.h * cell_ph).round().max(1.0) as u32;
-
     // Supersede a still-streaming previous frame: abort its upload
     // host-side (§8.2 — DropImage on an in-progress id) and reuse the
-    // id. If it carried the image element's CreateElement, that never
-    // went out — roll the flag back so this frame re-schedules it.
+    // id. Its element retarget never went out, so there is nothing to
+    // roll back.
     if let Some(old) = upload.take() {
         send(out, &[np(Command::DropImage { id: old.id })]);
-        if old.creates_element {
-            *created = false;
-        }
     }
 
-    // Manual crop into a tight buffer (avoids cloning the whole frame).
-    let mut crop = vec![0u8; (sw as usize) * (sh as usize) * 4];
-    let row_bytes = (sw as usize) * 4;
-    for row in 0..sh {
-        let src_off = (((sy + row) as usize) * (full.w as usize) + sx as usize) * 4;
-        let dst_off = (row as usize) * row_bytes;
-        crop[dst_off..dst_off + row_bytes]
-            .copy_from_slice(&full.rgba[src_off..src_off + row_bytes]);
+    // Raw locally, WebP over SSH — same policy as choose_encoding — but
+    // a full-resolution frame must also fit the host's advertised
+    // max_image_bytes (e.g. raw 4K RGBA is ~33 MB, over the 32 MiB
+    // default), so an over-limit raw payload falls back to WebP too.
+    let raw_bytes = full.w as usize * full.h as usize * 4;
+    let limit = max_image_bytes as usize; // 0 = host advertised no limit
+    let raw_fits = limit == 0 || raw_bytes <= limit;
+    let webp_ok = supported & 0x02 != 0;
+    let enc = if (ssh || !raw_fits) && webp_ok {
+        Encoding::WebpLossy(80.0)
+    } else if raw_fits {
+        Encoding::Raw
+    } else {
+        bail!(
+            "raw {}x{} frame ({raw_bytes} bytes) exceeds the host limit of {limit} bytes and the host does not support WebP",
+            full.w,
+            full.h
+        );
+    };
+    let (encoding, payload) = encode_payload(full.rgba.clone(), full.w, full.h, enc)?;
+    if limit > 0 && payload.len() > limit {
+        bail!(
+            "encoded {}x{} frame ({} bytes) exceeds the host limit of {limit} bytes",
+            full.w,
+            full.h,
+            payload.len()
+        );
     }
-    let crop_img = RgbaImage::from_raw(sw, sh, crop)
-        .ok_or_else(|| anyhow::anyhow!("crop buffer size mismatch"))?;
-    let resized = imageops::resize(&crop_img, tw, th, FilterType::Triangle);
 
     // `cur_id` is the texture the element currently references; the new
     // frame streams into the other slot of the A/B pair.
     let next_id = if cur_id == IMG_ID_A { IMG_ID_B } else { IMG_ID_A };
-    let enc = choose_encoding(supported, ssh, 80.0);
-    let (encoding, payload) = encode_payload(resized.into_raw(), tw, th, enc)?;
-    let (follow_up, creates_element) = if *created {
-        (
-            vec![
-                update_image_el(l.target, next_id, None),
-                Command::DropImage { id: cur_id.to_string() },
-            ],
-            false,
-        )
-    } else {
-        *created = true;
-        let mut fu = vec![create_image_el(l.target, next_id, None)];
-        // After a resize ClearAll the element is gone but the previously
-        // displayed texture survives in the session image table — drop
-        // it, or the next A/B flip would collide with it.
-        if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
-            fu.push(Command::DropImage { id: cur_id.to_string() });
-        }
-        (fu, true)
-    };
     *upload = Some(ChunkedUpload {
         id: next_id.to_string(),
         encoding,
-        width: tw,
-        height: th,
+        width: full.w,
+        height: full.h,
         payload,
         offset: 0,
-        follow_up,
-        creates_element,
     });
     Ok(())
 }
@@ -590,6 +568,7 @@ fn main() -> Result<()> {
     let cell_pw = probe.cell_pixel_width.max(1) as f32;
     let cell_ph = probe.cell_pixel_height.max(1) as f32;
     let supported = probe.supported_image_encodings;
+    let max_image_bytes = probe.max_image_bytes;
     let ssh = is_ssh_session();
 
     let ws = winsize().ok_or_else(|| anyhow::anyhow!("could not query terminal size"))?;
@@ -657,17 +636,14 @@ fn main() -> Result<()> {
         let first = grab_one_frame(&path_str, m.width, m.height, 0.0)?
             .ok_or_else(|| anyhow::anyhow!("could not decode the first video frame"))?;
         source_frame = Frame::new(m.width, m.height, first);
-        render_video_frame(
+        queue_frame_upload(
             &mut out,
-            &vp,
             &source_frame,
             &cur_id,
-            &mut created_img,
             &mut upload,
             supported,
             ssh,
-            cell_pw,
-            cell_ph,
+            max_image_bytes,
         )?;
     } else {
         let f = image_frame.unwrap();
@@ -938,27 +914,44 @@ fn main() -> Result<()> {
                     let m = meta.as_ref().unwrap();
                     source_frame = Frame::new(m.width, m.height, rgba);
                     pending = None;
-                    dirty_media = true;
+                    queue_frame_upload(
+                        &mut out,
+                        &source_frame,
+                        &cur_id,
+                        &mut upload,
+                        supported,
+                        ssh,
+                        max_image_bytes,
+                    )?;
+                    dirty_status = true;
                 }
                 DecodeState::Failed => pending = None,
             }
         }
 
-        // Coalesced redraws.
+        // Coalesced redraws. Pan/zoom is pure host-side: re-point the
+        // element's source_rect at the already-uploaded full-frame
+        // texture — no pixels travel.
         if dirty_media {
             if is_video {
-                render_video_frame(
-                    &mut out,
-                    &vp,
-                    &source_frame,
-                    &cur_id,
-                    &mut created_img,
-                    &mut upload,
-                    supported,
-                    ssh,
-                    cell_pw,
-                    cell_ph,
-                )?;
+                let l = vp.layout();
+                if created_img {
+                    send(
+                        &mut out,
+                        &[np(update_image_el(l.target, &cur_id, Some(l.source)))],
+                    );
+                } else if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
+                    // After a resize ClearAll the element is gone but the
+                    // texture survives in the session image table —
+                    // recreate the element over it, no re-upload.
+                    send(
+                        &mut out,
+                        &[np(create_image_el(l.target, &cur_id, Some(l.source)))],
+                    );
+                    created_img = true;
+                }
+                // Otherwise no texture has finished uploading yet; the
+                // first upload's completion creates the element.
             } else {
                 render_image_mode(&mut out, &vp, &mut created_img);
             }
@@ -967,13 +960,33 @@ fn main() -> Result<()> {
         }
 
         // Stream the next chunk of an in-flight frame upload. The final
-        // chunk carries the element retarget, so the texture the element
-        // references flips here and only here.
-        if let Some(u) = upload.as_mut()
-            && u.pump(&mut out)
-        {
-            cur_id = u.id.clone();
-            upload = None;
+        // chunk carries the element retarget — built here, from the
+        // viewport's current layout, so pans/zooms made while the frame
+        // streamed are honoured — and the texture the element references
+        // flips here and only here.
+        if let Some(u) = upload.as_mut() {
+            let follow_up = if u.next_is_last() {
+                let l = vp.layout();
+                let mut fu = vec![if created_img {
+                    update_image_el(l.target, &u.id, Some(l.source))
+                } else {
+                    create_image_el(l.target, &u.id, Some(l.source))
+                }];
+                created_img = true;
+                // Retire the texture the element previously referenced
+                // (also covers the one surviving a resize ClearAll), or
+                // the next A/B flip would collide with it.
+                if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
+                    fu.push(Command::DropImage { id: cur_id.clone() });
+                }
+                fu
+            } else {
+                Vec::new()
+            };
+            if u.pump(&mut out, follow_up) {
+                cur_id = u.id.clone();
+                upload = None;
+            }
         }
 
         if dirty_status {
@@ -1028,8 +1041,8 @@ fn main() -> Result<()> {
 
         // Spinner: reveal once the picture has been stale for SPIN_DELAY
         // — counting both the decode and the chunked upload that follows
-        // it — so quick seeks/steps/zooms don't flash it; hide it the
-        // moment the picture catches up. The angle is wall-clock based so
+        // it — so quick seeks/steps don't flash it; hide it the moment
+        // the picture catches up. The angle is wall-clock based so
         // the rotation rate is steady across tick lengths; updates are
         // rate-limited to one transform per SPIN_FRAME.
         match (pending.is_some() || upload.is_some(), busy_since) {
