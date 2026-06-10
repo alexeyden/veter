@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use clap::Parser;
 use image::{RgbaImage, imageops, imageops::FilterType};
-use vge_protocol::codec::{Point, Rect};
+use vge_protocol::codec::{Point, Rect, Transform};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
     UpdateTextBody, UpdateTextRange, UploadImageBody,
@@ -48,11 +48,18 @@ const IMG_ID_B: &str = "vplay-fb";
 
 const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
 
-/// Braille spinner frames, shown while a seek's frame is still decoding.
-const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Poll cycles a decode must outlive before its spinner appears, so quick
-/// seeks/steps don't flash an indicator.
-const SPIN_DELAY_TICKS: u32 = 2;
+/// Spinner angular speed, rad/s (§9.12 UpdateTransform). Time-based so
+/// the rotation rate is independent of the loop's variable tick.
+const SPIN_SPEED: f32 = 5.5;
+/// Minimum interval between spinner transform updates.
+const SPIN_FRAME: Duration = Duration::from_millis(33);
+/// How long a decode must stay pending before its spinner appears, so
+/// quick seeks/steps don't flash an indicator.
+const SPIN_DELAY: Duration = Duration::from_millis(160);
+/// Frame uploads bigger than this stream chunk-by-chunk from the event
+/// loop (§8.2) so the spinner keeps animating during the transfer; one
+/// chunk's PTY write is short enough to not visibly stall the loop.
+const UPLOAD_CHUNK_BYTES: usize = 1 << 20;
 
 fn flat(r: f32, g: f32, b: f32, a: f32) -> Style {
     Style::Flat(Color { r, g, b, a })
@@ -164,6 +171,50 @@ fn upload_cmd(
         is_last: true,
         data: payload,
     }))
+}
+
+/// A video-frame upload streamed chunk-by-chunk from the event loop
+/// (§8.2), so the loop — and the seek spinner — stays live during a
+/// multi-megabyte transfer. `follow_up` (the element retarget and the
+/// old texture's `DropImage`) rides in the same envelope as the final
+/// chunk, making the frame swap atomic with the upload's completion.
+struct ChunkedUpload {
+    id: String,
+    encoding: u8,
+    width: u32,
+    height: u32,
+    payload: Vec<u8>,
+    offset: usize,
+    follow_up: Vec<Command>,
+    /// True if `follow_up` contains the `CreateElement` for the image
+    /// element (first frame) — used to roll back `created_img` if this
+    /// upload is superseded before it completes.
+    creates_element: bool,
+}
+
+impl ChunkedUpload {
+    /// Send the next chunk (plus `follow_up` on the last one). Returns
+    /// `true` when the upload has fully streamed.
+    fn pump<W: Write>(&mut self, out: &mut W) -> bool {
+        let end = (self.offset + UPLOAD_CHUNK_BYTES).min(self.payload.len());
+        let is_last = end == self.payload.len();
+        let mut cmds = vec![np(Command::UploadImage(UploadImageBody {
+            id: self.id.clone(),
+            encoding: self.encoding,
+            width: self.width,
+            height: self.height,
+            total_bytes: self.payload.len() as u32,
+            chunk_offset: self.offset as u32,
+            is_last,
+            data: self.payload[self.offset..end].to_vec(),
+        }))];
+        if is_last {
+            cmds.extend(self.follow_up.drain(..).map(np));
+        }
+        send(out, &cmds);
+        self.offset = end;
+        is_last
+    }
 }
 
 fn create_bg(cols: u16, media_rows: u16) -> Command {
@@ -305,58 +356,59 @@ fn update_seek(cols: u16, rows: u16, frac: f32) -> Vec<Command> {
     ]
 }
 
-/// A centred, initially-hidden spinner: a translucent backdrop (index 0)
-/// behind an animated braille glyph (index 1).
+/// A centred, initially-hidden spinner: a fat white arc over a faint
+/// ring, rotated via `UpdateTransform` (§9.11).
 ///
-/// The backdrop is sized in cells to be pixel-square given the font's cell
-/// aspect (`cell_ph / cell_pw`, ~2 for typical monospace). The glyph renders
-/// in the row `[origin.y, origin.y + 1)` — visually centred at
-/// `origin.y + 0.5` — so its origin is placed half a row above the box
-/// centre to sit in the middle of the badge rather than its lower edge.
+/// One element, geometry centred on the origin and aspect-compensated
+/// (`x` in cell widths, `y` in rows) so both circles are pixel-circular —
+/// the ring is rotation-invariant, so only the highlight arc appears to
+/// spin. The per-tick update is a pure rotation matrix (§9.13); the
+/// geometry is created once and never re-sent.
 fn create_spinner(cols: u16, media_rows: u16, cell_pw: f32, cell_ph: f32) -> Command {
     let cx = cols as f32 / 2.0;
     let cy = media_rows as f32 / 2.0;
-    let box_h = 1.6_f32;
-    let box_w = box_h * (cell_ph / cell_pw).max(0.5); // pixel-square
+    let aspect = cell_ph / cell_pw;
+
+    let ry = 0.48_f32;
+    let rx = ry * aspect;
+    let arc_pt = |theta: f32| Point {
+        x: rx * theta.cos(),
+        y: ry * theta.sin(),
+    };
+    use std::f32::consts::TAU;
+
     Command::CreateElement(CreateElementBody {
         id: EL_SPINNER.into(),
         commands: vec![
-            DrawCmd::FillRectangles {
-                fill: flat(0.06, 0.07, 0.09, 0.62),
-                rects: vec![Rect {
-                    x: cx - box_w / 2.0,
-                    y: cy - box_h / 2.0,
-                    w: box_w,
-                    h: box_h,
-                }],
+            // Faint full ring under the bright arc.
+            DrawCmd::DrawLineLoop {
+                stroke: flat(1.0, 1.0, 1.0, 0.25),
+                line_width: 0.2,
+                points: (0..32).map(|i| arc_pt(TAU * i as f32 / 32.0)).collect(),
             },
-            DrawCmd::DrawText {
-                origin: Point {
-                    x: cx,
-                    y: cy - 0.5,
-                },
-                align: Align::Center,
-                fill: flat(0.85, 0.90, 0.97, 1.0),
-                font_style: FontStyle::default(),
-                text: SPIN_FRAMES[0].into(),
+            // The rotating highlight: a 120° arc.
+            DrawCmd::DrawLineStrip {
+                stroke: flat(1.0, 1.0, 1.0, 1.0),
+                line_width: 0.2,
+                points: (0..=14).map(|i| arc_pt(TAU / 3.0 * i as f32 / 14.0)).collect(),
             },
         ],
-        origin: Point { x: 0.0, y: 0.0 },
+        origin: Point { x: cx, y: cy },
         is_visible: false,
         draw_order: 20,
         parent: None,
         size: None,
-        transform: None,
+        transform: Some(Transform::IDENTITY),
     })
 }
 
-fn spinner_glyph(phase: usize) -> Command {
-    Command::UpdateText(UpdateTextBody {
+fn spinner_angle(theta: f32) -> Command {
+    // Geometry is centred on the element's origin, so this is a pure
+    // rotation matrix — no cell-size math needed (§9.13).
+    Command::UpdateTransform {
         id: EL_SPINNER.into(),
-        command_index: 1,
-        range: UpdateTextRange::Whole,
-        replacement: SPIN_FRAMES[phase % SPIN_FRAMES.len()].into(),
-    })
+        transform: Transform::rotate_about(theta, 0.0, 0.0, 1.0, 1.0),
+    }
 }
 
 fn spinner_show(visible: bool) -> Command {
@@ -401,12 +453,18 @@ fn render_image_mode<W: Write>(out: &mut W, vp: &Viewport, created: &mut bool) {
 /// footprint, upload it under the next ping-pong id, and point EL_IMG at
 /// it (source_rect = None, since the texture is already the exact crop).
 #[allow(clippy::too_many_arguments)]
+/// Crop+resize the current frame to the visible footprint and queue it
+/// as a [`ChunkedUpload`]. The event loop pumps the chunks; `cur_id`
+/// flips to the new texture only when the final chunk (and its
+/// element-retarget follow-up) has been sent.
+#[allow(clippy::too_many_arguments)]
 fn render_video_frame<W: Write>(
     out: &mut W,
     vp: &Viewport,
     full: &Frame,
-    cur_id: &mut String,
+    cur_id: &str,
     created: &mut bool,
+    upload: &mut Option<ChunkedUpload>,
     supported: u8,
     ssh: bool,
     cell_pw: f32,
@@ -419,6 +477,17 @@ fn render_video_frame<W: Write>(
     let sh = (l.source.h.round() as u32).clamp(1, full.h - sy);
     let tw = (l.target.w * cell_pw).round().max(1.0) as u32;
     let th = (l.target.h * cell_ph).round().max(1.0) as u32;
+
+    // Supersede a still-streaming previous frame: abort its upload
+    // host-side (§8.2 — DropImage on an in-progress id) and reuse the
+    // id. If it carried the image element's CreateElement, that never
+    // went out — roll the flag back so this frame re-schedules it.
+    if let Some(old) = upload.take() {
+        send(out, &[np(Command::DropImage { id: old.id })]);
+        if old.creates_element {
+            *created = false;
+        }
+    }
 
     // Manual crop into a tight buffer (avoids cloning the whole frame).
     let mut crop = vec![0u8; (sw as usize) * (sh as usize) * 4];
@@ -433,28 +502,40 @@ fn render_video_frame<W: Write>(
         .ok_or_else(|| anyhow::anyhow!("crop buffer size mismatch"))?;
     let resized = imageops::resize(&crop_img, tw, th, FilterType::Triangle);
 
-    let next_id = if *cur_id == IMG_ID_A {
-        IMG_ID_B
+    // `cur_id` is the texture the element currently references; the new
+    // frame streams into the other slot of the A/B pair.
+    let next_id = if cur_id == IMG_ID_A { IMG_ID_B } else { IMG_ID_A };
+    let enc = choose_encoding(supported, ssh, 80.0);
+    let (encoding, payload) = encode_payload(resized.into_raw(), tw, th, enc)?;
+    let (follow_up, creates_element) = if *created {
+        (
+            vec![
+                update_image_el(l.target, next_id, None),
+                Command::DropImage { id: cur_id.to_string() },
+            ],
+            false,
+        )
     } else {
-        IMG_ID_A
-    };
-    let mut cmds = vec![np(upload_cmd(
-        next_id,
-        tw,
-        th,
-        resized.into_raw(),
-        supported,
-        ssh,
-    )?)];
-    if *created {
-        cmds.push(np(update_image_el(l.target, next_id, None)));
-        cmds.push(np(Command::DropImage { id: cur_id.clone() }));
-    } else {
-        cmds.push(np(create_image_el(l.target, next_id, None)));
         *created = true;
-    }
-    send(out, &cmds);
-    *cur_id = next_id.to_string();
+        let mut fu = vec![create_image_el(l.target, next_id, None)];
+        // After a resize ClearAll the element is gone but the previously
+        // displayed texture survives in the session image table — drop
+        // it, or the next A/B flip would collide with it.
+        if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
+            fu.push(Command::DropImage { id: cur_id.to_string() });
+        }
+        (fu, true)
+    };
+    *upload = Some(ChunkedUpload {
+        id: next_id.to_string(),
+        encoding,
+        width: tw,
+        height: th,
+        payload,
+        offset: 0,
+        follow_up,
+        creates_element,
+    });
     Ok(())
 }
 
@@ -560,6 +641,8 @@ fn main() -> Result<()> {
     let mut created_img = false;
     let mut cur_id = IMG_ID.to_string();
     let mut source_frame: Frame;
+    // A decoded frame streaming to the terminal chunk-by-chunk (§8.2).
+    let mut upload: Option<ChunkedUpload> = None;
 
     // Video state. There is no continuous playback: the displayed frame
     // changes only when the user seeks.
@@ -569,7 +652,8 @@ fn main() -> Result<()> {
 
     if is_video {
         let m = meta.as_ref().unwrap();
-        // Grab and show the first frame.
+        // Grab and show the first frame. Queued, not sent — the event
+        // loop streams it in chunks like any later frame.
         let first = grab_one_frame(&path_str, m.width, m.height, 0.0)?
             .ok_or_else(|| anyhow::anyhow!("could not decode the first video frame"))?;
         source_frame = Frame::new(m.width, m.height, first);
@@ -577,8 +661,9 @@ fn main() -> Result<()> {
             &mut out,
             &vp,
             &source_frame,
-            &mut cur_id,
+            &cur_id,
             &mut created_img,
+            &mut upload,
             supported,
             ssh,
             cell_pw,
@@ -609,9 +694,10 @@ fn main() -> Result<()> {
     // in flight the loop animates a spinner and stays responsive; a newer
     // seek replaces it (killing the superseded ffmpeg).
     let mut pending: Option<Decode> = None;
-    let mut pending_ticks: u32 = 0;
-    let mut spin_phase: usize = 0;
+    let mut busy_since: Option<Instant> = None;
     let mut spinner_visible = false;
+    let spin_t0 = Instant::now();
+    let mut last_spin: Option<Instant> = None;
 
     // Exact per-frame presentation times (display order). When available
     // they are the source of truth for the frame count and for mapping a
@@ -668,8 +754,17 @@ fn main() -> Result<()> {
         // How long to block waiting for input. With no continuous playback
         // the loop is event-driven; 50 ms keeps a lone ESC responsive. While
         // a decode is pending, wake more often (and on the decode's pipe) to
-        // animate the spinner and apply the frame the moment it lands.
-        let tick = if pending.is_some() { 80 } else { 50 };
+        // animate the spinner — a ~50-byte UpdateTransform per tick — and
+        // apply the frame the moment it lands. While an upload is streaming,
+        // barely block at all: each iteration pushes one chunk, and the 1 ms
+        // poll keeps input (a superseding seek) flowing between chunks.
+        let tick = if upload.is_some() {
+            1
+        } else if pending.is_some() {
+            33
+        } else {
+            50
+        };
         let deadline = Instant::now() + Duration::from_millis(tick);
 
         let stdin_ready = match pending.as_ref() {
@@ -856,8 +951,9 @@ fn main() -> Result<()> {
                     &mut out,
                     &vp,
                     &source_frame,
-                    &mut cur_id,
+                    &cur_id,
                     &mut created_img,
+                    &mut upload,
                     supported,
                     ssh,
                     cell_pw,
@@ -868,6 +964,16 @@ fn main() -> Result<()> {
             }
             dirty_media = false;
             dirty_status = true;
+        }
+
+        // Stream the next chunk of an in-flight frame upload. The final
+        // chunk carries the element retarget, so the texture the element
+        // references flips here and only here.
+        if let Some(u) = upload.as_mut()
+            && u.pump(&mut out)
+        {
+            cur_id = u.id.clone();
+            upload = None;
         }
 
         if dirty_status {
@@ -920,27 +1026,34 @@ fn main() -> Result<()> {
             dirty_seek = false;
         }
 
-        // Spinner: reveal only once a decode has outlived a couple of poll
-        // cycles (so quick seeks/steps don't flash it) and animate while it
-        // persists; hide it the moment the picture catches up.
-        if pending.is_some() {
-            pending_ticks += 1;
-            if pending_ticks >= SPIN_DELAY_TICKS {
-                let mut cmds: Vec<(Command, u32)> = Vec::new();
-                if !spinner_visible {
-                    spinner_visible = true;
-                    cmds.push(np(spinner_show(true)));
-                }
-                spin_phase = spin_phase.wrapping_add(1);
-                cmds.push(np(spinner_glyph(spin_phase)));
-                send(&mut out, &cmds);
+        // Spinner: reveal once the picture has been stale for SPIN_DELAY
+        // — counting both the decode and the chunked upload that follows
+        // it — so quick seeks/steps/zooms don't flash it; hide it the
+        // moment the picture catches up. The angle is wall-clock based so
+        // the rotation rate is steady across tick lengths; updates are
+        // rate-limited to one transform per SPIN_FRAME.
+        match (pending.is_some() || upload.is_some(), busy_since) {
+            (true, None) => busy_since = Some(Instant::now()),
+            (false, Some(_)) => busy_since = None,
+            _ => {}
+        }
+        let busy = busy_since.is_some_and(|t| t.elapsed() >= SPIN_DELAY);
+        if busy {
+            let mut cmds: Vec<(Command, u32)> = Vec::new();
+            if !spinner_visible {
+                spinner_visible = true;
+                cmds.push(np(spinner_show(true)));
             }
-        } else {
-            pending_ticks = 0;
-            if spinner_visible {
-                spinner_visible = false;
-                send(&mut out, &[np(spinner_show(false))]);
+            if last_spin.is_none_or(|t| t.elapsed() >= SPIN_FRAME) {
+                last_spin = Some(Instant::now());
+                cmds.push(np(spinner_angle(
+                    spin_t0.elapsed().as_secs_f32() * SPIN_SPEED,
+                )));
             }
+            send(&mut out, &cmds);
+        } else if spinner_visible {
+            spinner_visible = false;
+            send(&mut out, &[np(spinner_show(false))]);
         }
     }
 
@@ -1038,7 +1151,17 @@ struct TermExit;
 impl Drop for TermExit {
     fn drop(&mut self) {
         let mut o = std::io::stdout();
-        let env = build_envelope(&[(Command::ClearAll, REQ_ID_NO_RESPONSE)]);
+        // ClearAll wipes elements only — images are session-scoped, so
+        // drop our textures (and abort any in-flight chunked upload,
+        // §8.2) explicitly. Unknown-id errors are unrequested and
+        // therefore silent.
+        let env = build_envelope(
+            &[IMG_ID, IMG_ID_A, IMG_ID_B]
+                .map(|id| (Command::DropImage { id: id.into() }, REQ_ID_NO_RESPONSE))
+                .into_iter()
+                .chain([(Command::ClearAll, REQ_ID_NO_RESPONSE)])
+                .collect::<Vec<_>>(),
+        );
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
