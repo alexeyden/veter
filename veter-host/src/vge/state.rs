@@ -1195,7 +1195,15 @@ impl VgeEngine {
             return Err((ERR_BAD_PAYLOAD, "empty image id"));
         }
         match self.state.shared.images.remove(id) {
-            None => Err((ERR_UNKNOWN_IMAGE, "image id not found")),
+            None => {
+                // §8.2: DropImage on an in-progress chunked upload
+                // aborts it and releases the id.
+                if self.pending_uploads.remove(id).is_some() {
+                    Ok(Vec::new())
+                } else {
+                    Err((ERR_UNKNOWN_IMAGE, "image id not found"))
+                }
+            }
             Some(img) => {
                 if let Some(gpu) = img.gpu.get() {
                     self.pending_image_deletes.push(gpu);
@@ -2110,6 +2118,41 @@ mod tests {
             let mut br = Reader::new(body);
             assert_eq!(br.string().unwrap(), "stream");
             assert_eq!(br.u32().unwrap(), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn drop_image_aborts_in_progress_upload() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        // Start a chunked upload but never finish it, then DropImage it
+        // (§8.2: abort). The slot is released and the id is reusable.
+        let chunk_a = upload_chunk_body("part", 0x01, 2, 2, 16, 0, false, &[0u8; 8]);
+        let mut drop_body = Writer::new();
+        drop_body.str("part");
+        let restart = upload_raw_2x2("part");
+
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &chunk_a);
+        append_command(&mut frames, CMD_DROP_IMAGE, 2, &drop_body.buf);
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 3, &restart);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        // The abandoned slot is gone and the fresh single-shot upload
+        // under the same id finalized.
+        assert!(engine.pending_uploads.is_empty());
+        assert!(engine.state.shared.images.contains_key("part"));
+
+        // Responses: ChunkAck, Ok (drop), ChunkAck — no errors.
+        let response = engine.take_responses();
+        let payload = unwrap_t2c_envelope(&response);
+        let mut r = Reader::new(&payload);
+        let _ = r.u8();
+        let _ = r.u32();
+        for expected in [RSP_CHUNK_ACK, RSP_OK, RSP_CHUNK_ACK] {
+            assert_eq!(r.u8().unwrap(), expected);
+            let _ = r.u32();
+            let body_len = r.u32().unwrap() as usize;
+            let _ = r.take(body_len).unwrap();
         }
     }
 
