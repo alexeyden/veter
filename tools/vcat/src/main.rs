@@ -1,23 +1,28 @@
-//! vcat — print an image to a VGE-aware terminal.
+//! vcat — print images to a VGE-aware terminal.
 //!
 //! Pipeline:
-//!   1. Decode the image (PNG, JPEG, WebP) via the `image` crate.
+//!   1. Decode the images (PNG, JPEG, WebP) via the `image` crate.
 //!   2. Probe the running terminal for its cell pixel dimensions.
 //!   3. Query the kernel for terminal column count (TIOCGWINSZ) so we
 //!      can clamp display width.
-//!   4. Compute target cell width and height that preserves the image's
-//!      visual aspect ratio on this terminal's anisotropic cell grid.
-//!   5. Resize to exact pixel dimensions matching that cell footprint
-//!      (Lanczos), upload as a Raw RGBA8 / WebP VGE image, and create an
-//!      element placed where the next prompt would have been.
+//!   4. Compute target cell width and height per image that preserves
+//!      its visual aspect ratio on this terminal's anisotropic cell
+//!      grid, then flow the images left-to-right with wrap-around —
+//!      like words in a paragraph, bottom-aligned within each row.
+//!   5. Resize each to exact pixel dimensions matching its cell
+//!      footprint (Lanczos), upload as a Raw RGBA8 / WebP VGE image,
+//!      and create elements placed where the next prompt would have
+//!      been.
 //!
 //! The terminal handshake, placement math, encoding, and response
 //! parsing live in the shared `vge-render` crate; this binary owns the
-//! CLI, the cursor-anchoring, and the upload progress bar.
+//! CLI, the flow layout, the cursor-anchoring, and the upload progress
+//! bar.
 //!
 //! Run inside veter:
 //!     vcat ~/Downloads/photo.jpg
 //!     vcat --width 40 logo.png
+//!     vcat *.png
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -34,7 +39,7 @@ use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
 
 use vge_render::is_ssh_session;
-use vge_render::placement::compute_placement;
+use vge_render::placement::{Placement, compute_placement};
 use vge_render::probe::run_probe;
 use vge_render::response::wait_for_chunk_ack;
 use vge_render::tty::{
@@ -43,7 +48,7 @@ use vge_render::tty::{
 use vge_render::upload::{Encoding, choose_encoding, encode_payload};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Display an image inside a VGE-aware terminal.")]
+#[command(version, about = "Display images inside a VGE-aware terminal.")]
 #[command(group(
     // The mode-selecting flags are mutually exclusive: pick one of
     // `--mode <m>`, `-r`, `-l`, or `-L Q`, or none (auto-detect).
@@ -52,13 +57,16 @@ use vge_render::upload::{Encoding, choose_encoding, encode_payload};
         .multiple(false)
 ))]
 struct Cli {
-    /// Path to a PNG, JPEG, or WebP file.
-    file: std::path::PathBuf,
+    /// Paths to PNG, JPEG, or WebP files. Multiple files flow
+    /// left-to-right and wrap to the next row when they don't fit the
+    /// terminal width, like words in a paragraph.
+    #[arg(required = true)]
+    files: Vec<std::path::PathBuf>,
 
-    /// Force the displayed image width in cell units. Without this
-    /// flag, vcat uses the image's natural pixel width divided by the
-    /// terminal's cell pixel width, clamped to the terminal column
-    /// count.
+    /// Force the displayed image width in cell units (applied to each
+    /// image). Without this flag, vcat uses the image's natural pixel
+    /// width divided by the terminal's cell pixel width, clamped to
+    /// the terminal column count.
     #[arg(long)]
     width: Option<u32>,
 
@@ -147,19 +155,25 @@ fn main() -> Result<()> {
         bail!("vcat must run with stdin and stdout connected to a terminal");
     }
 
-    trace!(v, "decoding {}", cli.file.display());
-    let dyn_img = ImageReader::open(&cli.file)
-        .with_context(|| format!("opening {}", cli.file.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("inspecting {}", cli.file.display()))?
-        .decode()
-        .with_context(|| format!("decoding {}", cli.file.display()))?;
-    let rgba = dyn_img.to_rgba8();
-    let (w_px, h_px) = rgba.dimensions();
-    if w_px == 0 || h_px == 0 {
-        bail!("image has zero extent");
+    // Decode every input up front — the flow layout needs all image
+    // dimensions before any vertical space can be reserved.
+    let mut images: Vec<image::RgbaImage> = Vec::with_capacity(cli.files.len());
+    for file in &cli.files {
+        trace!(v, "decoding {}", file.display());
+        let dyn_img = ImageReader::open(file)
+            .with_context(|| format!("opening {}", file.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("inspecting {}", file.display()))?
+            .decode()
+            .with_context(|| format!("decoding {}", file.display()))?;
+        let rgba = dyn_img.to_rgba8();
+        let (w_px, h_px) = rgba.dimensions();
+        if w_px == 0 || h_px == 0 {
+            bail!("{}: image has zero extent", file.display());
+        }
+        trace!(v, "decoded {w_px}x{h_px} px");
+        images.push(rgba);
     }
-    trace!(v, "decoded {w_px}x{h_px} px");
 
     let _guard = RawTty::enable()?;
 
@@ -184,29 +198,31 @@ fn main() -> Result<()> {
     let term_cols = winsize_cols().unwrap_or(80) as u32;
     trace!(v, "term_cols={term_cols}");
 
-    let placement = compute_placement(w_px, h_px, cell_pw, cell_ph, term_cols, cli.width);
-    trace!(
-        v,
-        "placement: {}x{} cells, target_rect_h={:.3}, pixels {}x{}",
-        placement.w_cells,
-        placement.h_cells,
-        placement.target_rect_h,
-        placement.target_px_w,
-        placement.target_px_h
-    );
+    let placements: Vec<Placement> = images
+        .iter()
+        .map(|img| {
+            let (w_px, h_px) = img.dimensions();
+            compute_placement(w_px, h_px, cell_pw, cell_ph, term_cols, cli.width)
+        })
+        .collect();
+    let layout = flow_layout(&placements, term_cols);
+    for (i, ((x, y), placement)) in layout.positions.iter().zip(&placements).enumerate() {
+        trace!(
+            v,
+            "placement[{i}]: {}x{} cells at ({x}, {y:.3}), target_rect_h={:.3}, pixels {}x{}",
+            placement.w_cells,
+            placement.h_cells,
+            placement.target_rect_h,
+            placement.target_px_w,
+            placement.target_px_h
+        );
+    }
+    trace!(v, "block: {} rows total", layout.total_rows);
 
-    trace!(v, "resizing");
-    let resized = image::imageops::resize(
-        &rgba,
-        placement.target_px_w,
-        placement.target_px_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-    trace!(v, "resized");
-
-    // Reserve vertical space and read back the cursor's new row.
+    // Reserve vertical space for the whole block and read back the
+    // cursor's new row.
     let mut stdout = std::io::stdout().lock();
-    for _ in 0..placement.h_cells {
+    for _ in 0..layout.total_rows {
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
@@ -230,18 +246,71 @@ fn main() -> Result<()> {
         }
     };
     trace!(v, "cursor row={cursor_row}");
-    // After printing h_cells newlines the cursor is at row C (1-indexed,
-    // top of screen = 1). The image should occupy rows
-    // [C - h_cells, C) in 1-indexed terms, which is origin.y =
-    // C - h_cells - 1 in VGE 0-indexed cells from the live screen top.
-    // For tall images origin.y may go negative — VGE anchors those to
-    // scrollback and clips automatically (§5.2). Don't clamp to 0.
-    let origin_y = (cursor_row as i32 - placement.h_cells as i32 - 1) as f32;
+    // After printing total_rows newlines the cursor is at row C
+    // (1-indexed, top of screen = 1). The block should occupy rows
+    // [C - total_rows, C) in 1-indexed terms, which is a block top of
+    // C - total_rows - 1 in VGE 0-indexed cells from the live screen
+    // top. For tall blocks the top may go negative — VGE anchors those
+    // to scrollback and clips automatically (§5.2). Don't clamp to 0.
+    let block_top_y = (cursor_row as i32 - layout.total_rows as i32 - 1) as f32;
 
-    // Build and write the VGE envelope.
+    // Upload each image and create its element, left-to-right in flow
+    // order. req_ids stay monotonic across images so chunk acks never
+    // collide.
     let pid = std::process::id();
-    let img_id = format!("vcat-img-{pid}");
-    let elem_id = format!("vcat-el-{pid}");
+    let mut req_id: u32 = 0;
+    for (idx, (rgba, placement)) in images.into_iter().zip(&placements).enumerate() {
+        let (x_cells, y_offset) = layout.positions[idx];
+        let element_origin = Point {
+            x: x_cells as f32,
+            y: block_top_y + y_offset,
+        };
+        upload_one(
+            &mut stdout,
+            rgba,
+            placement,
+            element_origin,
+            enc,
+            &format!("vcat-img-{pid}-{idx}"),
+            &format!("vcat-el-{pid}-{idx}"),
+            &mut req_id,
+            cli.timeout_ms,
+            v,
+        )
+        .with_context(|| format!("uploading {}", cli.files[idx].display()))?;
+    }
+    drop(stdout);
+
+    Ok(())
+}
+
+/// Resize, encode, chunk-upload one image, and create its VGE element
+/// at `element_origin`. The chunked upload (§8.1) slices the payload
+/// into ~32 KB chunks over SSH so the placeholder progress UI can be
+/// driven from the host's per-chunk acks; local runs send one chunk.
+#[allow(clippy::too_many_arguments)]
+fn upload_one(
+    stdout: &mut std::io::StdoutLock<'_>,
+    rgba: image::RgbaImage,
+    placement: &Placement,
+    element_origin: Point,
+    enc: Encoding,
+    img_id: &str,
+    elem_id: &str,
+    req_id: &mut u32,
+    timeout_ms: u64,
+    v: bool,
+) -> Result<()> {
+    trace!(v, "resizing");
+    let resized = image::imageops::resize(
+        &rgba,
+        placement.target_px_w,
+        placement.target_px_h,
+        image::imageops::FilterType::Lanczos3,
+    );
+    drop(rgba);
+    trace!(v, "resized");
+
     trace!(v, "encoding {enc:?}");
     let raw_rgba = resized.into_raw();
     let raw_len = raw_rgba.len();
@@ -278,12 +347,8 @@ fn main() -> Result<()> {
     };
     let final_draw = DrawCmd::DrawImage {
         target_rect,
-        image_id: img_id.clone(),
+        image_id: img_id.to_string(),
         source_rect: None,
-    };
-    let element_origin = Point {
-        x: 0.0,
-        y: origin_y,
     };
 
     // The element's command-index layout is fixed (see
@@ -298,7 +363,7 @@ fn main() -> Result<()> {
         let is_last = i == num_chunks - 1;
         let chunk_data = payload[offset as usize..end as usize].to_vec();
         let chunk_cmd = Command::UploadImage(UploadImageBody {
-            id: img_id.clone(),
+            id: img_id.to_string(),
             encoding,
             width: placement.target_px_w,
             height: placement.target_px_h,
@@ -307,14 +372,15 @@ fn main() -> Result<()> {
             is_last,
             data: chunk_data,
         });
-        let req_id = (i + 1) as u32; // monotonic, distinct from REQ_ID_NO_RESPONSE
+        *req_id += 1; // monotonic across images, distinct from REQ_ID_NO_RESPONSE
+        let rid = *req_id;
 
         let mut frames: Vec<(Command, u32)> = Vec::with_capacity(4);
 
         if i == 0 && show_progress {
             frames.push((
                 Command::CreateElement(CreateElementBody {
-                    id: elem_id.clone(),
+                    id: elem_id.to_string(),
                     commands: placeholder_cmds.clone(),
                     origin: element_origin,
                     is_visible: true,
@@ -331,7 +397,7 @@ fn main() -> Result<()> {
             let acked = offset; // cumulative bytes acked so far
             frames.push((
                 Command::UpdateCommand(UpdateCommandBody {
-                    id: elem_id.clone(),
+                    id: elem_id.to_string(),
                     index: 1,
                     command: bar_fill_cmd(target_rect, acked, total_bytes),
                 }),
@@ -339,7 +405,7 @@ fn main() -> Result<()> {
             ));
             frames.push((
                 Command::UpdateText(UpdateTextBody {
-                    id: elem_id.clone(),
+                    id: elem_id.to_string(),
                     command_index: 2,
                     range: UpdateTextRange::Whole,
                     replacement: progress_text(acked, total_bytes, total_mb),
@@ -348,17 +414,17 @@ fn main() -> Result<()> {
             ));
         }
 
-        frames.push((chunk_cmd, req_id));
+        frames.push((chunk_cmd, rid));
 
         if is_last {
             let final_element = if show_progress {
                 Command::UpdateCommands(UpdateCommandsBody {
-                    id: elem_id.clone(),
+                    id: elem_id.to_string(),
                     commands: vec![final_draw.clone()],
                 })
             } else {
                 Command::CreateElement(CreateElementBody {
-                    id: elem_id.clone(),
+                    id: elem_id.to_string(),
                     commands: vec![final_draw.clone()],
                     origin: element_origin,
                     is_visible: true,
@@ -384,17 +450,16 @@ fn main() -> Result<()> {
         stdout.write_all(&envelope)?;
         stdout.flush()?;
 
-        let bytes_received =
-            wait_for_chunk_ack(&img_id, req_id, Duration::from_millis(cli.timeout_ms))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "chunk-ack timed out for chunk {}/{} (req_id {}); \
-                         try --timeout-ms <larger>",
-                        i + 1,
-                        num_chunks,
-                        req_id
-                    )
-                })?;
+        let bytes_received = wait_for_chunk_ack(img_id, rid, Duration::from_millis(timeout_ms))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "chunk-ack timed out for chunk {}/{} (req_id {}); \
+                     try --timeout-ms <larger>",
+                    i + 1,
+                    num_chunks,
+                    rid
+                )
+            })?;
         trace!(
             v,
             "chunk {} acked: bytes_received={}",
@@ -402,9 +467,73 @@ fn main() -> Result<()> {
             bytes_received
         );
     }
-    drop(stdout);
 
     Ok(())
+}
+
+/// Gap between images on the same row, in cells — the inter-word space
+/// of the flow layout.
+const GAP_CELLS: u32 = 1;
+
+/// Result of [`flow_layout`]: where each image lands inside the block.
+struct FlowLayout {
+    /// Per-image (column, row offset from block top) in cells. The row
+    /// offset is fractional so each image's bottom edge sits exactly on
+    /// its row's bottom despite fractional `target_rect_h` values.
+    positions: Vec<(u32, f32)>,
+    /// Whole rows the block occupies — how many newlines to reserve.
+    total_rows: u32,
+}
+
+/// Flow a sequence of image footprints left-to-right with wrap-around,
+/// like words in a paragraph: images on the same row are separated by
+/// `GAP_CELLS` and bottom-aligned (text-baseline style); a row is as
+/// tall as its tallest image; an image that doesn't fit in the
+/// remaining columns starts a new row.
+fn flow_layout(placements: &[Placement], term_cols: u32) -> FlowLayout {
+    let term_cols = term_cols.max(1);
+
+    // Pass 1: assign each image a row and a column.
+    let mut row_of: Vec<usize> = Vec::with_capacity(placements.len());
+    let mut x_of: Vec<u32> = Vec::with_capacity(placements.len());
+    let mut row = 0usize;
+    let mut cur_x = 0u32;
+    for p in placements {
+        let x = if cur_x == 0 { 0 } else { cur_x + GAP_CELLS };
+        let x = if x > 0 && x + p.w_cells > term_cols {
+            row += 1;
+            0
+        } else {
+            x
+        };
+        row_of.push(row);
+        x_of.push(x);
+        cur_x = x + p.w_cells;
+    }
+
+    // Pass 2: row heights -> row tops -> bottom-aligned offsets.
+    let num_rows = row + 1;
+    let mut row_h = vec![0u32; num_rows];
+    for (p, &r) in placements.iter().zip(&row_of) {
+        row_h[r] = row_h[r].max(p.h_cells);
+    }
+    let mut row_top = vec![0u32; num_rows];
+    for r in 1..num_rows {
+        row_top[r] = row_top[r - 1] + row_h[r - 1];
+    }
+    let positions = placements
+        .iter()
+        .zip(&row_of)
+        .zip(&x_of)
+        .map(|((p, &r), &x)| {
+            let y = row_top[r] as f32 + (row_h[r] as f32 - p.target_rect_h);
+            (x, y)
+        })
+        .collect();
+    FlowLayout {
+        positions,
+        total_rows: row_top[num_rows - 1] + row_h[num_rows - 1],
+    }
 }
 
 /// Cell-units height of the progress bar inside the image rect.
@@ -566,5 +695,64 @@ mod tests {
     fn cursor_position_partial_returns_none() {
         let buf = b"\x1b[24;";
         assert_eq!(parse_cursor_position(buf).unwrap(), None);
+    }
+
+    fn placement(w_cells: u32, target_rect_h: f32) -> Placement {
+        Placement {
+            w_cells,
+            target_rect_h,
+            h_cells: target_rect_h.ceil().max(1.0) as u32,
+            target_px_w: w_cells * 10,
+            target_px_h: (target_rect_h * 20.0) as u32,
+        }
+    }
+
+    #[test]
+    fn flow_single_image_fills_own_block() {
+        let l = flow_layout(&[placement(10, 5.0)], 80);
+        assert_eq!(l.total_rows, 5);
+        assert_eq!(l.positions, vec![(0, 0.0)]);
+    }
+
+    #[test]
+    fn flow_two_images_share_a_row_with_gap() {
+        let l = flow_layout(&[placement(10, 4.0), placement(20, 4.0)], 80);
+        assert_eq!(l.total_rows, 4);
+        assert_eq!(l.positions, vec![(0, 0.0), (11, 0.0)]);
+    }
+
+    #[test]
+    fn flow_wraps_when_image_does_not_fit() {
+        let l = flow_layout(&[placement(50, 4.0), placement(40, 6.0)], 80);
+        assert_eq!(l.total_rows, 10);
+        assert_eq!(l.positions, vec![(0, 0.0), (0, 4.0)]);
+    }
+
+    #[test]
+    fn flow_bottom_aligns_shorter_images_in_row() {
+        // Second image is 2 cells shorter than the row: its top shifts
+        // down so the bottoms line up.
+        let l = flow_layout(&[placement(10, 6.0), placement(10, 4.0)], 80);
+        assert_eq!(l.total_rows, 6);
+        assert_eq!(l.positions[0], (0, 0.0));
+        assert_eq!(l.positions[1], (11, 2.0));
+    }
+
+    #[test]
+    fn flow_fractional_height_sits_on_row_bottom() {
+        // target_rect_h = 4.5 -> h_cells = 5; bottom-aligned means a
+        // 0.5-cell gap above, none below.
+        let l = flow_layout(&[placement(10, 4.5)], 80);
+        assert_eq!(l.total_rows, 5);
+        let (x, y) = l.positions[0];
+        assert_eq!(x, 0);
+        assert!((y - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flow_full_width_images_stack_vertically() {
+        let l = flow_layout(&[placement(80, 3.0), placement(80, 2.0)], 80);
+        assert_eq!(l.total_rows, 5);
+        assert_eq!(l.positions, vec![(0, 0.0), (0, 3.0)]);
     }
 }
