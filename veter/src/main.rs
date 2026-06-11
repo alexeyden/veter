@@ -2517,6 +2517,18 @@ impl ApplicationHandler for App {
                     let (cols, rows) = tr.terminal_size(size.width, size.height);
                     if let Some(parser) = &mut self.parser {
                         parser.screen_mut().set_size(rows, cols);
+                        // A vertical resize moves the live screen
+                        // relative to scrollback (xterm-style push/
+                        // pull); sync the engines' line trackers now
+                        // rather than waiting for the next PTY chunk,
+                        // or anchored elements/portals render shifted
+                        // until the shell redraws.
+                        if let Some(prt) = &mut self.prt {
+                            prt.after_vt100_process(parser);
+                        }
+                        if let Some(vge) = &mut self.vge {
+                            vge.after_vt100_process(parser);
+                        }
                     }
                     if let Some(pty) = &self.pty {
                         pty.resize(rows, cols);

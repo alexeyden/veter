@@ -11,9 +11,6 @@
 // CursorVisibilityChange, MouseModeChange, RawReply, WorkingDirChange)
 // are appended to the response envelope after the WritePortal Ok frame.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use prt_protocol::apc::{ApcStream, TerminalEvent};
 use prt_protocol::codec::Reader;
 use prt_protocol::command::{
@@ -32,6 +29,7 @@ use prt_protocol::frame::*;
 use super::portal::{
     Portal, PortalAnchor, PortalCallbacks, PortalSet, PolledStateCache, RawCallbackEvent,
 };
+use crate::line_tracker::LineTracker;
 
 /// Host-side caps published in the probe response (§2.1, §12).
 #[derive(Debug, Clone, Copy)]
@@ -722,7 +720,7 @@ impl PrtEngine {
         // screen has no scrollback (§5.3 per VGE precedent).
         if !self.state.on_alt() {
             self.line_tracker.update(parser);
-            self.evict_off_scrollback();
+            self.evict_off_scrollback(parser.screen().scrollback_fill());
         }
     }
 
@@ -816,12 +814,13 @@ impl PrtEngine {
     /// §5.2 — drop Scrollback portals whose anchor_line has fallen off
     /// the bottom of the parser's scrollback ring. Emit PortalEvicted
     /// reason=0 for each.
-    fn evict_off_scrollback(&mut self) {
-        if self.line_tracker.history_cap == 0 {
+    fn evict_off_scrollback(&mut self, scrollback_fill: usize) {
+        if scrollback_fill == 0 && self.line_tracker.top_of_live_screen == 0 {
+            // Nothing has ever scrolled; keep pre-scroll anchors alive.
             return;
         }
-        let oldest_visible = self.line_tracker.top_of_live_screen
-            - self.line_tracker.history_cap as i64;
+        let oldest_visible =
+            self.line_tracker.top_of_live_screen - scrollback_fill as i64;
         let to_evict: Vec<String> = self
             .state
             .current()
@@ -1116,7 +1115,19 @@ impl PrtEngine {
             .get_mut(id)
             .ok_or((ERR_UNKNOWN_PORTAL, "id not found"))?;
         let changed = portal.size_w != new_w || portal.size_h != new_h;
+        // A vertical resize moves the portal's live screen relative to
+        // its scrollback (xterm-style push/pull), so the per-portal
+        // engines' line trackers must observe it now rather than on
+        // the next WritePortal — or inner anchored elements render
+        // shifted until the inner program redraws. The pre-resize sync
+        // baselines trackers that haven't seen this vt yet (snapshot
+        // restore followed immediately by UpdateSize), so the
+        // post-resize sync counts exactly the resize shift.
+        portal.children.after_vt100_process(&mut portal.vt);
+        portal.vge.after_vt100_process(&mut portal.vt);
         portal.vt.screen_mut().set_size(new_h as u16, new_w as u16);
+        portal.children.after_vt100_process(&mut portal.vt);
+        portal.vge.after_vt100_process(&mut portal.vt);
         portal.size_w = new_w;
         portal.size_h = new_h;
         // §5.6 / §6.3 — emit ResizeNotify only on a material change so
@@ -1566,102 +1577,6 @@ impl Default for PrtEngine {
     }
 }
 
-// ---- LineTracker ------------------------------------------------------
-
-/// Tracks `top_of_live_screen` (absolute scrollback line index of
-/// vt100's first live-screen row) by probing the parser before/after
-/// `parser.process(...)` calls.
-///
-/// Same algorithm as VGE's tracker (see `veter/src/vge/state.rs`):
-/// pre-saturation growth advances the line count by added history rows;
-/// at-cap growth detects eviction by hashing vt100's topmost history
-/// row and comparing across probes.
-struct LineTracker {
-    top_of_live_screen: i64,
-    prev_history_size: usize,
-    history_cap: usize,
-    prev_top_hash: u64,
-    initialized: bool,
-}
-
-impl LineTracker {
-    fn new() -> Self {
-        Self {
-            top_of_live_screen: 0,
-            prev_history_size: 0,
-            history_cap: 0,
-            prev_top_hash: 0,
-            initialized: false,
-        }
-    }
-
-    fn update<CB: vt100::Callbacks>(&mut self, parser: &mut vt100::Parser<CB>) {
-        let (history_size, top_hash) = probe_history(parser);
-
-        if !self.initialized {
-            self.prev_history_size = history_size;
-            self.history_cap = history_size;
-            self.prev_top_hash = top_hash;
-            self.initialized = true;
-            return;
-        }
-
-        if history_size > self.history_cap {
-            self.history_cap = history_size;
-        }
-
-        if history_size > self.prev_history_size {
-            // Pre-saturation: every new history line corresponds to one
-            // live-screen scroll, with no eviction.
-            let added = history_size - self.prev_history_size;
-            self.top_of_live_screen += added as i64;
-        } else if history_size == self.prev_history_size
-            && self.history_cap > 0
-            && history_size == self.history_cap
-            && top_hash != self.prev_top_hash
-        {
-            // At cap, history size doesn't grow but the topmost row
-            // changed — at least one eviction. Counting 1 is a known
-            // limitation under heavy paste.
-            self.top_of_live_screen += 1;
-        }
-
-        self.prev_history_size = history_size;
-        self.prev_top_hash = top_hash;
-    }
-
-    /// Reset to initial state (used by RIS/DECSTR — line tracking is
-    /// re-derived after the parser also resets).
-    fn clear(&mut self) {
-        *self = Self::new();
-    }
-}
-
-fn probe_history<CB: vt100::Callbacks>(
-    parser: &mut vt100::Parser<CB>,
-) -> (usize, u64) {
-    let saved = parser.screen().scrollback();
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let history_size = parser.screen().scrollback();
-    let mut hasher = DefaultHasher::new();
-    if history_size > 0 {
-        let cols = parser.screen().size().1;
-        for col in 0..cols {
-            if let Some(cell) = parser.screen().cell(0, col) {
-                let s = cell.contents();
-                s.hash(&mut hasher);
-                if let vt100::Color::Rgb(r, g, b) = cell.fgcolor() {
-                    r.hash(&mut hasher);
-                    g.hash(&mut hasher);
-                    b.hash(&mut hasher);
-                }
-            }
-        }
-    }
-    parser.screen_mut().set_scrollback(saved);
-    (history_size, hasher.finish())
-}
-
 /// Standard base64 decoder for OSC 52 set form (§8.4).
 ///
 /// Tolerates `=` padding and whitespace; rejects on any other
@@ -2048,6 +1963,50 @@ mod tests {
         assert_eq!(portal.size_w, 100);
         assert_eq!(portal.size_h, 30);
         assert_eq!(portal.vt.screen().size(), (30, 100));
+    }
+
+    #[test]
+    fn update_size_syncs_inner_line_trackers() {
+        // A vertical shrink pushes inner top rows into the portal's
+        // scrollback (xterm-style); the per-portal VGE/PRT trackers
+        // must observe the shift during UpdateSize itself, not on the
+        // next WritePortal.
+        let mut engine = PrtEngine::new();
+        let body = encode::create_portal_body(&CreatePortalBody {
+            id: "p".into(),
+            size_w: 20,
+            size_h: 10,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 50,
+        });
+        let _ = dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &body);
+
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"line\r\n".repeat(15),
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+        let portal = &engine.state.current().portals["p"];
+        let top_before = portal.vge.top_of_live_screen();
+        assert_eq!(portal.vt.screen().cursor_position().0, 9);
+
+        // Shrink to 6 rows: cursor at row 9 forces 4 rows into
+        // scrollback.
+        let body = encode::update_size_body("p", 20, 6);
+        let _ = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 3, &body);
+        let portal = &engine.state.current().portals["p"];
+        assert_eq!(portal.vge.top_of_live_screen(), top_before + 4);
+
+        // Grow back: the rows are pulled out again.
+        let body = encode::update_size_body("p", 20, 10);
+        let _ = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 4, &body);
+        let portal = &engine.state.current().portals["p"];
+        assert_eq!(portal.vge.top_of_live_screen(), top_before);
     }
 
     #[test]
@@ -3022,6 +2981,44 @@ mod tests {
         engine.after_vt100_process(&mut parser);
         let top = engine.top_of_live_screen();
         assert!(top > 0 && top <= 5, "expected 1..=5 advance, got {top}");
+    }
+
+    #[test]
+    fn line_tracker_ignores_width_resize() {
+        // Regression: a width shrink used to read as a phantom
+        // scrollback eviction (probe-and-hash heuristic), shifting
+        // every Scrollback portal anchor up one row per resize step.
+        let mut engine = PrtEngine::new();
+        let mut parser = vt100::Parser::new(10, 80, 100);
+        parser.process(&b"line\r\n".repeat(15));
+        engine.after_vt100_process(&mut parser);
+        let top_before = engine.top_of_live_screen();
+
+        parser.screen_mut().set_size(10, 60);
+        parser.process(b"$ ");
+        engine.after_vt100_process(&mut parser);
+        assert_eq!(engine.top_of_live_screen(), top_before);
+    }
+
+    #[test]
+    fn line_tracker_follows_vertical_resize_roundtrip() {
+        // xterm-style push/pull resize: a vertical shrink advances
+        // top_of_live_screen by the pushed rows; growing back pulls
+        // them out again, so a Scrollback portal stays glued to its
+        // text line through the cycle.
+        let mut engine = PrtEngine::new();
+        let mut parser = vt100::Parser::new(10, 80, 100);
+        parser.process(&b"line\r\n".repeat(15));
+        engine.after_vt100_process(&mut parser);
+        let top_before = engine.top_of_live_screen();
+
+        parser.screen_mut().set_size(6, 80);
+        engine.after_vt100_process(&mut parser);
+        assert_eq!(engine.top_of_live_screen(), top_before + 4);
+
+        parser.screen_mut().set_size(10, 80);
+        engine.after_vt100_process(&mut parser);
+        assert_eq!(engine.top_of_live_screen(), top_before);
     }
 
     // ---- Phase 7: focus chain resolution -----------------------------

@@ -3,8 +3,6 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 use rgb::RGBA8;
 use vge_protocol::apc::ApcStream;
@@ -18,6 +16,8 @@ use vge_protocol::envelope::{
     append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ChunkAckBody, ProbeBody,
 };
 use vge_protocol::frame::*;
+
+use crate::line_tracker::LineTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -295,98 +295,6 @@ impl VgeState {
     }
 }
 
-/// Tracks `top_of_live_screen` (the absolute scrollback line index of
-/// vt100's first live-screen row) by probing the parser before/after
-/// `parser.process(...)` calls.
-struct LineTracker {
-    top_of_live_screen: i64,
-    prev_history_size: usize,
-    /// Cap (max scrollback) of the parser; cached after first probe. Used
-    /// to know when we're at saturation and must look for evicted rows.
-    history_cap: usize,
-    /// Hash of vt100's topmost history row from the previous probe; used
-    /// to detect eviction-induced scrolls when the history size is capped.
-    prev_top_hash: u64,
-    initialized: bool,
-}
-
-impl LineTracker {
-    fn new() -> Self {
-        Self {
-            top_of_live_screen: 0,
-            prev_history_size: 0,
-            history_cap: 0,
-            prev_top_hash: 0,
-            initialized: false,
-        }
-    }
-
-    fn update<CB: vt100::Callbacks>(&mut self, parser: &mut vt100::Parser<CB>) {
-        let (history_size, top_hash) = probe_history(parser);
-
-        if !self.initialized {
-            self.prev_history_size = history_size;
-            self.history_cap = history_size; // initial guess; refined below
-            self.prev_top_hash = top_hash;
-            self.initialized = true;
-            return;
-        }
-
-        // Track the largest history size we've ever seen as the cap.
-        if history_size > self.history_cap {
-            self.history_cap = history_size;
-        }
-
-        if history_size > self.prev_history_size {
-            // Pre-saturation growth: every new history line corresponds to
-            // one live-screen scroll, with no eviction.
-            let added = history_size - self.prev_history_size;
-            self.top_of_live_screen += added as i64;
-        } else if history_size == self.prev_history_size
-            && self.history_cap > 0
-            && history_size == self.history_cap
-            && top_hash != self.prev_top_hash
-        {
-            // At cap, history size doesn't grow but the topmost row
-            // changed — at least one eviction. We can't tell exactly how
-            // many between probes; counting 1 is a known limitation under
-            // heavy paste (documented in the plan).
-            self.top_of_live_screen += 1;
-        }
-
-        self.prev_history_size = history_size;
-        self.prev_top_hash = top_hash;
-    }
-}
-
-/// Probe the parser for (history_size, hash_of_topmost_history_row).
-/// Restores the user's scrollback offset before returning.
-fn probe_history<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> (usize, u64) {
-    let saved = parser.screen().scrollback();
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let history_size = parser.screen().scrollback();
-    // Topmost history row is row 0 when scrolled to the maximum.
-    let mut hasher = DefaultHasher::new();
-    if history_size > 0 {
-        let cols = parser.screen().size().1;
-        for col in 0..cols {
-            if let Some(cell) = parser.screen().cell(0, col) {
-                let s = cell.contents();
-                s.hash(&mut hasher);
-                // Include color/attrs lightly so identical-glyph but
-                // differently-styled lines still differ.
-                if let vt100::Color::Rgb(r, g, b) = cell.fgcolor() {
-                    r.hash(&mut hasher);
-                    g.hash(&mut hasher);
-                    b.hash(&mut hasher);
-                }
-            }
-        }
-    }
-    parser.screen_mut().set_scrollback(saved);
-    (history_size, hasher.finish())
-}
-
 /// Decode an UploadImage Raw payload (§8.1, encoding 0x01). Bytes must
 /// equal `width*height*4` straight-alpha RGBA8 octets.
 fn decode_raw_rgba8(
@@ -624,13 +532,6 @@ impl VgeEngine {
         self.line_tracker.top_of_live_screen
     }
 
-    /// Largest scrollback history size observed so far. Used for
-    /// diagnostics; eviction logic uses it directly via line_tracker.
-    #[allow(dead_code)]
-    pub fn history_cap(&self) -> usize {
-        self.line_tracker.history_cap
-    }
-
     /// Serialize the engine's full state as a binary blob for the VSS
     /// extension's `VgeFragment` payload. Captures both main and
     /// alternate element sets, the shared image / style tables (with
@@ -810,16 +711,18 @@ impl VgeEngine {
         // Scrollback anchoring is only meaningful on the main screen.
         if !self.state.on_alt() {
             self.line_tracker.update(parser);
-            self.evict();
+            self.evict(parser.screen().scrollback_fill());
         }
     }
 
-    fn evict(&mut self) {
-        if self.line_tracker.history_cap == 0 {
+    fn evict(&mut self, scrollback_fill: usize) {
+        if scrollback_fill == 0 && self.line_tracker.top_of_live_screen == 0 {
+            // Nothing has ever scrolled; keep pre-scroll anchors (e.g.
+            // a tall image whose origin reached above row 0) alive.
             return;
         }
-        let oldest_visible = self.line_tracker.top_of_live_screen
-            - self.line_tracker.history_cap as i64;
+        let oldest_visible =
+            self.line_tracker.top_of_live_screen - scrollback_fill as i64;
         // Eviction applies only to top-level elements. Their subtrees
         // cascade.
         let to_evict: Vec<String> = self
@@ -2910,6 +2813,62 @@ mod tests {
         let reply = engine.take_responses();
         let s = std::str::from_utf8(&reply).unwrap();
         assert_eq!(s, "\x1b[5;12R");
+    }
+
+    #[test]
+    fn width_resize_does_not_drift_element_anchors() {
+        // Regression: the old probe-and-hash line tracker hashed the
+        // topmost history row across the *current* column count, so a
+        // width shrink read as a phantom scrollback eviction and
+        // shifted every anchor up one row per resize step.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(10, 80, 100);
+        parser.process(&b"line\r\n".repeat(15));
+        engine.after_vt100_process(&mut parser);
+        let top_before = engine.top_of_live_screen();
+
+        // Window drag: several width steps, each followed by a
+        // SIGWINCH-triggered shell redraw.
+        for cols in [70u16, 60, 50] {
+            parser.screen_mut().set_size(10, cols);
+            parser.process(b"$ ");
+            engine.after_vt100_process(&mut parser);
+        }
+        assert_eq!(engine.top_of_live_screen(), top_before);
+    }
+
+    #[test]
+    fn vertical_resize_roundtrip_keeps_anchor_above_cursor() {
+        // Regression: shrinking the window vertically used to truncate
+        // the bottom of the vt100 grid, clamping the cursor up into
+        // the rows an image (anchored just above the prompt) occupies;
+        // growing back then left the prompt typing across the image.
+        // With xterm-style push/pull resize the cursor's absolute line
+        // — and its distance to the anchor — must survive a
+        // shrink/grow cycle.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(10, 80, 100);
+        parser.process(&b"line\r\n".repeat(15));
+        engine.after_vt100_process(&mut parser);
+
+        // Element anchored 4 rows above the cursor, like a vcat image
+        // above the prompt.
+        let cursor_abs = engine.top_of_live_screen()
+            + i64::from(parser.screen().cursor_position().0);
+        let anchor = cursor_abs - 4;
+
+        for rows in [6u16, 12, 10] {
+            parser.screen_mut().set_size(rows, 80);
+            parser.process(b"$ ");
+            engine.after_vt100_process(&mut parser);
+            let cursor_abs_now = engine.top_of_live_screen()
+                + i64::from(parser.screen().cursor_position().0);
+            assert_eq!(
+                cursor_abs_now - anchor,
+                4,
+                "anchor-to-cursor distance changed at {rows} rows"
+            );
+        }
     }
 
     // --- snapshot/replay roundtrip tests ------------------------------

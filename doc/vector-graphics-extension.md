@@ -283,9 +283,24 @@ survive the switch.
 
 When the terminal is resized, element origins, drawing commands, and
 anchors are not modified. Elements whose drawing now extends beyond the
-grid are simply clipped at render time. The client TUI is responsible for
-catching SIGWINCH (or its winit equivalent inside the client) and reissuing
-appropriate `UpdateOrigin` / `UpdateCommands` calls.
+grid are simply clipped at render time.
+
+The text grid itself resizes xterm-style on the main screen (no scroll
+region active): a **vertical shrink** pushes as many top rows into
+scrollback as needed to keep the cursor row on screen (instead of
+truncating the bottom of the grid), and a **vertical grow** pulls rows
+back out of scrollback. Each pushed/pulled row moves the live screen
+relative to scrollback, exactly like a scroll, and anchored elements
+travel with their lines per §5.2 — so an element placed above the
+prompt (e.g. a `vcat` image) keeps its distance to the prompt through
+a shrink/grow cycle without the client doing anything. Width changes
+never move the screen origin; rows are truncated or padded in place
+(no reflow).
+
+A live client TUI may still catch SIGWINCH (or its winit equivalent)
+and reissue `UpdateOrigin` / `UpdateCommands` when it wants layout
+beyond what anchoring preserves (e.g. re-fitting drawing to the new
+width).
 
 ### 5.6 Reset
 

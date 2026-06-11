@@ -138,6 +138,29 @@ impl Screen {
         self.grid.scroll_committed()
     }
 
+    /// Net downward movement of the *main* grid's first row in
+    /// absolute scrollback coordinates: lines scrolled off the top
+    /// count +1 (scroll-region scrolls excluded — they don't move the
+    /// screen relative to scrollback), rows pushed into scrollback by
+    /// a vertical shrink count +1 each, rows pulled back out by a
+    /// vertical grow count -1 each. The VGE/PRT line trackers advance
+    /// `top_of_live_screen` by deltas of this value. Runtime-only —
+    /// not preserved across a binary snapshot restore; delta-based
+    /// consumers must re-baseline after a restore.
+    #[must_use]
+    pub fn origin_shift(&self) -> i64 {
+        self.grid.origin_shift()
+    }
+
+    /// Number of rows currently held in the *main* grid's scrollback
+    /// ring (the alternate grid keeps no scrollback). Unlike
+    /// [`scrollback`](Self::scrollback), this is the fill level, not
+    /// the user's scroll offset.
+    #[must_use]
+    pub fn scrollback_fill(&self) -> usize {
+        self.grid.scrollback_fill()
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain
@@ -1543,6 +1566,69 @@ mod scs_tests {
         let mut p = Parser::new(2, 10, 0);
         p.process("\x1b(0é".as_bytes());
         assert_eq!(cell_at(&p, 0, 0), "é");
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use crate::Parser;
+
+    /// 15 numbered lines on a 10-row screen: 6 scrolled into history,
+    /// `line6`..`line14` visible, cursor on the blank bottom row.
+    fn parser_with_lines() -> Parser {
+        let mut p = Parser::new(10, 20, 100);
+        for i in 0..15 {
+            p.process(format!("line{i}\r\n").as_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn vertical_shrink_pushes_top_rows_keeping_cursor_line() {
+        let mut p = parser_with_lines();
+        assert_eq!(p.screen().cursor_position(), (9, 0));
+        assert_eq!(p.screen().origin_shift(), 6);
+
+        p.screen_mut().set_size(6, 20);
+        // The four rows above the kept window went into scrollback
+        // (not truncated off the bottom) and the cursor line survives
+        // as the new bottom row.
+        assert_eq!(p.screen().cursor_position(), (5, 0));
+        assert_eq!(p.screen().scrollback_fill(), 10);
+        assert_eq!(p.screen().origin_shift(), 10);
+        assert!(p.screen().contents().starts_with("line10"));
+    }
+
+    #[test]
+    fn vertical_shrink_grow_roundtrip_restores_layout() {
+        let mut p = parser_with_lines();
+        let before = p.screen().contents();
+        p.screen_mut().set_size(6, 20);
+        p.screen_mut().set_size(10, 20);
+        assert_eq!(p.screen().cursor_position(), (9, 0));
+        assert_eq!(p.screen().scrollback_fill(), 6);
+        assert_eq!(p.screen().origin_shift(), 6);
+        assert_eq!(p.screen().contents(), before);
+    }
+
+    #[test]
+    fn grow_without_scrollback_extends_bottom() {
+        let mut p = Parser::new(4, 20, 100);
+        p.process(b"a\r\nb");
+        // Nothing in scrollback to pull; growing adds blank rows at
+        // the bottom and leaves the cursor line alone.
+        p.screen_mut().set_size(8, 20);
+        assert_eq!(p.screen().cursor_position(), (1, 1));
+        assert_eq!(p.screen().origin_shift(), 0);
+    }
+
+    #[test]
+    fn resize_with_scroll_region_keeps_legacy_truncation() {
+        let mut p = Parser::new(10, 20, 100);
+        p.process(b"\x1b[2;5r");
+        p.screen_mut().set_size(6, 20);
+        assert_eq!(p.screen().origin_shift(), 0);
+        assert_eq!(p.screen().scrollback_fill(), 0);
     }
 }
 

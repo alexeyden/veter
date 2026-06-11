@@ -386,11 +386,21 @@ host grid are clipped at render time. The client is responsible for
 deciding whether to issue `UpdateOrigin` / `UpdateSize` calls in
 response.
 
+The host text grid resizes xterm-style (see the VGE spec §5.5): a
+vertical shrink pushes top rows into scrollback to keep the cursor row
+visible, a vertical grow pulls them back out, and the live screen
+moves relative to scrollback accordingly. Scrollback-anchored portals
+travel with their anchor lines through such a resize, like any
+scrolled line.
+
 Resizing a **portal** via `UpdateSize` (§6.3) is plumbed through to
-the portal's inner vt100 parser (rows = `size_h`, cols = `size_w`).
-The host emits a `ResizeNotify` event (§8.8) once the inner grid has
-been resized, so the client can decide when to deliver the
-SIGWINCH-equivalent to the program owning the portal's PTY.
+the portal's inner vt100 parser (rows = `size_h`, cols = `size_w`),
+with the same xterm-style push/pull semantics applied to the portal's
+own scrollback — anchored objects *inside* the portal (per-portal VGE
+elements, sub-portals) travel with their lines as well. The host emits
+a `ResizeNotify` event (§8.8) once the inner grid has been resized, so
+the client can decide when to deliver the SIGWINCH-equivalent to the
+program owning the portal's PTY.
 
 ### 5.7 Reset
 

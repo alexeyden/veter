@@ -18,6 +18,15 @@ pub struct Grid {
     /// runtime-only signal for the PRT activity heuristic — never
     /// serialized; reset to 0 on construction and snapshot restore.
     scroll_committed: u64,
+    /// Net number of lines the live grid's first row has moved *down*
+    /// in absolute scrollback coordinates: +1 per line scrolled off
+    /// the top (same sites as `scroll_committed`), +k when a vertical
+    /// shrink pushes k top rows into scrollback, -k when a vertical
+    /// grow pulls k rows back out. The VGE/PRT scrollback-line
+    /// trackers advance `top_of_live_screen` by deltas of this value.
+    /// Runtime-only — never serialized; reset to 0 on construction
+    /// and snapshot restore (delta-based consumers re-baseline).
+    origin_shift: i64,
 }
 
 impl Grid {
@@ -35,6 +44,7 @@ impl Grid {
             scrollback_len,
             scrollback_offset: 0,
             scroll_committed: 0,
+            origin_shift: 0,
         }
     }
 
@@ -42,6 +52,20 @@ impl Grid {
     /// See the field doc; used by the PRT activity heuristic.
     pub fn scroll_committed(&self) -> u64 {
         self.scroll_committed
+    }
+
+    /// Net downward movement of the live grid's first row in absolute
+    /// scrollback coordinates. See the field doc; used by the VGE/PRT
+    /// scrollback-line trackers.
+    pub fn origin_shift(&self) -> i64 {
+        self.origin_shift
+    }
+
+    /// Number of rows currently held in the scrollback ring. Distinct
+    /// from `scrollback_len` (the configured capacity) and
+    /// `scrollback_offset` (the user's scroll position).
+    pub fn scrollback_fill(&self) -> usize {
+        self.scrollback.len()
     }
 
     pub fn allocate_rows(&mut self) {
@@ -156,6 +180,7 @@ impl Grid {
             scrollback_len,
             scrollback_offset,
             scroll_committed: 0,
+            origin_shift: 0,
         })
     }
 
@@ -164,6 +189,54 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        // Vertical resize follows xterm when no scroll region is set:
+        // shrinking pushes top rows into scrollback so the cursor row
+        // survives instead of truncating the bottom of the grid, and
+        // growing pulls rows back out. Each moved row adjusts
+        // `origin_shift` so scrollback-anchored consumers stay aligned.
+        // With an active scroll region (or before the rows are lazily
+        // allocated) the legacy truncate/extend behavior applies.
+        if !self.rows.is_empty() && !self.scroll_region_active() {
+            if size.rows < self.size.rows {
+                let keep = usize::from(size.rows);
+                let push = usize::from(self.pos.row + 1).saturating_sub(keep);
+                for _ in 0..push {
+                    let row = self.rows.remove(0);
+                    self.origin_shift += 1;
+                    if self.scrollback_len > 0 {
+                        self.scrollback.push_back(row);
+                        while self.scrollback.len() > self.scrollback_len {
+                            self.scrollback.pop_front();
+                        }
+                    }
+                    // Same viewport-stability rule as `scroll_up`: a
+                    // scrolled-back view keeps showing the same lines.
+                    if self.scrollback_offset > 0 {
+                        self.scrollback_offset =
+                            self.scrollback.len().min(self.scrollback_offset + 1);
+                    }
+                }
+                self.pos.row -= push as u16;
+                self.saved_pos.row = self.saved_pos.row.saturating_sub(push as u16);
+            } else if size.rows > self.size.rows {
+                let grow = usize::from(size.rows - self.size.rows);
+                let pull = grow.min(self.scrollback.len());
+                for _ in 0..pull {
+                    let row = self.scrollback.pop_back().unwrap();
+                    self.rows.insert(0, row);
+                    self.origin_shift -= 1;
+                    if self.scrollback_offset > 0 {
+                        self.scrollback_offset -= 1;
+                    }
+                }
+                self.pos.row += pull as u16;
+                self.saved_pos.row =
+                    self.saved_pos.row.saturating_add(pull as u16);
+            }
+            self.scrollback_offset =
+                self.scrollback_offset.min(self.scrollback.len());
+        }
+
         if size.cols != self.size.cols {
             for row in &mut self.rows {
                 row.wrap(false);
@@ -676,6 +749,7 @@ impl Grid {
                 // A line scrolled off the top of the live grid: the
                 // signal the PRT activity heuristic watches.
                 self.scroll_committed = self.scroll_committed.wrapping_add(1);
+                self.origin_shift += 1;
                 if self.scrollback_len > 0 {
                     self.scrollback.push_back(removed);
                     while self.scrollback.len() > self.scrollback_len {

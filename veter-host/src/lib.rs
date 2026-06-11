@@ -14,6 +14,7 @@
 //! which is the right semantics for a daemon — VFT envelopes pass
 //! through to the renderer where the real picker lives.
 
+mod line_tracker;
 pub mod prt;
 pub mod ses;
 pub mod vft;

@@ -35,7 +35,7 @@ Each extension is split into a wire-format crate and host-side state lives only 
 | Crate | Role |
 |---|---|
 | `vge-protocol`, `prt-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Both host and clients depend on these. |
-| `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`). The screen model the host and every portal use. |
+| `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, and the `origin_shift` / `scroll_committed` counters the engines' line trackers consume). The screen model the host and every portal use. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the host vt100, the host-side PRT engine (`src/prt/`), and the host-side VGE engine (`src/vge/`). |
 | `vge-cli`, `prt-cli` | Emit raw envelopes for manual protocol testing. |
 | `tools/vmux` | Terminal multiplexer that runs *inside* veter, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
