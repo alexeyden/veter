@@ -41,3 +41,23 @@ pub const MARKER_H2C: &[u8; 3] = b"ses"; // host → client (responses)
 pub const ESC: u8 = 0x1B;
 pub const APC_OPEN: u8 = 0x5F; // '_'
 pub const ST_CLOSE: u8 = 0x5C; // '\\'
+
+// Transport-hostile payload bytes that byte-stuffing also neutralises.
+// A SES envelope can be relayed to an inner program through its input
+// channel — e.g. a portal's RawReply forwarded into a pane that is an
+// `ssh` client, where it becomes session input subject to escape
+// processing. Such relays interpret some bytes instead of forwarding
+// them: `~` is ssh's escape character (`\n~.` tears the session down)
+// and DC1/DC3 are software flow control (XON/XOFF). Escaping them keeps
+// the on-wire envelope body free of these — and in particular `~` can
+// never follow a newline.
+pub const TILDE: u8 = 0x7E; // '~'  ssh escape character
+pub const XON: u8 = 0x11; // DC1  XON (resume) flow control
+pub const XOFF: u8 = 0x13; // DC3  XOFF (pause) flow control
+
+// Second byte of each `ESC <mark>` escape inside an envelope body. ESC
+// itself stays `ESC ESC`; the rest map to safe ASCII letters that are
+// themselves transport-clean and distinct from `ESC`/`ST_CLOSE`.
+pub const ESC_MARK_TILDE: u8 = b'T'; // 0x54 → TILDE
+pub const ESC_MARK_XON: u8 = b'Q'; // 0x51 → XON
+pub const ESC_MARK_XOFF: u8 = b'S'; // 0x53 → XOFF
