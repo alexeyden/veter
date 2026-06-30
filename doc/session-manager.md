@@ -258,7 +258,8 @@ to PRT / VGE / VFT and routed by the same per-portal pipeline:
 - Payload framing matches PRT §1.1–1.4: `u8 protocol_version = 0`,
   `u32 payload_length`, then a sequence of
   `(u8 frame_type, u32 request_id, u32 body_length, body[body_length])`
-  frames. ESC byte-stuffing applied to the payload.
+  frames. Byte-stuffing per PRT §1.3 (ESC plus the `~`/XON/XOFF
+  transport escapes) applied to the payload.
 - Primitive encoding (`u8`, `u16`, `u32`, `i32`, `varu`, `string`,
   `bytes`) per PRT §1.4.
 

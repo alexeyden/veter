@@ -11,7 +11,10 @@
 // through verbatim — including foreign APC sequences. This matches
 // the foreign-marker pass-through rule in §1.1 of every other spec.
 
-use super::frame::{APC_OPEN, ESC, MARKER_E2R, ST_CLOSE};
+use super::frame::{
+    APC_OPEN, ESC, ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, MARKER_E2R, ST_CLOSE, TILDE, XOFF,
+    XON,
+};
 
 #[derive(Debug)]
 enum State {
@@ -175,8 +178,21 @@ impl ApcStream {
                     out.payloads.push(body);
                     State::Idle
                 }
+                ESC_MARK_TILDE => {
+                    body.push(TILDE);
+                    State::ApcVss { body }
+                }
+                ESC_MARK_XON => {
+                    body.push(XON);
+                    State::ApcVss { body }
+                }
+                ESC_MARK_XOFF => {
+                    body.push(XOFF);
+                    State::ApcVss { body }
+                }
                 _ => {
-                    // Spec only permits 1B-stuffing or ST close inside the
+                    // Only the byte-stuffing escapes (ESC-double, the
+                    // transport marks) or ST close are valid inside the
                     // envelope. Treat anything else as malformed: discard
                     // the partial body, emit the stray ESC + byte to
                     // passthrough, and resync.
@@ -217,6 +233,23 @@ mod tests {
         let mut s = ApcStream::new();
         let body = &[0x00, 0x1B, 0xFF, 0x1B];
         let out = s.feed(&envelope_e2r(body));
+        assert_eq!(out.payloads.len(), 1);
+        assert_eq!(&out.payloads[0], body);
+    }
+
+    #[test]
+    fn unstuffs_transport_hostile_bytes() {
+        // A body carrying ESC, ~, XON and XOFF (interleaved with the
+        // newline that makes ~ dangerous) round-trips exactly, and the
+        // on-wire envelope is free of literal ~ / XON / XOFF.
+        use super::super::frame::{TILDE, XOFF, XON};
+        let mut s = ApcStream::new();
+        let body = &[b'\n', TILDE, 0x00, ESC, XON, b'\r', TILDE, XOFF, 0xFF];
+        let env = envelope_e2r(body);
+        assert!(!env.contains(&TILDE), "wire envelope leaked a literal ~");
+        assert!(!env.contains(&XON), "wire envelope leaked a literal XON");
+        assert!(!env.contains(&XOFF), "wire envelope leaked a literal XOFF");
+        let out = s.feed(&env);
         assert_eq!(out.payloads.len(), 1);
         assert_eq!(&out.payloads[0], body);
     }
