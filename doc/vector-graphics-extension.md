@@ -84,15 +84,34 @@ suppression, the renderer's acks would round-trip through the chain and
 get re-interpreted as input by the inner program's tty. Clients that need
 acknowledgement MUST use any other value.
 
-### 1.3 ESC byte stuffing
+### 1.3 Byte stuffing
 
 All bytes of the payload (after computing `payload_length`, before placing
-in the envelope) are scanned. Any byte equal to `0x1B` is replaced with the
-two-byte sequence `0x1B 0x1B`. Decoding reverses this.
+in the envelope) are scanned and the following are replaced:
 
-This is the only escape rule. All other bytes pass through. `payload_length`
-is computed on the *unstuffed* payload, so the receiver knows how much data
-to expect after unstuffing.
+| Payload byte    | On-wire encoding | Reason                         |
+|-----------------|------------------|--------------------------------|
+| `0x1B` ESC      | `0x1B 0x1B`      | escape introducer / ST framing |
+| `0x7E` `~`      | `0x1B 0x54` (`ESC T`) | ssh escape character      |
+| `0x11` DC1      | `0x1B 0x51` (`ESC Q`) | XON (flow control)        |
+| `0x13` DC3      | `0x1B 0x53` (`ESC S`) | XOFF (flow control)       |
+
+Decoding reverses each case; any other byte after a body `0x1B` (other
+than these marks or the `0x5C` ST close) is malformed. All other bytes
+pass through.
+
+The `~` / XON / XOFF rules exist because a VGE envelope can be relayed to
+an inner program through its **input** channel — e.g. a portal's
+`RawReply` forwarded into an `ssh` client. Such relays interpret these
+bytes instead of forwarding them: `~` is ssh's escape character (a `\n~.`
+in the stream tears the session down) and DC1/DC3 are software flow
+control. Stuffing them guarantees the on-wire envelope never contains a
+literal `~` (so `~` can never follow a newline), DC1 or DC3, making the
+stream safe to relay 8-bit-clean. The mark bytes (`T`/`Q`/`S`) are
+themselves transport-clean and distinct from `0x1B`/`0x5C`.
+
+`payload_length` is computed on the *unstuffed* payload, so the receiver
+knows how much data to expect after unstuffing.
 
 ### 1.4 Encoding primitives
 

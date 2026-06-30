@@ -1492,16 +1492,28 @@ mod tests {
         assert_eq!(&env[..2], &[ESC, APC_OPEN]);
         assert_eq!(&env[2..5], marker);
         assert_eq!(&env[env.len() - 2..], &[ESC, ST_CLOSE]);
+        use vge_protocol::frame::{
+            ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, TILDE, XOFF, XON,
+        };
         let mut out = Vec::new();
         let mut i = 5;
         while i < env.len() - 2 {
-            if env[i] == ESC && i + 1 < env.len() - 2 && env[i + 1] == ESC {
-                out.push(ESC);
-                i += 2;
-            } else {
-                out.push(env[i]);
-                i += 1;
+            if env[i] == ESC && i + 1 < env.len() - 2 {
+                let decoded = match env[i + 1] {
+                    ESC => Some(ESC),
+                    ESC_MARK_TILDE => Some(TILDE),
+                    ESC_MARK_XON => Some(XON),
+                    ESC_MARK_XOFF => Some(XOFF),
+                    _ => None,
+                };
+                if let Some(b) = decoded {
+                    out.push(b);
+                    i += 2;
+                    continue;
+                }
             }
+            out.push(env[i]);
+            i += 1;
         }
         out
     }
