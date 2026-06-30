@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
@@ -10,6 +11,43 @@ use nix::unistd::{execvp, Pid};
 pub struct Pty {
     master: OwnedFd,
     child: Pid,
+    /// Output destined for the child is handed to a dedicated writer
+    /// thread rather than written inline. A blocking `write(2)` on the
+    /// master can stall for as long as the downstream reader is slow to
+    /// drain — most acutely a large VFT download relayed through vmux,
+    /// where the single-threaded relay empties the master far slower
+    /// than a direct client would. Doing that write on the winit
+    /// event-loop thread froze the GUI for the whole transfer; the
+    /// writer thread absorbs the blocking so `write_all` only ever does
+    /// a non-blocking channel push.
+    ///
+    /// The queue is currently unbounded: step A removes the freeze but
+    /// not the memory growth a flooding producer can cause. End-to-end
+    /// flow control (the planned VFT ack-windowing, step B) is what
+    /// bounds the producer; until then a runaway download grows this
+    /// queue instead of stalling the loop.
+    writer_tx: Sender<Vec<u8>>,
+}
+
+/// Drain queued buffers to the master fd with blocking writes. Runs on
+/// its own thread so the caller (the event loop) never blocks. A single
+/// consumer of a FIFO channel preserves the byte ordering callers rely
+/// on across successive `write_all` calls. Exits when the channel
+/// closes (Pty dropped) or the fd reports the child is gone.
+fn writer_loop(fd: OwnedFd, rx: Receiver<Vec<u8>>) {
+    while let Ok(buf) = rx.recv() {
+        let mut data = &buf[..];
+        while !data.is_empty() {
+            match nix::unistd::write(&fd, data) {
+                Ok(0) => return,
+                Ok(n) => data = &data[n..],
+                Err(nix::errno::Errno::EINTR) => continue,
+                // Child exited / fd closed: drop this and any further
+                // queued bytes — there's no reader left for them.
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 impl Pty {
@@ -59,18 +97,36 @@ impl Pty {
                 let err = execvp(&shell_path, &[&shell_path]).unwrap_err();
                 panic!("exec failed: {err}");
             }
-            ForkptyResult::Parent { child, master } => Ok(Pty { master, child }),
+            ForkptyResult::Parent { child, master } => {
+                // The writer thread owns its own dup of the master so it
+                // can block on `write(2)` independently of the reader
+                // thread (full-duplex on the same open file description)
+                // and of `resize`/`dup_master` on the main thread.
+                let writer_fd = nix::unistd::dup(master.as_raw_fd())
+                    .map_err(io::Error::other)?;
+                let writer_fd = unsafe { OwnedFd::from_raw_fd(writer_fd) };
+                let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+                std::thread::spawn(move || writer_loop(writer_fd, writer_rx));
+                Ok(Pty {
+                    master,
+                    child,
+                    writer_tx,
+                })
+            }
         }
     }
 
+    /// Queue `data` for the child. Never blocks: the bytes are handed to
+    /// the writer thread and flushed there. Returns an error only if the
+    /// writer thread has gone (its fd closed), which callers treat the
+    /// same as a failed write.
     pub fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        let mut written = 0;
-        while written < data.len() {
-            let n = nix::unistd::write(&self.master, &data[written..])
-                .map_err(io::Error::other)?;
-            written += n;
+        if data.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.writer_tx
+            .send(data.to_vec())
+            .map_err(|_| io::Error::other("pty writer thread is gone"))
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
