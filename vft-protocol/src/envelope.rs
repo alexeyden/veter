@@ -235,6 +235,50 @@ mod tests {
     }
 
     #[test]
+    fn download_chunk_envelope_is_transport_clean_and_round_trips() {
+        // End-to-end: a DownloadChunk whose file bytes contain ssh's
+        // escape char after a newline (`\n~`) plus XON/XOFF, wrapped as a
+        // real H2C envelope, must be relayable through an interactive
+        // transport — no literal `~`, XON or XOFF on the wire — and the
+        // client's APC parser must recover the bytes exactly.
+        use crate::frame::{EVT_DOWNLOAD_CHUNK, MARKER_H2C, TILDE, XOFF, XON};
+
+        let data = [b'\n', TILDE, 0x00, XON, b'\r', TILDE, XOFF, 0xFF, 0x1B];
+        let mut frames = Vec::new();
+        append_frame(
+            &mut frames,
+            EVT_DOWNLOAD_CHUNK,
+            0,
+            &download_chunk_body("vrecv-1", 0, &data),
+        );
+        let env = wrap_h2c_envelope(&frames);
+
+        assert!(!env.contains(&TILDE), "envelope leaked a literal ~");
+        assert!(!env.contains(&XON), "envelope leaked a literal XON");
+        assert!(!env.contains(&XOFF), "envelope leaked a literal XOFF");
+        for w in env.windows(2) {
+            assert!(
+                !((w[0] == b'\n' || w[0] == b'\r') && w[1] == TILDE),
+                "envelope leaked a newline-adjacent ~"
+            );
+        }
+
+        // Client-side parse recovers the chunk byte-for-byte.
+        let mut s = ApcStream::with_marker(*MARKER_H2C);
+        let out = s.feed(&env);
+        assert_eq!(out.payloads.len(), 1);
+        let mut r = Reader::new(&out.payloads[0]);
+        assert_eq!(r.u8().unwrap(), 0); // protocol_version
+        let _payload_len = r.u32().unwrap();
+        assert_eq!(r.u8().unwrap(), EVT_DOWNLOAD_CHUNK);
+        assert_eq!(r.u32().unwrap(), 0); // request_id
+        let _body_len = r.u32().unwrap();
+        assert_eq!(r.string().unwrap(), "vrecv-1");
+        assert_eq!(r.u64().unwrap(), 0);
+        assert_eq!(r.bytes().unwrap(), &data);
+    }
+
+    #[test]
     fn download_end_body_round_trip() {
         let body = download_end_body("vrecv-1", 8_421_376);
         let mut r = Reader::new(&body);

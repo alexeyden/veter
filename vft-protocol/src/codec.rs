@@ -1,6 +1,8 @@
 // Binary primitives shared by all VFT frame bodies (§1.4).
 
-use super::frame::{ERR_BAD_PAYLOAD, ESC};
+use super::frame::{
+    ERR_BAD_PAYLOAD, ESC, ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, TILDE, XOFF, XON,
+};
 
 #[derive(Debug, Copy, Clone)]
 pub struct DecodeError(pub u16);
@@ -174,13 +176,31 @@ impl Writer {
     }
 }
 
-/// Replace each `0x1B` byte with `0x1B 0x1B`. Used when emitting the APC
-/// payload (§1.3).
+/// Byte-stuff a payload for the APC envelope body (§1.3). `ESC` is
+/// doubled (`ESC ESC`); the transport-hostile bytes `~`, XON and XOFF are
+/// each replaced with `ESC <mark>`, so the emitted body is safe to cross
+/// an interactive relay (e.g. ssh) that would otherwise interpret them.
+/// Decoding (the APC parser) reverses all four cases.
 pub fn stuff(input: &[u8], out: &mut Vec<u8>) {
     for &b in input {
-        out.push(b);
-        if b == ESC {
-            out.push(ESC);
+        match b {
+            ESC => {
+                out.push(ESC);
+                out.push(ESC);
+            }
+            TILDE => {
+                out.push(ESC);
+                out.push(ESC_MARK_TILDE);
+            }
+            XON => {
+                out.push(ESC);
+                out.push(ESC_MARK_XON);
+            }
+            XOFF => {
+                out.push(ESC);
+                out.push(ESC_MARK_XOFF);
+            }
+            _ => out.push(b),
         }
     }
 }
@@ -249,5 +269,36 @@ mod tests {
         let mut out = Vec::new();
         stuff(&[0x00, 0x1B, 0xFF, 0x1B], &mut out);
         assert_eq!(out, vec![0x00, 0x1B, 0x1B, 0xFF, 0x1B, 0x1B]);
+    }
+
+    #[test]
+    fn stuff_escapes_transport_hostile_bytes() {
+        let mut out = Vec::new();
+        // ~, XON (0x11), XOFF (0x13) each become ESC <mark>.
+        stuff(&[TILDE, XON, XOFF], &mut out);
+        assert_eq!(
+            out,
+            vec![ESC, ESC_MARK_TILDE, ESC, ESC_MARK_XON, ESC, ESC_MARK_XOFF]
+        );
+    }
+
+    #[test]
+    fn stuffed_output_is_transport_clean() {
+        // The whole point: a stuffed body never contains a literal `~`,
+        // XON or XOFF — so `\n~` (ssh's escape trigger) can't appear and
+        // flow-control bytes can't pause an interactive relay. Exhaustive
+        // over every single byte value, plus a newline-adjacency probe.
+        let all: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+        let mut out = Vec::new();
+        stuff(&all, &mut out);
+        assert!(!out.contains(&TILDE), "literal ~ leaked");
+        assert!(!out.contains(&XON), "literal XON leaked");
+        assert!(!out.contains(&XOFF), "literal XOFF leaked");
+        for w in out.windows(2) {
+            assert!(
+                !((w[0] == b'\n' || w[0] == b'\r') && w[1] == TILDE),
+                "newline-adjacent ~ leaked"
+            );
+        }
     }
 }

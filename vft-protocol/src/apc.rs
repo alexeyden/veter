@@ -10,7 +10,10 @@
 // that are not part of a `VFT` (or `vft`) APC envelope pass through
 // verbatim — including non-VFT APC sequences.
 
-use super::frame::{APC_OPEN, ESC, MARKER_C2H, ST_CLOSE};
+use super::frame::{
+    APC_OPEN, ESC, ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, MARKER_C2H, ST_CLOSE, TILDE, XOFF,
+    XON,
+};
 
 #[derive(Debug)]
 enum State {
@@ -172,11 +175,24 @@ impl ApcStream {
                     out.payloads.push(body);
                     State::Idle
                 }
+                ESC_MARK_TILDE => {
+                    body.push(TILDE);
+                    State::ApcVft { body }
+                }
+                ESC_MARK_XON => {
+                    body.push(XON);
+                    State::ApcVft { body }
+                }
+                ESC_MARK_XOFF => {
+                    body.push(XOFF);
+                    State::ApcVft { body }
+                }
                 _ => {
-                    // Spec only permits 1B-stuffing or ST close inside the
-                    // envelope. Treat anything else as malformed: discard
-                    // the partial body, emit the stray ESC + byte to
-                    // passthrough, and resync.
+                    // Spec permits only the §1.3 escapes (ESC-double, the
+                    // transport marks) or ST close inside the envelope.
+                    // Anything else is malformed: discard the partial
+                    // body, emit the stray ESC + byte to passthrough, and
+                    // resync.
                     out.push_pass(ESC);
                     out.push_pass(b);
                     State::Idle
@@ -214,6 +230,22 @@ mod tests {
         let mut s = ApcStream::new();
         let body = &[0x00, 0x1B, 0xFF, 0x1B];
         let out = s.feed(&envelope(body));
+        assert_eq!(out.payloads.len(), 1);
+        assert_eq!(&out.payloads[0], body);
+    }
+
+    #[test]
+    fn unstuffs_transport_hostile_bytes() {
+        // A body carrying ESC, ~, XON and XOFF (interleaved with the
+        // newline that makes ~ dangerous) round-trips exactly, and the
+        // on-wire envelope is free of literal ~ / XON / XOFF.
+        let mut s = ApcStream::new();
+        let body = &[b'\n', TILDE, 0x00, ESC, XON, b'\r', TILDE, XOFF, 0xFF];
+        let env = envelope(body);
+        assert!(!env.contains(&TILDE), "wire envelope leaked a literal ~");
+        assert!(!env.contains(&XON), "wire envelope leaked a literal XON");
+        assert!(!env.contains(&XOFF), "wire envelope leaked a literal XOFF");
+        let out = s.feed(&env);
         assert_eq!(out.payloads.len(), 1);
         assert_eq!(&out.payloads[0], body);
     }

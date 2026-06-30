@@ -95,12 +95,33 @@ command's response.
 matching response. For event frames (host-originated, unsolicited)
 `request_id` MUST be `0` and the client MUST ignore it.
 
-### 1.3 ESC byte stuffing
+### 1.3 Byte stuffing
 
 All bytes of the payload (after computing `payload_length`, before
-placing in the envelope) are scanned. Any byte equal to `0x1B` is
-replaced with the two-byte sequence `0x1B 0x1B`. Decoding reverses
-this. This is the only escape rule.
+placing in the envelope) are scanned and the following are replaced:
+
+| Payload byte    | On-wire encoding | Reason                         |
+|-----------------|------------------|--------------------------------|
+| `0x1B` ESC      | `0x1B 0x1B`      | escape introducer / ST framing |
+| `0x7E` `~`      | `0x1B 0x54` (`ESC T`) | ssh escape character      |
+| `0x11` DC1      | `0x1B 0x51` (`ESC Q`) | XON (flow control)        |
+| `0x13` DC3      | `0x1B 0x53` (`ESC S`) | XOFF (flow control)       |
+
+Decoding reverses each case; any other byte after a body `0x1B`
+(other than these marks or the `0x5C` ST close) is malformed.
+
+The `~` / XON / XOFF rules exist because the download path (§7.2)
+delivers arbitrary file bytes through the inner program's **input**
+channel, which may traverse an interactive relay — most commonly an
+`ssh` client. Such relays interpret these bytes instead of
+forwarding them: `~` is ssh's escape character (a `\n~.` in the
+stream tears the session down), and DC1/DC3 are software flow
+control that can silently pause the relay. Stuffing them guarantees
+the on-wire envelope never contains a literal `~` (so `~` can never
+follow a newline), DC1 or DC3 — making the stream safe to relay
+8-bit-clean without the user having to disable ssh escapes
+(`ssh -e none`). The mark bytes (`T`/`Q`/`S`) are themselves
+transport-clean and distinct from `0x1B`/`0x5C`.
 
 `payload_length` is computed on the *unstuffed* payload, so the
 receiver knows how much data to expect after unstuffing.
@@ -110,10 +131,11 @@ fields *inside* VFT frames (§6.2, §7.2): they are part of the payload
 like any other field, so they get stuffed once at envelope-encode
 time. There is no double-stuffing.
 
-Worst-case overhead is 2× (a payload of all-`0x1B` bytes doubles
-under stuffing). Real file content is rarely close to this; clients
-that care about wire amplification SHOULD assume an average overhead
-of a few percent and size their chunks accordingly.
+Worst-case overhead is 2× (a payload of all-stuffed bytes doubles).
+Real file content is rarely close to this — the four stuffed values
+total well under 2% of typical binary — so clients that care about
+wire amplification SHOULD assume an average overhead of a few
+percent and size their chunks accordingly.
 
 ### 1.4 Encoding primitives
 
