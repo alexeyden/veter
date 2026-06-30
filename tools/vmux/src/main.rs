@@ -617,6 +617,13 @@ fn separator_hit(
 struct PanePty {
     master: OwnedFd,
     child: Pid,
+    /// Bytes queued *toward* the pane (host responses we relay, plus
+    /// forwarded keystrokes). Drained non-blocking so a slow pane — e.g.
+    /// an `ssh` client transmitting a download chunk at network speed —
+    /// never stalls vmux's single-threaded loop, which is what kept
+    /// keystrokes from being serviced. Memory stays bounded because the
+    /// VFT download window (§5.5) caps how far ahead the host streams.
+    out: OutQueue,
 }
 
 impl PanePty {
@@ -639,7 +646,14 @@ impl PanePty {
                 // through the parent's drop handlers.
                 std::process::exit(127);
             }
-            ForkptyResult::Parent { child, master } => Ok(Self { master, child }),
+            ForkptyResult::Parent { child, master } => {
+                // Non-blocking so both writes (the buffered `out` queue)
+                // and the poll-driven reads return `EAGAIN` instead of
+                // blocking the loop.
+                set_nonblocking(master.as_raw_fd())?;
+                let out = OutQueue::with_fd(master.as_raw_fd());
+                Ok(Self { master, child, out })
+            }
         }
     }
 
@@ -647,16 +661,27 @@ impl PanePty {
         self.master.as_raw_fd()
     }
 
-    fn write_all(&self, mut data: &[u8]) -> Result<()> {
-        while !data.is_empty() {
-            match nix::unistd::write(&self.master, data) {
-                Ok(0) => bail!("pty write returned 0"),
-                Ok(n) => data = &data[n..],
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(anyhow!("pty write: {e}")),
-            }
+    /// Queue bytes for the pane and attempt an immediate non-blocking
+    /// drain. Whatever doesn't fit stays buffered and is flushed later on
+    /// `POLLOUT` (see the main loop). Never blocks.
+    fn enqueue(&mut self, data: &[u8]) {
+        self.out.enqueue(data);
+        self.drain_out();
+    }
+
+    /// Drain queued bytes without blocking. A write error means the child
+    /// is gone; drop the buffer and let the loop's `POLLHUP` path close
+    /// the pane.
+    fn drain_out(&mut self) {
+        if self.out.flush().is_err() {
+            self.out.clear();
         }
-        Ok(())
+    }
+
+    /// True while bytes are still queued toward the pane (drives the
+    /// `POLLOUT` interest in the poll set).
+    fn wants_write(&self) -> bool {
+        self.out.pending() > 0
     }
 
     fn resize(&self, rows: u16, cols: u16) {
@@ -4707,8 +4732,14 @@ struct OutQueue {
 
 impl OutQueue {
     fn new() -> Self {
+        Self::with_fd(std::io::stdout().as_raw_fd())
+    }
+
+    /// Build a queue draining to an arbitrary (non-blocking) fd. Used for
+    /// per-pane PTY output so a slow pane never blocks the main loop.
+    fn with_fd(fd: RawFd) -> Self {
         OutQueue {
-            fd: std::io::stdout().as_raw_fd(),
+            fd,
             buf: Vec::new(),
             head: 0,
         }
@@ -4716,6 +4747,12 @@ impl OutQueue {
 
     fn enqueue(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Drop all queued bytes — used when the destination fd is gone.
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.head = 0;
     }
 
     /// Try to drain the queue to the fd. On a non-blocking fd this stops at
@@ -4772,6 +4809,18 @@ fn out_pending() -> usize {
 /// Drain whatever the `POLLOUT` poll says is writable.
 fn out_flush() -> Result<()> {
     OUT.with(|q| q.borrow_mut().flush())
+}
+
+/// Put an fd into non-blocking mode (used for pane PTY masters).
+fn set_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        bail!("fcntl(F_GETFL): {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        bail!("fcntl(F_SETFL): {}", std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_stdout_nonblocking(nonblocking: bool) -> Result<()> {
@@ -5265,10 +5314,21 @@ fn main() -> Result<()> {
                 unsafe { BorrowedFd::borrow_raw(raw) }
             })
             .collect();
-        if read_panes {
-            for bf in &pane_borroweds {
-                fds.push(PollFd::new(*bf, PollFlags::POLLIN));
+        // One pollfd per pane (preserving `pane_base + i` indexing): read
+        // its output unless we're backpressured, and watch for writability
+        // whenever bytes are queued toward it. The POLLOUT interest is
+        // independent of `read_panes` — relaying download data *into* a
+        // pane must keep flowing even while we've paused reading *out* of
+        // panes, and it's what keeps the loop from blocking on a slow pane.
+        for (i, id) in pane_ids.iter().enumerate() {
+            let mut ev = PollFlags::empty();
+            if read_panes {
+                ev |= PollFlags::POLLIN;
             }
+            if state.panes[id].pty.wants_write() {
+                ev |= PollFlags::POLLOUT;
+            }
+            fds.push(PollFd::new(pane_borroweds[i], ev));
         }
 
         let n = match poll(&mut fds, PollTimeout::from(50u16)) {
@@ -5326,19 +5386,30 @@ fn main() -> Result<()> {
             }
         }
 
-        // Pane PTYs: shell output → WritePortal display path. Skipped entirely
-        // while backpressured (their fds aren't in the poll set then).
+        // Pane PTYs: drain queued input toward the pane (POLLOUT) and
+        // relay shell output → WritePortal (POLLIN, unless backpressured).
         for (i, pid) in pane_ids.iter().enumerate() {
-            if !read_panes {
-                break;
-            }
             let revents =
                 fds[pane_base + i].revents().unwrap_or(PollFlags::empty());
-            if revents.contains(PollFlags::POLLIN) {
+
+            // Flush whatever we have queued toward this pane, first and
+            // unconditionally on writability. This is the non-blocking
+            // replacement for the old blocking write: a pane transmitting
+            // a download chunk at network speed no longer stalls the loop,
+            // so keystrokes and prefix commands stay responsive.
+            if revents.contains(PollFlags::POLLOUT) {
+                if let Some(p) = state.panes.get_mut(pid) {
+                    p.pty.drain_out();
+                }
+            }
+
+            if read_panes && revents.contains(PollFlags::POLLIN) {
                 let raw = state.panes[pid].pty.raw_fd();
                 let n = match nix::unistd::read(raw, &mut rd_buf) {
                     Ok(n) => n,
                     Err(nix::errno::Errno::EINTR) => continue,
+                    // POLLIN raced a drain; nothing to read this round.
+                    Err(nix::errno::Errno::EAGAIN) => continue,
                     Err(e) => return Err(anyhow!("pty read: {e}")),
                 };
                 if n == 0 {
@@ -5531,9 +5602,9 @@ fn handle_stdin_chunk(
                 let id = br.string().unwrap_or("").to_string();
                 let data = br.bytes().unwrap_or(&[]).to_vec();
                 if !id.is_empty() {
-                    if let Some(p) = state.panes.get(&id) {
+                    if let Some(p) = state.panes.get_mut(&id) {
                         dlog(&format!("rawreply>{id}"), &data);
-                        let _ = p.pty.write_all(&data);
+                        p.pty.enqueue(&data);
                     }
                 }
             } else if ft == EVT_TITLE_CHANGE || ft == EVT_ICON_NAME_CHANGE {
@@ -5930,8 +6001,8 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         portal_row + 1,
         final_byte as char,
     );
-    if let Some(p) = state.panes.get(&pane_id) {
-        let _ = p.pty.write_all(payload.as_bytes());
+    if let Some(p) = state.panes.get_mut(&pane_id) {
+        p.pty.enqueue(payload.as_bytes());
     }
     Ok(())
 }
@@ -6087,10 +6158,10 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     .position(|c| *c == prefix_byte())
                     .map(|p| idx + p)
                     .unwrap_or(bytes.len());
-                if let Some(pane) = state.panes.get(&focus_id) {
+                if let Some(pane) = state.panes.get_mut(&focus_id) {
                     dlog(&format!("key>{focus_id}"), &bytes[idx..stop]);
                     trace_vmux_to_pane(&focus_id, &bytes[idx..stop]);
-                    pane.pty.write_all(&bytes[idx..stop])?;
+                    pane.pty.enqueue(&bytes[idx..stop]);
                 }
                 idx = stop;
             }
@@ -6230,8 +6301,8 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         _ if b == prefix_byte() => {
             // Double-tap: forward a literal prefix byte to the focused pane.
             let focus_id = state.focus().to_string();
-            if let Some(pane) = state.panes.get(&focus_id) {
-                pane.pty.write_all(&[prefix_byte()])?;
+            if let Some(pane) = state.panes.get_mut(&focus_id) {
+                pane.pty.enqueue(&[prefix_byte()]);
             }
             Ok(Vec::new())
         }
