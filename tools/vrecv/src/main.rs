@@ -38,7 +38,7 @@ use vft_client::stream::{HostFrame, ResponseStream};
 use vft_client::tty::{drain_stale_stdin, winsize_cols, RawTty};
 
 use vft_protocol::codec::Reader;
-use vft_protocol::command::{BeginDownloadBody, Command};
+use vft_protocol::command::{BeginDownloadBody, Command, ReportDownloadAckBody};
 use vft_protocol::encode::build_envelope;
 use vft_protocol::frame::*;
 
@@ -155,6 +155,16 @@ fn main() -> Result<()> {
     // Streaming receive loop.
     let started = Instant::now();
     let mut received: u64 = 0;
+    // Flow control (§5.5 / §7.4): the host only sends one window ahead of
+    // what we've confirmed, so we must report receipt as we drain or the
+    // transfer stalls past the first window. Ack every ACK_INTERVAL bytes
+    // — frequent enough to keep an 8 MiB host window refilled, coarse
+    // enough to keep the back-channel chatter (one tiny envelope each)
+    // negligible. Acks are fire-and-forget; their empty Ok is ignored
+    // below. `ack_rid` stays in the VFT id space (begin used 1).
+    const ACK_INTERVAL: u64 = 1024 * 1024;
+    let mut last_acked: u64 = 0;
+    let mut ack_rid: u32 = begin_rid;
     loop {
         let frame = stream
             .recv_timeout(Duration::from_secs(60))
@@ -186,6 +196,15 @@ fn main() -> Result<()> {
                     received += data.len() as u64;
                     let rate = bytes_per_sec(received, started);
                     let _ = ui.update(received, total_bytes, rate);
+                    if received - last_acked >= ACK_INTERVAL {
+                        ack_rid = ack_rid.wrapping_add(1);
+                        let ack = Command::ReportDownloadAck(ReportDownloadAckBody {
+                            transfer_id: transfer_id.clone(),
+                            bytes_confirmed: received,
+                        });
+                        write_envelope(&build_envelope(&[(ack, ack_rid)]))?;
+                        last_acked = received;
+                    }
                 }
                 EVT_DOWNLOAD_END => {
                     break;

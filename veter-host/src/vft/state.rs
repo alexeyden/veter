@@ -62,6 +62,14 @@ impl Default for Limits {
     }
 }
 
+/// Maximum bytes a download worker may run ahead of the client's
+/// confirmed receipt (§5.5 / §7.4). Bounds total in-flight memory across
+/// the whole host→client pipe (host writer queue + kernel buffers + any
+/// PRT relays like vmux + client receive buffer) to roughly this plus
+/// one chunk, and paces the worker to the slowest consumer. The client
+/// MUST advance `ReportDownloadAck` to receive beyond the first window.
+const DOWNLOAD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Direction {
     Upload,
@@ -73,6 +81,10 @@ struct TransferHandle {
     /// Monotonic byte cursor used by upload offset checks (§6.2). For
     /// downloads this is the running `bytes_sent` mirror.
     bytes_received: u64,
+    /// Downloads only: cumulative bytes the client has confirmed via
+    /// `ReportDownloadAck` (§7.4). Drives the flow-control window — each
+    /// advance grants the worker that many more bytes of budget.
+    bytes_confirmed: u64,
     /// Shared with the upload worker; updated after each successful
     /// write so RequestAck (§8.1) can answer with a fresh value.
     bytes_processed: Arc<AtomicU64>,
@@ -122,6 +134,10 @@ pub struct VftEngine {
     /// surfaces Cancelled as `err_cancelled`.
     pending_pickers: Vec<PendingPicker>,
     limits: Limits,
+    /// Initial / max in-flight window granted to each download worker
+    /// (§5.5). Field rather than a bare const so tests can shrink it and
+    /// exercise the stall-then-grant path without an 8 MiB fixture.
+    download_window: u64,
     wakeup: Wakeup,
 }
 
@@ -156,8 +172,16 @@ impl VftEngine {
             transfers: HashMap::new(),
             pending_pickers: Vec::new(),
             limits: Limits::default(),
+            download_window: DOWNLOAD_WINDOW_BYTES,
             wakeup,
         }
+    }
+
+    /// Shrink the per-download flow-control window. Test-only; production
+    /// keeps the `DOWNLOAD_WINDOW_BYTES` default.
+    #[cfg(test)]
+    pub fn set_download_window(&mut self, bytes: u64) {
+        self.download_window = bytes;
     }
 
     /// Read the engine's currently-active limits. Useful for
@@ -416,6 +440,7 @@ impl VftEngine {
             TransferHandle {
                 direction: Direction::Upload,
                 bytes_received: 0,
+                bytes_confirmed: 0,
                 bytes_processed,
                 total_bytes: b.total_bytes,
                 resolved_path,
@@ -578,8 +603,16 @@ impl VftEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let wakeup = self.wakeup.clone();
+        let window = self.download_window;
         std::thread::spawn(move || {
-            worker::run_download(file, chunk_size, cmd_rx, evt_tx, wakeup);
+            worker::run_download(
+                file,
+                chunk_size,
+                window,
+                cmd_rx,
+                evt_tx,
+                wakeup,
+            );
         });
 
         let resolved_str = resolved_path.to_string_lossy().into_owned();
@@ -588,6 +621,7 @@ impl VftEngine {
             TransferHandle {
                 direction: Direction::Download,
                 bytes_received: 0,
+                bytes_confirmed: 0,
                 bytes_processed: Arc::new(AtomicU64::new(0)),
                 total_bytes,
                 resolved_path,
@@ -634,14 +668,24 @@ impl VftEngine {
     }
 
     fn handle_report_download_ack(&mut self, rid: u32, b: ReportDownloadAckBody) {
-        let h = match self.transfers.get(&b.transfer_id) {
+        let h = match self.transfers.get_mut(&b.transfer_id) {
             Some(h) if h.direction == Direction::Download => h,
             _ => {
                 self.push_err(rid, ERR_UNKNOWN_TRANSFER, "no such download");
                 return;
             }
         };
-        let _ = h; // Currently informational only — no host-side UI yet.
+        // §7.4: `bytes_confirmed` is monotonic non-decreasing and cannot
+        // exceed what we've actually sent. Clamp rather than error so a
+        // stale or over-eager client can't wedge the transfer. The
+        // increase frees exactly that many bytes of window, which we hand
+        // to the worker as fresh send budget (§5.5 flow control).
+        let confirmed = b.bytes_confirmed.clamp(h.bytes_confirmed, h.bytes_received);
+        let delta = confirmed - h.bytes_confirmed;
+        h.bytes_confirmed = confirmed;
+        if delta > 0 {
+            let _ = h.cmd_tx.send(WorkerCmd::Grant { bytes: delta });
+        }
         self.push_ok(rid);
     }
 
@@ -881,6 +925,25 @@ mod tests {
     fn feed(engine: &mut VftEngine, cmds: &[(Command, u32)]) {
         let env = build_envelope(cmds);
         let _ = engine.process_pty_chunk(&env);
+    }
+
+    /// Drain the engine's pending frames, appending DownloadChunk data to
+    /// `received` (in order) and flipping `ended` on DownloadEnd. A free
+    /// function rather than a closure so it can be called from inside
+    /// successive `drive_until` predicates without aliasing the buffers.
+    fn collect_download(engine: &mut VftEngine, received: &mut Vec<u8>, ended: &mut bool) {
+        for (ft, _rid, body) in explicit_frames(engine) {
+            let mut r = Reader::new(&body);
+            match ft {
+                EVT_DOWNLOAD_CHUNK => {
+                    let _ = r.string().unwrap();
+                    let _ = r.u64().unwrap();
+                    received.extend_from_slice(r.bytes().unwrap());
+                }
+                EVT_DOWNLOAD_END => *ended = true,
+                _ => {}
+            }
+        }
     }
 
     /// Drive the engine until either the predicate succeeds or the
@@ -1232,6 +1295,92 @@ mod tests {
         assert!(ok, "no DownloadEnd within timeout");
         let joined: Vec<u8> = chunks.into_iter().flatten().collect();
         assert_eq!(joined, b"hello world");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_flow_control_stalls_until_acked() {
+        // §5.5 / §7.4: a download larger than the window delivers only the
+        // first window's worth of bytes, then parks until the client
+        // confirms receipt via ReportDownloadAck — each ack frees exactly
+        // that much fresh send budget. Without this the worker would blast
+        // the whole file regardless of how fast the client drains.
+        let path = std::env::temp_dir().join(format!("vft-dl-fc-{}", std::process::id()));
+        let content: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let mut e = VftEngine::new(|| {});
+        e.set_download_window(16); // two 8-byte chunks per window
+        feed(
+            &mut e,
+            &[(
+                Command::BeginDownload(DLBody {
+                    transfer_id: "t".into(),
+                    host_path: path.to_string_lossy().into_owned(),
+                    chunk_size_hint: 8,
+                }),
+                1,
+            )],
+        );
+        assert_eq!(explicit_frames(&mut e)[0].0, RSP_OK);
+
+        let mut received: Vec<u8> = Vec::new();
+        let mut ended = false;
+
+        // First window arrives without any ack.
+        let got = drive_until(
+            &mut e,
+            |eng| {
+                collect_download(eng, &mut received, &mut ended);
+                received.len() >= 16
+            },
+            std::time::Duration::from_secs(3),
+        );
+        assert!(got, "first window not delivered");
+        assert_eq!(received.len(), 16, "worker overshot the window");
+        assert!(!ended, "ended before the whole file was sent");
+
+        // With the window exhausted and no ack, the worker is parked: no
+        // further bytes appear. (A short negative wait — proving absence.)
+        let progressed = drive_until(
+            &mut e,
+            |eng| {
+                collect_download(eng, &mut received, &mut ended);
+                received.len() > 16
+            },
+            std::time::Duration::from_millis(300),
+        );
+        assert!(!progressed, "worker sent past the window without an ack");
+
+        // Ack what we have; each ack frees a fresh window. Repeat until
+        // the transfer completes.
+        let mut rid = 1u32;
+        for _ in 0..16 {
+            if ended {
+                break;
+            }
+            rid += 1;
+            feed(
+                &mut e,
+                &[(
+                    Command::ReportDownloadAck(RDABody {
+                        transfer_id: "t".into(),
+                        bytes_confirmed: received.len() as u64,
+                    }),
+                    rid,
+                )],
+            );
+            drive_until(
+                &mut e,
+                |eng| {
+                    collect_download(eng, &mut received, &mut ended);
+                    ended
+                },
+                std::time::Duration::from_secs(1),
+            );
+        }
+        assert!(ended, "transfer never completed after acking");
+        assert_eq!(received, content, "reassembled bytes diverged from source");
         let _ = std::fs::remove_file(&path);
     }
 

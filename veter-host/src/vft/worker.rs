@@ -66,6 +66,12 @@ pub enum WorkerCmd {
     /// queuing this command (see VftEngine::handle_upload_chunk), so
     /// the worker just writes sequentially.
     Write { data: Vec<u8> },
+    /// Extend a download worker's send budget by `bytes` (§5.5 flow
+    /// control). The engine grants window back as the client confirms
+    /// receipt via ReportDownloadAck (§7.4); the worker pauses once its
+    /// budget is exhausted so it never runs more than one window ahead
+    /// of the client. Ignored by upload workers.
+    Grant { bytes: u64 },
     /// Stop reading new chunks and exit. The download worker yields
     /// `Aborted { reason = client_cancel }` before exiting.
     Cancel,
@@ -176,6 +182,9 @@ pub fn run_upload(
                 });
                 return;
             }
+            Ok(WorkerCmd::Grant { .. }) => {
+                // Flow-control grants are meaningful only for downloads.
+            }
             Ok(WorkerCmd::Cancel) => {
                 // Best-effort: drop the file handle, leave the partial
                 // file on disk for the host's policy to clean up.
@@ -200,41 +209,76 @@ pub fn run_upload(
 /// Download worker. Reads chunks of up to `chunk_size` bytes from
 /// `file` and pushes them as `DownloadChunk` events. Emits
 /// `DownloadEnd` on EOF and `Aborted` on error or cancel.
+///
+/// Flow control (§5.5): the worker may only send up to `budget` bytes,
+/// seeded with `initial_budget` and topped up by `WorkerCmd::Grant` as
+/// the engine relays the client's `ReportDownloadAck` (§7.4). When the
+/// budget is exhausted the worker *blocks* on the command channel until
+/// more window is granted (or it is cancelled), so it never runs more
+/// than one window ahead of the client and total in-flight memory across
+/// the host→client pipe stays bounded.
 pub fn run_download(
     mut file: File,
     chunk_size: u32,
+    initial_budget: u64,
     cmd_rx: Receiver<WorkerCmd>,
     evt_tx: Sender<WorkerEvt>,
     wakeup: Wakeup,
 ) {
+    use std::sync::mpsc::TryRecvError;
+
     let send = |evt: WorkerEvt| {
         let _ = evt_tx.send(evt);
         wakeup();
     };
+    let cancel = || {
+        send(WorkerEvt::Aborted {
+            reason: ABORT_CLIENT_CANCEL,
+            message: String::new(),
+            pending_request_id: None,
+        });
+    };
     let mut buf = vec![0u8; chunk_size as usize];
     let mut sent: u64 = 0;
+    let mut budget: u64 = initial_budget;
     loop {
-        // Check for cancel without blocking; otherwise read the next
-        // chunk. The cmd channel is the only signal a download worker
-        // listens for, so try_recv is sufficient.
-        match cmd_rx.try_recv() {
-            Ok(WorkerCmd::Cancel) => {
-                send(WorkerEvt::Aborted {
-                    reason: ABORT_CLIENT_CANCEL,
-                    message: String::new(),
-                    pending_request_id: None,
-                });
-                return;
+        // Out of window: block until the engine grants more (or cancels).
+        // This is the backpressure point that paces the worker to the
+        // client's confirmed-receipt rate.
+        if budget == 0 {
+            match cmd_rx.recv() {
+                Ok(WorkerCmd::Grant { bytes }) => budget += bytes,
+                Ok(WorkerCmd::Cancel) => {
+                    cancel();
+                    return;
+                }
+                Ok(_) => {}
+                // Engine dropped the sender (transfer reaped) — exit.
+                Err(_) => return,
             }
-            Ok(_) => {
-                // Other commands aren't meaningful for downloads —
-                // ignore (defensive).
+        }
+        // Absorb any further queued grants/cancels without blocking.
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(WorkerCmd::Grant { bytes }) => budget += bytes,
+                Ok(WorkerCmd::Cancel) => {
+                    cancel();
+                    return;
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+        }
+        if budget == 0 {
+            // Woke without a grant (defensive); wait again.
+            continue;
         }
 
-        match file.read(&mut buf) {
+        // Never read more than the remaining window, so a chunk can't
+        // exceed what the client has authorised.
+        let want = std::cmp::min(chunk_size as u64, budget) as usize;
+        match file.read(&mut buf[..want]) {
             Ok(0) => {
                 send(WorkerEvt::DownloadEnd { bytes_sent: sent });
                 return;
@@ -246,6 +290,7 @@ pub fn run_download(
                     data: chunk,
                 });
                 sent += n as u64;
+                budget -= n as u64;
             }
             Err(e) => {
                 send(WorkerEvt::Aborted {

@@ -375,31 +375,42 @@ configuration.
 
 ### 5.5 Acknowledgments
 
-VFT does **not** ack on its own. By default:
+Uploads and downloads differ here:
 
 - `UploadChunk` frames are fire-and-forget at the application
   layer. The host returns the standard per-command `Ok`/`Err`
   (§4.1) so the client knows the chunk parsed and was accepted into
   the transfer's byte stream, but it does **not** confirm that the
-  bytes have been written to disk or fsync'd.
-- `DownloadChunk` events are fire-and-forget too. The client
-  receives them but is not required to acknowledge.
+  bytes have been written to disk or fsync'd. Uploads are paced by
+  the client (it decides when to send the next `UploadChunk`), so
+  no host→client window is needed.
+- `DownloadChunk` events are **window-acknowledged** (§7.4). The
+  client drives the pace: the host emits at most one window
+  (`download_window`) of bytes beyond what the client has confirmed
+  via `ReportDownloadAck`, then pauses until the next ack advances
+  the window. This bounds in-flight memory across the whole
+  host→client path — including any PRT relays such as `vmux`, where
+  the host can no longer rely on its own PTY write blocking as
+  backpressure — and paces the host to the slowest consumer.
 
-When the client wants confirmation, it sends `RequestAck` (§8.1).
-The host replies with the current `bytes_received` and
-`bytes_processed` for that transfer. "Processed" means the host has
-durably handed the bytes to its filesystem (write returned; fsync is
-implementation-defined but SHOULD be performed at `EndUpload`, not
-per chunk).
+When the client wants confirmation of an *upload*, it sends
+`RequestAck` (§8.1). The host replies with the current
+`bytes_received` and `bytes_processed` for that transfer.
+"Processed" means the host has durably handed the bytes to its
+filesystem (write returned; fsync is implementation-defined but
+SHOULD be performed at `EndUpload`, not per chunk).
 
-For downloads, the client uses `ReportDownloadAck` (§7.4) to tell
-the host how far receipt has progressed; this is informational
-(typically for a host-side progress UI) and the host does not
-otherwise need it. The client decides if and when to send these.
+For downloads, the client sends `ReportDownloadAck` (§7.4) to
+advance the flow-control window as it consumes chunks. A client
+that wants more than the first window MUST keep acking; one that
+never acks receives only the first window and then the transfer
+stalls (until it acks or cancels). The host does not need to know
+the client's exact drain rate — the window absorbs jitter — but
+the client SHOULD ack well within one window of its last ack.
 
-This design — no implicit acks, no ack window, polling on
-demand — keeps the wire format minimal and matches what the
-underlying transport (TCP / PTY) already provides for delivery.
+This design keeps uploads minimal (client-paced, no window) while
+giving downloads a single, explicit flow-control signal that works
+identically at top level and inside a PRT portal.
 
 ### 5.6 Reset behavior
 
@@ -681,15 +692,36 @@ u64     bytes_confirmed    ; cumulative bytes the client has received
                            ;   and (optionally) processed
 ```
 
-A purely informational note from client to host. The host MAY use
-it to drive a host-side progress UI ("downloading 42 MiB / 60
-MiB"), or ignore it entirely. There is no flow-control implication;
-the host does not pause sending if the client falls behind.
-Standard transport-level backpressure (a full PTY buffer) is the
-only mechanism that throttles the host.
+The client's flow-control signal for downloads. `bytes_confirmed`
+is the cumulative count of bytes the client has received (and, if
+it likes, durably processed). It advances the **low edge** of the
+download window: after receiving this ack the host may have at most
+`bytes_confirmed + download_window` total bytes outstanding for the
+transfer, where `download_window` is a host-chosen constant. The
+host MUST NOT emit `DownloadChunk` bytes beyond that ceiling; once
+it reaches the ceiling it pauses the transfer until a later
+`ReportDownloadAck` raises it.
 
-`bytes_confirmed` SHOULD be monotonically non-decreasing within a
-transfer. Hosts MAY clamp out-of-range values rather than erroring.
+A host MAY additionally use the value to drive a progress UI, but
+the flow-control behaviour above is **mandatory**: it is what bounds
+in-flight memory and paces the transfer, and — unlike a top-level
+download draining straight into the client's TTY — it cannot be
+replaced by transport-level PTY backpressure once the path runs
+through a PRT relay (the relay forwards display bytes without
+blocking the host's event loop).
+
+`download_window` is implementation-defined and need not be
+advertised; the reference host uses **8 MiB**. The client does not
+have to know its value — it simply acks often enough (each ack well
+within one window of the previous one) to keep the transfer moving.
+The first window's worth of bytes streams immediately after the
+`BeginDownload` `Ok`, before any ack.
+
+`bytes_confirmed` MUST be monotonically non-decreasing within a
+transfer and MUST NOT exceed the bytes the host has emitted; hosts
+clamp out-of-range values into `[previous_confirmed, bytes_emitted]`
+rather than erroring, so a stale or over-eager ack can never wedge
+or over-extend the window.
 
 Response: empty `Ok`. Unknown transfer → `err_unknown_transfer`.
 
@@ -830,6 +862,15 @@ operation.
 - VFT responses and events generated inside a portal join that
   portal's `RawReply` stream — they look like ordinary bytes to
   the inner program.
+- Download flow control (§7.4) is per-portal and end-to-end: the
+  per-portal engine windows the transfer exactly as at top level,
+  and the inner program's `ReportDownloadAck` rides back up the
+  portal byte stream. This is the path that actually requires the
+  window — a download relayed through a portal does **not** get
+  PTY-write backpressure at the host (the relay forwards
+  `DownloadChunk` bytes onward without blocking the host's event
+  loop), so the ack window is the only thing bounding in-flight
+  memory across the relay.
 - The per-portal VFT engine has its own `transfer_id` table,
   scoped to that portal. A program inside the portal cannot
   address a transfer started by the host (or by a sibling
@@ -868,17 +909,24 @@ ops fail atomically. A non-exhaustive list:
 - `max_chunk_bytes`: per `UploadChunk` / `DownloadChunk` body.
 - `max_path_bytes`: per `host_path` field.
 - `max_file_bytes`: per single transfer; 0 = no host limit.
+- `download_window`: max bytes a download may run ahead of the
+  client's confirmed receipt (§7.4). Host-internal; not advertised.
 
 The reference implementation in this repo SHOULD start with: 8
 concurrent transfers, 4 MiB per chunk, 4096 bytes per path, no
-per-file size cap. These numbers can be tuned without breaking the
-protocol.
+per-file size cap, and an 8 MiB download window. These numbers can
+be tuned without breaking the protocol.
 
-Memory cost is dominated by per-chunk buffer space; clients with
-many concurrent transfers SHOULD pick smaller chunks. A host that
-buffers chunks before flushing to disk SHOULD apply transport-level
-backpressure (stop reading from the PTY) once a configured high-water
-mark is reached, rather than refusing chunks at the protocol level.
+Memory cost is dominated by per-chunk buffer space and the download
+window; clients with many concurrent transfers SHOULD pick smaller
+chunks. For uploads (host receiving), a host that buffers chunks
+before flushing to disk SHOULD apply transport-level backpressure
+(stop reading from the PTY) once a configured high-water mark is
+reached, rather than refusing chunks at the protocol level. For
+downloads (host sending), the §7.4 window is the backpressure
+mechanism — the host MUST cap outstanding bytes at `download_window`
+rather than relying on its PTY write blocking, which a PRT relay
+(§10) defeats.
 
 ## 12. Cookbook
 
