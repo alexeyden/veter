@@ -796,23 +796,63 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
         let x = origin_x + label_info.anchor_col as f32 * cell_w;
         let y = origin_y + row_i as f32 * cell_h;
 
+        let (bg_color, fg_color) = jump_label_colors(label_info.ch);
         let mut bg = femtovg::Path::new();
         bg.rect(x, y, cell_w, cell_h);
-        canvas.fill_path(&bg, &femtovg::Paint::color(Color::rgb(255, 196, 0)));
+        canvas.fill_path(&bg, &femtovg::Paint::color(bg_color));
 
         let mut buf = [0u8; 4];
         let label = label_info.ch.encode_utf8(&mut buf);
-        let text_y = y + ascent + (cell_h - ascent) * 0.5;
+        // Baseline at `y + ascent` centres the glyph vertically: the cell is
+        // exactly `ceil(ascent + descent)` tall, so the font em-box fills it
+        // like any other terminal cell (see renderer's `cy + ascent`).
+        let text_y = y + ascent;
         tr.draw_vge_text(
             canvas,
             x,
             text_y,
             label,
-            Color::rgb(0, 0, 0),
+            fg_color,
             vge::command::Align::Left,
             vge::command::FontStyle::default(),
         );
     }
+}
+
+/// Distinct, readable background colour for a jump label with key `ch`,
+/// paired with a glyph colour (black or white) chosen for contrast. Hues are
+/// spread by the golden angle so different keys stay easy to tell apart. The
+/// mapping is a pure function of `ch`, so a given key always renders the same
+/// colour (stable across frames and match sets) yet the palette looks random.
+fn jump_label_colors(ch: char) -> (Color, Color) {
+    let hue = (ch as u32 as f32 * 137.508) % 360.0;
+    let (r, g, b) = hsl_to_rgb(hue, 0.85, 0.55);
+    // sRGB-weighted luminance picks the higher-contrast glyph colour.
+    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    let fg = if luma > 140.0 {
+        Color::rgb(0, 0, 0)
+    } else {
+        Color::rgb(255, 255, 255)
+    };
+    (Color::rgb(r, g, b), fg)
+}
+
+/// Convert HSL (hue in degrees, saturation/lightness in `0..=1`) to 8-bit RGB.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
+    (to(r1), to(g1), to(b1))
 }
 
 fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
