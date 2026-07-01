@@ -488,6 +488,57 @@ fn find_word_range_in_parser<CB: vt100::Callbacks>(
     result
 }
 
+/// End (inclusive last cell) of the next whitespace-delimited token
+/// after `(from_line, from_col)`, following soft-wrap and stopping at
+/// the end of the logical (wrapped) line. `None` when only whitespace
+/// remains to end of line — i.e. the head already covers the last word,
+/// which is how incremental expansion detects "whole line selected".
+/// Drives [`App::extend_expand`]; a word is any run of non-whitespace
+/// cells, matching [`find_word_range_in_parser`]'s [`is_word_char`].
+fn next_word_end_in_parser<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    from_line: i64,
+    from_col: u16,
+) -> Option<(i64, u16)> {
+    let (_, cols) = parser.screen().size();
+    let saved = parser.screen().scrollback();
+
+    let mut line = from_line;
+    let mut col = from_col;
+    let mut in_word = false;
+    let mut result: Option<(i64, u16)> = None;
+
+    loop {
+        // Step to the next cell, following soft-wrap; stop at the end of
+        // the logical line (an unwrapped row's last column).
+        if col + 1 >= cols {
+            if row_wrapped_at(parser, top_of_live_screen, line) {
+                line += 1;
+                col = 0;
+            } else {
+                break;
+            }
+        } else {
+            col += 1;
+        }
+        let is_word = matches!(
+            cell_char_at(parser, top_of_live_screen, line, col),
+            Some(ch) if is_word_char(ch)
+        );
+        if is_word {
+            in_word = true;
+            result = Some((line, col));
+        } else if in_word {
+            // Reached the end of the next word — done.
+            break;
+        }
+    }
+
+    parser.screen_mut().set_scrollback(saved);
+    result
+}
+
 /// Host-level pre-attach state stashed on the first VSS
 /// `SnapshotBegin` so a `DetachNotify` later can roll back to the
 /// view the user had before they attached. Same idea as
@@ -607,6 +658,29 @@ struct SearchState {
     /// `handle_search_key_input` so the drawn labels and the keymap
     /// always agree.
     labels: Vec<JumpLabel>,
+    /// Set once a jump label is first pressed: the overlay stays open in
+    /// incremental word-by-word expansion mode. While `Some`, all other
+    /// labels vanish and repeated presses of the committed key grow the
+    /// selection toward end of line. `None` in the normal query/navigate
+    /// phase. See [`ExpandState`].
+    expand: Option<ExpandState>,
+}
+
+/// Live incremental-expansion state (word-by-word selection growth).
+/// Entered by the first jump-label press: the label's word becomes the
+/// initial selection, and every subsequent press of `ch` extends the
+/// selection head to the end of the next whitespace-delimited token,
+/// following soft-wrap and stopping at the end of the logical line.
+#[derive(Clone, Debug)]
+struct ExpandState {
+    /// Leaf the selection lives in — same target the selection carries.
+    target: SelectionTarget,
+    /// The committed label key; only this key extends the selection.
+    ch: char,
+    /// End (inclusive last cell) of the currently-selected span. Marches
+    /// forward one word per press; mirrors the live selection head (the
+    /// selection's anchor — the first word's start — never moves).
+    head: (i64, u16),
 }
 
 /// One flash jump label: a key, the match it acts on, and the cell the
@@ -632,6 +706,7 @@ impl SearchState {
             matches: Vec::new(),
             current: 0,
             labels: Vec::new(),
+            expand: None,
         }
     }
 }
@@ -1147,6 +1222,32 @@ impl App {
     /// stored labels always equal what was last drawn — which is exactly
     /// what the user sees when they press a label key.
     fn recompute_labels(&mut self) {
+        // Incremental-expansion mode: a single committed label sits just
+        // past the *next* word — the one the next press would add — so it
+        // visibly marches forward as the selection grows. Dropped once no
+        // word remains (whole line selected), the terminal state.
+        if let Some(exp) = self.search.as_ref().and_then(|s| s.expand.clone()) {
+            let mut labels = Vec::new();
+            if let Some((next_line, next_col)) = self.next_word_end(&exp.target, exp.head) {
+                let path = match &exp.target {
+                    SelectionTarget::Host => Vec::new(),
+                    SelectionTarget::Portal(p) => p.clone(),
+                };
+                let cols =
+                    self.with_target_leaf_screen_mut(&path, |s| s.size().1).unwrap_or(0);
+                let anchor_col = if next_col + 1 < cols { next_col + 1 } else { next_col };
+                labels.push(JumpLabel {
+                    match_idx: 0,
+                    ch: exp.ch,
+                    anchor_line: next_line,
+                    anchor_col,
+                });
+            }
+            if let Some(s) = self.search.as_mut() {
+                s.labels = labels;
+            }
+            return;
+        }
         let (path, has_matches) = match self.search.as_ref() {
             Some(s) => (s.target_path.clone(), !s.matches.is_empty()),
             None => return,
@@ -1588,13 +1689,39 @@ impl App {
         }
     }
 
-    /// Flash jump-label action: select the word at match `idx` — the
-    /// same word a double-click on its first cell would — leave it
-    /// highlighted, and close the overlay. Updates PRIMARY so middle-
-    /// click paste works, like any selection. The word stays selected so
-    /// follow-up actions (copy, etc.) can act on it later; the scroll
-    /// position is left as-is since the match is already on screen.
-    fn select_word_at_match(&mut self, idx: usize) {
+    /// End of the next whitespace token after `from` on `target`, for
+    /// incremental selection expansion. Same host/portal dispatch as
+    /// [`Self::find_word_range`]; see [`next_word_end_in_parser`].
+    fn next_word_end(
+        &mut self,
+        target: &SelectionTarget,
+        from: (i64, u16),
+    ) -> Option<(i64, u16)> {
+        match target {
+            SelectionTarget::Host => {
+                let parser = self.parser.as_mut()?;
+                let top_live = self.prt.as_ref()?.top_of_live_screen();
+                next_word_end_in_parser(parser, top_live, from.0, from.1)
+            }
+            SelectionTarget::Portal(path) => {
+                let prt = self.prt.as_mut()?;
+                let portal = resolve_portal_target_mut(prt, path)?;
+                let top_live = portal.children.top_of_live_screen();
+                next_word_end_in_parser(&mut portal.vt, top_live, from.0, from.1)
+            }
+        }
+    }
+
+    /// First jump-label press for key `ch`: select the word at match
+    /// `idx` — the same word a double-click on its first cell would —
+    /// then enter incremental-expansion mode instead of closing the
+    /// overlay, so pressing `ch` again grows the selection word-by-word
+    /// toward end of line (see [`Self::extend_expand`]). Updates PRIMARY
+    /// so middle-click paste works, like any selection. The scroll
+    /// position is left as-is since the match is already on screen. If
+    /// the match doesn't sit on a word (a whitespace query), nothing is
+    /// selected and the overlay just closes, as before.
+    fn select_word_at_match(&mut self, idx: usize, ch: char) {
         let (m, target) = match self.search.as_ref() {
             Some(s) => {
                 let Some(m) = s.matches.get(idx).copied() else { return };
@@ -1607,21 +1734,69 @@ impl App {
             }
             None => return,
         };
-        if let Some(((s_line, s_col), (e_line, e_col))) =
+        let Some(((s_line, s_col), (e_line, e_col))) =
             self.find_word_range(&target, m.line, m.col_start)
-        {
-            self.selection = Some(Selection {
-                target,
-                anchor_line: s_line,
-                anchor_col: s_col,
-                head_line: e_line,
-                head_col: e_col,
-                dragging: false,
-                block_cols: None,
-            });
-            self.copy_selection_to_clipboard(true);
+        else {
+            self.search = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        };
+        self.selection = Some(Selection {
+            target: target.clone(),
+            anchor_line: s_line,
+            anchor_col: s_col,
+            head_line: e_line,
+            head_col: e_col,
+            dragging: false,
+            block_cols: None,
+        });
+        self.copy_selection_to_clipboard(true);
+        // Enter expansion mode only if a further word remains on the line
+        // to grow into; otherwise this word already *is* the whole line,
+        // so close the overlay as the plain select-word action did.
+        if self.next_word_end(&target, (e_line, e_col)).is_some() {
+            if let Some(s) = self.search.as_mut() {
+                s.editing = false;
+                s.expand = Some(ExpandState {
+                    target,
+                    ch,
+                    head: (e_line, e_col),
+                });
+            }
+        } else {
+            self.search = None;
         }
-        self.search = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Incremental-expansion step: grow the active selection by one
+    /// whitespace token toward end of line. No-op when the head already
+    /// covers the last word on the (wrap-following) logical line — in
+    /// that case `recompute_labels` also stops drawing the label, which
+    /// is the "whole line selected" terminal state.
+    fn extend_expand(&mut self) {
+        let Some(exp) = self.search.as_ref().and_then(|s| s.expand.clone()) else {
+            return;
+        };
+        if let Some(new_head) = self.next_word_end(&exp.target, exp.head) {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.head_line = new_head.0;
+                sel.head_col = new_head.1;
+            }
+            if let Some(exp2) = self.search.as_mut().and_then(|s| s.expand.as_mut()) {
+                exp2.head = new_head;
+            }
+            self.copy_selection_to_clipboard(true);
+            // If that was the last word, the whole line is now selected:
+            // close the overlay, leaving the final selection in place.
+            if self.next_word_end(&exp.target, new_head).is_none() {
+                self.search = None;
+            }
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -2066,6 +2241,15 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Enter) => {
+                // In expansion mode Enter commits: close the overlay,
+                // leaving the grown selection in place.
+                if search.expand.is_some() {
+                    self.search = None;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if search.editing {
                     search.editing = false;
                 } else if !search.matches.is_empty() {
@@ -2089,6 +2273,28 @@ impl App {
             }
             Key::Character(c) => {
                 let s = c.as_str();
+                // Incremental-expansion mode: the committed label key
+                // grows the selection one word at a time toward EOL; any
+                // other plain key ends the mode and closes the overlay,
+                // leaving the selection. Intercepted before the generic
+                // label/query logic below (whose label lookup would
+                // otherwise re-select the original word).
+                if !self.modifiers.alt_key()
+                    && !self.modifiers.control_key()
+                    && s.chars().count() == 1
+                    && let Some(ch) = s.chars().next()
+                    && let Some(exp_ch) = search.expand.as_ref().map(|e| e.ch)
+                {
+                    if ch == exp_ch {
+                        self.extend_expand();
+                    } else {
+                        self.search = None;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Flash jump label vs. query input. A label only fires
                 // when typing it would *not* keep narrowing the search —
                 // i.e. appending it to the query matches nothing (or
@@ -2117,7 +2323,7 @@ impl App {
                             None => false,
                         };
                     if !would_narrow {
-                        self.select_word_at_match(match_idx);
+                        self.select_word_at_match(match_idx, ch);
                         return;
                     }
                 }
@@ -3113,6 +3319,36 @@ mod jump_label_tests {
         assert_eq!(char_at_col(row, 0), Some('あ'));
         assert_eq!(char_at_col(row, 1), None);
         assert_eq!(char_at_col(row, 2), Some('b'));
+    }
+
+    #[test]
+    fn next_word_end_steps_one_token() {
+        // "ls $HOME": from the end of "ls" (col 1) the next word is
+        // "$HOME", ending on 'E' at col 7. Stepping again finds only
+        // trailing space -> None (whole line covered).
+        let mut p = parse(b"ls $HOME", 1, 20);
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 1), Some((0, 7)));
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 7), None);
+    }
+
+    #[test]
+    fn next_word_end_skips_runs_of_whitespace() {
+        // Multiple spaces between tokens are skipped; the end lands on
+        // the last cell of the following token.
+        let mut p = parse(b"a   bb", 1, 20);
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 0), Some((0, 5)));
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 5), None);
+    }
+
+    #[test]
+    fn next_word_end_follows_soft_wrap() {
+        // cols=4: "abcd" fills row 0 (wrapped), " ef" continues on row
+        // 1. From the end of "abcd" (0,3) the next word "ef" ends at
+        // (1,2), proving the walk follows the wrap into the next row.
+        let mut p = parse(b"abcd ef", 2, 4);
+        assert!(p.screen().row_wrapped(0));
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 3), Some((1, 2)));
+        assert_eq!(next_word_end_in_parser(&mut p, 0, 1, 2), None);
     }
 
     #[test]
