@@ -65,6 +65,10 @@ pub struct Screen {
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
+
+    // Last graphic character committed to the grid, used by REP (CSI Ps b).
+    // Stored post-charset-translation so re-emitting it is idempotent.
+    last_char: Option<char>,
 }
 
 impl Screen {
@@ -87,6 +91,8 @@ impl Screen {
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+
+            last_char: None,
         }
     }
 
@@ -835,11 +841,17 @@ impl Screen {
             // don't even try to draw control characters
             return;
         }
-        let width = width
+        let width: u16 = width
             .unwrap_or(1)
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+
+        // Remember this glyph for REP (CSI Ps b). Zero-width (combining)
+        // characters aren't repeatable graphic characters, so skip them.
+        if width > 0 {
+            self.last_char = Some(c);
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
@@ -1141,6 +1153,17 @@ impl Screen {
     // CSI @
     pub(crate) fn ich(&mut self, count: u16) {
         self.grid_mut().insert_cells(count);
+    }
+
+    // CSI Ps b -- REP: repeat the preceding graphic character `count` times.
+    // ncurses emits this (via the `rep` terminfo capability) to fill runs such
+    // as jtop's gauge bars; without it only the single seed glyph survives.
+    pub(crate) fn rep(&mut self, count: u16) {
+        if let Some(c) = self.last_char {
+            for _ in 0..count {
+                self.text(c);
+            }
+        }
     }
 
     // CSI A
@@ -1501,6 +1524,47 @@ mod scs_tests {
 
     fn cell_at(p: &Parser, row: u16, col: u16) -> &str {
         p.screen().cell(row, col).unwrap().contents()
+    }
+
+    #[test]
+    fn rep_repeats_preceding_graphic_char() {
+        let mut p = Parser::new(2, 10, 0);
+        // Print `|` once, then REP 4 -> five `|` total (ncurses gauge fill).
+        p.process(b"|\x1b[4b");
+        for col in 0..5 {
+            assert_eq!(cell_at(&p, 0, col), "|");
+        }
+        assert_eq!(cell_at(&p, 0, 5), "");
+        assert_eq!(p.screen().cursor_position(), (0, 5));
+    }
+
+    #[test]
+    fn rep_default_param_is_one() {
+        let mut p = Parser::new(2, 10, 0);
+        // No parameter defaults to a single repeat.
+        p.process(b"X\x1b[b");
+        assert_eq!(cell_at(&p, 0, 0), "X");
+        assert_eq!(cell_at(&p, 0, 1), "X");
+        assert_eq!(cell_at(&p, 0, 2), "");
+    }
+
+    #[test]
+    fn rep_repeats_charset_translated_glyph() {
+        let mut p = Parser::new(2, 10, 0);
+        // DEC line-drawing `q` (─) then REP must repeat the translated glyph,
+        // not the raw `q`.
+        p.process(b"\x1b(0q\x1b[2b");
+        assert_eq!(cell_at(&p, 0, 0), "─");
+        assert_eq!(cell_at(&p, 0, 1), "─");
+        assert_eq!(cell_at(&p, 0, 2), "─");
+    }
+
+    #[test]
+    fn rep_without_preceding_char_is_noop() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[5b");
+        assert_eq!(cell_at(&p, 0, 0), "");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
     }
 
     #[test]
