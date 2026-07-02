@@ -1577,18 +1577,18 @@ fn build_chrome_commands(
     let ph = rect.h as f32;
     let mut cmds: Vec<DrawCmd> = Vec::new();
 
-    // Title text in the bottom-right portal cell, right-aligned, with
+    // Title text in the top-right portal cell, right-aligned, with
     // a semi-transparent rounded "thumb" behind it (no stroke). Drawn
     // at higher draw_order than the portal so it overlays shell text.
     // 0.5-cell inset from the right edge keeps the thumb clear of any
     // separator on the pane boundary. Both thumb and text are nudged
-    // up by 1/4 of a cell so the thumb doesn't visually fuse with the
-    // bottom edge of the pane.
+    // down by 1/4 of a cell so the thumb doesn't visually fuse with the
+    // top edge of the pane.
     if show_title && !title.is_empty() {
         let text_w = title.chars().count() as f32;
-        let lift = 0.25;
+        let top_pad = 0.25;
         let text_origin_x = pw - 1.0;
-        let text_origin_y = ph - 1.0 - lift;
+        let text_origin_y = top_pad;
         let pad_x = 0.5;
         let thumb_x0 = text_origin_x - text_w - pad_x;
         let thumb_x1 = text_origin_x + pad_x;
@@ -1623,16 +1623,16 @@ fn build_chrome_commands(
 
     // Scrollbar thumb at the right edge of the pane. Drawn in cell
     // units; sized by visible_rows / (visible_rows + history_depth)
-    // and positioned by offset. Track stops above the lifted title
-    // row so the thumb never collides with the scroll-indicator title
-    // that sits in the bottom-right cell while we're scrolling.
+    // and positioned by offset. Track starts below the title row so the
+    // thumb never collides with the scroll-indicator title that sits in
+    // the top-right cell while we're scrolling.
     if let Some(s) = scroll {
         let portal_rows = ph.max(1.0);
         let total = portal_rows + s.history_depth as f32;
         let track_x = pw - 1.30;
         let track_w = 0.35;
-        let track_y0 = 0.5;
-        let track_y1 = (ph - 1.25).max(track_y0 + 1.0);
+        let track_y0 = 1.25;
+        let track_y1 = (ph - 0.5).max(track_y0 + 1.0);
         let track_h = (track_y1 - track_y0).max(1.0);
 
         let thumb_h_norm = (portal_rows / total).clamp(0.05, 1.0);
