@@ -68,7 +68,31 @@ impl Default for Limits {
 /// PRT relays like vmux + client receive buffer) to roughly this plus
 /// one chunk, and paces the worker to the slowest consumer. The client
 /// MUST advance `ReportDownloadAck` to receive beyond the first window.
-const DOWNLOAD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+///
+/// Kept deliberately small (128 KiB, not the spec's suggested 8 MiB). The
+/// window is also the ceiling on how much download data is buffered
+/// *ahead of an interrupt keystroke* on the shared input stream: a client
+/// can't see a Ctrl+C, and can't finish draining a cancel, until it has
+/// read past the in-flight bytes. On a slow relay (e.g. an ssh session at
+/// tens of KB/s) an 8 MiB window made Ctrl+C take many seconds and left
+/// the post-cancel drain unable to keep up — the raw bytes spilled onto
+/// the shell. 128 KiB keeps interrupt latency and drain time to a few
+/// seconds on such links while still allowing pipelining (it is several
+/// chunks) and full throughput on low-latency ones. Tune up if you need
+/// more on a high-bandwidth, high-latency path (§11 permits it).
+const DOWNLOAD_WINDOW_BYTES: u64 = 128 * 1024;
+
+/// Bytes a download worker may send *before the client acks even once*.
+/// The full `download_window` only opens after the first
+/// `ReportDownloadAck` proves the client is alive and draining (see
+/// `handle_report_download_ack`). This bounds the "blast radius" if the
+/// client dies right after `BeginDownload`: without it, a crashed or
+/// killed `vrecv` would leave a whole window (8 MiB) of raw file bytes
+/// already committed to the PTY, which then land on whatever now owns the
+/// tty — typically a shell that interprets them as keystrokes. Keep this
+/// at or above one typical chunk so at least one chunk reaches the client
+/// and triggers the ack that opens the window.
+const INITIAL_DOWNLOAD_BURST_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Direction {
@@ -85,6 +109,12 @@ struct TransferHandle {
     /// `ReportDownloadAck` (§7.4). Drives the flow-control window — each
     /// advance grants the worker that many more bytes of budget.
     bytes_confirmed: u64,
+    /// Downloads only: window bytes withheld from the initial burst
+    /// (`download_window - INITIAL_DOWNLOAD_BURST_BYTES`). Released to the
+    /// worker as one extra grant on the first `ReportDownloadAck` that
+    /// advances receipt, opening the transfer up to the full window once
+    /// the client has proven liveness. `0` for uploads and once released.
+    window_slack: u64,
     /// Shared with the upload worker; updated after each successful
     /// write so RequestAck (§8.1) can answer with a fresh value.
     bytes_processed: Arc<AtomicU64>,
@@ -441,6 +471,7 @@ impl VftEngine {
                 direction: Direction::Upload,
                 bytes_received: 0,
                 bytes_confirmed: 0,
+                window_slack: 0,
                 bytes_processed,
                 total_bytes: b.total_bytes,
                 resolved_path,
@@ -604,11 +635,19 @@ impl VftEngine {
         let (evt_tx, evt_rx) = mpsc::channel();
         let wakeup = self.wakeup.clone();
         let window = self.download_window;
+        // Seed the worker with only the initial burst; the remaining
+        // window is withheld as `slack` and released on the first ack
+        // (§7.4 flow control — see the constant's docs). `min` keeps the
+        // test-shrunk windows (`set_download_window`) behaving exactly as
+        // before, since their whole window is <= the burst.
+        let initial_budget = window.min(INITIAL_DOWNLOAD_BURST_BYTES);
+        let window_slack = window - initial_budget;
         std::thread::spawn(move || {
             worker::run_download(
                 file,
                 chunk_size,
-                window,
+                total_bytes,
+                initial_budget,
                 cmd_rx,
                 evt_tx,
                 wakeup,
@@ -622,6 +661,7 @@ impl VftEngine {
                 direction: Direction::Download,
                 bytes_received: 0,
                 bytes_confirmed: 0,
+                window_slack,
                 bytes_processed: Arc::new(AtomicU64::new(0)),
                 total_bytes,
                 resolved_path,
@@ -684,7 +724,13 @@ impl VftEngine {
         let delta = confirmed - h.bytes_confirmed;
         h.bytes_confirmed = confirmed;
         if delta > 0 {
-            let _ = h.cmd_tx.send(WorkerCmd::Grant { bytes: delta });
+            // The ack advances the low edge by `delta`, which frees that
+            // many bytes of window (§7.4). On the first advancing ack we
+            // also release the withheld `window_slack`, opening the
+            // transfer from the initial burst up to the full window now
+            // that the client has proven it is alive and draining.
+            let grant = delta + std::mem::take(&mut h.window_slack);
+            let _ = h.cmd_tx.send(WorkerCmd::Grant { bytes: grant });
         }
         self.push_ok(rid);
     }
@@ -1380,6 +1426,95 @@ mod tests {
             );
         }
         assert!(ended, "transfer never completed after acking");
+        assert_eq!(received, content, "reassembled bytes diverged from source");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_initial_burst_caps_pre_ack_bytes_then_ramps() {
+        // Fix: before the client acks even once, the worker may send only
+        // the initial burst (INITIAL_DOWNLOAD_BURST_BYTES), *not* a whole
+        // 8 MiB window — so a client that dies right after BeginDownload
+        // can leak at most one burst into the tty. The first advancing ack
+        // then releases the withheld window slack, opening the transfer to
+        // the full window (no per-window ack required for the remainder).
+        let path = std::env::temp_dir().join(format!("vft-dl-burst-{}", std::process::id()));
+        let file_len = (INITIAL_DOWNLOAD_BURST_BYTES + 128 * 1024) as usize; // > burst
+        let content: Vec<u8> = (0..file_len).map(|i| i as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let mut e = VftEngine::new(|| {});
+        // Keep the production window: the *burst* cap is what limits the
+        // pre-ack bytes here, and it is smaller than the file, so the
+        // worker must park after the burst. The file is sized to burst +
+        // one window, so after the single ack opens the window the send
+        // budget hits exactly 0 at EOF — this also exercises the
+        // finish-on-total-bytes guard in run_download (without it the
+        // worker would block and DownloadEnd would never fire).
+        feed(
+            &mut e,
+            &[(
+                Command::BeginDownload(DLBody {
+                    transfer_id: "t".into(),
+                    host_path: path.to_string_lossy().into_owned(),
+                    chunk_size_hint: 16 * 1024,
+                }),
+                1,
+            )],
+        );
+        assert_eq!(explicit_frames(&mut e)[0].0, RSP_OK);
+
+        let mut received: Vec<u8> = Vec::new();
+        let mut ended = false;
+
+        // The initial burst arrives with no ack...
+        let got = drive_until(
+            &mut e,
+            |eng| {
+                collect_download(eng, &mut received, &mut ended);
+                received.len() as u64 >= INITIAL_DOWNLOAD_BURST_BYTES
+            },
+            std::time::Duration::from_secs(3),
+        );
+        assert!(got, "initial burst not delivered");
+        // ...and the worker then parks exactly at the burst, not the window.
+        let progressed = drive_until(
+            &mut e,
+            |eng| {
+                collect_download(eng, &mut received, &mut ended);
+                received.len() as u64 > INITIAL_DOWNLOAD_BURST_BYTES
+            },
+            std::time::Duration::from_millis(300),
+        );
+        assert!(!progressed, "worker sent past the initial burst without an ack");
+        assert_eq!(
+            received.len() as u64,
+            INITIAL_DOWNLOAD_BURST_BYTES,
+            "pre-ack bytes exceeded the initial burst"
+        );
+        assert!(!ended, "ended before the whole file was sent");
+
+        // A single advancing ack opens the full window; the rest of the
+        // file (well under one window) drains to EOF with no further acks.
+        feed(
+            &mut e,
+            &[(
+                Command::ReportDownloadAck(RDABody {
+                    transfer_id: "t".into(),
+                    bytes_confirmed: received.len() as u64,
+                }),
+                2,
+            )],
+        );
+        let done = drive_until(
+            &mut e,
+            |eng| {
+                collect_download(eng, &mut received, &mut ended);
+                ended
+            },
+            std::time::Duration::from_secs(3),
+        );
+        assert!(done, "transfer did not finish after the window opened");
         assert_eq!(received, content, "reassembled bytes diverged from source");
         let _ = std::fs::remove_file(&path);
     }

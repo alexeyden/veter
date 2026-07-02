@@ -12,6 +12,7 @@
 //!   * `progress`  — a `ProgressUI` trait with VGE-driven and ASCII
 //!                   fallback implementations.
 
+pub mod cancel;
 pub mod probe;
 pub mod progress;
 pub mod stream;

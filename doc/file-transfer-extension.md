@@ -733,11 +733,40 @@ through a PRT relay (the relay forwards display bytes without
 blocking the host's event loop).
 
 `download_window` is implementation-defined and need not be
-advertised; the reference host uses **8 MiB**. The client does not
-have to know its value — it simply acks often enough (each ack well
-within one window of the previous one) to keep the transfer moving.
-The first window's worth of bytes streams immediately after the
-`BeginDownload` `Ok`, before any ack.
+advertised. The reference host uses a deliberately small **128 KiB**
+(not a large multi-megabyte window): because a download and any
+interrupt keystroke share one ordered input stream at the client, the
+window is also the ceiling on how much file data is buffered *ahead of
+a Ctrl+C* — a client cannot see the interrupt, nor finish draining a
+cancel, until it has read past the in-flight bytes. A large window
+therefore makes cancellation slow and lets a mid-cancel client spill
+raw bytes onto its shell on a slow relay. A small window keeps
+interrupt latency and drain time to a few seconds even at tens of
+KB/s, while still pipelining several chunks and running at full speed
+on low-latency paths. The client does not have to know the value — it
+simply acks often enough (each ack well within one window of the
+previous one) to keep the transfer moving.
+
+A host MAY withhold most of the window until the client's first
+advancing `ReportDownloadAck`, streaming only a smaller **initial
+burst** before any ack and opening up to the full `download_window`
+once that first ack proves the client is alive and draining. This
+bounds how much a client that dies right after `BeginDownload` can
+leak into the tty it abandons (the reference host bursts **64 KiB**,
+then ramps to the full 128 KiB on the first ack). The initial burst
+MUST be at least one chunk so a client that acks per received chunk
+never stalls before it can ack. A client sees this only as the window
+starting small and growing; the "ack well within one window" rule is
+unchanged, and the burst is never smaller than one chunk, so a client
+that acks as it drains always makes progress.
+
+A host MUST end the transfer (emit `DownloadEnd`) as soon as it has
+sent the whole file, rather than waiting for a further read to return
+EOF: the send budget can be exhausted exactly at the file's end when
+its size lands on a window boundary, and the client may not ack a
+sub-window tail — so a host that waits for the EOF read would block
+and never emit `DownloadEnd`. The declared `total_bytes` (reported in
+the `BeginDownload` `Ok`) is the authoritative end of the transfer.
 
 `bytes_confirmed` MUST be monotonically non-decreasing within a
 transfer and MUST NOT exceed the bytes the host has emitted; hosts
@@ -936,8 +965,9 @@ ops fail atomically. A non-exhaustive list:
 
 The reference implementation in this repo SHOULD start with: 8
 concurrent transfers, 4 MiB per chunk, 4096 bytes per path, no
-per-file size cap, and an 8 MiB download window. These numbers can
-be tuned without breaking the protocol.
+per-file size cap, and a **128 KiB** download window (small on
+purpose — see §7.4 for why the window doubles as the cancel-latency
+bound). These numbers can be tuned without breaking the protocol.
 
 Memory cost is dominated by per-chunk buffer space and the download
 window; clients with many concurrent transfers SHOULD pick smaller

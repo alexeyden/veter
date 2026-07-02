@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
+use vft_client::cancel::CancelGuard;
 use vft_client::probe::{read_cursor_row, run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -61,8 +62,10 @@ struct Cli {
     #[arg(long, default_value_t = 2000)]
     progress_delay_ms: u64,
 
-    /// Bytes per UploadChunk frame. Default 256 KiB.
-    #[arg(long, default_value_t = 256 * 1024)]
+    /// Bytes per UploadChunk frame. Kept modest (64 KiB) so a slow link
+    /// doesn't block for a long time inside a single chunk write, which
+    /// would delay the progress bar and the per-chunk UI refresh.
+    #[arg(long, default_value_t = 64 * 1024)]
     chunk_size: usize,
 
     /// Probe timeout, milliseconds.
@@ -148,6 +151,13 @@ fn main() -> Result<()> {
             .to_owned())
     })?;
 
+    // Arm the cancel-on-exit net now that the upload is active on the
+    // host: any early exit (error return, panic, SIGTERM / SIGHUP) emits
+    // a CancelTransfer so the host aborts the upload and drops its
+    // partial destination file instead of leaking a half-written file.
+    // Disarmed once EndUpload is acknowledged.
+    let mut cancel = CancelGuard::new(&transfer_id);
+
     // Progress UI
     let delay = Duration::from_millis(cli.progress_delay_ms);
     let mut ui: Box<dyn ProgressUI> = if cli.no_progress {
@@ -176,6 +186,12 @@ fn main() -> Result<()> {
     let mut offset: u64 = 0;
     let mut buf = vec![0u8; cli.chunk_size];
     loop {
+        // Ctrl+C: the reader flags a bare ETX keystroke (the tty runs with
+        // ISIG cleared). Bail so the guard's Drop cancels the upload and
+        // the host drops its partial destination file.
+        if stream.interrupted() {
+            return Err(anyhow!("upload cancelled (Ctrl+C)"));
+        }
         let n = local.read(&mut buf).context("reading local file")?;
         if n == 0 {
             break;
@@ -212,6 +228,8 @@ fn main() -> Result<()> {
             .map_err(|_| anyhow!("EndUpload Ok: missing bytes_written"))?;
         Ok(path)
     })?;
+    // Upload finalised on the host; nothing left to cancel.
+    cancel.disarm();
 
     let _ = ui.update(total_bytes, total_bytes, bytes_per_sec(offset, started));
     ui.finish(&format!("uploaded -> {final_path}"))?;

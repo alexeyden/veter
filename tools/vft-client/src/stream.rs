@@ -30,15 +30,33 @@ pub enum HostFrame {
 pub struct ResponseStream {
     rx: Receiver<HostFrame>,
     eof: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
 }
 
 impl ResponseStream {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel();
         let eof = Arc::new(AtomicBool::new(false));
+        let interrupt = Arc::new(AtomicBool::new(false));
         let eof_thread = eof.clone();
-        std::thread::spawn(move || run_reader(tx, eof_thread));
-        Self { rx, eof }
+        let interrupt_thread = interrupt.clone();
+        std::thread::spawn(move || run_reader(tx, eof_thread, interrupt_thread));
+        Self {
+            rx,
+            eof,
+            interrupt,
+        }
+    }
+
+    /// True once the reader has seen a bare `ETX` (Ctrl+C) keystroke on
+    /// the input. "Bare" means outside any VGE/VFT envelope: the host's
+    /// download bytes carry their own `0x03`s *inside* envelopes, which
+    /// the APC parser keeps out of the passthrough, so this only ever
+    /// flips for an actual interrupt keypress. Long-running command loops
+    /// poll it to cancel promptly (the tty runs with `ISIG` cleared, so
+    /// Ctrl+C never arrives as a signal). Latching: never clears.
+    pub fn interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::Relaxed)
     }
 
     /// Non-blocking pull. `Some(frame)` if available, `None`
@@ -112,7 +130,12 @@ impl ResponseStream {
     }
 }
 
-fn run_reader(tx: Sender<HostFrame>, eof: Arc<AtomicBool>) {
+/// ETX (Ctrl+C). A bare one in the passthrough is a user interrupt
+/// keystroke; download-data `0x03`s stay inside VFT envelopes and never
+/// reach the passthrough, so this can't be confused with file bytes.
+const ETX: u8 = 0x03;
+
+fn run_reader(tx: Sender<HostFrame>, eof: Arc<AtomicBool>, interrupt: Arc<AtomicBool>) {
     let mut vge_apc =
         vge_protocol::apc::ApcStream::with_marker(*vge_protocol::frame::MARKER_T2C);
     let mut vft_apc =
@@ -138,10 +161,14 @@ fn run_reader(tx: Sender<HostFrame>, eof: Arc<AtomicBool>) {
         for payload in vft_out.payloads {
             emit_frames(&payload, &tx, false);
         }
-        // vft_out.passthrough contains anything that's neither a VGE
-        // nor a VFT envelope (e.g. unsolicited control replies). v1
-        // discards it — vsend/vrecv don't drive any further DSR
-        // queries after probe time.
+        // vft_out.passthrough is anything that is neither a VGE nor a VFT
+        // envelope — normally just user keystrokes (the host's replies are
+        // all enveloped). We otherwise discard it, but watch it for a bare
+        // Ctrl+C so a long-running transfer can be interrupted from the
+        // keyboard even though the tty has `ISIG` cleared.
+        if vft_out.passthrough.contains(&ETX) {
+            interrupt.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -176,5 +203,47 @@ fn emit_frames(payload: &[u8], tx: &Sender<HostFrame>, vge: bool) {
         if tx.send(frame).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vft_protocol::envelope::{append_frame, wrap_h2c_envelope};
+
+    // Mirror the reader thread's parser pipeline (VGE then VFT) and return
+    // the residual passthrough that run_reader scans for a bare Ctrl+C.
+    fn passthrough(input: &[u8]) -> Vec<u8> {
+        let mut vge =
+            vge_protocol::apc::ApcStream::with_marker(*vge_protocol::frame::MARKER_T2C);
+        let mut vft =
+            vft_protocol::apc::ApcStream::with_marker(*vft_protocol::frame::MARKER_H2C);
+        let vge_out = vge.feed(input);
+        vft.feed(&vge_out.passthrough).passthrough
+    }
+
+    #[test]
+    fn bare_ctrl_c_reaches_passthrough() {
+        // A lone ETX keystroke (optionally amid other typed bytes) lands
+        // in the passthrough, so the reader flags it as an interrupt.
+        assert!(passthrough(&[0x03]).contains(&0x03));
+        assert!(passthrough(b"ab\x03cd").contains(&0x03));
+    }
+
+    #[test]
+    fn download_data_etx_stays_out_of_passthrough() {
+        // An 0x03 carried *inside* a VFT download envelope (the common
+        // case for binary file data) is extracted as frame body and must
+        // NOT appear in the passthrough — otherwise file bytes would be
+        // mistaken for a Ctrl+C. `stuff` does not escape 0x03, so it
+        // travels literally in the body, which is exactly the case we must
+        // not misread.
+        let mut frames = Vec::new();
+        append_frame(&mut frames, 0x80 /* DownloadChunk */, 0, &[0x03, 0x00, 0x03, 0xFF]);
+        let env = wrap_h2c_envelope(&frames);
+        assert!(env.iter().any(|&b| b == 0x03), "fixture must contain a raw 0x03");
+        assert!(
+            !passthrough(&env).contains(&0x03),
+            "download-data 0x03 leaked into the interrupt-scanned passthrough"
+        );
     }
 }

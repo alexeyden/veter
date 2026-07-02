@@ -220,6 +220,7 @@ pub fn run_upload(
 pub fn run_download(
     mut file: File,
     chunk_size: u32,
+    total_bytes: u64,
     initial_budget: u64,
     cmd_rx: Receiver<WorkerCmd>,
     evt_tx: Sender<WorkerEvt>,
@@ -291,6 +292,19 @@ pub fn run_download(
                 });
                 sent += n as u64;
                 budget -= n as u64;
+                // Finish as soon as the whole declared file has been sent,
+                // rather than waiting for the next read to return 0. That
+                // read would require budget > 0, but the budget can hit
+                // exactly 0 here when the file size lands on a window
+                // boundary — and the client may not ack a sub-window tail,
+                // so the worker would block forever and `DownloadEnd` would
+                // never fire. `total_bytes` is the file's size at open time
+                // (the value already reported to the client), so this is
+                // the authoritative end of the transfer.
+                if total_bytes != 0 && sent >= total_bytes {
+                    send(WorkerEvt::DownloadEnd { bytes_sent: sent });
+                    return;
+                }
             }
             Err(e) => {
                 send(WorkerEvt::Aborted {
