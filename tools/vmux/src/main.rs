@@ -8,7 +8,7 @@
 //!   h  split horizontally (new pane below)
 //!   x  close the focused pane
 //!   r  rename the focused pane (modal edit window)
-//!   o  cycle focus to the next pane
+//!   ←↑↓→  move focus to the neighbouring pane in that direction
 //!   q  quit vmux (asks for confirmation first)
 //!
 //! When the last pane closes, vmux exits.
@@ -497,9 +497,64 @@ fn layout_rects(node: &Layout, bounds: PaneRect, out: &mut HashMap<String, PaneR
     }
 }
 
-/// Which way a keyboard resize nudges the focused pane's nearest divider.
+/// Pick the best focus target when moving `dir` from `from` (the rect of
+/// the currently focused pane `cur`), given the laid-out rects of every
+/// visible pane. A candidate qualifies when it sits wholly on the `dir`
+/// side of `from`'s matching edge (panes tile without gaps, so the
+/// immediate neighbour shares that edge → gap 0). Among qualifying panes
+/// the winner is the one closest along the movement axis, breaking ties by
+/// the smaller cross-axis centre offset — i.e. the adjacent row/column,
+/// then the pane nearest the focused pane's centre line. `None` when no
+/// pane lies in that direction.
+fn pick_directional(
+    rects: &HashMap<String, PaneRect>,
+    cur: &str,
+    from: PaneRect,
+    dir: Dir,
+) -> Option<String> {
+    // Doubled centres so the midpoint stays integral for odd extents.
+    let fcx2 = 2 * from.x as i64 + from.w as i64;
+    let fcy2 = 2 * from.y as i64 + from.h as i64;
+    let mut best: Option<(i64, i64, &String)> = None;
+    for (id, r) in rects {
+        if id == cur {
+            continue;
+        }
+        let (axis_gap, cross) = match dir {
+            Dir::Right => (
+                r.x as i64 - (from.x as i64 + from.w as i64),
+                ((2 * r.y as i64 + r.h as i64) - fcy2).abs(),
+            ),
+            Dir::Left => (
+                from.x as i64 - (r.x as i64 + r.w as i64),
+                ((2 * r.y as i64 + r.h as i64) - fcy2).abs(),
+            ),
+            Dir::Down => (
+                r.y as i64 - (from.y as i64 + from.h as i64),
+                ((2 * r.x as i64 + r.w as i64) - fcx2).abs(),
+            ),
+            Dir::Up => (
+                from.y as i64 - (r.y as i64 + r.h as i64),
+                ((2 * r.x as i64 + r.w as i64) - fcx2).abs(),
+            ),
+        };
+        // Negative gap → the candidate overlaps or sits behind `from` on
+        // this axis, so it is not on the `dir` side.
+        if axis_gap < 0 {
+            continue;
+        }
+        if best.is_none_or(|(a, c, _)| (axis_gap, cross) < (a, c)) {
+            best = Some((axis_gap, cross, id));
+        }
+    }
+    best.map(|(_, _, id)| id.clone())
+}
+
+/// A cardinal direction. Used both for keyboard resize (which way to nudge
+/// the focused pane's nearest divider) and directional focus (`prefix +
+/// arrow` — which neighbour to move focus to).
 #[derive(Debug, Clone, Copy)]
-enum ResizeDir {
+enum Dir {
     Left,
     Right,
     Up,
@@ -1769,7 +1824,7 @@ fn help_lines() -> &'static [String] {
             "Pane".into(),
             "  v        split focused pane vertically".into(),
             "  h        split focused pane horizontally".into(),
-            "  o        cycle focus to next pane".into(),
+            "  ←↑↓→    move focus to the pane in that direction".into(),
             "  x        close focused pane".into(),
             "  r        rename focused pane".into(),
             "  z        toggle zoom (focused pane fills the tab)".into(),
@@ -1780,8 +1835,8 @@ fn help_lines() -> &'static [String] {
             "".into(),
             "Tab".into(),
             "  c        new tab".into(),
-            "  n / →    next tab".into(),
-            "  p / ←    previous tab".into(),
+            "  n        next tab".into(),
+            "  p        previous tab".into(),
             "  1..9     jump to tab N".into(),
             "  < / >    move current tab left / right".into(),
             "  R        rename current tab".into(),
@@ -3459,6 +3514,29 @@ impl State {
         self.relayout_and_render()
     }
 
+    /// Move focus to the nearest visible pane in `dir` — the spatial
+    /// counterpart of `cycle_focus`, bound to `prefix + arrow`. No-op when
+    /// the tab is zoomed (only one pane is visible) or when no pane lies in
+    /// that direction. Re-emits chrome and `SetFocus`.
+    fn focus_dir(&mut self, dir: Dir) -> Result<Vec<u8>> {
+        if self.tabs[self.active_tab].zoomed.is_some() {
+            return Ok(Vec::new());
+        }
+        let mut rects = HashMap::new();
+        layout_rects(self.active_layout(), self.full_bounds(), &mut rects);
+        let cur = self.focus().to_string();
+        let Some(&from) = rects.get(&cur) else {
+            return Ok(Vec::new());
+        };
+        match pick_directional(&rects, &cur, from, dir) {
+            Some(next) => {
+                self.set_focus(next);
+                self.relayout_and_render()
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Enter interactive resize mode for the active tab. No-op when there
     /// is nothing to resize (a single pane, or the tab is zoomed so only
     /// one pane is visible). Re-emits the focused pane's chrome so the
@@ -3492,15 +3570,15 @@ impl State {
     /// one. So with the bottom pane focused, Up moves the border up and
     /// grows it; Down shrinks it. No-op (empty output) when there's no
     /// matching split to move.
-    fn resize_focus(&mut self, dir: ResizeDir) -> Result<Vec<u8>> {
+    fn resize_focus(&mut self, dir: Dir) -> Result<Vec<u8>> {
         if self.tabs[self.active_tab].zoomed.is_some() {
             return Ok(Vec::new());
         }
         let (want, cells) = match dir {
-            ResizeDir::Left => (SplitDir::Vertical, -RESIZE_STEP),
-            ResizeDir::Right => (SplitDir::Vertical, RESIZE_STEP),
-            ResizeDir::Up => (SplitDir::Horizontal, -RESIZE_STEP),
-            ResizeDir::Down => (SplitDir::Horizontal, RESIZE_STEP),
+            Dir::Left => (SplitDir::Vertical, -RESIZE_STEP),
+            Dir::Right => (SplitDir::Vertical, RESIZE_STEP),
+            Dir::Up => (SplitDir::Horizontal, -RESIZE_STEP),
+            Dir::Down => (SplitDir::Horizontal, RESIZE_STEP),
         };
         let target = self.focus().to_string();
         let bounds = self.full_bounds();
@@ -5921,7 +5999,7 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     };
 
     // A left click anywhere in a pane focuses it — the pointer
-    // equivalent of `prefix-o`. Done before the forward logic below so
+    // equivalent of prefix-arrow focus. Done before the forward logic below so
     // that when the inner program also wants the click it both focuses
     // the pane and receives the event. Gated to `Mode::Normal` so a
     // stray click can't move focus out from under a modal.
@@ -6240,7 +6318,6 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         b'v' => state.split(SplitDir::Vertical),
         b'h' => state.split(SplitDir::Horizontal),
         b'x' => state.close_focused(),
-        b'o' => state.cycle_focus(),
         b'z' => state.toggle_zoom(),
         b's' => state.enter_resize(),
         // layout restructuring (structure-preserving)
@@ -6310,16 +6387,19 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
     }
 }
 
-/// Final-byte dispatch for `prefix + <arrow>`. Right (`C`) cycles to
-/// the next tab, left (`D`) to the previous one. Up/down are reserved
-/// for future use and silently consumed. Caller has already reset the
-/// mode to `Mode::Normal` and consumed the whole CSI/SS3 sequence.
+/// Final-byte dispatch for `prefix + <arrow>`: move focus to the nearest
+/// pane in the arrow's direction (`A` up, `B` down, `C` right, `D` left).
+/// Tabs are switched with `prefix n`/`prefix p` instead. Caller has already
+/// reset the mode to `Mode::Normal` and consumed the whole CSI/SS3 sequence.
 fn handle_prefix_arrow(state: &mut State, final_byte: u8) -> Result<Vec<u8>> {
-    match final_byte {
-        b'C' => state.next_tab(),
-        b'D' => state.prev_tab(),
-        _ => Ok(Vec::new()),
-    }
+    let dir = match final_byte {
+        b'A' => Dir::Up,
+        b'B' => Dir::Down,
+        b'C' => Dir::Right,
+        b'D' => Dir::Left,
+        _ => return Ok(Vec::new()),
+    };
+    state.focus_dir(dir)
 }
 
 /// Process keystrokes while the rename modal is up. Feeds the front of
@@ -6486,7 +6566,7 @@ fn handle_confirm_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
 fn handle_resize_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
     enum Action {
         Nothing,
-        Resize(ResizeDir),
+        Resize(Dir),
         Exit,
     }
 
@@ -6501,10 +6581,10 @@ fn handle_resize_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
                     Action::Nothing
                 }
                 b'q' | b'\r' | b'\n' => Action::Exit,
-                b'h' => Action::Resize(ResizeDir::Left),
-                b'l' => Action::Resize(ResizeDir::Right),
-                b'k' => Action::Resize(ResizeDir::Up),
-                b'j' => Action::Resize(ResizeDir::Down),
+                b'h' => Action::Resize(Dir::Left),
+                b'l' => Action::Resize(Dir::Right),
+                b'k' => Action::Resize(Dir::Up),
+                b'j' => Action::Resize(Dir::Down),
                 _ => Action::Nothing,
             }
         } else if csi_buf.len() == 1 {
@@ -6521,10 +6601,10 @@ fn handle_resize_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
             csi_buf.push(b);
             if (0x40..=0x7E).contains(&b) {
                 let act = match b {
-                    b'D' => Action::Resize(ResizeDir::Left),
-                    b'C' => Action::Resize(ResizeDir::Right),
-                    b'A' => Action::Resize(ResizeDir::Up),
-                    b'B' => Action::Resize(ResizeDir::Down),
+                    b'D' => Action::Resize(Dir::Left),
+                    b'C' => Action::Resize(Dir::Right),
+                    b'A' => Action::Resize(Dir::Up),
+                    b'B' => Action::Resize(Dir::Down),
                     _ => Action::Nothing,
                 };
                 csi_buf.clear();
@@ -7236,6 +7316,56 @@ mod tests {
         let Layout::Split { ratio: inner, .. } = b.as_ref() else { unreachable!() };
         // Inner region is the right half (width 50); +5 cells → +0.1.
         assert!((*inner - 0.6).abs() < 1e-6, "inner ratio {inner} should be 0.6");
+    }
+
+    // ── directional focus ─────────────────────────────────────────────
+
+    #[test]
+    fn directional_focus_moves_to_the_adjacent_neighbour() {
+        // a | b, a left / b right over 100×40.
+        let (layout, bounds) = vsplit_5050();
+        let mut rects = HashMap::new();
+        layout_rects(&layout, bounds, &mut rects);
+        let a = rects["a"];
+        let b = rects["b"];
+        assert_eq!(pick_directional(&rects, "a", a, Dir::Right).as_deref(), Some("b"));
+        assert_eq!(pick_directional(&rects, "b", b, Dir::Left).as_deref(), Some("a"));
+        // No pane lies further left of `a` or above either pane.
+        assert_eq!(pick_directional(&rects, "a", a, Dir::Left), None);
+        assert_eq!(pick_directional(&rects, "a", a, Dir::Up), None);
+    }
+
+    #[test]
+    fn directional_focus_picks_the_neighbour_nearest_the_centre_line() {
+        // Left pane `a` spans full height; the right half is split top/bottom
+        // into `c` (upper) and `d` (lower). Moving Right from `a` should land
+        // on whichever of c/d straddles a's vertical centre — here they meet
+        // exactly at the midline, so the tie-break resolves deterministically
+        // to the smaller-id candidate (`c`), and both are equidistant.
+        let layout = Layout::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(Layout::Leaf("a".into())),
+            b: Box::new(Layout::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                a: Box::new(Layout::Leaf("c".into())),
+                b: Box::new(Layout::Leaf("d".into())),
+            }),
+        };
+        let bounds = PaneRect { x: 0, y: 0, w: 100, h: 40 };
+        let mut rects = HashMap::new();
+        layout_rects(&layout, bounds, &mut rects);
+        let a = rects["a"];
+        // Right from `a` reaches a right-column pane (c or d); both are
+        // adjacent (gap 0) and equidistant from a's centre.
+        let right = pick_directional(&rects, "a", a, Dir::Right);
+        assert!(matches!(right.as_deref(), Some("c") | Some("d")));
+        // From the upper-right pane `c`, Down reaches `d` and Left reaches `a`.
+        let c = rects["c"];
+        assert_eq!(pick_directional(&rects, "c", c, Dir::Down).as_deref(), Some("d"));
+        assert_eq!(pick_directional(&rects, "c", c, Dir::Left).as_deref(), Some("a"));
+        assert_eq!(pick_directional(&rects, "c", c, Dir::Up), None);
     }
 
     #[test]
