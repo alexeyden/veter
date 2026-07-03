@@ -30,7 +30,7 @@
 //!      `Session::attached` back to `false`. The session keeps
 //!      running.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,7 +110,9 @@ pub fn start(
     let spawn = std::thread::Builder::new()
         .name("vsd-attach".into())
         .spawn(move || {
-            if let Err(e) = handler_main(stdin, stdout, master_writer, engines) {
+            if let Err(e) =
+                handler_main(stdin, stdout, master_writer, engines, &cli_socket)
+            {
                 eprintln!(
                     "vsd: attach `{session_name_owned}` ended: {e:#}"
                 );
@@ -140,6 +142,7 @@ fn handler_main(
     stdout_fd: OwnedFd,
     master_writer_fd: OwnedFd,
     engines: Arc<Mutex<EngineState>>,
+    ipc_socket: &UnixStream,
 ) -> Result<()> {
     // Step 0: put the renderer's tty into raw mode. Without this, the
     // SSH PTY slave we just inherited stays in canonical (line-edited)
@@ -265,7 +268,17 @@ fn handler_main(
     // (PTY master output → renderer stdout) via `renderer_stdout` we
     // installed above. Per the PRT spec, input never crosses the
     // engines — we forward keystrokes verbatim.
-    let result = splice_input(&stdin_fd, master_writer_fd, shutdown_read);
+    //
+    // We also watch the IPC socket the `vsd attach` CLI is blocked on:
+    // when the renderer's tab/window dies the CLI process exits and its
+    // end of the socket closes. That's the only *always-reliable*
+    // disconnect signal — the renderer stdin fd only EOFs/HUPs if the
+    // multiplexer that owns the pane promptly tears the pty down, which
+    // isn't guaranteed (a `vmux` pane can still hold the master open),
+    // so relying on stdin alone left the attach spliced forever and the
+    // `attached` flag stuck at `true`, refusing every re-attach.
+    let result =
+        splice_input(&stdin_fd, master_writer_fd, shutdown_read, ipc_socket.as_fd());
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
     // on engines so the worker stops writing / signaling, then emit a
@@ -547,10 +560,13 @@ impl DetachScanner {
 
 /// Renderer-stdin → inner-PTY-master forwarding loop. Returns on EOF
 /// of stdin (renderer disconnected cleanly), on write error (inner
-/// program gone), when the [`DetachScanner`] fires, or when the
+/// program gone), when the [`DetachScanner`] fires, when the
 /// `shutdown_read` self-pipe becomes readable (the per-session worker
 /// signaled session shutdown — typically because the inner program
-/// exited).
+/// exited), or when `ipc_fd` (the socket the `vsd attach` CLI blocks
+/// on) becomes ready — the CLI closing it is the reliable "the
+/// renderer's tab/window died" signal that doesn't depend on the
+/// multiplexer having torn down the renderer's pty (see the call site).
 /// Note `stdin_fd` is borrowed, not moved: the caller (`handler_main`)
 /// needs the OwnedFd alive *after* this returns so the post-detach
 /// tty restore (`restore_tty_canonical` + `RawTty::Drop`) can call
@@ -564,9 +580,9 @@ fn splice_input(
     stdin_fd: &OwnedFd,
     master_writer_fd: OwnedFd,
     shutdown_read: OwnedFd,
+    ipc_fd: BorrowedFd<'_>,
 ) -> Result<()> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::fd::AsFd;
 
     let stdin_raw = stdin_fd.as_raw_fd();
     let writer_raw = master_writer_fd.as_raw_fd();
@@ -593,6 +609,7 @@ fn splice_input(
         let mut fds = [
             PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
             PollFd::new(shutdown_read.as_fd(), PollFlags::POLLIN),
+            PollFd::new(ipc_fd, PollFlags::POLLIN),
         ];
         match poll(&mut fds, PollTimeout::from(esc_timeout_ms)) {
             Ok(_) => {}
@@ -604,6 +621,20 @@ fn splice_input(
         // tear down even if there are buffered keystrokes.
         let shutdown_revents = fds[1].revents().unwrap_or(PollFlags::empty());
         if shutdown_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            return Ok(());
+        }
+
+        // The IPC socket the `vsd attach` CLI holds open for the whole
+        // attach: any readability or hangup means the CLI process is
+        // gone (its tab/window died). The CLI is contractually silent
+        // after the attach handshake, so we don't read — a live fd only
+        // becomes ready here on peer close. Treat it as a detach so the
+        // handler unwinds and the `attached` flag clears even when the
+        // renderer's pty master is still held open by the multiplexer.
+        let ipc_revents = fds[2].revents().unwrap_or(PollFlags::empty());
+        if ipc_revents
+            .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)
+        {
             return Ok(());
         }
 
@@ -907,5 +938,97 @@ mod tests {
         let (out, detached) = feed_chunks(&[b"vim", &[DETACH_PREFIX], b"d after"]);
         assert_eq!(out, b"vim");
         assert!(detached);
+    }
+
+    /// Reproduces the "session already attached" re-attach failure: when
+    /// the renderer/tab dies but the multiplexer that owns the pane still
+    /// holds the renderer's pty master open, the renderer stdin fd never
+    /// HUPs, so the pre-fix splice loop (which polled only stdin + the
+    /// shutdown pipe) blocked forever and the `attached` flag stuck at
+    /// `true`. The always-reliable death signal is the `vsd attach` CLI
+    /// closing its IPC socket, which the splice loop now also polls.
+    #[test]
+    fn renderer_death_via_ipc_close_clears_attached_flag() {
+        use crate::engines::EngineState;
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        // IPC socketpair standing in for the CLI ↔ daemon connection.
+        let (cli_side, mut daemon_side) = UnixStream::pair().expect("ipc socketpair");
+
+        // Renderer stdio = a pty slave. We keep the MASTER open (and
+        // draining) for the whole test to model a multiplexer that hasn't
+        // torn the pane pty down yet — so stdin never delivers EOF/HUP and
+        // the *only* disconnect signal is the CLI closing `cli_side`.
+        let renderer = nix::pty::openpty(None, None).expect("renderer pty");
+        // A second dup of the master feeds a drain thread so the ~KB
+        // attach snapshot write doesn't block on a full pty buffer; the
+        // original master fd stays in this thread so the slave keeps a
+        // live master (no HUP) until the test ends.
+        let master_dup = dup_owned(&renderer.master).expect("dup renderer master");
+        let drain = std::thread::spawn(move || {
+            let mut f = std::fs::File::from(master_dup);
+            let mut buf = [0u8; 4096];
+            // Reads until the slave side is fully closed (all dups gone).
+            while let Ok(n) = f.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        // Hand the slave over as both stdin and stdout, exactly like the
+        // real CLI's `send_stdio(stdin, stdout)`.
+        let slave_raw = renderer.slave.as_raw_fd();
+        crate::fdpass::send_stdio(&cli_side, slave_raw, slave_raw)
+            .expect("send renderer stdio");
+
+        // The session's inner PTY master the handler splices input into.
+        let inner = nix::pty::openpty(None, None).expect("inner pty");
+        let master_writer = inner.master;
+
+        let engines = Arc::new(Mutex::new(EngineState::new("repro".into())));
+        let attached = Arc::new(AtomicBool::new(false));
+
+        start(
+            &mut daemon_side,
+            Arc::clone(&engines),
+            master_writer,
+            Arc::clone(&attached),
+            "repro",
+        )
+        .expect("attach start");
+
+        // `start` flips the flag synchronously before spawning the handler.
+        assert!(attached.load(Ordering::Acquire), "flag set on attach");
+
+        // Drop our copy of the slave so only the handler's dups reference
+        // it; the master stays open via this thread + the drain thread.
+        drop(renderer.slave);
+
+        // Simulate the tab/renderer dying: the `vsd attach` CLI process
+        // exits, closing its end of the IPC socket. stdin stays HUP-free.
+        drop(cli_side);
+
+        // The splice loop must notice the IPC close and tear the attach
+        // down, clearing the flag. Allow generous slack for the 500 ms
+        // probe timeout the handler runs first.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while attached.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !attached.load(Ordering::Acquire),
+            "attached flag must clear after the renderer's IPC socket closes"
+        );
+
+        // Let the drain thread finish: closing both master fds HUPs the
+        // slave (whatever dups the handler still holds also drop as the
+        // handler thread has returned), so its read loop ends.
+        drop(renderer.master);
+        drop(inner.slave);
+        let _ = drain.join();
     }
 }
