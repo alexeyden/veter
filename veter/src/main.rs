@@ -1287,11 +1287,14 @@ impl App {
                 std::collections::HashSet::new();
             let mut visible: Vec<usize> = Vec::new();
             for (idx, m) in search.matches.iter().enumerate() {
-                let row_i = m.line - viewport_top;
-                if row_i < 0 || row_i >= rows as i64 {
-                    continue;
-                }
-                visible.push(idx);
+                // Build the exclusion set from *every* match in the buffer,
+                // not just the on-screen ones. A label char is only genuine
+                // if appending it to the query narrows to nothing anywhere —
+                // otherwise `would_narrow` in handle_search_key_input (which
+                // searches the whole buffer) swallows the keystroke as query
+                // input, and the label the user sees does nothing. The
+                // continuation char of any match — visible or scrolled off —
+                // is exactly such a query-refining key, so exclude it.
                 if let Some(cache) = &search.cache
                     && let Some(&ri) = line_row.get(&m.line)
                     && let Some(c) = char_at_col(&cache.rows[ri], m.col_end)
@@ -1303,6 +1306,11 @@ impl App {
                     };
                     excluded.insert(c);
                 }
+                let row_i = m.line - viewport_top;
+                if row_i < 0 || row_i >= rows as i64 {
+                    continue;
+                }
+                visible.push(idx);
             }
             assign_jump_labels(&visible, &excluded)
         };
