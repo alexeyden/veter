@@ -46,6 +46,52 @@ fn host_accent_palette(config: &config::Config) -> vge::HostThemePalette {
     }
 }
 
+/// Run a user-defined selection command (`config.selection_commands`) on
+/// the selected `selection` text. The command runs via `$SHELL -c`, with
+/// the selection exported as `$VETER_SELECTION` and passed as positional
+/// `$1` (so `xdg-open "$1"` and `xdg-open "$VETER_SELECTION"` both work).
+///
+/// Fire-and-forget: the child is detached into its own session
+/// (`setsid`) with null stdio so a browser/`xdg-open` outlives veter and
+/// isn't hit by terminal signals; a short reaper thread waits on it so it
+/// doesn't linger as a zombie. Never blocks the UI thread.
+fn run_selection_command(command: &str, selection: &str) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut cmd = Command::new(shell);
+    cmd.arg("-c")
+        .arg(command)
+        // `$0` = "veter-selection", `$1` / `"$@"` = the selection text.
+        .arg("veter-selection")
+        .arg(selection)
+        .env("VETER_SELECTION", selection)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Expose this exact veter binary so commands can run `veter -e …`
+    // (e.g. edit-then-open) even when it isn't on the launcher's PATH.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("VETER_EXE", exe);
+    }
+    // SAFETY: setsid() is async-signal-safe and touches no shared state.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!("veter: selection command failed to spawn: {e}"),
+    }
+}
+
 fn load_window_icon() -> Option<Icon> {
     let img = image::load_from_memory(WINDOW_ICON_PNG).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -610,11 +656,19 @@ struct App {
     search: Option<SearchState>,
 
     /// User configuration loaded once at startup (accent palette,
-    /// search-chrome colors, host key chords). Missing file / parse
-    /// error → built-in defaults; see `config.rs`.
+    /// search-chrome colors, host key chords, selection commands).
+    /// Missing file / parse error → built-in defaults; see `config.rs`.
     config: config::Config,
     /// Compiled key chord → action tables, derived from `config.keys`.
     keys: config::KeyBindings,
+    /// True while the current selection is "fresh" — made since the last
+    /// key was sent to the shell. Gates `[[selection_commands]]` so a
+    /// lingering highlight can't hijack normal typing: the first key
+    /// forwarded to the PTY clears this.
+    selection_fresh: bool,
+    /// `veter -e <command>` entry-point command: exec this instead of the
+    /// default vmux/`$SHELL`. `None` for a normal launch.
+    entry_command: Option<Vec<String>>,
 }
 
 /// One scrollback-search session, owned by `App::search`.
@@ -942,7 +996,11 @@ fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<()>, config: config::Config) -> Self {
+    fn new(
+        proxy: EventLoopProxy<()>,
+        config: config::Config,
+        entry_command: Option<Vec<String>>,
+    ) -> Self {
         let keys = config.key_bindings();
         Self {
             window: None,
@@ -971,6 +1029,8 @@ impl App {
             search: None,
             config,
             keys,
+            selection_fresh: false,
+            entry_command,
         }
     }
 
@@ -1761,6 +1821,7 @@ impl App {
             block_cols: None,
         });
         self.copy_selection_to_clipboard(true);
+        self.selection_fresh = true;
         // Enter expansion mode only if a further word remains on the line
         // to grow into; otherwise this word already *is* the whole line,
         // so close the overlay as the plain select-word action did.
@@ -1799,6 +1860,7 @@ impl App {
                 exp2.head = new_head;
             }
             self.copy_selection_to_clipboard(true);
+            self.selection_fresh = true;
             // If that was the last word, the whole line is now selected:
             // close the overlay, leaving the final selection in place.
             if self.next_word_end(&exp.target, new_head).is_none() {
@@ -2011,6 +2073,32 @@ impl App {
             return;
         }
 
+        // Custom selection commands (`[[selection_commands]]`). While a
+        // *fresh* selection exists, a bound key runs the user's shell
+        // command on the selected text instead of reaching the PTY.
+        // Fresh = made since the last key sent to the shell, so a
+        // lingering highlight never hijacks normal typing. Checked after
+        // host chords (which win on conflict) and before the key reaches
+        // the shell. Running consumes the selection, like copy.
+        if self.selection_fresh
+            && self.selection.is_some()
+            && let Some(command) =
+                self.keys.resolve_selection_command(&event.logical_key, &self.modifiers)
+        {
+            if let Some(text) = self.extract_selection_text() {
+                let sel = text.trim();
+                if !sel.is_empty() {
+                    run_selection_command(&command, sel);
+                }
+            }
+            self.selection = None;
+            self.selection_fresh = false;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
         // Any non-scroll key resets scrollback to bottom on the *host*
         // leaf (a plain `veter` shell with no multiplexer), so typing
         // jumps back to live. Skipped when already at live to avoid a
@@ -2049,6 +2137,13 @@ impl App {
         // mode: the user expects to keep reading scrollback after
         // grabbing a snippet.
         let is_copy = host_action == Some(HostAction::Copy);
+        // A real keystroke bound for the shell disarms selection commands,
+        // so a lingering highlight can't hijack later typing. Modifier-only
+        // presses (reaching for a chord) and host actions — which returned
+        // above — don't disarm.
+        if !is_modifier_only {
+            self.selection_fresh = false;
+        }
         let path = self.focused_leaf_path();
         if path.is_empty() && !is_modifier_only && !is_copy && self.focused_leaf_scrollback() > 0 {
             self.set_target_scrollback(&path, 0);
@@ -2718,7 +2813,8 @@ impl ApplicationHandler for App {
             10000,
             clipboard::HostCallbacks::default(),
         );
-        let pty = pty::Pty::new(term_rows, term_cols).expect("Failed to create PTY");
+        let pty = pty::Pty::new(term_rows, term_cols, self.entry_command.clone())
+            .expect("Failed to create PTY");
 
         // Start PTY reader thread
         let (tx, rx) = mpsc::channel();
@@ -2859,6 +2955,7 @@ impl ApplicationHandler for App {
                                 block_cols: None,
                             });
                             self.copy_selection_to_clipboard(true);
+                            self.selection_fresh = true;
                             self.last_click = None;
                             if let Some(w) = &self.window {
                                 w.request_redraw();
@@ -2932,6 +3029,8 @@ impl ApplicationHandler for App {
                             // PRIMARY selection only. Ctrl+Shift+C also
                             // updates the main clipboard.
                             self.copy_selection_to_clipboard(true);
+                            // A just-finished selection arms selection commands.
+                            self.selection_fresh = true;
                         }
                     }
                     (ElementState::Pressed, MouseButton::Middle) => {
@@ -3246,11 +3345,27 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    let entry_command = parse_entry_command();
     let config = config::Config::load();
     let event_loop = EventLoop::new().unwrap();
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy, config);
+    let mut app = App::new(proxy, config, entry_command);
     event_loop.run_app(&mut app).unwrap();
+}
+
+/// Parse a `veter -e <command> [args…]` entry-point command. Everything
+/// after `-e` (or `--command`) is the program + args to run instead of
+/// the default vmux/`$SHELL`. Returns `None` when the flag is absent (or
+/// has no command after it), leaving the default behaviour.
+fn parse_entry_command() -> Option<Vec<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "-e" || arg == "--command" {
+            let rest: Vec<String> = args.collect();
+            return (!rest.is_empty()).then_some(rest);
+        }
+    }
+    None
 }
 
 /// Diagnostic-only trace of keyboard bytes about to be written to the

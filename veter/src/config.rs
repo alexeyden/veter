@@ -360,14 +360,31 @@ impl Default for SearchKeysConfig {
     }
 }
 
+/// One user-defined command run against the current selection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelectionCommandConfig {
+    /// Chord that triggers it (see [`Chord`] for syntax).
+    pub key: String,
+    /// Shell command, run via `$SHELL -c` with the selection in
+    /// `$VETER_SELECTION` and `$1`.
+    pub command: String,
+    /// Optional human note; accepted for self-documentation but unused
+    /// at runtime.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub description: Option<String>,
+}
+
 /// Compiled chord → action tables, resolved from [`KeyBindingsConfig`].
 pub struct KeyBindings {
     host: Vec<(Chord, HostAction)>,
     search: Vec<(Chord, SearchAction)>,
+    /// Chord → shell command for selection commands (in config order).
+    selection: Vec<(Chord, String)>,
 }
 
 impl KeyBindings {
-    fn build(cfg: &KeyBindingsConfig) -> Self {
+    fn build(cfg: &KeyBindingsConfig, selection_cmds: &[SelectionCommandConfig]) -> Self {
         // Fall back to the built-in default chord for any spec that fails
         // to parse, so one bad line never disarms an action.
         let defaults = KeyBindingsConfig::default();
@@ -416,7 +433,21 @@ impl KeyBindings {
             (parse(&s.page_down, &ds.page_down), SearchAction::PageDown),
         ];
 
-        Self { host, search }
+        // Selection commands have no built-in defaults; a bad chord is
+        // skipped (its command simply won't be bound) with a warning.
+        let mut selection = Vec::new();
+        for sc in selection_cmds {
+            match Chord::parse(&sc.key) {
+                Ok(c) => selection.push((c, sc.command.clone())),
+                Err(e) => eprintln!("veter: config: selection command: {e}; skipping"),
+            }
+        }
+
+        Self {
+            host,
+            search,
+            selection,
+        }
     }
 
     pub fn resolve_host(&self, key: &Key, mods: &ModifiersState) -> Option<HostAction> {
@@ -432,6 +463,15 @@ impl KeyBindings {
             .find(|(chord, _)| chord.matches(key, mods))
             .map(|(_, action)| *action)
     }
+
+    /// The shell command bound to this key, if any. Returns an owned
+    /// `String` so the caller can then take `&mut self`.
+    pub fn resolve_selection_command(&self, key: &Key, mods: &ModifiersState) -> Option<String> {
+        self.selection
+            .iter()
+            .find(|(chord, _)| chord.matches(key, mods))
+            .map(|(_, command)| command.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +484,9 @@ pub struct Config {
     pub accent: AccentConfig,
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
+    /// User-defined commands run against the current selection. Empty by
+    /// default — there are no built-in selection commands.
+    pub selection_commands: Vec<SelectionCommandConfig>,
 }
 
 impl Config {
@@ -496,7 +539,7 @@ impl Config {
     }
 
     pub fn key_bindings(&self) -> KeyBindings {
-        KeyBindings::build(&self.keys)
+        KeyBindings::build(&self.keys, &self.selection_commands)
     }
 }
 
@@ -535,9 +578,65 @@ mod tests {
     #[test]
     fn default_config_parses_all_chords() {
         // build() must never hit its error branch for the defaults.
-        let keys = KeyBindings::build(&KeyBindingsConfig::default());
+        let keys = KeyBindings::build(&KeyBindingsConfig::default(), &[]);
         assert_eq!(keys.host.len(), 6);
         assert_eq!(keys.search.len(), 6);
+        assert!(keys.selection.is_empty());
+    }
+
+    #[test]
+    fn selection_commands_resolve_by_key() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[selection_commands]]
+            key = "o"
+            command = 'xdg-open "$VETER_SELECTION"'
+
+            [[selection_commands]]
+            key = "Ctrl+B"
+            command = "firefox \"$1\""
+            "#,
+        )
+        .unwrap();
+        let keys = cfg.key_bindings();
+        let none = ModifiersState::empty();
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            keys.resolve_selection_command(&Key::Character("o".into()), &none)
+                .as_deref(),
+            Some(r#"xdg-open "$VETER_SELECTION""#)
+        );
+        assert_eq!(
+            keys.resolve_selection_command(&Key::Character("b".into()), &ctrl)
+                .as_deref(),
+            Some(r#"firefox "$1""#)
+        );
+        // Unbound key → None.
+        assert!(keys
+            .resolve_selection_command(&Key::Character("z".into()), &none)
+            .is_none());
+    }
+
+    #[test]
+    fn selection_command_bad_chord_is_skipped() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[selection_commands]]
+            key = "Nonsense+Bad"
+            command = "true"
+
+            [[selection_commands]]
+            key = "o"
+            command = "true"
+            "#,
+        )
+        .unwrap();
+        // The bad entry is dropped; the good one still binds.
+        let keys = cfg.key_bindings();
+        assert_eq!(keys.selection.len(), 1);
+        assert!(keys
+            .resolve_selection_command(&Key::Character("o".into()), &ModifiersState::empty())
+            .is_some());
     }
 
     #[test]

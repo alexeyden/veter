@@ -51,7 +51,11 @@ fn writer_loop(fd: OwnedFd, rx: Receiver<Vec<u8>>) {
 }
 
 impl Pty {
-    pub fn new(rows: u16, cols: u16) -> io::Result<Self> {
+    /// Spawn the child. With `command = None` the child runs the default
+    /// vmux → `$SHELL` chain; with `Some(argv)` (from `veter -e …`) it
+    /// execs that program directly instead — the standard terminal
+    /// entry-point-command behaviour (`xterm -e`, `alacritty -e`).
+    pub fn new(rows: u16, cols: u16, command: Option<Vec<String>>) -> io::Result<Self> {
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -66,6 +70,21 @@ impl Pty {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 unsafe { std::env::set_var("COLORTERM", "truecolor") };
+                // `veter -e <command>`: exec the requested program
+                // directly, bypassing vmux and the shell. On failure the
+                // child must exit — it must never fall through into
+                // veter's own vmux/$SHELL path (it's a fork of veter).
+                if let Some(argv) = command.filter(|c| !c.is_empty()) {
+                    let cargv: Vec<CString> = argv
+                        .iter()
+                        .filter_map(|a| CString::new(a.as_bytes()).ok())
+                        .collect();
+                    if cargv.len() == argv.len() {
+                        let _ = execvp(&cargv[0], &cargv);
+                    }
+                    eprintln!("veter: failed to exec: {}", argv.join(" "));
+                    std::process::exit(127);
+                }
                 // Prefer vmux when available so veter sessions get
                 // the multiplexer transparently. `make install`
                 // ships vmux alongside veter in the same bindir, so

@@ -54,3 +54,32 @@
 # toggle_case = "Alt+C"
 # page_up     = "PageUp"
 # page_down   = "PageDown"
+
+# ---------------------------------------------------------------------------
+# Selection commands
+# ---------------------------------------------------------------------------
+# Run a shell command on the selected text. While a *fresh* selection is
+# active — one you just made, before typing anything else in the shell — the
+# bound key runs the command instead of going to the shell. The first normal
+# key you type disarms it, so a lingering highlight never hijacks your typing.
+#
+# The command runs via `$SHELL -c` (detached), with the selected text
+# available as $VETER_SELECTION and as the positional $1.
+#
+# Bare letters are case-sensitive: "o" is the o key, "O" is Shift+o. Chords
+# with modifiers work too (e.g. "Ctrl+O"). There are no defaults — nothing
+# runs unless you add entries here.
+#
+# [[selection_commands]]
+# key = "o"                                  # open a path/URL with the default app
+# command = 'xdg-open "$VETER_SELECTION"'
+#
+# Edit the selection in vim first, then open the (possibly edited) result.
+# Commands run detached, so vim gets its own window via `veter -e` (a new
+# veter window that closes when vim exits). $VETER_EXE is the running veter
+# binary; on save+quit the edited text is handed to xdg-open. Needs vim and
+# xdg-open.
+# [[selection_commands]]
+# key = "e"
+# description = "edit in vim, then open"     # optional, ignored at runtime
+# command = 'f=$(mktemp); printf "%s" "$VETER_SELECTION" > "$f"; "${VETER_EXE:-veter}" -e vim "$f" && xdg-open "$(cat "$f")"; rm -f "$f"'
