@@ -1,0 +1,56 @@
+# Veter configuration.
+#
+# Location: $XDG_CONFIG_HOME/veter/config.toml
+#           (falls back to ~/.config/veter/config.toml)
+#
+# Every setting is optional. Anything left commented keeps its built-in
+# default — the value shown after each `#` below. A malformed value or a
+# broken key chord logs one line to stderr and falls back to the default
+# for just that setting, so a typo never stops veter from starting.
+#
+# Colors are hex strings: "#rrggbb" or "#rrggbbaa".
+# Key chords are "Mod+Mod+Key", e.g. "Ctrl+Shift+C", "Alt+I", "Shift+PageUp".
+#   Modifiers:  Ctrl, Shift, Alt.
+#   Named keys: Space, Enter, Escape, Backspace, Tab, PageUp, PageDown,
+#               Home, End, Delete, Insert, Up, Down, Left, Right, F1..F12.
+#   A single character is written literally ("/", "n"); for a key with no
+#   Ctrl/Alt its case matters ("n" vs "N").
+
+# ---------------------------------------------------------------------------
+# Shared accent palette
+# ---------------------------------------------------------------------------
+# Published into the reserved `host.*` VGE style namespace; vmux and other
+# in-terminal tools draw their chrome (pane outlines, tabs, titles) from it.
+# Slot 1 is `host.accent.1`, and the contextual `host.accent` rotates through
+# the list by portal nesting depth. Any length >= 1.
+[accent]
+# palette = ["#56799f", "#859f3d", "#5a3c9e"]  # muted blue / olive / violet
+
+# ---------------------------------------------------------------------------
+# Search chrome colors
+# ---------------------------------------------------------------------------
+[search]
+# bar_bg        = "#56799f"   # search-bar background (default: accent slot 1)
+# bar_text      = "#e6e6e6"   # search-bar text
+# current_match = "#dca000"   # the active match (the one n/N navigates to)
+# match         = "#50501e"   # all other matches
+
+# ---------------------------------------------------------------------------
+# Host key chords (intercepted before the terminal forwards keys to the shell)
+# ---------------------------------------------------------------------------
+[keys]
+# open_search      = "/"                 # open search (only while scrolled back)
+# open_overlay     = "Ctrl+Shift+Space"  # open the scrollback/search overlay
+# scroll_page_up   = "Shift+PageUp"
+# scroll_page_down = "Shift+PageDown"
+# copy             = "Ctrl+Shift+C"
+# paste            = "Ctrl+Shift+V"
+
+# In-search-overlay keys.
+[keys.search]
+# close       = "Escape"
+# next_match  = "n"
+# prev_match  = "N"
+# toggle_case = "Alt+C"
+# page_up     = "PageUp"
+# page_down   = "PageDown"

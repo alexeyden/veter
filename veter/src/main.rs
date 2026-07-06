@@ -3,6 +3,9 @@
 // crates pull the same code through `veter::*`.
 use veter::{clipboard, prt, pty, renderer, search, ses, vft, vge, vss};
 
+mod config;
+use config::{HostAction, SearchAction};
+
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::sync::{mpsc, Arc};
@@ -35,24 +38,11 @@ const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/128x128/veter.
 /// `host.accent.{N+1}`; the contextual `host.accent` rotates through
 /// these by portal nesting depth, so a top-level vmux, a vmux nested
 /// inside it, and one nested again render their chrome in slots 0/1/2.
-/// Hardcoded for now; a user-facing config can replace this later.
-const HOST_ACCENT_RGB: [(u8, u8, u8); 3] = [
-    (0x56, 0x79, 0x9F), // accent.1 — muted blue
-    (0x85, 0x9F, 0x3D), // accent.2 — olive
-    (0x5A, 0x3C, 0x9E), // accent.3 — violet
-];
-
-fn host_accent_palette() -> vge::HostThemePalette {
+/// The concrete colors come from the user's config (`[accent]`), which
+/// defaults to the built-in blue/olive/violet triple in `config.rs`.
+fn host_accent_palette(config: &config::Config) -> vge::HostThemePalette {
     vge::HostThemePalette {
-        accents: HOST_ACCENT_RGB
-            .iter()
-            .map(|&(r, g, b)| vge::Color {
-                r: r as f32 / 255.0,
-                g: g as f32 / 255.0,
-                b: b as f32 / 255.0,
-                a: 1.0,
-            })
-            .collect(),
+        accents: config.accent_palette(),
     }
 }
 
@@ -618,6 +608,13 @@ struct App {
     /// Opened by `/` when the focused-leaf parser has scrollback > 0;
     /// closed by Esc (restores scrollback) or once the user is done.
     search: Option<SearchState>,
+
+    /// User configuration loaded once at startup (accent palette,
+    /// search-chrome colors, host key chords). Missing file / parse
+    /// error → built-in defaults; see `config.rs`.
+    config: config::Config,
+    /// Compiled key chord → action tables, derived from `config.keys`.
+    keys: config::KeyBindings,
 }
 
 /// One scrollback-search session, owned by `App::search`.
@@ -781,8 +778,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
 
     let mut bg_path = femtovg::Path::new();
     bg_path.rect(0.0, bar_y, window_w_px, bar_h);
-    let (ar, ag, ab) = HOST_ACCENT_RGB[0];
-    canvas.fill_path(&bg_path, &femtovg::Paint::color(Color::rgb(ar, ag, ab)));
+    canvas.fill_path(&bg_path, &femtovg::Paint::color(tr.search_bar_bg()));
 
     let case_indicator = if search.case_insensitive { "[aA]" } else { "[Aa]" };
     let counter = if search.matches.is_empty() {
@@ -806,12 +802,13 @@ fn draw_search_bar<T: femtovg::Renderer>(
 
     let ascent = tr.ascent();
     let text_y = bar_y + ascent + (bar_h - ascent) * 0.5;
+    let text_color = tr.search_bar_text();
     tr.draw_vge_text(
         canvas,
         0.0,
         text_y,
         &text,
-        Color::rgb(230, 230, 230),
+        text_color,
         vge::command::Align::Left,
         vge::command::FontStyle::default(),
     );
@@ -945,7 +942,8 @@ fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<()>) -> Self {
+    fn new(proxy: EventLoopProxy<()>, config: config::Config) -> Self {
+        let keys = config.key_bindings();
         Self {
             window: None,
             gl_surface: None,
@@ -971,6 +969,8 @@ impl App {
             mouse_buttons_held: 0,
             last_motion_cell: None,
             search: None,
+            config,
+            keys,
         }
     }
 
@@ -1945,15 +1945,16 @@ impl App {
             return;
         }
 
-        // Open search on `/` while the focused-leaf parser is scrolled
-        // back. Checked before the "any key resets scrollback" reset
-        // below so opening search preserves the scroll position.
-        if let Key::Character(c) = &event.logical_key
-            && c.as_str() == "/"
-            && self.focused_leaf_scrollback() > 0
-            && !self.modifiers.control_key()
-            && !self.modifiers.alt_key()
-        {
+        // Resolve the configured host chord for this key once; each
+        // action below keeps its own extra guards (e.g. OpenSearch only
+        // fires while scrolled back). Defaults: `/`, Ctrl+Shift+Space,
+        // Shift+PageUp/Down, Ctrl+Shift+C/V — see `config.rs`.
+        let host_action = self.keys.resolve_host(&event.logical_key, &self.modifiers);
+
+        // Open search while the focused-leaf parser is scrolled back.
+        // Checked before the "any key resets scrollback" reset below so
+        // opening search preserves the scroll position.
+        if host_action == Some(HostAction::OpenSearch) && self.focused_leaf_scrollback() > 0 {
             let path = self.focused_leaf_path();
             let saved = self.focused_leaf_scrollback();
             self.search = Some(SearchState::new(path, saved));
@@ -1963,55 +1964,44 @@ impl App {
             return;
         }
 
-        // Shift+PageUp/Down for scrollback. Targets the focused-leaf
-        // parser so scrolling inside a vmux pane navigates that pane's
-        // scrollback rather than the host vt100 (which inside vmux holds
-        // only chrome paint — pane bytes are routed through PRT into
-        // per-portal vt100s). Routed through `set_target_scrollback` so
-        // a portal leaf stays in sync with its client's stored offset.
-        if self.modifiers.shift_key() {
-            match &event.logical_key {
-                Key::Named(NamedKey::PageUp) => {
-                    let path = self.focused_leaf_path();
-                    if let Some((rows, current)) =
-                        self.with_target_leaf_screen_mut(&path, |s| {
-                            (s.size().0 as usize, s.scrollback())
-                        })
-                    {
-                        self.set_target_scrollback(&path, current + rows);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    return;
-                }
-                Key::Named(NamedKey::PageDown) => {
-                    let path = self.focused_leaf_path();
-                    if let Some((rows, current)) =
-                        self.with_target_leaf_screen_mut(&path, |s| {
-                            (s.size().0 as usize, s.scrollback())
-                        })
-                    {
-                        self.set_target_scrollback(&path, current.saturating_sub(rows));
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    return;
-                }
-                _ => {}
+        // Scrollback paging. Targets the focused-leaf parser so scrolling
+        // inside a vmux pane navigates that pane's scrollback rather than
+        // the host vt100 (which inside vmux holds only chrome paint —
+        // pane bytes are routed through PRT into per-portal vt100s).
+        // Routed through `set_target_scrollback` so a portal leaf stays
+        // in sync with its client's stored offset.
+        if host_action == Some(HostAction::ScrollPageUp) {
+            let path = self.focused_leaf_path();
+            if let Some((rows, current)) = self
+                .with_target_leaf_screen_mut(&path, |s| (s.size().0 as usize, s.scrollback()))
+            {
+                self.set_target_scrollback(&path, current + rows);
             }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        if host_action == Some(HostAction::ScrollPageDown) {
+            let path = self.focused_leaf_path();
+            if let Some((rows, current)) = self
+                .with_target_leaf_screen_mut(&path, |s| (s.size().0 as usize, s.scrollback()))
+            {
+                self.set_target_scrollback(&path, current.saturating_sub(rows));
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
         }
 
-        // Ctrl+Shift+Space opens the unified scrollback/search/select
-        // overlay at the current bottom *without* scrolling — the
-        // keyboard entry point. Works from live output, unlike `/` which
-        // requires being scrolled back first. Checked before the
-        // any-key-resets-scrollback block below so opening while already
-        // scrolled back preserves the position.
-        let is_space = matches!(&event.logical_key, Key::Named(NamedKey::Space))
-            || matches!(&event.logical_key, Key::Character(c) if c.as_str() == " ");
-        if self.modifiers.control_key() && self.modifiers.shift_key() && is_space {
+        // Open the unified scrollback/search/select overlay at the
+        // current bottom *without* scrolling — the keyboard entry point.
+        // Works from live output, unlike OpenSearch which requires being
+        // scrolled back first. Checked before the any-key-resets-scrollback
+        // block below so opening while already scrolled back preserves the
+        // position.
+        if host_action == Some(HostAction::OpenOverlay) {
             let path = self.focused_leaf_path();
             let saved = self.focused_leaf_scrollback();
             self.search = Some(SearchState::new(path, saved));
@@ -2054,16 +2044,11 @@ impl App {
                     | NamedKey::SymbolLock
             )
         );
-        // Ctrl+Shift+C copies / clears the selection but sends nothing to
-        // the PTY, so — like modifier-only presses — it must not drop
-        // scroll mode: the user expects to keep reading scrollback after
+        // Copy copies / clears the selection but sends nothing to the
+        // PTY, so — like modifier-only presses — it must not drop scroll
+        // mode: the user expects to keep reading scrollback after
         // grabbing a snippet.
-        let is_copy = self.modifiers.control_key()
-            && self.modifiers.shift_key()
-            && matches!(
-                &event.logical_key,
-                Key::Character(c) if c.eq_ignore_ascii_case("c")
-            );
+        let is_copy = host_action == Some(HostAction::Copy);
         let path = self.focused_leaf_path();
         if path.is_empty() && !is_modifier_only && !is_copy && self.focused_leaf_scrollback() > 0 {
             self.set_target_scrollback(&path, 0);
@@ -2074,32 +2059,26 @@ impl App {
             None => return,
         };
 
-        // Ctrl+Shift+{V,C}: paste / copy. Handled before the generic
-        // Ctrl+letter block so V/C don't get clobbered into ^V/^C.
-        if self.modifiers.control_key()
-            && self.modifiers.shift_key()
-            && let Key::Character(c) = &event.logical_key
-            && let Some(ch) = c.chars().next()
-        {
-            if ch.eq_ignore_ascii_case(&'v') {
-                if let Some(text) = self.clipboard.get_text() {
-                    let bracketed = self.focused_vt_bracketed_paste();
-                    let bytes = clipboard::build_paste_bytes(&text, bracketed);
-                    let _ = pty.write_all(&bytes);
-                }
-                return;
+        // Paste / copy. Handled before the generic Ctrl+letter block so
+        // the default Ctrl+Shift+V/C don't get clobbered into ^V/^C.
+        if host_action == Some(HostAction::Paste) {
+            if let Some(text) = self.clipboard.get_text() {
+                let bracketed = self.focused_vt_bracketed_paste();
+                let bytes = clipboard::build_paste_bytes(&text, bracketed);
+                let _ = pty.write_all(&bytes);
             }
-            if ch.eq_ignore_ascii_case(&'c') {
-                self.copy_selection_to_clipboard(false);
-                // Reset the selection after copying so the highlight clears.
-                if self.selection.is_some() {
-                    self.selection = None;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+            return;
+        }
+        if host_action == Some(HostAction::Copy) {
+            self.copy_selection_to_clipboard(false);
+            // Reset the selection after copying so the highlight clears.
+            if self.selection.is_some() {
+                self.selection = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
-                return;
             }
+            return;
         }
 
         // Ctrl+key
@@ -2221,13 +2200,25 @@ impl App {
     /// of the search work; this scaffold only owns the state
     /// transitions and redraw triggers.
     fn handle_search_key_input(&mut self, event: &winit::event::KeyEvent) {
-        let Some(search) = self.search.as_mut() else { return };
-
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => {
-                let path = search.target_path.clone();
-                let saved = search.saved_scrollback;
-                let was_editing = search.editing;
+        if self.search.is_none() {
+            return;
+        }
+        // Resolve the configured in-search chord once, before borrowing
+        // `search` mutably. Close and paging are safe to dispatch up front
+        // — their chords don't collide with query typing, jump labels, or
+        // expand mode. NextMatch/PrevMatch/ToggleCase are handled at their
+        // proper precedence inside the character arm below.
+        let search_action = self.keys.resolve_search(&event.logical_key, &self.modifiers);
+        match search_action {
+            Some(SearchAction::Close) => {
+                let (path, saved, was_editing) = {
+                    let search = self.search.as_ref().unwrap();
+                    (
+                        search.target_path.clone(),
+                        search.saved_scrollback,
+                        search.editing,
+                    )
+                };
                 self.search = None;
                 if was_editing {
                     self.set_target_scrollback(&path, saved);
@@ -2235,19 +2226,28 @@ impl App {
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+                return;
             }
-            Key::Named(NamedKey::PageUp) => {
+            Some(SearchAction::PageUp) => {
                 self.search_scroll_by_pages(1);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+                return;
             }
-            Key::Named(NamedKey::PageDown) => {
+            Some(SearchAction::PageDown) => {
                 self.search_scroll_by_pages(-1);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
+                return;
             }
+            _ => {}
+        }
+
+        let Some(search) = self.search.as_mut() else { return };
+
+        match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
                 // In expansion mode Enter commits: close the overlay,
                 // leaving the grown selection in place.
@@ -2335,47 +2335,47 @@ impl App {
                         return;
                     }
                 }
+                if search_action == Some(SearchAction::ToggleCase) {
+                    search.case_insensitive = !search.case_insensitive;
+                    search.current = 0;
+                    self.recompute_search_matches();
+                    self.scroll_to_current_match();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                // Swallow any other Alt combo so it doesn't leak into the
+                // query (matches the pre-config behavior where only Alt+C
+                // did anything and every other Alt press was ignored).
                 if self.modifiers.alt_key() {
-                    if s.eq_ignore_ascii_case("c") {
-                        search.case_insensitive = !search.case_insensitive;
-                        search.current = 0;
-                        self.recompute_search_matches();
+                    return;
+                }
+                if !search.editing {
+                    if search_action == Some(SearchAction::NextMatch) {
+                        if !search.matches.is_empty() {
+                            search.current = (search.current + 1) % search.matches.len();
+                        }
                         self.scroll_to_current_match();
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
+                        return;
                     }
-                    return;
-                }
-                if !search.editing {
-                    match s {
-                        "n" => {
-                            if !search.matches.is_empty() {
-                                search.current =
-                                    (search.current + 1) % search.matches.len();
-                            }
-                            self.scroll_to_current_match();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
+                    if search_action == Some(SearchAction::PrevMatch) {
+                        if !search.matches.is_empty() {
+                            let n = search.matches.len();
+                            search.current = (search.current + n - 1) % n;
                         }
-                        "N" => {
-                            if !search.matches.is_empty() {
-                                let n = search.matches.len();
-                                search.current = (search.current + n - 1) % n;
-                            }
-                            self.scroll_to_current_match();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                            return;
+                        self.scroll_to_current_match();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
                         }
-                        _ => {
-                            search.editing = true;
-                            search.query.clear();
-                        }
+                        return;
                     }
+                    // Any other key starts a fresh query.
+                    search.editing = true;
+                    search.query.clear();
                 }
                 search.query.push_str(s);
                 search.current = 0;
@@ -2662,7 +2662,15 @@ impl ApplicationHandler for App {
 
         // Initialize terminal renderer and measure cell dimensions
         let font_size = 16.0 * window.scale_factor() as f32;
-        let term_renderer = renderer::TerminalRenderer::new(&mut canvas, font_size);
+        let mut term_renderer = renderer::TerminalRenderer::new(&mut canvas, font_size);
+        // Apply configured search-chrome colors (bar background falls
+        // back to accent slot 0 when unset).
+        term_renderer.set_search_colors(
+            self.config.search_bar_bg().to_femto(),
+            self.config.search.bar_text.to_femto(),
+            self.config.search.current_match.to_femto(),
+            self.config.search.match_color.to_femto(),
+        );
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
         // VGE engine: needs cell pixel dimensions and HiDPI scale factor.
@@ -2676,7 +2684,7 @@ impl ApplicationHandler for App {
         // engine's reserved `host.*` namespace (depth 0). vmux and other
         // clients reference `host.accent` instead of hardcoding colors;
         // per-portal engines get their own depth-keyed copy on creation.
-        vge_engine.seed_host_styles(host_accent_palette(), 0);
+        vge_engine.seed_host_styles(host_accent_palette(&self.config), 0);
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -2698,7 +2706,7 @@ impl ApplicationHandler for App {
         // Same palette as the top-level VGE engine, inherited by every
         // per-portal VGE engine PRT spawns; each portal keys its
         // contextual `host.accent` on its own nesting depth.
-        prt_engine.set_host_palette(host_accent_palette());
+        prt_engine.set_host_palette(host_accent_palette(&self.config));
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a
@@ -3238,9 +3246,10 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    let config = config::Config::load();
     let event_loop = EventLoop::new().unwrap();
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, config);
     event_loop.run_app(&mut app).unwrap();
 }
 

@@ -973,6 +973,14 @@ pub struct TerminalRenderer {
     // engine state stays GUI-free.
     gpu_image_handles: HashMap<crate::vge::GpuImageId, femtovg::ImageId>,
     next_gpu_image_id: u64,
+
+    // Search-chrome colors. Configurable via the user's config
+    // (`[search]`); default to the values that were hardcoded here
+    // before the config existed. Set via `set_search_colors`.
+    search_bar_bg: Color,
+    search_bar_text: Color,
+    search_current_match: Color,
+    search_match: Color,
 }
 
 impl TerminalRenderer {
@@ -1048,7 +1056,36 @@ impl TerminalRenderer {
             glyph_cache: GlyphCache::new(),
             gpu_image_handles: HashMap::new(),
             next_gpu_image_id: 0,
+            search_bar_bg: Color::rgb(0x56, 0x79, 0x9f),
+            search_bar_text: Color::rgb(230, 230, 230),
+            search_current_match: Color::rgb(220, 160, 0),
+            search_match: Color::rgb(80, 80, 30),
         }
+    }
+
+    /// Override the search-chrome colors from user config. Called once
+    /// after construction; the defaults above stand in until then.
+    pub fn set_search_colors(
+        &mut self,
+        bar_bg: Color,
+        bar_text: Color,
+        current_match: Color,
+        other_match: Color,
+    ) {
+        self.search_bar_bg = bar_bg;
+        self.search_bar_text = bar_text;
+        self.search_current_match = current_match;
+        self.search_match = other_match;
+    }
+
+    /// Search-bar background color (for `draw_search_bar`).
+    pub fn search_bar_bg(&self) -> Color {
+        self.search_bar_bg
+    }
+
+    /// Search-bar text color (for `draw_search_bar`).
+    pub fn search_bar_text(&self) -> Color {
+        self.search_bar_text
     }
 
     /// Allocate a fresh `GpuImageId` and record the renderer-side
@@ -1426,15 +1463,17 @@ impl TerminalRenderer {
         // The current match takes precedence over other matches on the
         // same cell so n/N reliably colors the active hit even if it
         // happens to overlap another (e.g. very short query).
+        let current_match = self.search_current_match;
+        let other_match = self.search_match;
         let highlight_color = |r: u16, c: u16| -> Option<Color> {
             let spans = search_highlights?;
             let mut color: Option<Color> = None;
             for span in spans {
                 if span.row == r && c >= span.col_start && c < span.col_end {
                     if span.is_current {
-                        return Some(Color::rgb(220, 160, 0));
+                        return Some(current_match);
                     }
-                    color = Some(Color::rgb(80, 80, 30));
+                    color = Some(other_match);
                 }
             }
             color

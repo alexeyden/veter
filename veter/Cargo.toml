@@ -36,3 +36,5 @@ imgref = "1"
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 memchr = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

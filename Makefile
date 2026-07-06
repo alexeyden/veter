@@ -16,6 +16,15 @@ DESKTOP_FILE := $(APPDIR)/veter.desktop
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
 
+# Skeleton config. The live copy lands in the user's config dir (the same
+# path veter reads at startup) only when absent, so edits survive
+# re-installs; a pristine reference copy is always refreshed under
+# $(PREFIX)/share/veter.
+CONFIGDIR ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/veter
+EXAMPLE_CONFIG_SRC := $(CURDIR)/assets/config.toml
+EXAMPLE_CONFIG_DST := $(PREFIX)/share/veter/config.example.toml
+USER_CONFIG_DST := $(CONFIGDIR)/config.toml
+
 # Raster sizes installed for desktop menus that don't pick up the
 # scalable SVG (KDE Plasma's menu cache, GTK older versions, etc).
 ICON_PNG_SIZES := 16 32 48 64 128 256
@@ -39,7 +48,7 @@ RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
 .PHONY: all build install uninstall clean help install-desktop install-icon \
-        dist-clean install-dist-maybe \
+        install-config dist-clean install-dist-maybe \
         dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb \
         dist-aarch64-manifest install-remote-aarch64 \
         dist-amd64-build dist-amd64-tarxz dist-amd64-deb \
@@ -51,6 +60,7 @@ help:
 	@echo "Targets:"
 	@echo "  build               cargo build --release for $(PACKAGES)"
 	@echo "  install             build and copy binaries into \$$BINDIR + desktop entry"
+	@echo "                      + skeleton config into \$$CONFIGDIR (if absent)"
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
@@ -84,7 +94,7 @@ build:
 # is missing after the build.
 $(BINS): build
 
-install: $(BINS) install-desktop install-icon install-dist-maybe
+install: $(BINS) install-desktop install-icon install-config install-dist-maybe
 	@$(INSTALL) -d $(BINDIR)
 	@for pkg in $(PACKAGES); do \
 	    src="$(RELEASE_DIR)/$$pkg"; \
@@ -144,6 +154,22 @@ install-icon:
 	    gtk-update-icon-cache -q -f -t "$(ICONROOT)" >/dev/null 2>&1 || true; \
 	fi
 
+# Install the commented skeleton config. A pristine reference copy is
+# always (re)written to $(EXAMPLE_CONFIG_DST); the live copy is dropped
+# into $(USER_CONFIG_DST) only if none exists yet, so re-running install
+# never overwrites your edits.
+install-config:
+	@$(INSTALL) -d "$(dir $(EXAMPLE_CONFIG_DST))"
+	@$(INSTALL) -m 0644 "$(EXAMPLE_CONFIG_SRC)" "$(EXAMPLE_CONFIG_DST)"
+	@echo "    config.example.toml -> $(EXAMPLE_CONFIG_DST)"
+	@if [ -f "$(USER_CONFIG_DST)" ]; then \
+	    echo "    config.toml already at $(USER_CONFIG_DST) (left unchanged)"; \
+	else \
+	    $(INSTALL) -d "$(CONFIGDIR)"; \
+	    $(INSTALL) -m 0644 "$(EXAMPLE_CONFIG_SRC)" "$(USER_CONFIG_DST)"; \
+	    echo "    config.toml -> $(USER_CONFIG_DST)"; \
+	fi
+
 uninstall:
 	@for pkg in $(PACKAGES); do \
 	    rm -f "$(BINDIR)/$$pkg" && echo "    removed $(BINDIR)/$$pkg"; \
@@ -151,6 +177,12 @@ uninstall:
 	@if [ -d "$(PREFIX)/share/veter/dist" ]; then \
 	    rm -rf "$(PREFIX)/share/veter/dist" && \
 	    echo "    removed $(PREFIX)/share/veter/dist"; \
+	fi
+	@if [ -f "$(EXAMPLE_CONFIG_DST)" ]; then \
+	    rm -f "$(EXAMPLE_CONFIG_DST)" && echo "    removed $(EXAMPLE_CONFIG_DST)"; \
+	fi
+	@if [ -f "$(USER_CONFIG_DST)" ]; then \
+	    echo "    kept user config $(USER_CONFIG_DST) (remove by hand if unwanted)"; \
 	fi
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
