@@ -74,12 +74,11 @@
 # key = "o"                                  # open a path/URL with the default app
 # command = 'xdg-open "$VETER_SELECTION"'
 #
-# Edit the selection in vim first, then open the (possibly edited) result.
-# Commands run detached, so vim gets its own window via `veter -e` (a new
-# veter window that closes when vim exits). $VETER_EXE is the running veter
-# binary; on save+quit the edited text is handed to xdg-open. Needs vim and
-# xdg-open.
+# Edit the selection in vim, then run the edited text as a command in $SHELL.
+# Opens a veter window (vim needs a terminal); on save & quit the edited
+# command runs there, and the window closes when it finishes. $VETER_EXE is
+# the running veter binary (so it works regardless of PATH). Needs vim.
 # [[selection_commands]]
 # key = "e"
-# description = "edit in vim, then open"     # optional, ignored at runtime
-# command = 'f=$(mktemp); printf "%s" "$VETER_SELECTION" > "$f"; "${VETER_EXE:-veter}" -e vim "$f" && xdg-open "$(cat "$f")"; rm -f "$f"'
+# description = "edit in vim, then run"      # optional, ignored at runtime
+# command = 'export VETER_EDIT=$(mktemp); printf "%s" "$VETER_SELECTION" > "$VETER_EDIT"; "${VETER_EXE:-veter}" -e "$SHELL" -c "vim \"\$VETER_EDIT\" && \"\$SHELL\" \"\$VETER_EDIT\""; rm -f "$VETER_EDIT"'
