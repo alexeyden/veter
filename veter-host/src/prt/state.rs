@@ -711,9 +711,16 @@ impl PrtEngine {
                     );
                 }
             }
-            // Line tracker meaningfully tracks the main screen only;
-            // re-prime against the freshly-restored main vt100 state.
-            self.line_tracker.clear();
+            // Don't clear the line tracker here: `set_size` resizes the
+            // *main* grid too, so a resize while the alt screen was up
+            // pushes/pulls main-grid rows and moves `origin_shift`. The
+            // main screen's text genuinely shifted by that much, so the
+            // `update` below must apply the accumulated delta (matching
+            // VGE) instead of re-baselining it away — otherwise
+            // Scrollback-anchored portals land N rows off after a
+            // resize-during-alt round trip. Updates are skipped while on
+            // alt (below), so `prev_shift` stayed frozen at the pre-alt
+            // value and the delta is exactly the resize shift.
         }
 
         // Anchor math is meaningful only on the main screen — the alt
@@ -2007,6 +2014,43 @@ mod tests {
         let _ = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 4, &body);
         let portal = &engine.state.current().portals["p"];
         assert_eq!(portal.vge.top_of_live_screen(), top_before);
+    }
+
+    #[test]
+    fn resize_during_alt_screen_keeps_main_line_tracker_aligned() {
+        // Regression: leaving the alt screen used to `clear()` the line
+        // tracker, discarding the `origin_shift` delta a resize applied
+        // to the *main* grid while the alt screen was up. `set_size`
+        // resizes both grids, so a vim-then-resize-then-quit round trip
+        // pushed N rows into the main scrollback yet left
+        // `top_of_live_screen` unmoved, landing Scrollback-anchored
+        // portals N rows off. The tracker must follow the shift — the
+        // same way the VGE engine already does.
+        let mut engine = PrtEngine::new();
+        let mut parser = vt100::Parser::new(10, 80, 100);
+
+        // Fill the main screen; the tracker baselines on the first call.
+        parser.process(&b"line\r\n".repeat(15));
+        engine.after_vt100_process(&mut parser);
+        let top_before = engine.top_of_live_screen();
+
+        // Enter the alt screen (vim-style) — updates are skipped while
+        // alt is active, freezing the tracker's baseline.
+        parser.process(b"\x1b[?1049h");
+        engine.after_vt100_process(&mut parser);
+        assert!(parser.screen().alternate_screen());
+
+        // Resize while on alt. The cursor sat on the main grid's bottom
+        // row, so shrinking to 6 pushes 4 rows into the main scrollback.
+        parser.screen_mut().set_size(6, 80);
+        engine.after_vt100_process(&mut parser);
+
+        // Quit back to the main screen: the 4-row shift the resize
+        // introduced must now be reflected.
+        parser.process(b"\x1b[?1049l");
+        engine.after_vt100_process(&mut parser);
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(engine.top_of_live_screen(), top_before + 4);
     }
 
     #[test]
