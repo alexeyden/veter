@@ -162,13 +162,14 @@ fn main() -> Result<()> {
     let delay = Duration::from_millis(cli.progress_delay_ms);
     let mut ui: Box<dyn ProgressUI> = if cli.no_progress {
         Box::new(NoopProgress)
-    } else if vge_probe.is_some() {
+    } else if let Some(vge) = vge_probe {
         Box::new(DelayedProgress::new(
             VgeProgress::new(
                 format!("vsend-progress-{}", std::process::id()),
                 format!("vsend: {basename}"),
                 cursor_row,
                 term_cols,
+                (vge.cell_pixel_width, vge.cell_pixel_height),
             ),
             delay,
         ))
