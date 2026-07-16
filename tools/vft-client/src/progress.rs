@@ -24,6 +24,7 @@ use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
 };
 use vge_protocol::encode::build_envelope;
+use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_protocol::path::{PathNode, PathSegment};
 
 /// Bar thickness in cells. The element still occupies a full 1-cell
@@ -32,6 +33,16 @@ use vge_protocol::path::{PathNode, PathSegment};
 const BAR_H: f32 = 0.5;
 /// Y offset of the bar within its row, centring `BAR_H` vertically.
 const BAR_Y: f32 = (1.0 - BAR_H) / 2.0;
+/// `origin.y` for the status text. The renderer places a `DrawText`
+/// baseline at `origin.y * cell_h + ascent`
+/// (`doc/vector-graphics-extension.md` §7.4), i.e. `origin.y` is the
+/// *top of the text's cell row*, not the baseline. So `0.0` is what puts
+/// the text inside the bar's own row, exactly where the terminal's own
+/// grid text would sit. A nonzero fraction here reads like "nudge the
+/// baseline down within the row" but actually adds a whole ascent on top
+/// and pushes the label into the *next* row, where it collides with
+/// whatever the caller prints after the bar.
+const TEXT_Y: f32 = 0.0;
 
 const TRACK_RGBA: Color = Color {
     r: 0.20,
@@ -66,9 +77,26 @@ pub trait ProgressUI {
     /// `total = 0` means "unknown size" — the implementation should
     /// fall back to a count-only display.
     fn update(&mut self, current: u64, total: u64, rate_bps: f64) -> Result<()>;
-    /// Tear down the UI (e.g. delete the VGE element) and print
-    /// `final_line` on its own row at the cursor.
-    fn finish(&mut self, final_line: &str) -> Result<()>;
+    /// Remove the UI from the screen (e.g. delete the VGE element)
+    /// without printing anything.
+    ///
+    /// Must be idempotent and safe on a UI that never started, so every
+    /// exit path — including the error and Ctrl+C ones — can call it
+    /// unconditionally. A VGE element the client forgets to delete
+    /// outlives the process: it is host state, and nothing else ever
+    /// collects it.
+    fn teardown(&mut self) -> Result<()>;
+    /// Tear the UI down and print `final_line` on its own row at the
+    /// cursor. `\r\n` (not `\n`) because the caller holds the tty in raw
+    /// mode, where `OPOST` is off and a bare `\n` would not return the
+    /// carriage.
+    fn finish(&mut self, final_line: &str) -> Result<()> {
+        self.teardown()?;
+        let mut out = std::io::stdout().lock();
+        write!(out, "{final_line}\r\n")?;
+        out.flush()?;
+        Ok(())
+    }
 }
 
 /// Adapter that suppresses an inner `ProgressUI` until the transfer
@@ -86,6 +114,11 @@ pub struct DelayedProgress<P: ProgressUI> {
     delay: std::time::Duration,
     started_at: Option<Instant>,
     showing: bool,
+    /// Latched by `teardown`. Without it a late `update` would sail past
+    /// the `showing` check and `start()` the inner UI a second time,
+    /// resurrecting a bar that was just deleted — and leaving that one
+    /// on screen for good, since nothing tears it down twice.
+    done: bool,
 }
 
 impl<P: ProgressUI> DelayedProgress<P> {
@@ -95,6 +128,7 @@ impl<P: ProgressUI> DelayedProgress<P> {
             delay,
             started_at: None,
             showing: false,
+            done: false,
         }
     }
 }
@@ -105,7 +139,22 @@ impl<P: ProgressUI> ProgressUI for DelayedProgress<P> {
         Ok(())
     }
 
+    fn teardown(&mut self) -> Result<()> {
+        let was_showing = self.showing;
+        self.showing = false;
+        self.done = true;
+        if !was_showing {
+            // The bar never materialised, so there is nothing on screen
+            // and — crucially — no VGE element on the host to delete.
+            return Ok(());
+        }
+        self.inner.teardown()
+    }
+
     fn update(&mut self, current: u64, total: u64, rate_bps: f64) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
         if !self.showing {
             let Some(t0) = self.started_at else {
                 return Ok(());
@@ -119,18 +168,9 @@ impl<P: ProgressUI> ProgressUI for DelayedProgress<P> {
         self.inner.update(current, total, rate_bps)
     }
 
-    fn finish(&mut self, final_line: &str) -> Result<()> {
-        if self.showing {
-            self.inner.finish(final_line)
-        } else {
-            // Bar never materialised; just emit the final line so the
-            // caller's wrapper output sequence remains uniform.
-            let mut out = std::io::stdout().lock();
-            write!(out, "{final_line}\r\n")?;
-            out.flush()?;
-            Ok(())
-        }
-    }
+    // `finish` is the default: teardown (a no-op when the bar never
+    // materialised) then the final line, so the caller's output sequence
+    // is uniform whether or not the threshold was crossed.
 }
 
 // ---- VGE progress ----------------------------------------------------
@@ -147,6 +187,9 @@ pub struct VgeProgress {
     corner_rx: f32,
     label: String,
     last_render: Option<Instant>,
+    /// Set once `DeleteElement` has been emitted, so `teardown` is
+    /// idempotent.
+    torn_down: bool,
 }
 
 impl VgeProgress {
@@ -165,6 +208,7 @@ impl VgeProgress {
             corner_rx: corner_rx_cells(cell_px.0, cell_px.1),
             label,
             last_render: None,
+            torn_down: false,
         }
     }
 
@@ -178,6 +222,19 @@ impl VgeProgress {
         format_status(&self.label, current, total, rate_bps)
     }
 
+    /// Emit VGE commands with `REQ_ID_NO_RESPONSE`.
+    ///
+    /// The bar is pure decoration: nothing here inspects a response, and
+    /// `vsend` / `vrecv` discard every `HostFrame::Vge` they receive. A
+    /// real request id would make the host ack *every* command
+    /// (`VgeEngine::dispatch_frame` acks anything but this sentinel), so
+    /// a 30 Hz bar bills the client two `RSP_OK` envelopes per tick —
+    /// tens of thousands over a multi-minute transfer. Any of that
+    /// backlog still unread when the client exits lands on the shell's
+    /// stdin, where zsh's zle binds `ESC _` to `insert-last-word` and
+    /// echoes the lot back as caret-notation garbage. Not generating the
+    /// acks is the only way to be sure none leak. `vcat`'s upload bar
+    /// uses the same sentinel for the same reason.
     fn write_envelope(&self, env: &[u8]) -> Result<()> {
         let mut out = std::io::stdout().lock();
         out.write_all(env)?;
@@ -186,8 +243,9 @@ impl VgeProgress {
     }
 }
 
-impl ProgressUI for VgeProgress {
-    fn start(&mut self) -> Result<()> {
+impl VgeProgress {
+    /// The `CreateElement` envelope `start` puts on the wire.
+    fn create_envelope(&self) -> Vec<u8> {
         let bg = DrawCmd::FillPath {
             fill: Style::Flat(TRACK_RGBA),
             segments: self.bar_path(self.bar_w),
@@ -199,7 +257,7 @@ impl ProgressUI for VgeProgress {
         let text = DrawCmd::DrawText {
             origin: Point {
                 x: self.bar_w / 2.0,
-                y: 0.78,
+                y: TEXT_Y,
             },
             align: Align::Center,
             fill: Style::Flat(TEXT_RGBA),
@@ -219,8 +277,63 @@ impl ProgressUI for VgeProgress {
             size: None,
             transform: None,
         });
-        let env = build_envelope(&[(create, 0)]);
-        self.write_envelope(&env)?;
+        build_envelope(&[(create, REQ_ID_NO_RESPONSE)])
+    }
+
+    /// The paired `UpdateCommand` envelope `update` puts on the wire.
+    fn update_envelope(&self, current: u64, total: u64, rate_bps: f64) -> Vec<u8> {
+        let frac = if total == 0 {
+            0.0
+        } else {
+            (current as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        let fill_w = self.bar_w * frac;
+        let fg_cmd = DrawCmd::FillPath {
+            fill: Style::Flat(FILL_RGBA),
+            segments: self.bar_path(fill_w),
+        };
+        let text_cmd = DrawCmd::DrawText {
+            origin: Point {
+                x: self.bar_w / 2.0,
+                y: TEXT_Y,
+            },
+            align: Align::Center,
+            fill: Style::Flat(TEXT_RGBA),
+            font_style: FontStyle::default(),
+            text: self.render_text(current, total, rate_bps),
+        };
+        let upd_fg = Command::UpdateCommand(UpdateCommandBody {
+            id: self.element_id.clone(),
+            index: CMD_IDX_FG,
+            command: fg_cmd,
+        });
+        let upd_text = Command::UpdateCommand(UpdateCommandBody {
+            id: self.element_id.clone(),
+            index: CMD_IDX_TEXT,
+            command: text_cmd,
+        });
+        build_envelope(&[
+            (upd_fg, REQ_ID_NO_RESPONSE),
+            (upd_text, REQ_ID_NO_RESPONSE),
+        ])
+    }
+
+    /// The `DeleteElement` envelope `teardown` puts on the wire.
+    fn delete_envelope(&self) -> Vec<u8> {
+        let del = Command::DeleteElement {
+            id: self.element_id.clone(),
+        };
+        build_envelope(&[(del, REQ_ID_NO_RESPONSE)])
+    }
+}
+
+impl ProgressUI for VgeProgress {
+    fn start(&mut self) -> Result<()> {
+        // Hand the delete to the signal handler before drawing anything:
+        // a SIGTERM/SIGHUP kills the process without unwinding, so this
+        // is the only thing that can take the bar down on that path.
+        crate::cancel::set_signal_cleanup_envelope(&self.delete_envelope());
+        self.write_envelope(&self.create_envelope())?;
         // Move the cursor below the bar so subsequent stdout doesn't
         // overlap. \r\n covers raw + cooked modes.
         let mut out = std::io::stdout().lock();
@@ -238,51 +351,18 @@ impl ProgressUI for VgeProgress {
             }
         }
         self.last_render = Some(now);
-
-        let frac = if total == 0 {
-            0.0
-        } else {
-            (current as f32 / total as f32).clamp(0.0, 1.0)
-        };
-        let fill_w = self.bar_w * frac;
-        let fg_cmd = DrawCmd::FillPath {
-            fill: Style::Flat(FILL_RGBA),
-            segments: self.bar_path(fill_w),
-        };
-        let text_cmd = DrawCmd::DrawText {
-            origin: Point {
-                x: self.bar_w / 2.0,
-                y: 0.78,
-            },
-            align: Align::Center,
-            fill: Style::Flat(TEXT_RGBA),
-            font_style: FontStyle::default(),
-            text: self.render_text(current, total, rate_bps),
-        };
-        let upd_fg = Command::UpdateCommand(UpdateCommandBody {
-            id: self.element_id.clone(),
-            index: CMD_IDX_FG,
-            command: fg_cmd,
-        });
-        let upd_text = Command::UpdateCommand(UpdateCommandBody {
-            id: self.element_id.clone(),
-            index: CMD_IDX_TEXT,
-            command: text_cmd,
-        });
-        let env = build_envelope(&[(upd_fg, 0), (upd_text, 0)]);
-        self.write_envelope(&env)
+        self.write_envelope(&self.update_envelope(current, total, rate_bps))
     }
 
-    fn finish(&mut self, final_line: &str) -> Result<()> {
-        let del = Command::DeleteElement {
-            id: self.element_id.clone(),
-        };
-        let env = build_envelope(&[(del, 0)]);
-        self.write_envelope(&env)?;
-        let mut out = std::io::stdout().lock();
-        write!(out, "{final_line}\r\n")?;
-        out.flush()?;
-        Ok(())
+    fn teardown(&mut self) -> Result<()> {
+        if self.torn_down {
+            return Ok(());
+        }
+        self.torn_down = true;
+        // The bar is coming down here; a signal arriving later must not
+        // re-send a delete for an id that no longer exists.
+        crate::cancel::clear_signal_cleanup_envelope();
+        self.write_envelope(&self.delete_envelope())
     }
 }
 
@@ -332,13 +412,13 @@ impl ProgressUI for AsciiProgress {
         Ok(())
     }
 
-    fn finish(&mut self, final_line: &str) -> Result<()> {
+    fn teardown(&mut self) -> Result<()> {
+        // Erase the in-place bar line; `finish` then prints the final
+        // line over the cleared row.
         let mut err = std::io::stderr().lock();
         write!(err, "\r\x1b[K")?;
         err.flush()?;
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{final_line}")?;
-        out.flush()?;
+        self.last_line_len = 0;
         Ok(())
     }
 }
@@ -674,7 +754,7 @@ mod tests {
     struct Recorder {
         starts: u32,
         updates: Vec<(u64, u64, f64)>,
-        finishes: Vec<String>,
+        teardowns: u32,
     }
 
     impl ProgressUI for Recorder {
@@ -686,8 +766,8 @@ mod tests {
             self.updates.push((c, t, r));
             Ok(())
         }
-        fn finish(&mut self, line: &str) -> Result<()> {
-            self.finishes.push(line.to_string());
+        fn teardown(&mut self) -> Result<()> {
+            self.teardowns += 1;
             Ok(())
         }
     }
@@ -702,9 +782,9 @@ mod tests {
         d.finish("done").unwrap();
         assert_eq!(d.inner.starts, 0, "inner.start should not run for fast transfers");
         assert!(d.inner.updates.is_empty());
-        assert!(
-            d.inner.finishes.is_empty(),
-            "inner.finish should not run if the bar never materialised"
+        assert_eq!(
+            d.inner.teardowns, 0,
+            "nothing was drawn, so there is nothing to tear down"
         );
     }
 
@@ -723,6 +803,137 @@ mod tests {
         d.update(100, 100, 0.0).unwrap();
         d.finish("done").unwrap();
         assert_eq!(d.inner.updates.len(), 2);
-        assert_eq!(d.inner.finishes, vec!["done".to_string()]);
+        assert_eq!(d.inner.teardowns, 1, "a revealed bar must be torn down");
+    }
+
+    #[test]
+    fn teardown_is_idempotent_once_shown() {
+        // Every exit path calls teardown unconditionally, and some call
+        // it twice (an explicit teardown, then a finish). The second
+        // call must not emit a second DeleteElement.
+        use std::thread::sleep;
+        use std::time::Duration;
+        let mut d = DelayedProgress::new(Recorder::default(), Duration::from_millis(1));
+        d.start().unwrap();
+        sleep(Duration::from_millis(5));
+        d.update(10, 100, 0.0).unwrap();
+        d.teardown().unwrap();
+        d.teardown().unwrap();
+        d.finish("done").unwrap();
+        assert_eq!(d.inner.teardowns, 1, "teardown must collapse to one delete");
+
+        // A late update must not redraw the bar we just deleted.
+        let before = d.inner.starts;
+        d.update(90, 100, 0.0).unwrap();
+        assert_eq!(d.inner.starts, before, "a torn-down bar must stay down");
+    }
+
+    #[test]
+    fn vge_progress_never_asks_the_host_for_a_response() {
+        // The bar is decoration: no caller inspects a VGE response, and
+        // an unread ack backlog is what garbles the shell on exit. Every
+        // command it emits must carry the "apply but don't ack" sentinel.
+        use vge_protocol::apc::ApcStream;
+        use vge_protocol::codec::Reader;
+        use vge_protocol::frame::MARKER_C2T;
+
+        // Reach past `write_envelope` (which goes to the real stdout) and
+        // assert on the encoder the way the host's parser would see it.
+        let bar = VgeProgress::new("p".into(), "vsend: f".into(), 5, 80, (10, 20));
+        let create = Command::CreateElement(CreateElementBody {
+            id: "p".into(),
+            commands: vec![DrawCmd::FillPath {
+                fill: Style::Flat(FILL_RGBA),
+                segments: bar.bar_path(bar.bar_w),
+            }],
+            origin: Point { x: 0.0, y: 0.0 },
+            is_visible: true,
+            draw_order: 0,
+            parent: None,
+            size: None,
+            transform: None,
+        });
+        let del = Command::DeleteElement { id: "p".into() };
+        let env = build_envelope(&[
+            (create, REQ_ID_NO_RESPONSE),
+            (del, REQ_ID_NO_RESPONSE),
+        ]);
+
+        let mut s = ApcStream::with_marker(*MARKER_C2T);
+        let out = s.feed(&env);
+        let payload = &out.payloads[0];
+        let mut r = Reader::new(payload);
+        r.u8().unwrap(); // protocol version
+        r.u32().unwrap(); // payload len
+        let mut seen = 0;
+        while !r.at_end() {
+            let _frame_type = r.u8().unwrap();
+            let request_id = r.u32().unwrap();
+            let body_len = r.u32().unwrap() as usize;
+            r.take(body_len).unwrap();
+            assert_eq!(
+                request_id, REQ_ID_NO_RESPONSE,
+                "a progress command with a real request id makes the host ack it"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+    }
+
+    /// The bug this guards: a cancelled `vsend` / a failed `vrecv` left
+    /// the shell echoing screenfuls of `^[_vge^@^@…`. Those were the
+    /// host's acks for the bar's own draw commands — one per command, at
+    /// 30 Hz, tens of thousands over a long transfer — that nobody read
+    /// before the client exited.
+    ///
+    /// Drive the *real* host engine with the bar's real on-wire bytes:
+    /// a full transfer's worth of commands must leave the host with
+    /// nothing to say back, while still actually drawing and removing
+    /// the element.
+    #[test]
+    fn host_never_answers_the_bar() {
+        use veter_host::vge::VgeEngine;
+
+        let mut engine = VgeEngine::new((10, 20), 1.0);
+        let mut bar = VgeProgress::new("vsend-progress-1".into(), "vsend: f".into(), 5, 80, (10, 20));
+
+        engine.process_pty_chunk(&bar.create_envelope());
+        assert!(
+            engine.state.elements().contains_key("vsend-progress-1"),
+            "the bar must still be drawn — quiet means unacked, not ignored"
+        );
+        assert!(
+            engine.take_responses().is_empty(),
+            "CreateElement drew an ack the client would have had to read"
+        );
+
+        for i in 0..=100u64 {
+            engine.process_pty_chunk(&bar.update_envelope(i, 100, 1024.0));
+        }
+        assert!(
+            engine.take_responses().is_empty(),
+            "the 30 Hz update stream is what floods the shell; it must be silent"
+        );
+
+        bar.torn_down = false; // exercise the envelope teardown() emits
+        engine.process_pty_chunk(&bar.delete_envelope());
+        assert!(
+            !engine.state.elements().contains_key("vsend-progress-1"),
+            "teardown must actually remove the host-side element"
+        );
+        assert!(
+            engine.take_responses().is_empty(),
+            "DeleteElement is the last thing on the wire before exit; \
+             its ack is the one most likely to land on the shell"
+        );
+    }
+
+    #[test]
+    fn status_text_sits_in_the_bar_row() {
+        // The renderer puts a DrawText baseline at
+        // `origin.y * cell_h + ascent`, so origin.y is the top of the
+        // text's row. Any nonzero value pushes the label a whole row down
+        // — onto the line the caller prints its own output on.
+        assert_eq!(TEXT_Y, 0.0);
     }
 }

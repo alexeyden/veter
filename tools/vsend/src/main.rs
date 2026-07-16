@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use vft_client::cancel::CancelGuard;
+use vft_client::cancel::{cancel_and_drain, CancelGuard};
 use vft_client::probe::{read_cursor_row, run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -181,11 +181,79 @@ fn main() -> Result<()> {
     };
     ui.start()?;
     let _ = ui.update(0, total_bytes, 0.0);
-
-    // Streaming loop
     let started = Instant::now();
+
+    // Everything from here on must funnel through the teardown below:
+    // the progress bar is a VGE element living in the *host*, so an exit
+    // path that skips the DeleteElement leaves the bar painted on the
+    // terminal for good, with the shell's next output printing over it.
+    let outcome = upload(
+        &stream,
+        &mut local,
+        &transfer_id,
+        total_bytes,
+        &mut next_req,
+        cli.chunk_size,
+        ui.as_mut(),
+        started,
+    );
+
+    // Take the bar down before printing anything else, on success and on
+    // failure alike (including Ctrl+C).
+    let _ = ui.teardown();
+
+    let result = match outcome {
+        Ok(final_path) => {
+            // Upload finalised on the host; nothing left to cancel.
+            cancel.disarm();
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "uploaded -> {final_path}\r\n");
+            let _ = out.flush();
+            Ok(())
+        }
+        Err(e) => {
+            // Cancel here rather than leaving it to the guard's Drop.
+            // The host answers a CancelTransfer with an RSP_OK and then a
+            // TransferAborted event; the guard fires too late in the exit
+            // sequence for anyone to read those, so they would land on the
+            // shell's stdin, where zsh's zle turns the `ESC _` marker into
+            // `insert-last-word`. Draining them here is quick — an upload
+            // has no host→client data in flight, only the two replies.
+            cancel_and_drain(&stream, &transfer_id, Duration::from_secs(5));
+            cancel.disarm();
+            Err(e)
+        }
+    };
+
+    // The bar emitted its commands with REQ_ID_NO_RESPONSE, so the host
+    // owes us no acks and there is nothing of ours left on the wire.
+    // Round-trip one VGE Probe anyway as a cheap fence: it proves the
+    // host has consumed our DeleteElement, and it costs a single response
+    // that we consume here rather than leaving for the shell.
+    if !cli.no_progress && vge_probe.is_some() {
+        stream.vge_barrier(next_req, Duration::from_secs(2));
+    }
+    let _ = resolved; // silence warning when --no-progress / non-vge
+    result
+}
+
+/// Stream the file as `UploadChunk` envelopes and finalise with
+/// `EndUpload`, returning the host's resolved final path. Every error
+/// here (Ctrl+C, a local read failure, a host abort) returns `Err` so the
+/// caller can tear the progress bar down on one path.
+#[allow(clippy::too_many_arguments)]
+fn upload(
+    stream: &ResponseStream,
+    local: &mut File,
+    transfer_id: &str,
+    total_bytes: u64,
+    next_req: &mut u32,
+    chunk_size: usize,
+    ui: &mut dyn ProgressUI,
+    started: Instant,
+) -> Result<String> {
     let mut offset: u64 = 0;
-    let mut buf = vec![0u8; cli.chunk_size];
+    let mut buf = vec![0u8; chunk_size];
     loop {
         // Ctrl+C: the reader flags a bare ETX keystroke (the tty runs with
         // ISIG cleared). Bail so the guard's Drop cancels the upload and
@@ -199,26 +267,27 @@ fn main() -> Result<()> {
         }
         let chunk = buf[..n].to_vec();
         let cmd = Command::UploadChunk(UploadChunkBody {
-            transfer_id: transfer_id.clone(),
+            transfer_id: transfer_id.to_string(),
             offset,
             data: chunk,
         });
-        let rid = next_req;
-        next_req += 1;
+        let rid = *next_req;
+        *next_req += 1;
         write_envelope(&build_envelope(&[(cmd, rid)]))?;
         offset += n as u64;
-        drain_responses(&stream)?;
+        drain_responses(stream)?;
         let rate = bytes_per_sec(offset, started);
         let _ = ui.update(offset, total_bytes, rate);
     }
 
     // EndUpload (deferred Ok)
     let end = Command::EndUpload(EndUploadBody {
-        transfer_id: transfer_id.clone(),
+        transfer_id: transfer_id.to_string(),
     });
-    let end_rid = next_req;
+    let end_rid = *next_req;
+    *next_req += 1;
     write_envelope(&build_envelope(&[(end, end_rid)]))?;
-    let final_path = wait_for_vft_ok(&stream, end_rid, |body| {
+    let final_path = wait_for_vft_ok(stream, end_rid, |body| {
         let mut r = Reader::new(body);
         let path = r
             .string()
@@ -229,23 +298,8 @@ fn main() -> Result<()> {
             .map_err(|_| anyhow!("EndUpload Ok: missing bytes_written"))?;
         Ok(path)
     })?;
-    // Upload finalised on the host; nothing left to cancel.
-    cancel.disarm();
-
     let _ = ui.update(total_bytes, total_bytes, bytes_per_sec(offset, started));
-    ui.finish(&format!("uploaded -> {final_path}"))?;
-    // VGE responses for the trailing UpdateCommand / DeleteElement
-    // envelopes the progress UI emitted are still in flight; if
-    // they land on the shell's stdin after we exit, zsh's zle
-    // interprets `ESC _` as `insert-last-word` and pastes our argv
-    // back onto the next prompt. Round-trip a VGE Probe to flush
-    // them deterministically (VGE spec §1.2: one response per
-    // command, in order).
-    if !cli.no_progress && vge_probe.is_some() {
-        stream.vge_barrier(next_req, Duration::from_secs(2));
-    }
-    let _ = resolved; // silence warning when --no-progress / non-vge
-    Ok(())
+    Ok(final_path)
 }
 
 // -------- helpers ------------------------------------------------------
@@ -258,10 +312,7 @@ impl ProgressUI for NoopProgress {
     fn update(&mut self, _: u64, _: u64, _: f64) -> Result<()> {
         Ok(())
     }
-    fn finish(&mut self, line: &str) -> Result<()> {
-        let mut out = std::io::stdout().lock();
-        write!(out, "{line}\r\n")?;
-        out.flush()?;
+    fn teardown(&mut self) -> Result<()> {
         Ok(())
     }
 }

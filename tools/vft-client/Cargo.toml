@@ -10,3 +10,11 @@ vge-protocol = { path = "../../vge-protocol" }
 anyhow = "1"
 nix = { version = "0.29", features = ["term", "poll"] }
 libc = "0.2"
+
+[dev-dependencies]
+# The real host engine, so the progress bar's exact on-wire bytes can be
+# tested against the thing that will actually parse them — in particular
+# that they provoke no response frames (an unread ack backlog is what
+# garbles the shell when a transfer is cancelled). No `gui` feature: the
+# VGE engine is GUI-free.
+veter-host = { path = "../../veter-host" }

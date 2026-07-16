@@ -173,20 +173,26 @@ fn main() -> Result<()> {
     ) {
         Ok(n) => n,
         Err(e) => {
+            // Take the bar down first: it is a VGE element living in the
+            // *host*, so an exit that skips the DeleteElement leaves it
+            // painted on the terminal for good.
+            let _ = ui.teardown();
             // Graceful error / Ctrl+C: tell the host to stop and swallow
             // the chunks already in flight so they don't land on the shell
             // once we exit. The download window is small (host caps it at
             // ~128 KiB), so this drains in a few seconds even on a slow
             // link; the 30 s cap is only a safety net for a host that
             // never confirms the abort. Note it, since draining can take a
-            // moment and should not look like a hang.
-            let _ = ui.finish(&format!("cancelling: {e}"));
+            // moment and should not look like a hang. The error itself is
+            // printed by the caller, so don't repeat it here.
+            {
+                let mut out = std::io::stdout().lock();
+                let _ = write!(out, "cancelling transfer...\r\n");
+                let _ = out.flush();
+            }
             cancel_and_drain(&stream, &transfer_id, Duration::from_secs(30));
             cancel.disarm();
             let _ = std::fs::remove_file(&local_path);
-            // Flush the progress bar's trailing VGE responses too, so they
-            // don't leak onto the shell after we exit (same rationale as
-            // the success path below).
             if !cli.no_progress && vge_probe.is_some() {
                 stream.vge_barrier(begin_rid.wrapping_add(1), Duration::from_secs(2));
             }
@@ -204,13 +210,11 @@ fn main() -> Result<()> {
         resolved_path,
         local_path.display()
     ))?;
-    // VGE responses for the trailing UpdateCommand / DeleteElement
-    // envelopes the progress UI emitted are still in flight; if
-    // they land on the shell's stdin after we exit, zsh's zle
-    // interprets `ESC _` as `insert-last-word` and pastes our argv
-    // back onto the next prompt. Round-trip a VGE Probe to flush
-    // them deterministically (VGE spec §1.2: one response per
-    // command, in order).
+    // The bar emitted its commands with REQ_ID_NO_RESPONSE, so the host
+    // owes us no acks and there is nothing of ours left on the wire.
+    // Round-trip one VGE Probe anyway as a cheap fence: it proves the
+    // host has consumed our DeleteElement, and it costs a single response
+    // that we consume here rather than leaving for the shell.
     if !cli.no_progress && vge_probe.is_some() {
         stream.vge_barrier(begin_rid.wrapping_add(1), Duration::from_secs(2));
     }
@@ -328,10 +332,7 @@ impl ProgressUI for NoopProgress {
     fn update(&mut self, _: u64, _: u64, _: f64) -> Result<()> {
         Ok(())
     }
-    fn finish(&mut self, line: &str) -> Result<()> {
-        let mut out = std::io::stdout().lock();
-        write!(out, "{line}\r\n")?;
-        out.flush()?;
+    fn teardown(&mut self) -> Result<()> {
         Ok(())
     }
 }

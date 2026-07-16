@@ -2925,6 +2925,7 @@ dependencies = [
  "anyhow",
  "libc",
  "nix 0.29.0",
+ "veter-host",
  "vft-protocol",
  "vge-protocol",
 ]

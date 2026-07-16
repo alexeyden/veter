@@ -67,27 +67,50 @@ static SIG_ENVELOPE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static SIG_ENVELOPE_LEN: AtomicUsize = AtomicUsize::new(0);
 static SIG_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn handle_cancel_signal(sig: libc::c_int) {
-    let ptr = SIG_ENVELOPE_PTR.load(Ordering::SeqCst);
-    let len = SIG_ENVELOPE_LEN.load(Ordering::SeqCst);
-    if !ptr.is_null() && len > 0 {
-        // Best-effort async-signal-safe write straight to fd 1. Partial
-        // writes are retried; any error (e.g. the terminal already hung
-        // up) is ignored — there is nothing useful to do from here.
-        let mut off = 0usize;
-        while off < len {
-            let n = unsafe {
-                libc::write(
-                    libc::STDOUT_FILENO,
-                    ptr.add(off) as *const libc::c_void,
-                    len - off,
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            off += n as usize;
+// A second envelope written right after the cancel one: the progress
+// bar's `DeleteElement`. The handler re-raises with the default
+// disposition, so the process dies without unwinding — no `Drop`, no
+// `ProgressUI::teardown`. Without this, a `kill` during a transfer would
+// leave the bar's VGE element painted on the terminal permanently, since
+// the element is host state that only an explicit delete ever frees.
+static SIG_CLEANUP_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static SIG_CLEANUP_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Best-effort async-signal-safe write straight to fd 1. Partial writes
+/// are retried; any error (e.g. the terminal already hung up) is ignored
+/// — there is nothing useful to do from a signal handler.
+unsafe fn raw_write_stdout(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let mut off = 0usize;
+    while off < len {
+        let n = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                ptr.add(off) as *const libc::c_void,
+                len - off,
+            )
+        };
+        if n <= 0 {
+            break;
         }
+        off += n as usize;
+    }
+}
+
+extern "C" fn handle_cancel_signal(sig: libc::c_int) {
+    unsafe {
+        raw_write_stdout(
+            SIG_ENVELOPE_PTR.load(Ordering::SeqCst),
+            SIG_ENVELOPE_LEN.load(Ordering::SeqCst),
+        );
+        // Cancel first, then erase the bar: the host stops streaming
+        // before we drop the UI it was driving.
+        raw_write_stdout(
+            SIG_CLEANUP_PTR.load(Ordering::SeqCst),
+            SIG_CLEANUP_LEN.load(Ordering::SeqCst),
+        );
     }
     // Restore the default disposition and re-raise so the process
     // terminates with the conventional status for this signal.
@@ -95,6 +118,24 @@ extern "C" fn handle_cancel_signal(sig: libc::c_int) {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
+}
+
+/// Publish an envelope for the signal handler to write after the cancel
+/// — used by `VgeProgress` to register its `DeleteElement` so a killed
+/// client still takes its progress bar off the screen. Replaces any
+/// previously registered cleanup. `LEN` is stored before `PTR` and read
+/// after, so a non-null `PTR` always sees a consistent length.
+pub fn set_signal_cleanup_envelope(envelope: &[u8]) {
+    let leaked: &'static mut [u8] = Box::leak(envelope.to_vec().into_boxed_slice());
+    SIG_CLEANUP_LEN.store(leaked.len(), Ordering::SeqCst);
+    SIG_CLEANUP_PTR.store(leaked.as_mut_ptr(), Ordering::SeqCst);
+}
+
+/// Stop the handler from emitting a cleanup that has already been done
+/// (a normal `teardown`), so it can't delete an id the client may have
+/// since reused.
+pub fn clear_signal_cleanup_envelope() {
+    SIG_CLEANUP_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
 }
 
 fn install_signal_handler(envelope: &[u8]) {
