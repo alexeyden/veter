@@ -23,6 +23,23 @@ use swash::{
 
 const TEXTURE_SIZE: usize = 512;
 
+/// Transparent padding reserved to the right of and below every glyph
+/// in the atlas. Glyph quads map 1:1 to texels and sample NEAREST, so a
+/// quad edge landing exactly on a half-pixel puts the interpolated
+/// texel coordinate exactly on a texel boundary, where float error can
+/// floor it one texel outside the glyph's own box. Without padding that
+/// texel is the *adjacent glyph*, which then bleeds in as a 1px sliver
+/// of an unrelated letter. The gutter makes the out-of-range texel
+/// transparent instead. The atlas is created fully transparent and
+/// `update_image` only ever writes the glyph's own w*h box, so the
+/// reserved gutter stays transparent for the atlas's lifetime.
+///
+/// A single trailing gutter covers the leading edge too: the column
+/// left of a glyph is the previous glyph's gutter, and glyphs at
+/// `atlas_x == 0` clamp to their own first column (the atlas is not
+/// REPEAT-wrapped).
+const GLYPH_GUTTER: usize = 1;
+
 /// Selection range expressed in visible-row coords (i.e. as the
 /// renderer sees them after the user's current scrollback offset is
 /// applied). `start_row` may be negative when the selection extends
@@ -727,10 +744,12 @@ impl GlyphCache {
             Content::SubpixelMask => unreachable!(),
         }
 
-        // Find atlas space
+        // Find atlas space. Reserve the glyph box plus its gutter; the
+        // returned (ax, ay) still addresses the glyph's own top-left,
+        // and `RenderedGlyph.width/height` stay the glyph's real size.
         let mut found = None;
         for (idx, tex) in self.textures.iter_mut().enumerate() {
-            if let Some((ax, ay)) = tex.atlas.add_rect(w, h) {
+            if let Some((ax, ay)) = tex.atlas.add_rect(w + GLYPH_GUTTER, h + GLYPH_GUTTER) {
                 found = Some((idx, ax, ay));
                 break;
             }
@@ -749,7 +768,7 @@ impl GlyphCache {
                     ImageFlags::NEAREST,
                 )
                 .unwrap();
-            let (ax, ay) = atlas.add_rect(w, h).unwrap();
+            let (ax, ay) = atlas.add_rect(w + GLYPH_GUTTER, h + GLYPH_GUTTER).unwrap();
             let idx = self.textures.len();
             self.textures.push(FontTexture { atlas, image_id });
             (idx, ax, ay)
@@ -877,8 +896,16 @@ fn push_glyph_quad(
 ) {
     let it = 1.0 / TEXTURE_SIZE as f32;
     let mut q = Quad::default();
-    q.x0 = pen_x + rendered.offset_x as f32;
-    q.y0 = pen_y - rendered.offset_y as f32;
+    // Snap to whole pixels on both axes. VGE coordinates are f32 and
+    // sub-cell (`vector-graphics-extension.md` §5.1), and `align_offset`
+    // can halve an odd width, so a quad edge can otherwise land
+    // mid-pixel; the glyphs are hinted at integer positions (`hint(true)`
+    // above) so a fractional quad buys no extra fidelity, it only blurs
+    // the raster and risks the half-pixel texel-boundary case the
+    // GLYPH_GUTTER guards. Both axes matter: y carries the font's
+    // fractional ascent, so it is only incidentally safe per-font.
+    q.x0 = (pen_x + rendered.offset_x as f32).round();
+    q.y0 = (pen_y - rendered.offset_y as f32).round();
     q.x1 = q.x0 + rendered.width as f32;
     q.y1 = q.y0 + rendered.height as f32;
     q.s0 = rendered.atlas_x as f32 * it;
