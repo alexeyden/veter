@@ -13,6 +13,7 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 use vge_protocol::path::PathSegment;
 
+use crate::doc::{Element, Shape};
 use crate::tools::{
     COLORS, FILLS, LINE_TYPES, LineType, THICKNESSES, TOOLS, Tool, ToolState,
 };
@@ -88,16 +89,31 @@ impl Chrome {
     }
 }
 
-/// Build the palette (and, when the tool has any, the options row) for a
-/// terminal of `cols` x `rows`. The block is centred horizontally and
-/// anchored to the bottom, above the status line.
-pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
+/// Build the palette and options row for a terminal of `cols` x `rows`.
+/// The block is centred horizontally and anchored to the bottom, above
+/// the status line.
+///
+/// The options row describes **the selection when there is one**, and
+/// otherwise the defaults for the next shape drawn. That is what makes
+/// the controls reachable under the Select tool, which has no options
+/// of its own, and it means the highlighted swatches reflect the shape
+/// you are looking at rather than what you last drew with.
+pub fn layout(
+    cols: u16,
+    rows: u16,
+    state: &ToolState,
+    selected: Option<&Element>,
+) -> Chrome {
     let cols = cols as f32;
     let rows = rows as f32;
     let mut hotspots = Vec::new();
     let mut panels = Vec::new();
 
-    let show_options = state.tool.has_options();
+    let sel_shape = selected.and_then(|e| e.shape());
+    let show_options = match sel_shape {
+        Some(_) => true,
+        None => state.tool.has_options(),
+    };
     // Stack upward from the status line at `rows - 1`. The options row
     // is reserved even when empty (Select), so the palette holds still
     // instead of hopping a row every time the tool changes.
@@ -128,8 +144,28 @@ pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
 
     // --- options ---
     if show_options {
-        let show_line = state.tool.has_line_type();
-        let show_fill = state.tool.has_fill();
+        let (show_line, show_fill) = match sel_shape {
+            Some(s) => (s != Shape::Text, s.is_closed()),
+            None => (state.tool.has_line_type(), state.tool.has_fill()),
+        };
+        // Which value each group highlights: the selection's, or the
+        // tool defaults when nothing is selected.
+        let is_thickness = |t: f32| match selected {
+            Some(e) => (t - e.stroke_width).abs() < f32::EPSILON,
+            None => (t - state.thickness).abs() < f32::EPSILON,
+        };
+        let is_color = |c: &str| match selected {
+            Some(e) => c == e.stroke_color,
+            None => c == state.color,
+        };
+        let is_fill = |c: &str| match selected {
+            Some(e) => c == e.background_color,
+            None => c == state.fill,
+        };
+        let is_line = |lt: LineType| match selected {
+            Some(e) => lt.as_str() == e.stroke_style,
+            None => lt == state.line_type,
+        };
         let thick_w = OPT_W * THICKNESSES.len() as f32;
         let line_w = if show_line {
             OPT_W * LINE_TYPES.len() as f32
@@ -161,7 +197,7 @@ pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
                     h: OPT_H,
                 },
                 action: Action::Thickness(t),
-                active: (t - state.thickness).abs() < f32::EPSILON,
+                active: is_thickness(t),
             });
             x += OPT_W;
         }
@@ -176,7 +212,7 @@ pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
                         h: OPT_H,
                     },
                     action: Action::Line(lt),
-                    active: lt == state.line_type,
+                    active: is_line(lt),
                 });
                 x += OPT_W;
             }
@@ -191,7 +227,7 @@ pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
                     h: OPT_H,
                 },
                 action: Action::Color(c),
-                active: c == state.color,
+                active: is_color(c),
             });
             x += SWATCH_W;
         }
@@ -206,7 +242,7 @@ pub fn layout(cols: u16, rows: u16, state: &ToolState) -> Chrome {
                         h: OPT_H,
                     },
                     action: Action::Fill(c),
-                    active: c == state.fill,
+                    active: is_fill(c),
                 });
                 x += SWATCH_W;
             }
@@ -522,7 +558,7 @@ mod tests {
     #[test]
     fn every_tool_button_hits_its_own_tool() {
         let st = state(Tool::Box);
-        let ch = layout(120, 40, &st);
+        let ch = layout(120, 40, &st, None);
         for t in TOOLS {
             let h = ch
                 .hotspots
@@ -537,7 +573,7 @@ mod tests {
 
     #[test]
     fn select_tool_shows_no_options() {
-        let ch = layout(120, 40, &state(Tool::Select));
+        let ch = layout(120, 40, &state(Tool::Select), None);
         assert!(
             ch.hotspots
                 .iter()
@@ -548,8 +584,8 @@ mod tests {
 
     #[test]
     fn palette_stays_put_when_the_options_row_appears() {
-        let without = layout(120, 40, &state(Tool::Select));
-        let with = layout(120, 40, &state(Tool::Box));
+        let without = layout(120, 40, &state(Tool::Select), None);
+        let with = layout(120, 40, &state(Tool::Box), None);
         let tool_row = |c: &Chrome| {
             c.hotspots
                 .iter()
@@ -567,7 +603,7 @@ mod tests {
 
     #[test]
     fn text_tool_hides_line_type_but_keeps_colour() {
-        let ch = layout(120, 40, &state(Tool::Text));
+        let ch = layout(120, 40, &state(Tool::Text), None);
         assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Thickness(_))));
@@ -576,7 +612,7 @@ mod tests {
     #[test]
     fn fill_swatches_appear_only_for_closed_shapes() {
         for t in [Tool::Box, Tool::Ellipse, Tool::Diamond] {
-            let ch = layout(120, 40, &state(t));
+            let ch = layout(120, 40, &state(t), None);
             assert!(
                 ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))),
                 "{} should offer a fill",
@@ -584,7 +620,7 @@ mod tests {
             );
         }
         for t in [Tool::Line, Tool::Arrow, Tool::Text, Tool::Select] {
-            let ch = layout(120, 40, &state(t));
+            let ch = layout(120, 40, &state(t), None);
             assert!(
                 !ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))),
                 "{} has no interior to fill",
@@ -595,7 +631,7 @@ mod tests {
 
     #[test]
     fn stroke_and_fill_swatches_are_distinct_actions() {
-        let ch = layout(120, 40, &state(Tool::Box));
+        let ch = layout(120, 40, &state(Tool::Box), None);
         // The same colour string can appear in both palettes; clicking
         // one must not change the other.
         let strokes: Vec<_> = ch
@@ -622,7 +658,7 @@ mod tests {
     #[test]
     fn the_widest_options_row_fits_in_eighty_columns() {
         for t in TOOLS {
-            let ch = layout(80, 40, &state(t));
+            let ch = layout(80, 40, &state(t), None);
             for h in &ch.hotspots {
                 assert!(
                     h.rect.x >= 0.0 && h.rect.x + h.rect.w <= 80.0,
@@ -666,7 +702,7 @@ mod tests {
 
     #[test]
     fn the_two_panels_are_visually_separated() {
-        let ch = layout(120, 40, &state(Tool::Box));
+        let ch = layout(120, 40, &state(Tool::Box), None);
         assert_eq!(ch.panels.len(), 2, "palette + options");
         let (palette, options) = (ch.panels[0], ch.panels[1]);
         assert!(
@@ -680,9 +716,77 @@ mod tests {
         assert!(ch.hit(60, gap_row).is_none());
     }
 
+    fn styled(shape: Shape) -> Element {
+        let mut e = Element::new("e", shape, 0.0, 0.0, 10.0, 10.0);
+        e.stroke_color = COLORS[3].into();
+        e.background_color = FILLS[2].into();
+        e.stroke_width = THICKNESSES[2];
+        e.stroke_style = "dashed".into();
+        e
+    }
+
+    /// Select has no options of its own, so without this a selected
+    /// shape would have no reachable style controls at all.
+    #[test]
+    fn a_selection_shows_options_even_under_the_select_tool() {
+        let sel = styled(Shape::Rectangle);
+        let ch = layout(120, 40, &state(Tool::Select), Some(&sel));
+        assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
+        assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))));
+        assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
+    }
+
+    /// The highlighted swatches must describe the selected shape, not
+    /// whatever was last drawn with — otherwise the bar claims a red box
+    /// is blue.
+    #[test]
+    fn options_highlight_the_selection_not_the_tool_defaults() {
+        let sel = styled(Shape::Rectangle);
+        // Tool defaults deliberately differ from the selection.
+        let st = ToolState {
+            tool: Tool::Select,
+            color: COLORS[0],
+            fill: FILLS[0],
+            thickness: THICKNESSES[0],
+            line_type: LineType::Solid,
+        };
+        let ch = layout(120, 40, &st, Some(&sel));
+        let active = |f: fn(&Action) -> bool| {
+            ch.hotspots
+                .iter()
+                .find(|h| f(&h.action) && h.active)
+                .map(|h| h.action)
+        };
+        assert_eq!(active(|a| matches!(a, Action::Color(_))), Some(Action::Color(COLORS[3])));
+        assert_eq!(active(|a| matches!(a, Action::Fill(_))), Some(Action::Fill(FILLS[2])));
+        assert_eq!(
+            active(|a| matches!(a, Action::Thickness(_))),
+            Some(Action::Thickness(THICKNESSES[2]))
+        );
+        assert_eq!(
+            active(|a| matches!(a, Action::Line(_))),
+            Some(Action::Line(LineType::Dashed))
+        );
+    }
+
+    /// Group visibility follows the selected shape, not the tool: an
+    /// arrow has no interior, so no fill swatches even if the Box tool
+    /// happens to be active.
+    #[test]
+    fn option_groups_follow_the_selected_shape() {
+        let arrow = styled(Shape::Arrow);
+        let ch = layout(120, 40, &state(Tool::Box), Some(&arrow));
+        assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))));
+
+        let text = styled(Shape::Text);
+        let ch = layout(120, 40, &state(Tool::Box), Some(&text));
+        assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
+        assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
+    }
+
     #[test]
     fn hotspots_never_overlap() {
-        let ch = layout(120, 40, &state(Tool::Box));
+        let ch = layout(120, 40, &state(Tool::Box), None);
         for (i, a) in ch.hotspots.iter().enumerate() {
             for b in &ch.hotspots[i + 1..] {
                 let disjoint = a.rect.x + a.rect.w <= b.rect.x
@@ -697,7 +801,7 @@ mod tests {
     #[test]
     fn exactly_one_control_per_group_is_active() {
         let st = state(Tool::Box);
-        let ch = layout(120, 40, &st);
+        let ch = layout(120, 40, &st, None);
         let count = |f: fn(&Action) -> bool| {
             ch.hotspots.iter().filter(|h| f(&h.action) && h.active).count()
         };
@@ -709,7 +813,7 @@ mod tests {
 
     #[test]
     fn chrome_sits_above_the_status_line() {
-        let ch = layout(120, 40, &state(Tool::Box));
+        let ch = layout(120, 40, &state(Tool::Box), None);
         for h in &ch.hotspots {
             assert!(
                 h.rect.y + h.rect.h <= 39.0,
@@ -721,7 +825,7 @@ mod tests {
 
     #[test]
     fn covers_includes_panel_padding_between_groups() {
-        let ch = layout(120, 40, &state(Tool::Box));
+        let ch = layout(120, 40, &state(Tool::Box), None);
         let p = ch.panels.last().expect("options panel");
         // A gap cell between two option groups is not a hotspot but
         // must still count as chrome, so dragging there doesn't pan.

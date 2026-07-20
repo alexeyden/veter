@@ -123,7 +123,7 @@ fn main() -> Result<()> {
 
     let mut cursor = (0u16, 0u16);
     let mut state = ToolState::default();
-    let mut bar = chrome::layout(cols, rows, &state);
+    let mut bar = chrome::layout(cols, rows, &state, None);
     send(&full_render(&document, &cam, &bar, cursor, &state, rows))?;
 
     let mut parser = InputParser::new();
@@ -160,6 +160,10 @@ fn main() -> Result<()> {
         // Commands produced while handling events (committed shapes),
         // flushed with the rest of the frame below.
         let mut frame_extra: Vec<(Command, u32)> = Vec::new();
+        // The options row reflects the selection, so any change of
+        // selection has to rebuild it. Compared once here rather than
+        // flagged at each of the half-dozen sites that can change it.
+        let selection_before = selected;
 
         for ev in events {
             if let Some(pos) = pointer_pos(&ev) {
@@ -340,6 +344,27 @@ fn main() -> Result<()> {
                     // so a press on the palette never starts a pan.
                     if let Some(action) = bar.hit(col, row) {
                         apply(&mut state, action);
+                        // With something selected, a style option
+                        // restyles it as well as becoming the default
+                        // for the next shape.
+                        if let Some(i) = selected {
+                            // Probe on a copy so the undo checkpoint is
+                            // only taken when the option actually
+                            // applies to this shape.
+                            let mut probe = document.elements[i].clone();
+                            if restyle(&mut probe, action) {
+                                history.checkpoint(&document);
+                                document.elements[i] = probe;
+                                dirty_doc = true;
+                                push_element_update(
+                                    &mut frame_extra,
+                                    &document.elements[i],
+                                    i as i32 + 1,
+                                    &cam,
+                                    false,
+                                );
+                            }
+                        }
                         chrome_dirty = true;
                         status_dirty = true;
                     } else if bar.covers(col, row) {
@@ -536,6 +561,10 @@ fn main() -> Result<()> {
             }
         }
 
+        if selected != selection_before {
+            chrome_dirty = true;
+        }
+
         if take_sigwinch(winch) {
             if let Ok((c, r)) = term_size() {
                 if (c, r) != (cols, rows) {
@@ -627,7 +656,12 @@ fn main() -> Result<()> {
         if chrome_dirty {
             // Switching tools can add or remove the options row, so the
             // whole bar is re-laid out, not just restyled.
-            bar = chrome::layout(cols, rows, &state);
+            bar = chrome::layout(
+                cols,
+                rows,
+                &state,
+                selected.map(|i| &document.elements[i]),
+            );
             frame.push((
                 Command::UpdateCommands(UpdateCommandsBody {
                     id: CHROME_ID.into(),
@@ -776,6 +810,40 @@ fn preview_body(
     let (x, y, w, h) = d.extent();
     let el = state.new_element("preview", x, y, w, h)?;
     render::element_body(&el, PREVIEW_ORDER, cam)
+}
+
+/// Apply a style option to an existing element, mirroring what
+/// `ToolState::new_element` would have baked in at creation time.
+///
+/// Returns whether anything changed: switching tools is not a restyle,
+/// and an option the shape can't express (a fill on an arrow, a line
+/// type on text) is a no-op rather than a silent lie in the document.
+fn restyle(e: &mut doc::Element, action: Action) -> bool {
+    match action {
+        Action::Tool(_) => false,
+        Action::Thickness(w) => {
+            e.stroke_width = w;
+            true
+        }
+        Action::Color(c) => {
+            e.stroke_color = c.into();
+            true
+        }
+        Action::Fill(c) => match e.shape() {
+            Some(s) if s.is_closed() => {
+                e.background_color = c.into();
+                true
+            }
+            _ => false,
+        },
+        Action::Line(lt) => match e.shape() {
+            Some(doc::Shape::Text) | None => false,
+            Some(_) => {
+                e.stroke_style = lt.as_str().into();
+                true
+            }
+        },
+    }
 }
 
 fn apply(state: &mut ToolState, action: Action) {
