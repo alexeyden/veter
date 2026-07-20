@@ -893,7 +893,7 @@ fn status_text(
         None => String::new(),
     };
     format!(
-        "vdraw{}  [{}]  {}%  ({:.0}, {:.0}){}   s/b/e/d/l/a/t · ^Z undo · ^Y redo · ^S save · q quit",
+        "vdraw{}  [{}]  {}%  ({:.0}, {:.0}){}   s/b/e/d/l/a/t · 0 reset · ^Z/^Y undo · ^S save · q quit",
         if dirty { "*" } else { "" },
         state.tool.label(),
         cam.zoom_percent(),
