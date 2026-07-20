@@ -10,19 +10,30 @@ use anyhow::{Context, Result};
 
 /// Block until stdin has data ready or `deadline` elapses. Returns
 /// `true` if stdin is readable, `false` on timeout.
+///
+/// A signal arriving mid-poll (SIGWINCH on every terminal resize, since
+/// these clients install a handler for it) makes `poll` fail with
+/// `EINTR`. That is normal, not an error: the call is retried against
+/// the remaining time rather than propagated, which would take the
+/// whole app down on a window resize.
 pub fn poll_stdin_until(deadline: Instant) -> Result<bool> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::BorrowedFd;
-    let now = Instant::now();
-    if now >= deadline {
-        return Ok(false);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
+        let fd = std::io::stdin().as_raw_fd();
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(remaining_ms)) {
+            Ok(n) => return Ok(n > 0),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e).context("poll(stdin)"),
+        }
     }
-    let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
-    let fd = std::io::stdin().as_raw_fd();
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-    let n = poll(&mut fds, PollTimeout::from(remaining_ms)).context("poll(stdin)")?;
-    Ok(n > 0)
 }
 
 /// Block until stdin or `extra` has data ready (or hangs up), or until
@@ -39,30 +50,49 @@ pub fn poll_stdin_and(
     if now >= deadline {
         return Ok((false, false));
     }
-    let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
-    let stdin_fd = std::io::stdin().as_raw_fd();
-    let in_b = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-    let ex_b = unsafe { BorrowedFd::borrow_raw(extra) };
     let wake = PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR;
-    let mut fds = [
-        PollFd::new(in_b, PollFlags::POLLIN),
-        PollFd::new(ex_b, PollFlags::POLLIN),
-    ];
-    poll(&mut fds, PollTimeout::from(remaining_ms)).context("poll(stdin+fd)")?;
-    let ready = |i: usize| {
-        fds[i]
-            .revents()
-            .map(|r| r.intersects(wake))
-            .unwrap_or(false)
-    };
-    Ok((ready(0), ready(1)))
+    // Retried on EINTR for the same reason as `poll_stdin_until`.
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok((false, false));
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as u16;
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let in_b = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+        let ex_b = unsafe { BorrowedFd::borrow_raw(extra) };
+        let mut fds = [
+            PollFd::new(in_b, PollFlags::POLLIN),
+            PollFd::new(ex_b, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::from(remaining_ms)) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e).context("poll(stdin+fd)"),
+        }
+        let ready = |i: usize| {
+            fds[i]
+                .revents()
+                .map(|r| r.intersects(wake))
+                .unwrap_or(false)
+        };
+        return Ok((ready(0), ready(1)));
+    }
 }
 
 /// Single read off stdin; returns the byte count (0 on EOF).
+///
+/// Retries on `EINTR`: a signal can land between the poll that reported
+/// readiness and this read.
 pub fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     let fd = std::io::stdin().as_raw_fd();
-    let n = nix::unistd::read(fd, buf).context("read(stdin)")?;
-    Ok(n)
+    loop {
+        match nix::unistd::read(fd, buf) {
+            Ok(n) => return Ok(n),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e).context("read(stdin)"),
+        }
+    }
 }
 
 /// Pull anything currently sitting on stdin without blocking. Used at
