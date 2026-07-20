@@ -411,7 +411,7 @@ fn main() -> Result<()> {
                             status_dirty = true;
                         }
                     } else if button == input::Button::Left && state.tool == Tool::Select {
-                        let p = cam.screen_to_doc(col as f32, row as f32);
+                        let p = cam.pointer_to_doc(col, row);
                         let tol = cam.cell_w.max(cam.cell_h) / cam.zoom * 0.6;
                         // A handle on the current selection wins over
                         // whatever element happens to sit under it.
@@ -887,7 +887,7 @@ fn status_text(
     if editing {
         return "vdraw  [text]  typing — Enter or Esc commits".into();
     }
-    let p = cam.screen_to_doc(cursor.0 as f32, cursor.1 as f32);
+    let p = cam.pointer_to_doc(cursor.0, cursor.1);
     let sel = match selected {
         Some(e) => format!("  sel:{}", e.kind),
         None => String::new(),

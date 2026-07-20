@@ -64,13 +64,22 @@ impl Camera {
         }
     }
 
-    /// Screen cell -> doc px. The inverse used to turn a mouse report
-    /// back into a document coordinate.
+    /// Screen cell -> doc px. The pure inverse of the forward mapping.
     pub fn screen_to_doc(&self, col: f32, row: f32) -> Point {
         Point {
             x: (col - self.pan.x) * self.cell_w / self.zoom,
             y: (row - self.pan.y) * self.cell_h / self.zoom,
         }
+    }
+
+    /// Where the *pointer* is, given a mouse report of cell `(col, row)`.
+    ///
+    /// A report only says which cell the cursor is in, not where inside
+    /// it. Treating that as the cell's top-left corner biases every
+    /// click up and left by half a cell; the cell centre is the best
+    /// estimate available and is unbiased.
+    pub fn pointer_to_doc(&self, col: u16, row: u16) -> Point {
+        self.screen_to_doc(col as f32 + 0.5, row as f32 + 0.5)
     }
 
     pub fn pan_by(&mut self, dcols: f32, drows: f32) {
@@ -145,6 +154,20 @@ mod tests {
         let after = c.screen_to_doc(col, row);
         assert!((before.x - after.x).abs() < 1e-3);
         assert!((before.y - after.y).abs() < 1e-3);
+    }
+
+    /// A mouse report names a cell, not a position within it. Taking it
+    /// as the top-left corner biases every click up and left by half a
+    /// cell; the centre is unbiased.
+    #[test]
+    fn pointer_lands_mid_cell_not_at_its_corner() {
+        let c = cam();
+        let p = c.pointer_to_doc(3, 2);
+        let corner = c.screen_to_doc(3.0, 2.0);
+        assert_eq!(p.x - corner.x, c.cell_w / 2.0);
+        assert_eq!(p.y - corner.y, c.cell_h / 2.0);
+        // Still inside the cell that was reported.
+        assert!(p.x > corner.x && p.x < corner.x + c.cell_w);
     }
 
     #[test]

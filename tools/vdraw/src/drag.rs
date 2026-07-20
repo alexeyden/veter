@@ -53,18 +53,29 @@ impl Drag {
     }
 }
 
-/// Quantise a doc-space point to the cell grid.
+/// Quantise a doc-space point to the grid.
+///
+/// Grid points sit at cell *centres*, offset half a cell from the cell
+/// boundaries. A mouse report only identifies a cell, so the pointer's
+/// best-estimate position is that cell's centre — and snapping to a
+/// grid of centres lands exactly there, with no bias in any direction.
+/// Snapping to boundaries instead would put every click precisely
+/// halfway between two grid points, where the tie-break shifts every
+/// shape half a cell off the drag that made it.
+///
+/// Spacing is still one cell, so shapes remain a whole number of cells
+/// wide and align with each other exactly as before.
 pub fn snap(p: Point, cam: &Camera) -> Point {
     Point {
-        x: (p.x / cam.cell_w).round() * cam.cell_w,
-        y: (p.y / cam.cell_h).round() * cam.cell_h,
+        x: ((p.x / cam.cell_w - 0.5).round() + 0.5) * cam.cell_w,
+        y: ((p.y / cam.cell_h - 0.5).round() + 0.5) * cam.cell_h,
     }
 }
 
 /// Snap the doc-space point under a screen cell — the usual entry point
 /// from a mouse event.
 pub fn snap_screen(col: u16, row: u16, cam: &Camera) -> Point {
-    snap(cam.screen_to_doc(col as f32, row as f32), cam)
+    snap(cam.pointer_to_doc(col, row), cam)
 }
 
 #[cfg(test)]
@@ -75,14 +86,37 @@ mod tests {
         Camera::new(8.0, 17.0)
     }
 
+    /// Grid points sit at cell centres — half a cell off the boundaries,
+    /// one cell apart.
     #[test]
-    fn snap_lands_on_grid_multiples() {
+    fn snap_lands_on_cell_centres() {
         let c = cam();
         let p = snap(Point { x: 19.0, y: 40.0 }, &c);
-        assert_eq!(p.x % c.cell_w, 0.0);
-        assert_eq!(p.y % c.cell_h, 0.0);
-        assert_eq!(p.x, 16.0); // 19 / 8 -> 2 -> 16
-        assert_eq!(p.y, 34.0); // 40 / 17 -> 2 -> 34
+        assert_eq!(p.x, 20.0); // centre of cell 2: (2 + 0.5) * 8
+        assert_eq!(p.y, 42.5); // centre of cell 2: (2 + 0.5) * 17
+        assert_eq!((p.x - c.cell_w / 2.0) % c.cell_w, 0.0);
+        assert_eq!((p.y - c.cell_h / 2.0) % c.cell_h, 0.0);
+    }
+
+    /// The whole point of the centre grid: the snapped point is exactly
+    /// where the pointer is estimated to be, not half a cell away.
+    #[test]
+    fn snapping_a_click_is_lossless() {
+        let c = cam();
+        for col in 0..12u16 {
+            for row in 0..5u16 {
+                let p = c.pointer_to_doc(col, row);
+                let s = snap_screen(col, row, &c);
+                assert!(
+                    (p.x - s.x).abs() < 1e-3 && (p.y - s.y).abs() < 1e-3,
+                    "cell ({col},{row}) moved from ({}, {}) to ({}, {})",
+                    p.x,
+                    p.y,
+                    s.x,
+                    s.y
+                );
+            }
+        }
     }
 
     #[test]
@@ -94,11 +128,13 @@ mod tests {
     }
 
     #[test]
-    fn snap_screen_is_grid_aligned_at_unit_zoom() {
+    fn snap_screen_steps_one_cell_per_column() {
         let c = cam();
-        for col in 0..20u16 {
-            let p = snap_screen(col, 3, &c);
-            assert_eq!(p.x % c.cell_w, 0.0, "col {col}");
+        let mut prev = snap_screen(0, 3, &c).x;
+        for col in 1..20u16 {
+            let x = snap_screen(col, 3, &c).x;
+            assert_eq!(x - prev, c.cell_w, "col {col} did not advance one cell");
+            prev = x;
         }
     }
 
@@ -114,8 +150,9 @@ mod tests {
     }
 
     /// The whole point of snapping: a shape drawn from snapped
-    /// endpoints must land on the grid in *document* space, not merely
-    /// look aligned at the zoom it was drawn at.
+    /// endpoints must be a whole number of cells, in *document* space,
+    /// not merely look aligned at the zoom it was drawn at. Its origin
+    /// sits on the centre grid, so shapes still align with each other.
     #[test]
     fn snapped_drag_produces_grid_aligned_geometry() {
         use crate::tools::{Tool, ToolState};
@@ -128,10 +165,20 @@ mod tests {
         d.current = snap(Point { x: 131.0, y: 99.0 }, &c);
         let (x, y, w, h) = d.extent();
         let e = st.new_element("t", x, y, w, h).expect("element");
-        assert_eq!(e.x % c.cell_w, 0.0, "x off grid: {}", e.x);
-        assert_eq!(e.y % c.cell_h, 0.0, "y off grid: {}", e.y);
-        assert_eq!(e.width % c.cell_w, 0.0, "w off grid: {}", e.width);
-        assert_eq!(e.height % c.cell_h, 0.0, "h off grid: {}", e.height);
+        assert_eq!(
+            (e.x - c.cell_w / 2.0) % c.cell_w,
+            0.0,
+            "x off the centre grid: {}",
+            e.x
+        );
+        assert_eq!(
+            (e.y - c.cell_h / 2.0) % c.cell_h,
+            0.0,
+            "y off the centre grid: {}",
+            e.y
+        );
+        assert_eq!(e.width % c.cell_w, 0.0, "w not a whole cell count: {}", e.width);
+        assert_eq!(e.height % c.cell_h, 0.0, "h not a whole cell count: {}", e.height);
     }
 
     #[test]
