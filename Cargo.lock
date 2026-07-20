@@ -2863,6 +2863,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vdraw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "vge-protocol",
+ "vge-render",
+]
+
+[[package]]
 name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

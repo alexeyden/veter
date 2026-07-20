@@ -2,16 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around a family of APC-framed protocols that ride a single PTY: PRT (portals / multiplexing), VGE (vector graphics in the grid), VFT (file transfer), plus a session layer (SES + VSS) that keeps sessions alive across renderer disconnects. The terminal binary itself is `veter`; the supporting tools and library crates keep their names (`vmux`, `vcat`, `vplay`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, and the `*-protocol` wire crates).
+The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around a family of APC-framed protocols that ride a single PTY: PRT (portals / multiplexing), VGE (vector graphics in the grid), VFT (file transfer), plus a session layer (SES + VSS) that keeps sessions alive across renderer disconnects. The terminal binary itself is `veter`; the supporting tools and library crates keep their names (`vmux`, `vcat`, `vplay`, `vdraw`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, and the `*-protocol` wire crates).
 
 ## Build & run
 
 Cargo workspace; edition 2024 (the vendored `vt100` fork stays on 2021).
 
 - Build everything: `cargo build` (release: `cargo build --release`)
-- Build one crate: `cargo build -p veter` (or `veter-host`, `vmux`, `vcat`, `vplay`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol`, `breakout`)
+- Build one crate: `cargo build -p veter` (or `veter-host`, `vmux`, `vcat`, `vplay`, `vdraw`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol`, `breakout`)
 - Run the GUI terminal: `cargo run -p veter`
-- Install `veter` plus the tool set (`vcat`, `vplay`, `vmux`, `vsend`, `vrecv`, `vsd`, `vssh`) to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them). `make install-remote-<arch>` cross-compiles a musl build and scp-installs it to `$REMOTE`.
+- Install `veter` plus the tool set (`vcat`, `vplay`, `vdraw`, `vmux`, `vsend`, `vrecv`, `vsd`, `vssh`) to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them). `make install-remote-<arch>` cross-compiles a musl build and scp-installs it to `$REMOTE`.
 
 ## Tests
 
@@ -41,11 +41,12 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`veter-
 | `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, and the `origin_shift` / `scroll_committed` counters the engines' line trackers consume). The screen model the host and every portal use. |
 | `veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines and the shared line tracker. `gui` feature pulls desktop-only deps VFT needs on a real renderer. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
-| `vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal (used by `vcat`, `vplay`). |
+| `vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal, plus the shared raw-TTY / poll / probe helpers every VGE client uses (`vcat`, `vplay`, `vdraw`, `spinner`, `breakout`). |
 | `vge-cli`, `prt-cli` | Emit raw envelopes for manual protocol testing. |
 | `tools/vmux` | Terminal multiplexer that runs *inside* veter, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
 | `tools/vcat` | Display images inside a VGE-aware terminal. |
 | `tools/vplay` | Interactive image and video viewer for VGE-aware terminals. |
+| `tools/vdraw` | Interactive block-diagram editor. Draws with VGE, stores documents in Excalidraw's `.excalidraw` JSON schema. Geometry snaps to the cell grid, since SGR mouse reports are only cell-accurate. |
 | `tools/vsend`, `tools/vrecv` | VFT clients: upload a local file to / pull a host-side file back from a VFT-aware terminal. `tools/vft-client` is their shared client library (raw-TTY guard, host-side frame stream, probe/cursor helpers, progress UI). |
 | `tools/vsd` | Persistent veter session daemon — holds host vt100 / PRT / VGE state across renderer disconnects. |
 | `tools/vssh` | SSH wrapper that keeps the veter tools fresh on remote hosts. |
