@@ -47,17 +47,87 @@ impl Default for Document {
     }
 }
 
+/// Excalidraw's line-height multiple for text elements.
+pub const LINE_HEIGHT: f32 = 1.25;
+/// Used when a text element has no cell-derived size to work from.
+pub const DEFAULT_FONT_SIZE: f32 = 16.0;
+
 impl Document {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parsing {} as an .excalidraw document", path.display()))
+        let mut doc: Self = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {} as an .excalidraw document", path.display()))?;
+        doc.fold_bound_labels();
+        Ok(doc)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = serde_json::to_string_pretty(self)?;
+        let text = serde_json::to_string_pretty(&self.with_split_labels())?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Excalidraw keeps a container's label as a *separate* text element
+    /// bound by `containerId`, and ignores any `text` on the container
+    /// itself. vdraw keeps the label inline so a shape and its caption
+    /// stay one VGE element; fold the bound form into that on load.
+    fn fold_bound_labels(&mut self) {
+        let labels: Vec<(String, String)> = self
+            .elements
+            .iter()
+            .filter(|e| !e.is_deleted)
+            .filter_map(|e| {
+                let container = e.container_id.clone()?;
+                (e.shape() == Some(Shape::Text)).then(|| (container, e.text.clone()))
+            })
+            .collect();
+        for (container_id, text) in labels {
+            if let Some(c) = self.elements.iter_mut().find(|e| e.id == container_id) {
+                c.text = text;
+            }
+        }
+    }
+
+    /// Inverse of `fold_bound_labels`: emit each container's caption as
+    /// the bound text element Excalidraw expects, cross-linked via
+    /// `containerId` / `boundElements`.
+    fn with_split_labels(&self) -> Document {
+        let mut out = self.clone();
+        let mut extra: Vec<Element> = Vec::new();
+        for e in out.elements.iter_mut() {
+            // Text elements carry their own string; only containers need
+            // splitting, and bound labels already in the file are kept.
+            if e.shape() == Some(Shape::Text) || e.container_id.is_some() {
+                continue;
+            }
+            if e.text.trim().is_empty() {
+                continue;
+            }
+            let label_id = format!("{}-label", e.id);
+            let font_size = e.font_size.unwrap_or(DEFAULT_FONT_SIZE);
+            let mut label =
+                Element::new(label_id.clone(), Shape::Text, e.x, e.y, e.width, e.height);
+            label.text = e.text.clone();
+            label.container_id = Some(e.id.clone());
+            label.text_align = "center".into();
+            label.vertical_align = Some("middle".into());
+            label.stroke_color = e.stroke_color.clone();
+            label.opacity = e.opacity;
+            label.apply_text_metrics(font_size);
+            e.bound_elements = Some(serde_json::json!([
+                { "type": "text", "id": label_id }
+            ]));
+            extra.push(label);
+        }
+        out.elements.extend(extra);
+        // Standalone text needs its metrics too, whatever its origin.
+        for e in out.elements.iter_mut() {
+            if e.shape() == Some(Shape::Text) {
+                let size = e.font_size.unwrap_or(DEFAULT_FONT_SIZE);
+                e.apply_text_metrics(size);
+            }
+        }
+        out
     }
 }
 
@@ -149,6 +219,25 @@ pub struct Element {
     pub seed: u32,
     #[serde(default)]
     pub locked: bool,
+    // --- text metadata, emitted only for text elements ---
+    //
+    // Excalidraw composes its canvas font as `${fontSize}px ${family}`.
+    // Omitting these yields an invalid font, so the glyphs never paint
+    // while the element stays selectable — text that looks transparent
+    // and ignores every styling change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height: Option<f32>,
+    /// Elements bound to this one — for a container, its label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_elements: Option<Value>,
     /// Everything else in the file, preserved so a round-trip through
     /// vdraw doesn't strip properties it doesn't understand.
     #[serde(flatten)]
@@ -227,7 +316,28 @@ impl Element {
             roughness: 0.0,
             seed: 1,
             locked: false,
+            font_size: None,
+            font_family: None,
+            vertical_align: None,
+            original_text: None,
+            line_height: None,
+            bound_elements: None,
             extra: Map::new(),
+        }
+    }
+
+    /// Fill in the metadata Excalidraw needs to actually paint a string.
+    /// vdraw's own renderer ignores all of it — VGE text is locked to
+    /// the cell size (§7.4) — so this exists purely for interop.
+    pub fn apply_text_metrics(&mut self, font_size: f32) {
+        self.font_size = Some(font_size);
+        // 3 = Cascadia, the monospace family. Closest to what vdraw
+        // draws, where every ASCII character is exactly one cell wide.
+        self.font_family = Some(3);
+        self.line_height = Some(LINE_HEIGHT);
+        self.original_text = Some(self.text.clone());
+        if self.vertical_align.is_none() {
+            self.vertical_align = Some("top".into());
         }
     }
 
@@ -295,6 +405,98 @@ mod tests {
       "appState": { "gridSize": null, "viewBackgroundColor": "#ffffff" },
       "files": {}
     }"##;
+
+    fn doc_with_text() -> Document {
+        let mut d = Document::default();
+        let mut t = Element::new("t1", Shape::Text, 100.0, 200.0, 48.0, 17.0);
+        t.text = "hello".into();
+        t.font_size = Some(13.6);
+        let mut b = Element::new("b1", Shape::Rectangle, 0.0, 0.0, 160.0, 68.0);
+        b.text = "label".into();
+        b.font_size = Some(13.6);
+        d.elements = vec![t, b];
+        d
+    }
+
+    /// Excalidraw builds its font as `${fontSize}px ${family}`; without
+    /// these the font string is invalid and the glyphs never paint,
+    /// while the element stays selectable — text that reads as
+    /// transparent and ignores every styling change.
+    #[test]
+    fn saved_text_carries_the_metadata_excalidraw_needs() {
+        let out = doc_with_text().with_split_labels();
+        let json = serde_json::to_value(&out).unwrap();
+        for el in json["elements"].as_array().unwrap() {
+            if el["type"] != "text" {
+                continue;
+            }
+            for key in [
+                "fontSize",
+                "fontFamily",
+                "lineHeight",
+                "verticalAlign",
+                "originalText",
+            ] {
+                assert!(
+                    !el[key].is_null(),
+                    "text element {} is missing {key}",
+                    el["id"]
+                );
+            }
+            assert!(el["fontSize"].as_f64().unwrap() > 0.0);
+            assert_eq!(el["originalText"], el["text"]);
+        }
+    }
+
+    /// A container's caption must become a separate bound text element:
+    /// Excalidraw ignores `text` on a rectangle entirely, so an inline
+    /// label simply never appears.
+    #[test]
+    fn container_labels_are_split_into_bound_text_elements() {
+        let out = doc_with_text().with_split_labels();
+        let label = out
+            .elements
+            .iter()
+            .find(|e| e.container_id.as_deref() == Some("b1"))
+            .expect("no bound label emitted for the container");
+        assert_eq!(label.shape(), Some(Shape::Text));
+        assert_eq!(label.text, "label");
+        assert_eq!(label.text_align, "center");
+        assert_eq!(label.vertical_align.as_deref(), Some("middle"));
+
+        // ...and the container must point back at it.
+        let container = out.elements.iter().find(|e| e.id == "b1").unwrap();
+        let bound = container.bound_elements.as_ref().expect("boundElements");
+        assert_eq!(bound[0]["type"], "text");
+        assert_eq!(bound[0]["id"], label.id.as_str());
+    }
+
+    #[test]
+    fn standalone_text_is_not_split_or_bound() {
+        let out = doc_with_text().with_split_labels();
+        let t = out.elements.iter().find(|e| e.id == "t1").unwrap();
+        assert!(t.container_id.is_none());
+        assert!(t.bound_elements.is_none());
+        // Exactly one extra element: the container's label.
+        assert_eq!(out.elements.len(), 3);
+    }
+
+    /// Round trip through the on-disk form: a caption written as a bound
+    /// element has to fold back onto its container, or a file vdraw
+    /// saved would reopen with the label missing.
+    #[test]
+    fn labels_survive_a_save_load_round_trip() {
+        let dir = std::env::temp_dir().join("vdraw-label-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.excalidraw");
+        doc_with_text().save(&path).unwrap();
+        let back = Document::load(&path).unwrap();
+        let b = back.elements.iter().find(|e| e.id == "b1").unwrap();
+        assert_eq!(b.text, "label", "container lost its caption");
+        let t = back.elements.iter().find(|e| e.id == "t1").unwrap();
+        assert_eq!(t.text, "hello");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn parses_a_real_excalidraw_file() {

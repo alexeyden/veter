@@ -715,6 +715,14 @@ fn full_render(
 /// and the selection outline match what is drawn. The terminal font is
 /// the primary font, so one ASCII character is one cell wide.
 fn resize_text_box(e: &mut doc::Element, cam: &Camera) {
+    // Record the font size a *web* renderer should use, for every
+    // element that carries text — containers included, since their
+    // caption is split out into a real text element on save. Derived
+    // from the cell height so the saved document matches what vdraw
+    // drew; vdraw's own rendering ignores it (VGE text is cell-sized).
+    if !e.text.is_empty() {
+        e.font_size = Some(cam.cell_h / doc::LINE_HEIGHT);
+    }
     if e.shape() != Some(doc::Shape::Text) {
         return;
     }
