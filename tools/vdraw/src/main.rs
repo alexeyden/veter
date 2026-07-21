@@ -25,7 +25,14 @@
 //! snapshot-based undo/redo (`history.rs`, Ctrl-Z / Ctrl-Y). Undo takes
 //! one checkpoint per *gesture*, on mouse-down, so a drag is a single
 //! step rather than one per motion event.
+//!
+//! Phase 7 adds an optional `--background IMAGE` reference picture
+//! (`background.rs`): uploaded once, fitted to the pane on open, and
+//! drawn behind everything as a canvas child so it pans and zooms with
+//! the drawing. It is not part of the document — never saved, selected,
+//! or undone.
 
+mod background;
 mod camera;
 mod chrome;
 mod doc;
@@ -54,6 +61,7 @@ use vge_render::tty::{
     winsize,
 };
 
+use background::Background;
 use camera::Camera;
 use chrome::{Action, CHROME_ID};
 use drag::Drag;
@@ -82,8 +90,8 @@ const PAN_STEP: f32 = 2.0;
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
-    // `vdraw [file.excalidraw]` — a missing file is created on save.
-    let path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    // `vdraw [file.excalidraw] [--background IMAGE]`.
+    let Args { path, background } = parse_args()?;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("vdraw must run with stdin and stdout connected to a terminal");
@@ -96,7 +104,7 @@ fn main() -> Result<()> {
     // (?1002) in SGR encoding (?1006) — the same pair vplay uses.
     out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h")?;
     out.flush()?;
-    let _term = TermExit;
+    let mut term = TermExit { drop_background: false };
 
     drain_stale_stdin();
     let probe = run_probe(PROBE_TIMEOUT)?.ok_or_else(|| {
@@ -108,6 +116,21 @@ fn main() -> Result<()> {
         probe.cell_pixel_height.max(1) as f32,
     );
     let (mut cols, mut rows) = term_size()?;
+
+    // Optional reference image, fitted to the pane on open. Uploaded once
+    // here; it survives every later `ClearAll`, so `full_render` only
+    // re-creates the element (see `background.rs`).
+    let background = match &background {
+        Some(p) => {
+            let (bg, uploads) = Background::load(p, &cam, cols, rows, &probe)?;
+            send(&uploads)?;
+            // Release the image on exit so it doesn't linger in the
+            // (portal-owned) image table after vdraw quits.
+            term.drop_background = true;
+            Some(bg)
+        }
+        None => None,
+    };
 
     // Existing geometry goes out once; the camera never re-sends it.
     // New shapes append one `CreateElement` each as they are committed.
@@ -124,7 +147,15 @@ fn main() -> Result<()> {
     let mut cursor = (0u16, 0u16);
     let mut state = ToolState::default();
     let mut bar = chrome::layout(cols, rows, &state, None);
-    send(&full_render(&document, &cam, &bar, cursor, &state, rows))?;
+    send(&full_render(
+        &document,
+        &cam,
+        &bar,
+        cursor,
+        &state,
+        rows,
+        background.as_ref(),
+    ))?;
 
     let mut parser = InputParser::new();
     let mut buf = [0u8; 1024];
@@ -303,7 +334,13 @@ fn main() -> Result<()> {
                         editing = None;
                         dirty_doc = true;
                         frame_extra.extend(full_render(
-                            &document, &cam, &bar, cursor, &state, rows,
+                            &document,
+                            &cam,
+                            &bar,
+                            cursor,
+                            &state,
+                            rows,
+                            background.as_ref(),
                         ));
                     }
                 }
@@ -729,11 +766,17 @@ fn full_render(
     cursor: (u16, u16),
     state: &ToolState,
     rows: u16,
+    background: Option<&Background>,
 ) -> Vec<(Command, u32)> {
     let mut out = vec![
         (Command::ClearAll, REQ_ID_NO_RESPONSE),
         (render::canvas_element(cam), REQ_ID_NO_RESPONSE),
     ];
+    // Behind every shape, but a child of the canvas so it pans and zooms
+    // with the drawing. The image itself outlives the `ClearAll` above.
+    if let Some(bg) = background {
+        out.push((bg.element(), REQ_ID_NO_RESPONSE));
+    }
     out.extend(render::document_elements(document, cam));
     out.push((render::preview_element(), REQ_ID_NO_RESPONSE));
     out.push((render::selection_element(), REQ_ID_NO_RESPONSE));
@@ -936,6 +979,39 @@ fn status_element(cam: &Camera, cursor: (u16, u16), state: &ToolState, rows: u16
     })
 }
 
+/// Parsed command line: an optional document path and an optional
+/// `--background` reference image.
+struct Args {
+    path: Option<PathBuf>,
+    background: Option<PathBuf>,
+}
+
+/// `vdraw [file.excalidraw] [--background IMAGE] [-b IMAGE]`. The
+/// document path stays positional (a missing file is created on save);
+/// the background is opt-in and takes the next argument as its path.
+fn parse_args() -> Result<Args> {
+    let mut path = None;
+    let mut background = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--background" | "-b" => {
+                let p = it
+                    .next()
+                    .ok_or_else(|| anyhow!("{arg} requires an image path"))?;
+                background = Some(PathBuf::from(p));
+            }
+            s if s.starts_with("--background=") => {
+                background = Some(PathBuf::from(&s["--background=".len()..]));
+            }
+            s if s.starts_with('-') && s != "-" => bail!("unknown option: {s}"),
+            s if path.is_none() => path = Some(PathBuf::from(s)),
+            s => bail!("unexpected extra argument: {s}"),
+        }
+    }
+    Ok(Args { path, background })
+}
+
 fn term_size() -> Result<(u16, u16)> {
     let ws = winsize().ok_or_else(|| anyhow!("could not query terminal size"))?;
     Ok((ws.ws_col.max(1), ws.ws_row.max(1)))
@@ -948,12 +1024,24 @@ fn send(cmds: &[(Command, u32)]) -> Result<()> {
     Ok(())
 }
 
-struct TermExit;
+struct TermExit {
+    /// Whether a background image was uploaded and should be released.
+    drop_background: bool,
+}
 
 impl Drop for TermExit {
     fn drop(&mut self) {
         let mut o = std::io::stdout();
-        let env = build_envelope(&[(Command::ClearAll, REQ_ID_NO_RESPONSE)]);
+        let mut cmds = vec![(Command::ClearAll, REQ_ID_NO_RESPONSE)];
+        if self.drop_background {
+            cmds.push((
+                Command::DropImage {
+                    id: background::BACKGROUND_ID.into(),
+                },
+                REQ_ID_NO_RESPONSE,
+            ));
+        }
+        let env = build_envelope(&cmds);
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
