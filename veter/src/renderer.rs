@@ -1203,29 +1203,36 @@ impl TerminalRenderer {
         color: Color,
         align: vge::command::Align,
         font_style: vge::command::FontStyle,
+        scale: f32,
     ) {
         if text.is_empty() {
             return;
         }
 
+        // `scale` is the element's composed on-screen scale (VGE §9.11). We
+        // rasterise glyphs at `font_size · scale` so a zoomed-in text element
+        // is drawn crisp at its final pixel size rather than magnified from a
+        // cell-size atlas. `x_px`/`y_px` already arrive in device pixels.
+        let font_px = self.font_size * scale;
+
         // Render the glyphs themselves and recover the actual rendered
         // extent (start_x, total_width) so we can stack underline /
         // strikethrough rules on top.
         let (start_x, total_width) = if font_style.bold() || font_style.italic() {
-            self.draw_text_styled(canvas, x_px, y_px, text, color, align, font_style)
+            self.draw_text_styled(canvas, x_px, y_px, text, color, align, font_style, font_px)
         } else {
-            self.draw_text_plain(canvas, x_px, y_px, text, color, align)
+            self.draw_text_plain(canvas, x_px, y_px, text, color, align, font_px)
         };
 
         if font_style.underline() || font_style.strikethrough() {
             let mut path = Path::new();
-            let thickness = (self.font_size / 16.0).max(1.0);
+            let thickness = (font_px / 16.0).max(1.0);
             if font_style.underline() {
-                let uy = y_px + (self.cell_height - self.ascent) * 0.5;
+                let uy = y_px + (self.cell_height - self.ascent) * 0.5 * scale;
                 path.rect(start_x, uy, total_width, thickness);
             }
             if font_style.strikethrough() {
-                let sy = y_px - self.ascent * 0.35;
+                let sy = y_px - self.ascent * 0.35 * scale;
                 path.rect(start_x, sy, total_width, thickness);
             }
             canvas.fill_path(&path, &Paint::color(color));
@@ -1243,6 +1250,7 @@ impl TerminalRenderer {
         text: &str,
         color: Color,
         align: vge::command::Align,
+        font_px: f32,
     ) -> (f32, f32) {
         struct CharInfo {
             ch: char,
@@ -1259,7 +1267,7 @@ impl TerminalRenderer {
             let font_ref = self.font_ref_for(font_id);
             let advance = font_ref
                 .glyph_metrics(&[])
-                .scale(self.font_size)
+                .scale(font_px)
                 .advance_width(glyph_id);
             total_width += advance;
             infos.push(CharInfo {
@@ -1287,7 +1295,7 @@ impl TerminalRenderer {
                     &mut self.scale_cx,
                     fr,
                     info.glyph_id,
-                    self.font_size,
+                    font_px,
                     0,
                 )
             } else {
@@ -1298,7 +1306,7 @@ impl TerminalRenderer {
                     &mut self.scale_cx,
                     fr,
                     info.glyph_id,
-                    self.font_size,
+                    font_px,
                     info.font_id,
                 )
             };
@@ -1339,6 +1347,7 @@ impl TerminalRenderer {
         color: Color,
         align: vge::command::Align,
         font_style: vge::command::FontStyle,
+        font_px: f32,
     ) -> (f32, f32) {
         use parley::style::{FontStyle as PStyle, FontWeight};
 
@@ -1366,7 +1375,7 @@ impl TerminalRenderer {
             ]))
         };
         builder.push_default(stack);
-        builder.push_default(StyleProperty::FontSize(self.font_size));
+        builder.push_default(StyleProperty::FontSize(font_px));
         builder.push_default(StyleProperty::FontWeight(weight));
         builder.push_default(StyleProperty::FontStyle(pstyle));
         let mut layout: Layout<Color> = builder.build(text);
@@ -1443,7 +1452,7 @@ impl TerminalRenderer {
                 &mut self.scale_cx,
                 fr,
                 g.glyph_id,
-                self.font_size,
+                font_px,
                 g.font_id,
             );
             let rendered = match rendered {

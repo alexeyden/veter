@@ -235,6 +235,7 @@ pub fn render_one_top_level<T: Renderer>(
         cell_w,
         cell_h,
         stroke_scale,
+        1.0,
     );
 }
 
@@ -249,6 +250,7 @@ fn render_element<T: Renderer>(
     cell_w: f32,
     cell_h: f32,
     stroke_scale: f32,
+    scale: f32,
 ) {
     if !el.is_visible {
         return;
@@ -259,18 +261,40 @@ fn render_element<T: Renderer>(
     if let Some(size) = el.clip_size {
         canvas.intersect_scissor(ox, oy, size.x * cell_w, size.y * cell_h);
     }
-    // Element transform (§9.11): premultiplied into the canvas state, so
-    // it composes with every ancestor transform already on the stack and
-    // is inherited by the subtree below. Downstream code keeps baking
-    // untransformed pixel coordinates; the composed canvas matrix is
-    // translate(ox, oy) · M_px · translate(−ox, −oy) with
-    // M_px = [a, b, c, d, e·cell_w, f·cell_h] — the linear part acts on
-    // pixel geometry about the origin, the translation is in cell units.
-    if let Some(t) = &el.transform {
-        let tx = ox - t.a * ox - t.c * oy + t.e * cell_w;
-        let ty = oy - t.b * ox - t.d * oy + t.f * cell_h;
-        canvas.set_transform(&Transform2D::new(t.a, t.b, t.c, t.d, tx, ty));
-    }
+    // Element transform (§9.11). A pure axis-aligned scale + translate
+    // (`b == c == 0` — the pan/zoom case) is *folded into the baked
+    // coordinate system* rather than pushed onto the canvas matrix: we
+    // scale the cell size, shift the origin, and carry a uniform `scale`
+    // for glyph rasterisation, leaving the matrix untouched. femtovg then
+    // tessellates strokes and rasterises text at the final on-screen
+    // resolution, so a magnified element keeps a ~1px AA fringe and crisp
+    // glyphs — instead of scaling a result built at zoom 1, which showed up
+    // as a notch on stroked seams and blurry text.
+    //
+    // Rotation / shear still go through the matrix (which premultiplies
+    // onto the ancestor stack): rare, and the residual softness on rotated
+    // content is acceptable. Baking uses `translate(ox,oy) · M_px ·
+    // translate(−ox,−oy)` with `M_px = [a,b,c,d, e·cell_w, f·cell_h]` — the
+    // linear part acts on pixel geometry about the origin, the translation
+    // is in cell units.
+    let (ox, oy, cell_w, cell_h, stroke_scale, scale) = match &el.transform {
+        Some(t) if t.b == 0.0 && t.c == 0.0 => {
+            let ox = ox + t.e * cell_w;
+            let oy = oy + t.f * cell_h;
+            let cell_w = t.a * cell_w;
+            let cell_h = t.d * cell_h;
+            let stroke_scale = (cell_w.abs() + cell_h.abs()) * 0.5;
+            let scale = scale * (t.a.abs() + t.d.abs()) * 0.5;
+            (ox, oy, cell_w, cell_h, stroke_scale, scale)
+        }
+        Some(t) => {
+            let tx = ox - t.a * ox - t.c * oy + t.e * cell_w;
+            let ty = oy - t.b * ox - t.d * oy + t.f * cell_h;
+            canvas.set_transform(&Transform2D::new(t.a, t.b, t.c, t.d, tx, ty));
+            (ox, oy, cell_w, cell_h, stroke_scale, scale)
+        }
+        None => (ox, oy, cell_w, cell_h, stroke_scale, scale),
+    };
 
     // Children first, in (draw_order, creation_seq) order.
     let key = element_storage_key(state, el);
@@ -290,6 +314,7 @@ fn render_element<T: Renderer>(
                 cell_w,
                 cell_h,
                 stroke_scale,
+                scale,
             );
         }
     }
@@ -307,6 +332,7 @@ fn render_element<T: Renderer>(
             cell_w,
             cell_h,
             stroke_scale,
+            scale,
         );
     }
 
@@ -344,6 +370,7 @@ fn render_cmd<T: Renderer>(
     cell_w: f32,
     cell_h: f32,
     stroke_scale: f32,
+    scale: f32,
 ) {
     match cmd {
         DrawCmd::FillRectangles { fill, rects } => {
@@ -374,7 +401,9 @@ fn render_cmd<T: Renderer>(
                 None => MAGENTA,
             };
             let baseline_x = ox + origin.x * cell_w;
-            let baseline_y = oy + origin.y * cell_h + renderer.ascent();
+            // Baseline drop scales with the glyphs so the text stays pinned
+            // to its origin under zoom.
+            let baseline_y = oy + origin.y * cell_h + renderer.ascent() * scale;
             renderer.draw_vge_text(
                 canvas,
                 baseline_x,
@@ -383,6 +412,7 @@ fn render_cmd<T: Renderer>(
                 color,
                 *align,
                 *font_style,
+                scale,
             );
         }
         DrawCmd::FillPolygon { fill, points } => {

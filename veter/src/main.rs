@@ -865,6 +865,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
         text_color,
         vge::command::Align::Left,
         vge::command::FontStyle::default(),
+        1.0,
     );
 }
 
@@ -941,6 +942,7 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
             fg_color,
             vge::command::Align::Left,
             vge::command::FontStyle::default(),
+            1.0,
         );
     }
 }
