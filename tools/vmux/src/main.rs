@@ -951,6 +951,23 @@ fn surface_style() -> Style {
     }
 }
 
+/// A color darkened by `amount` (0..1) — each channel scaled toward black,
+/// hue and saturation preserved. Alpha is untouched.
+fn darken(c: Color, amount: f32) -> Color {
+    let k = 1.0 - amount;
+    Color { r: c.r * k, g: c.g * k, b: c.b * k, a: c.a }
+}
+
+/// Background-activity marker for an inactive tab's number cell: the accent
+/// darkened by 40%. Muting it keeps it distinct from the full-accent
+/// active-tab badge, which otherwise reads as the same color. Derived as a
+/// concrete `Style::Flat` (like `surface_style`) rather than the
+/// `Style::Ref("host.accent")` `accent_style` emits, since a host style ref
+/// cannot be shaded locally.
+fn activity_style() -> Style {
+    Style::Flat(darken(accent_color(), 0.4))
+}
+
 /// Same hue as COLOR_BRAND but semi-transparent — the fallback thumb fill
 /// behind a pane's title text when the host does not theme `host.*`.
 const COLOR_TITLE_THUMB: Color = Color {
@@ -1505,13 +1522,13 @@ fn build_tabbar_commands(
         let name_text = format!(" {} ", slot.label);
         let is_active = i == active;
 
-        // Number sub-rect, top-left corner rounded. Dim modal
-        // background normally; the brand fill — the same highlight the
-        // active tab's name rect uses — when the tab has unseen
-        // background activity.
+        // Number sub-rect, top-left corner rounded. Dim modal background
+        // normally; a 40%-darker accent fill when the tab has unseen
+        // background activity — muted so it stays distinct from the
+        // full-accent active-tab name badge.
         let has_activity = activity.get(i).copied().unwrap_or(false);
         let num_bg = if has_activity {
-            accent_style()
+            activity_style()
         } else {
             surface_style()
         };
@@ -6889,6 +6906,21 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn darken_scales_channels_and_keeps_alpha() {
+        let c = Color { r: 0.2, g: 0.5, b: 0.9, a: 0.8 };
+        let d = darken(c, 0.4); // 40% darker → channels * 0.6
+        assert!((d.r - 0.12).abs() < 1e-6);
+        assert!((d.g - 0.30).abs() < 1e-6);
+        assert!((d.b - 0.54).abs() < 1e-6);
+        assert_eq!(d.a, c.a, "alpha untouched");
+
+        // 0.0 is identity; 1.0 collapses to black.
+        assert_eq!(darken(c, 0.0), c);
+        let black = darken(c, 1.0);
+        assert!(black.r == 0.0 && black.g == 0.0 && black.b == 0.0);
+    }
 
     #[test]
     fn parse_prefix_key_variants() {
