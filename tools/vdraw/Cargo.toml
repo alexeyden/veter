@@ -7,6 +7,7 @@ description = "Interactive block-diagram editor for VGE-aware terminals."
 [dependencies]
 vge-render = { path = "../../vge-render" }
 vge-protocol = { path = "../../vge-protocol" }
+prt-protocol = { path = "../../prt-protocol" }
 anyhow = "1"
 nix = { version = "0.29", features = ["term", "poll", "signal"] }
 libc = "0.2"

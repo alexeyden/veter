@@ -270,7 +270,9 @@ fn panel_border() -> Style {
     rgba(255, 255, 255, 0.12)
 }
 fn active_bg() -> Style {
-    rgba(52, 116, 214, 0.95)
+    // Follows the terminal's themed accent when available; otherwise the
+    // built-in #3474D6 (see `theme::active_tool_fill`).
+    crate::theme::active_tool_fill()
 }
 fn ink() -> Style {
     rgba(214, 218, 226, 1.0)

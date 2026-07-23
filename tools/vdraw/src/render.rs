@@ -79,7 +79,7 @@ pub fn selection_element() -> Command {
 
 /// Dashed bounds plus a square at each resize handle.
 pub fn selection_commands(e: &Element, cam: &Camera) -> Vec<DrawCmd> {
-    let accent = ACCENT;
+    let accent = crate::theme::selection_accent();
     let pad_x = 3.0 / cam.cell_w;
     let pad_y = 3.0 / cam.cell_h;
     let tl = cam.doc_to_canvas(e.x, e.y);

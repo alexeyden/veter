@@ -41,6 +41,7 @@ mod history;
 mod hit;
 mod input;
 mod render;
+mod theme;
 mod tools;
 
 use std::io::Write;
@@ -66,7 +67,7 @@ use camera::Camera;
 use chrome::{Action, CHROME_ID};
 use drag::Drag;
 use input::{Dir, Event, InputParser};
-use render::{ACCENT, CANVAS_ID, CHROME_ORDER, PREVIEW_ID, PREVIEW_ORDER};
+use render::{CANVAS_ID, CHROME_ORDER, PREVIEW_ID, PREVIEW_ORDER};
 use tools::{Tool, ToolState};
 
 /// What the pointer is currently doing. Making this explicit keeps the
@@ -110,6 +111,12 @@ fn main() -> Result<()> {
     let probe = run_probe(PROBE_TIMEOUT)?.ok_or_else(|| {
         anyhow!("VGE probe timed out — this terminal does not appear to support VGE")
     })?;
+    // Adopt the terminal's themed accent when it publishes one, so the
+    // selection, caret and active-tool highlight track veter's theme.
+    // A terminal that doesn't speak PRT simply keeps vdraw's own accent.
+    if let Some(accent) = probe_host_accent(PROBE_TIMEOUT) {
+        theme::set_host_accent(accent);
+    }
 
     let mut cam = Camera::new(
         probe.cell_pixel_width.max(1) as f32,
@@ -822,7 +829,7 @@ fn push_element_update(
     };
     let mut commands = body.commands;
     if caret {
-        commands.push(render::caret_command(e, ACCENT));
+        commands.push(render::caret_command(e, theme::selection_accent()));
     }
     frame.push((
         Command::UpdateOrigin {
@@ -1012,6 +1019,76 @@ fn parse_args() -> Result<Args> {
     Ok(Args { path, background })
 }
 
+/// Query the terminal's themed accent with a PRT probe (portal-extension
+/// §2.1 / §10). Returns the concrete `host.accent` colour for this pane's
+/// nesting depth when the host advertises `FEAT_VGE_HOST_THEMED_STYLES`,
+/// else `None`. vdraw runs inside a vmux portal, so this tracks veter's
+/// configured accent and the pane depth — the same signal vmux keys its
+/// chrome off. Best-effort: any read hiccup or a non-PRT terminal just
+/// yields `None` and vdraw keeps its built-in accent.
+fn probe_host_accent(timeout: Duration) -> Option<Color> {
+    use prt_protocol::frame::MARKER_T2C;
+
+    let env = prt_protocol::encode::build_envelope(&[(prt_protocol::command::Command::Probe, 0)]);
+    {
+        let mut out = std::io::stdout();
+        out.write_all(&env).ok()?;
+        out.flush().ok()?;
+    }
+
+    let mut apc = prt_protocol::ApcStream::with_marker(*MARKER_T2C);
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 4096];
+    loop {
+        if !poll_stdin_until(deadline).ok()? {
+            return None;
+        }
+        let n = read_stdin(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        if let Some(payload) = apc.feed(&buf[..n]).payloads.into_iter().next() {
+            return parse_prt_accent(&payload);
+        }
+    }
+}
+
+/// Pull the themed accent out of a PRT ProbeResponse payload. The accent
+/// RGBA8 follows the `vge_features` byte (§10) only when the host sets
+/// `FEAT_VGE_HOST_THEMED_STYLES`; a short body (older host) reads the
+/// trailing fields as absent and yields `None`.
+fn parse_prt_accent(payload: &[u8]) -> Option<Color> {
+    use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, RSP_PROBE};
+
+    let mut r = prt_protocol::Reader::new(payload);
+    let _ = r.u8(); // payload protocol_version
+    let _ = r.u32(); // payload_length
+    if r.u8().ok()? != RSP_PROBE {
+        return None;
+    }
+    let _ = r.u32(); // request_id
+    let _ = r.u32(); // body_length
+    let _ = r.u16(); // protocol_version
+    let _ = r.u32(); // max_portals
+    let _ = r.u32(); // max_portal_cells_w
+    let _ = r.u32(); // max_portal_cells_h
+    let _ = r.u32(); // max_scrollback_lines
+    let _ = r.u32(); // max_write_bytes
+    let _ = r.u8(); // features
+    let _ = r.u8(); // max_nesting_depth
+    let vge_features = r.u8().unwrap_or(0); // §10 trailing byte
+    if vge_features & FEAT_VGE_HOST_THEMED_STYLES == 0 {
+        return None;
+    }
+    let (red, green, blue, alpha) = (r.u8().ok()?, r.u8().ok()?, r.u8().ok()?, r.u8().ok()?);
+    Some(Color {
+        r: red as f32 / 255.0,
+        g: green as f32 / 255.0,
+        b: blue as f32 / 255.0,
+        a: alpha as f32 / 255.0,
+    })
+}
+
 fn term_size() -> Result<(u16, u16)> {
     let ws = winsize().ok_or_else(|| anyhow!("could not query terminal size"))?;
     Ok((ws.ws_col.max(1), ws.ws_row.max(1)))
@@ -1045,5 +1122,54 @@ impl Drop for TermExit {
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prt_protocol::envelope::{append_frame, wrap_t2c_envelope, ProbeBody};
+    use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, MARKER_T2C, RSP_PROBE};
+
+    /// Round-trip a PRT ProbeResponse through the real APC stream and
+    /// then `parse_prt_accent`, exactly as `probe_host_accent` does.
+    fn accent_from_probe(vge_features: Option<u8>, accent: Option<[u8; 4]>) -> Option<Color> {
+        let body = ProbeBody {
+            protocol_version: 0,
+            max_portals: 8,
+            max_portal_cells_w: 1000,
+            max_portal_cells_h: 1000,
+            max_scrollback_lines: 10_000,
+            max_write_bytes: 65_536,
+            features: 0,
+            max_nesting_depth: 8,
+            vge_features,
+            accent_rgba: accent,
+        }
+        .encode();
+        let mut frames = Vec::new();
+        append_frame(&mut frames, RSP_PROBE, 0, &body);
+        let env = wrap_t2c_envelope(&frames);
+        let mut apc = prt_protocol::ApcStream::with_marker(*MARKER_T2C);
+        let payload = apc.feed(&env).payloads.into_iter().next().expect("payload");
+        parse_prt_accent(&payload)
+    }
+
+    #[test]
+    fn parses_the_themed_accent() {
+        let c = accent_from_probe(Some(FEAT_VGE_HOST_THEMED_STYLES), Some([0x11, 0x22, 0x33, 0xFF]))
+            .expect("themed accent");
+        assert!((c.r - 0x11 as f32 / 255.0).abs() < 1e-6);
+        assert!((c.g - 0x22 as f32 / 255.0).abs() < 1e-6);
+        assert!((c.b - 0x33 as f32 / 255.0).abs() < 1e-6);
+        assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn no_accent_when_host_is_unthemed_or_old() {
+        // Themed bit clear → no accent, even if bytes trail.
+        assert!(accent_from_probe(Some(0), None).is_none());
+        // Older host that omits the vge_features byte entirely.
+        assert!(accent_from_probe(None, None).is_none());
     }
 }
