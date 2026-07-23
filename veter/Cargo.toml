@@ -22,7 +22,7 @@ vge-protocol = { path = "../vge-protocol" }
 prt-protocol = { path = "../prt-protocol" }
 vft-protocol = { path = "../vft-protocol" }
 vt100 = { path = "../vt100" }
-femtovg = { version = "0.22", features = ["swash"] }
+femtovg = { path = "../femtovg", features = ["swash"] }
 parley = "0.7"
 swash = "0.2"
 winit = "0.30"

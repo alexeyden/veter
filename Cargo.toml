@@ -1,3 +1,3 @@
 [workspace]
-members = ["veter", "veter-host", "vge-protocol", "vge-render", "vge-cli", "prt-protocol", "prt-cli", "vft-protocol", "vss-protocol", "ses-protocol", "tools/vcat", "tools/vplay", "tools/vdraw", "tools/breakout", "tools/spinner", "tools/vmux", "tools/vft-client", "tools/vsend", "tools/vrecv", "tools/vsd", "tools/vssh", "vt100"]
+members = ["veter", "veter-host", "vge-protocol", "vge-render", "vge-cli", "prt-protocol", "prt-cli", "vft-protocol", "vss-protocol", "ses-protocol", "tools/vcat", "tools/vplay", "tools/vdraw", "tools/breakout", "tools/spinner", "tools/vmux", "tools/vft-client", "tools/vsend", "tools/vrecv", "tools/vsd", "tools/vssh", "vt100", "femtovg"]
 resolver = "2"
