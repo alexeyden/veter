@@ -28,7 +28,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -61,11 +61,19 @@ use ses_protocol::{
 use vge_protocol::apc::ApcStream as VgeApcStream;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Align, Color, Command as VgeCommand, CreateElementBody, DrawCmd, FontStyle, Style,
+    Align, Command as VgeCommand, CreateElementBody, DrawCmd, FontStyle, Style,
 };
 use vge_protocol::encode::build_envelope as build_vge_envelope;
 use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PROBE};
-use vge_protocol::path::{PathNode, PathSegment};
+
+use vge_ui::edit::{EditOutcome, LineEditor};
+use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
+use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
+use vge_ui::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
+use vge_ui::theme::{
+    self, COLOR_ACTIVE_TEXT, COLOR_DIM_TEXT, COLOR_SCROLLBAR, COLOR_TITLE_TEXT, accent_style,
+    activity_style, surface_style, title_thumb_style,
+};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
 
@@ -859,257 +867,6 @@ const PORTAL_SCROLLBACK_LINES: u32 = 5_000;
 /// the right pane.
 const SCROLL_REQUEST_ID_BASE: u32 = 0x5C_00_00_00;
 
-/// Brand color (#56799f) shared by separators, the title thumb, the
-/// active-tab gradient, and the modal outline. Muted blue — distinctive
-/// against the terminal background. Only used as a fallback when the host
-/// does not theme `host.*`; otherwise the host's accent palette wins.
-const COLOR_BRAND: Color = Color {
-    r: 0x56 as f32 / 255.0,
-    g: 0x79 as f32 / 255.0,
-    b: 0x9f as f32 / 255.0,
-    a: 1.0,
-};
-
-/// Reserved host-provided accent style id (VGE spec §7.3). Resolves to
-/// veter's configured accent for this portal's nesting depth.
-const HOST_ACCENT_STYLE_ID: &str = "host.accent";
-
-/// Set once at startup from the PRT probe (`FEAT_VGE_HOST_THEMED_STYLES`).
-/// When true, chrome accents reference the host `host.accent` style so
-/// they follow veter's theme and signal nesting depth; otherwise they
-/// use the compiled-in `COLOR_BRAND`.
-static HOST_THEMED_STYLES: AtomicBool = AtomicBool::new(false);
-
-/// Accent fill/stroke style for vmux chrome — a host `StyleRef` when the
-/// host themes `host.*`, else the compiled-in brand color.
-fn accent_style() -> Style {
-    if CLI_ACCENT_SET.load(Ordering::Relaxed) {
-        Style::Flat(accent_color())
-    } else if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
-        Style::Ref(HOST_ACCENT_STYLE_ID.to_string())
-    } else {
-        Style::Flat(COLOR_BRAND)
-    }
-}
-
-/// Straight RGBA8 accent the host reported for this vmux's nesting depth,
-/// packed `0xRRGGBBAA`. Valid only when `HOST_THEMED_STYLES` is set; it is
-/// the concrete value `host.accent` resolves to, so locally-derived shades
-/// match the `StyleRef` chrome exactly.
-static HOST_ACCENT_RGBA: AtomicU32 = AtomicU32::new(0);
-
-/// CLI accent override (`--accent`/`-A`), packed `0xRRGGBBAA`. When
-/// `CLI_ACCENT_SET` is true this wins over both the host's reported accent
-/// and the compiled-in brand, letting an outer `ssh`/`vmux` give a nested
-/// session a distinct chrome color. Set once at startup.
-static CLI_ACCENT_SET: AtomicBool = AtomicBool::new(false);
-static CLI_ACCENT_RGBA: AtomicU32 = AtomicU32::new(0);
-
-/// Unpack a `0xRRGGBBAA` value into a normalized `Color`.
-fn color_from_rgba(rgba: u32) -> Color {
-    let [r, g, b, a] = rgba.to_be_bytes();
-    Color {
-        r: r as f32 / 255.0,
-        g: g as f32 / 255.0,
-        b: b as f32 / 255.0,
-        a: a as f32 / 255.0,
-    }
-}
-
-/// The accent as a concrete color — the host's reported accent when it
-/// themes `host.*`, else the compiled-in brand. Used to derive shades the
-/// host does not provide as their own styles.
-fn accent_color() -> Color {
-    if CLI_ACCENT_SET.load(Ordering::Relaxed) {
-        color_from_rgba(CLI_ACCENT_RGBA.load(Ordering::Relaxed))
-    } else if HOST_THEMED_STYLES.load(Ordering::Relaxed) {
-        color_from_rgba(HOST_ACCENT_RGBA.load(Ordering::Relaxed))
-    } else {
-        COLOR_BRAND
-    }
-}
-
-/// Translucent accent for the thumb behind a pane's title text.
-fn title_thumb_style() -> Style {
-    if CLI_ACCENT_SET.load(Ordering::Relaxed) || HOST_THEMED_STYLES.load(Ordering::Relaxed) {
-        Style::Flat(Color { a: 0.35, ..accent_color() })
-    } else {
-        Style::Flat(COLOR_TITLE_THUMB)
-    }
-}
-
-/// Dark accent-tinted surface for modal/dialog backgrounds, the tab-bar
-/// session segment, and inactive tab-number cells. Scaled toward black so
-/// light foreground text stays legible over arbitrary shell content.
-fn surface_style() -> Style {
-    if CLI_ACCENT_SET.load(Ordering::Relaxed) || HOST_THEMED_STYLES.load(Ordering::Relaxed) {
-        let c = accent_color();
-        const K: f32 = 0.20;
-        Style::Flat(Color { r: c.r * K, g: c.g * K, b: c.b * K, a: 0.96 })
-    } else {
-        Style::Flat(COLOR_MODAL_BG)
-    }
-}
-
-/// A color darkened by `amount` (0..1) — each channel scaled toward black,
-/// hue and saturation preserved. Alpha is untouched.
-fn darken(c: Color, amount: f32) -> Color {
-    let k = 1.0 - amount;
-    Color { r: c.r * k, g: c.g * k, b: c.b * k, a: c.a }
-}
-
-/// Background-activity marker for an inactive tab's number cell: the accent
-/// darkened by 40%. Muting it keeps it distinct from the full-accent
-/// active-tab badge, which otherwise reads as the same color. Derived as a
-/// concrete `Style::Flat` (like `surface_style`) rather than the
-/// `Style::Ref("host.accent")` `accent_style` emits, since a host style ref
-/// cannot be shaded locally.
-fn activity_style() -> Style {
-    Style::Flat(darken(accent_color(), 0.4))
-}
-
-/// Same hue as COLOR_BRAND but semi-transparent — the fallback thumb fill
-/// behind a pane's title text when the host does not theme `host.*`.
-const COLOR_TITLE_THUMB: Color = Color {
-    r: COLOR_BRAND.r,
-    g: COLOR_BRAND.g,
-    b: COLOR_BRAND.b,
-    a: 0.35,
-};
-const COLOR_TAB_INACTIVE_TEXT: Color = Color {
-    r: 0.55,
-    g: 0.58,
-    b: 0.65,
-    a: 1.0,
-};
-const COLOR_TAB_ACTIVE_TEXT: Color = Color {
-    r: 0.98,
-    g: 0.94,
-    b: 0.85,
-    a: 1.0,
-};
-const COLOR_TITLE_TEXT: Color = Color {
-    r: 0.92,
-    g: 0.94,
-    b: 0.98,
-    a: 1.0,
-};
-const COLOR_SCROLLBAR: Color = Color {
-    r: 1.0,
-    g: 1.0,
-    b: 1.0,
-    a: 0.35,
-};
-/// Modal background: a dark, mostly-opaque base for legibility — the
-/// modal can sit over arbitrary shell text. Tinted slightly toward
-/// COLOR_BRAND so it reads as part of the same palette as the brand
-/// accents (separators, title thumb, active tab) instead of looking
-/// like a leftover from another design.
-const COLOR_MODAL_BG: Color = Color {
-    r: 0.09,
-    g: 0.06,
-    b: 0.16,
-    a: 0.96,
-};
-const COLOR_MODAL_TEXT: Color = Color {
-    r: 0.96,
-    g: 0.96,
-    b: 0.98,
-    a: 1.0,
-};
-
-/// Slight corner rounding applied uniformly across vmux chrome (active
-/// tab top edges, modal corners, pane title pills). One value so all
-/// chrome reads as part of the same visual language; conservative on
-/// purpose — too aggressive and the chrome turns into a button.
-/// Y units only; the matching `rx` is computed per call site so
-/// anisotropic cells don't produce visually elliptical corners.
-const CHROME_CORNER_RY: f32 = 0.175;
-
-/// Compute an `rx` in cell units that yields a visually-circular arc
-/// for `ry` given the host's pixel-per-cell ratios. Clamps so the corner
-/// never exceeds 40% of the rect's smaller dimension (prevents arcs
-/// from collapsing into each other on narrow shapes).
-fn chrome_corner_radii(width: f32, height: f32, cell_pw: f32, cell_ph: f32) -> (f32, f32) {
-    let ry = CHROME_CORNER_RY.min(height * 0.4);
-    let rx = (CHROME_CORNER_RY * cell_ph / cell_pw).min(width * 0.4);
-    (rx, ry)
-}
-
-/// Build a closed rectangle path with selectable rounded corners.
-/// Corner toggles are `(top_left, top_right, bottom_right, bottom_left)`
-/// — `false` produces a square corner. Traversal is CCW in y-down
-/// coords (matches femtovg's tessellator preference — see `brick_drawcmd`
-/// in tools/breakout).
-fn rounded_rect_path_corners(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    rx: f32,
-    ry: f32,
-    tl: bool,
-    tr: bool,
-    br: bool,
-    bl: bool,
-) -> Vec<PathSegment> {
-    let arc = |dst: Point| PathNode::ArcEllipseTo {
-        large: false,
-        sweep: false,
-        rx,
-        ry,
-        rotation: 0.0,
-        dst,
-    };
-    let start_y = if tl { y0 + ry } else { y0 };
-    let mut nodes: Vec<PathNode> = Vec::new();
-    // Down the left edge.
-    nodes.push(PathNode::VerticalLineTo {
-        y: if bl { y1 - ry } else { y1 },
-    });
-    if bl {
-        nodes.push(arc(Point { x: x0 + rx, y: y1 }));
-    }
-    // Across the bottom.
-    nodes.push(PathNode::HorizontalLineTo {
-        x: if br { x1 - rx } else { x1 },
-    });
-    if br {
-        nodes.push(arc(Point { x: x1, y: y1 - ry }));
-    }
-    // Up the right edge.
-    nodes.push(PathNode::VerticalLineTo {
-        y: if tr { y0 + ry } else { y0 },
-    });
-    if tr {
-        nodes.push(arc(Point { x: x1 - rx, y: y0 }));
-    }
-    // Across the top.
-    nodes.push(PathNode::HorizontalLineTo {
-        x: if tl { x0 + rx } else { x0 },
-    });
-    if tl {
-        nodes.push(arc(Point { x: x0, y: y0 + ry }));
-    }
-    nodes.push(PathNode::ClosePath);
-    vec![PathSegment {
-        start: Point { x: x0, y: start_y },
-        nodes,
-    }]
-}
-
-/// Build a closed rounded-rectangle path with all four corners rounded.
-fn rounded_rect_path(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    rx: f32,
-    ry: f32,
-) -> Vec<PathSegment> {
-    rounded_rect_path_corners(x0, y0, x1, y1, rx, ry, true, true, true, true)
-}
-
 /// VGE element ID used for a pane's chrome (title thumb + scroll thumb).
 fn chrome_element_id(pane_id: &str) -> String {
     format!("vmux-chrome-{pane_id}")
@@ -1123,6 +880,14 @@ const MODAL_BODY_FILL_ID: &str = "vmux-modal-bg";
 const MODAL_BODY_LINES_ID: &str = "vmux-modal-body";
 const MODAL_TRACK_ID: &str = "vmux-modal-track";
 const MODAL_THUMB_ID: &str = "vmux-modal-thumb";
+/// The same ids, in the shape [`ScrollModal`] wants.
+const MODAL_IDS: ModalIds<'static> = ModalIds {
+    root: MODAL_ELEMENT_ID,
+    body_fill: MODAL_BODY_FILL_ID,
+    body_lines: MODAL_BODY_LINES_ID,
+    track: MODAL_TRACK_ID,
+    thumb: MODAL_THUMB_ID,
+};
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
 /// Floor on the per-tab label length when the bar is crowded. Labels
 /// shrink uniformly to reclaim space but never below this many
@@ -1493,7 +1258,7 @@ fn build_tabbar_commands(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: 0.0, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(COLOR_TAB_ACTIVE_TEXT),
+            fill: Style::Flat(COLOR_ACTIVE_TEXT),
             font_style: FontStyle(0x01),
             text: format!(" {label} "),
         });
@@ -1546,7 +1311,7 @@ fn build_tabbar_commands(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(COLOR_TAB_ACTIVE_TEXT),
+            fill: Style::Flat(COLOR_ACTIVE_TEXT),
             font_style: FontStyle(0x00),
             text: num_text,
         });
@@ -1589,9 +1354,9 @@ fn build_tabbar_commands(
             origin: Point { x: name_x0, y: 0.0 },
             align: Align::Left,
             fill: Style::Flat(if name_lit {
-                COLOR_TAB_ACTIVE_TEXT
+                COLOR_ACTIVE_TEXT
             } else {
-                COLOR_TAB_INACTIVE_TEXT
+                COLOR_DIM_TEXT
             }),
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
             text: name_text,
@@ -1739,110 +1504,14 @@ fn build_chrome_commands(
     cmds
 }
 
-fn build_modal_commands(
-    host_w: u32,
-    host_h: u32,
-    title: &str,
-    line: &str,
-    cell_pw: f32,
-    cell_ph: f32,
-    caret: Option<usize>,
-) -> CreateElementBody {
-    // Center a fixed-size modal box on the host grid. The 4-cell box
-    // is (title strip)(body top pad)(body line)(body bottom pad) —
-    // title row is filled with brand color, the rest with the modal
-    // bg, and the whole box gets a rounded-edge brand outline that
-    // matches the tab and pill styling.
-    let chars = line.chars().count() as f32;
-    let inner_w = chars.max(20.0);
-    let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
-    let box_h = 4.0_f32.min(host_h.saturating_sub(2) as f32);
-
-    let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
-    let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
-
-    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
-    let mut cmds = vec![
-        // Body fill — full rounded rect; the title strip is drawn over
-        // its top region.
-        DrawCmd::FillPath {
-            fill: surface_style(),
-            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-        },
-        // Title strip — rounded only on the top corners so the seam
-        // with the body fill below is straight.
-        DrawCmd::FillPath {
-            fill: accent_style(),
-            segments: rounded_rect_path_corners(
-                0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
-            ),
-        },
-        DrawCmd::DrawLinePath {
-            stroke: accent_style(),
-            line_width: 0.1,
-            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-        },
-        DrawCmd::DrawText {
-            origin: Point {
-                x: box_w * 0.5,
-                y: 0.0,
-            },
-            align: Align::Center,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(0x01),
-            text: title.into(),
-        },
-        DrawCmd::DrawText {
-            origin: Point {
-                x: box_w * 0.5,
-                y: 2.0,
-            },
-            align: Align::Center,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(0x00),
-            text: line.into(),
-        },
-    ];
-
-    // Text cursor: a thin vertical bar drawn at the insertion point rather
-    // than a literal caret glyph in the string, so it doesn't shift the
-    // text. The body line is center-aligned, so its left edge is
-    // `box_w/2 - chars/2`; the bar sits `caret` cells to the right of that
-    // (one glyph advance ≈ one cell, the same assumption the box sizing
-    // above makes).
-    if let Some(c) = caret {
-        let caret_x = box_w * 0.5 - chars * 0.5 + c.min(line.chars().count()) as f32;
-        const HALF_W: f32 = 0.07;
-        cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(accent_color()),
-            segments: rounded_rect_path(caret_x - HALF_W, 2.1, caret_x + HALF_W, 2.9, 0.0, 0.0),
-        });
-    }
-
-    CreateElementBody {
-        id: MODAL_ELEMENT_ID.to_string(),
-        commands: cmds,
-        origin: Point {
-            x: origin_x,
-            y: origin_y,
-        },
-        is_visible: true,
-        draw_order: MODAL_DRAW_ORDER,
-        parent: None,
-        size: None,
-        transform: None,
-    }
-}
-
-/// Help-modal contents: list of every prefix keybinding. Activated via
-/// `prefix-?`, dismissed by any keystroke. Built once on first use so the
-/// prefix-key lines reflect `--prefix`; the layout/sizing helpers read the
-/// resulting slice exactly as they did the former `const`.
-fn help_lines() -> &'static [String] {
-    static LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    LINES.get_or_init(|| {
+/// The help overlay: every prefix keybinding, as a scrollable modal.
+/// Activated via `prefix-?`, dismissed by any keystroke. Built once on
+/// first use so the prefix-key lines reflect `--prefix`.
+fn help_modal() -> &'static ScrollModal {
+    static MODAL: std::sync::OnceLock<ScrollModal> = std::sync::OnceLock::new();
+    MODAL.get_or_init(|| {
         let p = prefix_name();
-        vec![
+        ScrollModal::new(vec![
             format!("vmux keybindings  —  prefix is {p}"),
             "".into(),
             "Pane".into(),
@@ -1900,379 +1569,15 @@ fn help_lines() -> &'static [String] {
             format!("  {p}  send a literal {p}"),
             "".into(),
             "j/k or ↑/↓ scroll · any other key dismisses".into(),
-        ]
+        ])
     })
 }
 
 /// Number of body lines a half-page jump moves through.
 const HELP_HALF_PAGE: i64 = 6;
 
-/// Returns (visible body rows, max scroll offset in body lines) given a
-/// modal box height. Body lines start at row 2 (after the title strip
-/// and a one-row gap) and stop at row `box_h - 1`, leaving a one-row
-/// bottom pad. When `box_h` is too small for the gap/pad, body content
-/// fills whatever is left.
-fn help_body_window(box_h: f32) -> (usize, u32) {
-    let body_rows = (box_h as i32 - 3).max(1) as usize;
-    let body_lines = help_lines().len().saturating_sub(1);
-    let max_offset = body_lines.saturating_sub(body_rows) as u32;
-    (body_rows, max_offset)
-}
 
-/// Y-coordinate of the scrollbar thumb element's origin (parent-local)
-/// for a given scroll `offset`. Centralised so initial creation and
-/// `UpdateOrigin`-driven scroll updates compute identical values.
-fn help_thumb_origin_y(box_h: f32, offset: u32) -> f32 {
-    let (body_rows, max_offset) = help_body_window(box_h);
-    let body_lines = help_lines().len().saturating_sub(1);
-    if body_lines <= body_rows || max_offset == 0 {
-        return 2.0;
-    }
-    let track_h = body_rows as f32;
-    let thumb_h = (track_h * body_rows as f32 / body_lines as f32).max(0.5);
-    let thumb_max_off = (track_h - thumb_h).max(0.0);
-    let off = offset.min(max_offset) as f32;
-    2.0 + thumb_max_off * off / max_offset as f32
-}
 
-/// Build the help modal as a parent element (chrome + clip rect) plus
-/// children for the body fill, the scrollable body lines, and — when
-/// content overflows — a scrollbar track and thumb. Scrolling is handled
-/// purely by shifting the body-lines and thumb children's origins, so
-/// the body's draw commands never need to be rebuilt.
-fn build_help_modal_elements(
-    host_w: u32,
-    host_h: u32,
-    offset: u32,
-    cell_pw: f32,
-    cell_ph: f32,
-) -> Vec<CreateElementBody> {
-    let max_line = help_lines()
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20) as f32;
-    let inner_w = max_line.max(30.0);
-    let box_w = (inner_w + 6.0).min(host_w.saturating_sub(2) as f32);
-    let inner_h = help_lines().len() as f32;
-    let box_h = (inner_h + 2.0).min(host_h.saturating_sub(2) as f32);
-
-    let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
-    let origin_y = ((host_h as f32 - box_h) * 0.5).floor();
-
-    let (body_rows, max_offset) = help_body_window(box_h);
-    let offset = offset.min(max_offset);
-    let body_lines = help_lines().len().saturating_sub(1);
-    let scrollable = body_lines > body_rows;
-
-    let mut elements: Vec<CreateElementBody> = Vec::new();
-
-    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
-
-    // Parent — its `size` clips every child to the modal's bounds, and
-    // its own `commands` (title strip, outline, title text) draw last,
-    // on top of every child, so the title strip cleanly masks any body
-    // line that scrolls into rows 0/1. Title strip rounds only its top
-    // corners; the bottom seam meets the body fill cleanly.
-    elements.push(CreateElementBody {
-        id: MODAL_ELEMENT_ID.into(),
-        commands: vec![
-            DrawCmd::FillPath {
-                fill: accent_style(),
-                segments: rounded_rect_path_corners(
-                    0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
-                ),
-            },
-            DrawCmd::DrawText {
-                origin: Point {
-                    x: box_w * 0.5,
-                    y: 0.0,
-                },
-                align: Align::Center,
-                fill: Style::Flat(COLOR_MODAL_TEXT),
-                font_style: FontStyle(0x01),
-                text: help_lines()[0].to_string(),
-            },
-            DrawCmd::DrawLinePath {
-                stroke: accent_style(),
-                line_width: 0.1,
-                segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-            },
-        ],
-        origin: Point {
-            x: origin_x,
-            y: origin_y,
-        },
-        is_visible: true,
-        draw_order: MODAL_DRAW_ORDER,
-        parent: None,
-        size: Some(Point {
-            x: box_w,
-            y: box_h,
-        }),
-        transform: None,
-    });
-
-    // Body fill — full rounded rect underneath the scrolling body lines.
-    // The title strip drawn by the parent (above) covers its top region;
-    // we rely on draw order rather than masking the body fill itself.
-    elements.push(CreateElementBody {
-        id: MODAL_BODY_FILL_ID.into(),
-        commands: vec![DrawCmd::FillPath {
-            fill: surface_style(),
-            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-        }],
-        origin: Point { x: 0.0, y: 0.0 },
-        is_visible: true,
-        draw_order: 0,
-        parent: Some(MODAL_ELEMENT_ID.into()),
-        size: None,
-        transform: None,
-    });
-
-    // Body lines — every line drawn at its natural y position; the
-    // element's origin shifts the whole stack up to scroll, and the
-    // parent's clip rect hides what goes out of view.
-    let mut body_cmds = Vec::with_capacity(body_lines);
-    for i in 1..help_lines().len() {
-        let line = &help_lines()[i];
-        let bold = !line.is_empty() && !line.starts_with(' ');
-        body_cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: 3.0,
-                y: 1.0 + i as f32,
-            },
-            align: Align::Left,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
-            text: line.to_string(),
-        });
-    }
-    elements.push(CreateElementBody {
-        id: MODAL_BODY_LINES_ID.into(),
-        commands: body_cmds,
-        origin: Point {
-            x: 0.0,
-            y: -(offset as f32),
-        },
-        is_visible: true,
-        draw_order: 1,
-        parent: Some(MODAL_ELEMENT_ID.into()),
-        size: None,
-        transform: None,
-    });
-
-    if scrollable {
-        let track_h = body_rows as f32;
-        let thumb_h = (track_h * body_rows as f32 / body_lines as f32).max(0.5);
-
-        elements.push(CreateElementBody {
-            id: MODAL_TRACK_ID.into(),
-            commands: vec![DrawCmd::FillRectangles {
-                fill: Style::Flat(COLOR_SCROLLBAR),
-                rects: vec![Rect {
-                    x: box_w - 1.0,
-                    y: 2.0,
-                    w: 0.4,
-                    h: track_h,
-                }],
-            }],
-            origin: Point { x: 0.0, y: 0.0 },
-            is_visible: true,
-            draw_order: 2,
-            parent: Some(MODAL_ELEMENT_ID.into()),
-            size: None,
-            transform: None,
-        });
-
-        // Thumb command is anchored at local (box_w-1, 0); the
-        // element's origin places it at the right y, so scroll updates
-        // are a single `UpdateOrigin` away.
-        elements.push(CreateElementBody {
-            id: MODAL_THUMB_ID.into(),
-            commands: vec![DrawCmd::FillRectangles {
-                fill: accent_style(),
-                rects: vec![Rect {
-                    x: box_w - 1.0,
-                    y: 0.0,
-                    w: 0.4,
-                    h: thumb_h,
-                }],
-            }],
-            origin: Point {
-                x: 0.0,
-                y: help_thumb_origin_y(box_h, offset),
-            },
-            is_visible: true,
-            draw_order: 3,
-            parent: Some(MODAL_ELEMENT_ID.into()),
-            size: None,
-            transform: None,
-        });
-    }
-
-    elements
-}
-
-/// Build the picker modal as a single VGE element (rebuilt on every
-/// keystroke — cheap, and the content changes with each filter edit).
-/// Layout top to bottom: title strip (row 0), the filter / command input
-/// with a caret (row 1), then the filtered list rows with the selected row
-/// highlighted. A scrollbar appears when matches overflow the visible rows.
-fn build_picker_elements(
-    host_w: u32,
-    host_h: u32,
-    picker: &Picker,
-    cell_pw: f32,
-    cell_ph: f32,
-) -> Vec<CreateElementBody> {
-    // Rows available for the list (everything but the title + input rows and
-    // a little vertical margin), capped so a huge list stays compact.
-    let avail = (host_h.saturating_sub(4)).max(1) as usize;
-    let visible_rows = picker.matches.len().max(1).min(avail).min(14);
-
-    // Window the matches so the selection stays on screen.
-    let total = picker.matches.len();
-    let max_scroll = total.saturating_sub(visible_rows);
-    let scroll = (if picker.selected >= visible_rows {
-        picker.selected - visible_rows + 1
-    } else {
-        0
-    })
-    .min(max_scroll);
-
-    // Width: widest of the title, the input line, and every match row
-    // (label + gap + hint), within the host.
-    // Width is taken over *all* items (not just current matches) so the box
-    // keeps a stable width while filtering; the input line can still widen
-    // it when a long command line is typed.
-    let input_line = format!("> {}", picker.editor.buffer);
-    let mut max_w = picker.title.chars().count().max(input_line.chars().count());
-    for it in &picker.items {
-        max_w = max_w.max(it.label.chars().count() + 3 + it.hint.chars().count());
-    }
-    let inner_w = (max_w as f32).max(26.0);
-    let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
-    let box_h = (2 + visible_rows) as f32;
-
-    // Anchor the top edge using the box's *maximum* height (the full item
-    // count, which is stable across filtering) so the input row never moves
-    // as matches shrink — the box only grows/shrinks downward.
-    let max_rows = picker.items.len().max(1).min(avail).min(14);
-    let max_box_h = (2 + max_rows) as f32;
-    let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
-    let origin_y = ((host_h as f32 - max_box_h) * 0.5).floor();
-    let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
-
-    let mut cmds: Vec<DrawCmd> = vec![
-        // Body fill.
-        DrawCmd::FillPath {
-            fill: surface_style(),
-            segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-        },
-        // Title strip (top corners rounded only).
-        DrawCmd::FillPath {
-            fill: accent_style(),
-            segments: rounded_rect_path_corners(
-                0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false,
-            ),
-        },
-        DrawCmd::DrawText {
-            origin: Point { x: box_w * 0.5, y: 0.0 },
-            align: Align::Center,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(0x01),
-            text: picker.title.clone(),
-        },
-        // Filter / command input.
-        DrawCmd::DrawText {
-            origin: Point { x: 1.0, y: 1.0 },
-            align: Align::Left,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
-            font_style: FontStyle(0x00),
-            text: input_line,
-        },
-    ];
-    // Caret bar — "> " is 2 cells, then `cursor` glyphs in.
-    let caret_x = 1.0 + 2.0 + picker.editor.cursor.min(picker.editor.char_count()) as f32;
-    const HALF_W: f32 = 0.07;
-    cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(accent_color()),
-        segments: rounded_rect_path(caret_x - HALF_W, 1.1, caret_x + HALF_W, 1.9, 0.0, 0.0),
-    });
-
-    // List rows.
-    for j in 0..visible_rows {
-        let m = scroll + j;
-        if m >= total {
-            break;
-        }
-        let it = &picker.items[picker.matches[m]];
-        let y = 2.0 + j as f32;
-        let selected = m == picker.selected;
-        if selected {
-            cmds.push(DrawCmd::FillRectangles {
-                fill: title_thumb_style(),
-                rects: vec![Rect { x: 0.5, y: y + 0.05, w: box_w - 1.0, h: 0.9 }],
-            });
-        }
-        cmds.push(DrawCmd::DrawText {
-            origin: Point { x: 1.5, y },
-            align: Align::Left,
-            fill: Style::Flat(if selected { COLOR_TAB_ACTIVE_TEXT } else { COLOR_MODAL_TEXT }),
-            font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
-            text: it.label.clone(),
-        });
-        if !it.hint.is_empty() {
-            cmds.push(DrawCmd::DrawText {
-                origin: Point { x: box_w - 1.5, y },
-                align: Align::Right,
-                fill: Style::Flat(COLOR_TAB_INACTIVE_TEXT),
-                font_style: FontStyle(0x00),
-                text: it.hint.clone(),
-            });
-        }
-    }
-
-    // Scrollbar when the list overflows.
-    if total > visible_rows {
-        let track_h = visible_rows as f32;
-        let thumb_h = (track_h * visible_rows as f32 / total as f32).max(0.5);
-        let thumb_max = (track_h - thumb_h).max(0.0);
-        let thumb_y = 2.0
-            + if max_scroll == 0 {
-                0.0
-            } else {
-                thumb_max * scroll as f32 / max_scroll as f32
-            };
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(COLOR_SCROLLBAR),
-            rects: vec![Rect { x: box_w - 0.7, y: 2.0, w: 0.4, h: track_h }],
-        });
-        cmds.push(DrawCmd::FillRectangles {
-            fill: accent_style(),
-            rects: vec![Rect { x: box_w - 0.7, y: thumb_y, w: 0.4, h: thumb_h }],
-        });
-    }
-
-    // Outline last, above the fills.
-    cmds.push(DrawCmd::DrawLinePath {
-        stroke: accent_style(),
-        line_width: 0.1,
-        segments: rounded_rect_path(0.0, 0.0, box_w, box_h, rx, ry),
-    });
-
-    vec![CreateElementBody {
-        id: MODAL_ELEMENT_ID.to_string(),
-        commands: cmds,
-        origin: Point { x: origin_x, y: origin_y },
-        is_visible: true,
-        draw_order: MODAL_DRAW_ORDER,
-        parent: None,
-        size: None,
-        transform: None,
-    }]
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Input mode state machine
@@ -2284,274 +1589,6 @@ enum RenameTarget {
     Tab(usize),
 }
 
-/// Result of feeding input bytes to a [`LineEditor`].
-enum EditOutcome {
-    /// Nothing visible changed (e.g. an unrecognised / incomplete key).
-    Noop,
-    /// Buffer or cursor moved — the modal should be re-rendered.
-    Redraw,
-    /// Enter pressed — commit the current buffer.
-    Commit,
-    /// Esc / Ctrl+G pressed — abandon the edit.
-    Cancel,
-}
-
-/// A single-line text editor with a readline-flavored keybinding set,
-/// backing the rename modal. ASCII-only for now (non-ASCII / non-printable
-/// input is dropped), so byte and char indices coincide; even so every
-/// operation routes through char positions to stay UTF-8-ready.
-#[derive(Debug)]
-struct LineEditor {
-    /// The edited text.
-    buffer: String,
-    /// Insertion point as a char index in `0..=char_count`.
-    cursor: usize,
-    /// Max length, in chars. Inserts past this are dropped.
-    max: usize,
-}
-
-/// Max title length, in chars. Mirrors the historical rename cap.
-const RENAME_MAX_CHARS: usize = 32;
-
-/// Max command-line length, in chars. Roomier than the rename cap so a
-/// full `rename-tab 2 some longer name` fits in the command palette.
-const COMMAND_MAX_CHARS: usize = 256;
-
-impl LineEditor {
-    /// Start editing `buffer` with the cursor at its end, capped at the
-    /// historical rename length.
-    fn new(buffer: String) -> Self {
-        Self::with_max(buffer, RENAME_MAX_CHARS)
-    }
-
-    /// Start editing `buffer` with an explicit max length.
-    fn with_max(buffer: String, max: usize) -> Self {
-        let cursor = buffer.chars().count();
-        LineEditor { buffer, cursor, max }
-    }
-
-    fn char_count(&self) -> usize {
-        self.buffer.chars().count()
-    }
-
-    /// Byte offset of char index `idx` (or buffer end if past the end).
-    fn byte_offset(&self, idx: usize) -> usize {
-        self.buffer
-            .char_indices()
-            .nth(idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.buffer.len())
-    }
-
-    /// Remove chars in the half-open range `[a, b)`. Caller fixes up the
-    /// cursor afterwards.
-    fn delete_range(&mut self, a: usize, b: usize) {
-        if a >= b {
-            return;
-        }
-        self.buffer = self
-            .buffer
-            .chars()
-            .enumerate()
-            .filter(|(i, _)| *i < a || *i >= b)
-            .map(|(_, c)| c)
-            .collect();
-    }
-
-    fn insert(&mut self, c: char) {
-        if self.char_count() >= self.max {
-            return;
-        }
-        let at = self.byte_offset(self.cursor);
-        self.buffer.insert(at, c);
-        self.cursor += 1;
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor < self.char_count() {
-            self.cursor += 1;
-        }
-    }
-
-    /// Char index of the previous word start (alphanumeric-delimited).
-    fn prev_word(&self) -> usize {
-        let chars: Vec<char> = self.buffer.chars().collect();
-        let mut i = self.cursor;
-        while i > 0 && !chars[i - 1].is_alphanumeric() {
-            i -= 1;
-        }
-        while i > 0 && chars[i - 1].is_alphanumeric() {
-            i -= 1;
-        }
-        i
-    }
-
-    /// Char index of the next word end (alphanumeric-delimited).
-    fn next_word(&self) -> usize {
-        let chars: Vec<char> = self.buffer.chars().collect();
-        let n = chars.len();
-        let mut i = self.cursor;
-        while i < n && !chars[i].is_alphanumeric() {
-            i += 1;
-        }
-        while i < n && chars[i].is_alphanumeric() {
-            i += 1;
-        }
-        i
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.delete_range(self.cursor - 1, self.cursor);
-            self.cursor -= 1;
-        }
-    }
-
-    fn delete_forward(&mut self) {
-        self.delete_range(self.cursor, self.cursor + 1);
-    }
-
-    fn kill_to_end(&mut self) {
-        self.delete_range(self.cursor, self.char_count());
-    }
-
-    fn kill_to_start(&mut self) {
-        self.delete_range(0, self.cursor);
-        self.cursor = 0;
-    }
-
-    fn kill_word_back(&mut self) {
-        let start = self.prev_word();
-        self.delete_range(start, self.cursor);
-        self.cursor = start;
-    }
-
-    fn kill_word_forward(&mut self) {
-        let end = self.next_word();
-        self.delete_range(self.cursor, end);
-    }
-
-    /// Consume one keystroke from the front of `bytes`, returning how many
-    /// bytes were consumed and the resulting outcome. A whole escape
-    /// sequence is consumed at once when one is present in this read, so a
-    /// lone trailing Esc still reads as an immediate cancel.
-    fn feed(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
-        let Some(&b) = bytes.first() else {
-            return (1, EditOutcome::Noop);
-        };
-        match b {
-            b'\r' | b'\n' => (1, EditOutcome::Commit),
-            0x1B => self.feed_escape(bytes),
-            0x01 => {
-                self.cursor = 0; // Ctrl+A
-                (1, EditOutcome::Redraw)
-            }
-            0x05 => {
-                self.cursor = self.char_count(); // Ctrl+E
-                (1, EditOutcome::Redraw)
-            }
-            0x02 => {
-                self.move_left(); // Ctrl+B
-                (1, EditOutcome::Redraw)
-            }
-            0x06 => {
-                self.move_right(); // Ctrl+F
-                (1, EditOutcome::Redraw)
-            }
-            0x04 => {
-                self.delete_forward(); // Ctrl+D
-                (1, EditOutcome::Redraw)
-            }
-            0x08 | 0x7F => {
-                self.backspace(); // Ctrl+H / DEL
-                (1, EditOutcome::Redraw)
-            }
-            0x0B => {
-                self.kill_to_end(); // Ctrl+K
-                (1, EditOutcome::Redraw)
-            }
-            0x15 => {
-                self.kill_to_start(); // Ctrl+U
-                (1, EditOutcome::Redraw)
-            }
-            0x17 => {
-                self.kill_word_back(); // Ctrl+W
-                (1, EditOutcome::Redraw)
-            }
-            0x07 => (1, EditOutcome::Cancel), // Ctrl+G
-            0x20..=0x7E => {
-                self.insert(b as char);
-                (1, EditOutcome::Redraw)
-            }
-            _ => (1, EditOutcome::Noop),
-        }
-    }
-
-    /// Handle an ESC-introduced sequence: Alt-<key> bindings, CSI/SS3
-    /// cursor keys, or a bare Esc (cancel). `bytes[0]` is `0x1B`.
-    fn feed_escape(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
-        // Lone Esc with nothing following in this read → cancel.
-        let Some(&next) = bytes.get(1) else {
-            return (1, EditOutcome::Cancel);
-        };
-        match next {
-            b'b' | b'B' => {
-                self.cursor = self.prev_word(); // Alt+B
-                (2, EditOutcome::Redraw)
-            }
-            b'f' | b'F' => {
-                self.cursor = self.next_word(); // Alt+F
-                (2, EditOutcome::Redraw)
-            }
-            b'd' | b'D' => {
-                self.kill_word_forward(); // Alt+D
-                (2, EditOutcome::Redraw)
-            }
-            0x7F | 0x08 => {
-                self.kill_word_back(); // Alt+Backspace
-                (2, EditOutcome::Redraw)
-            }
-            b'[' | b'O' => self.feed_csi(bytes),
-            // ESC + unrecognised byte: treat the ESC as a cancel and leave
-            // the trailing byte for the next loop iteration.
-            _ => (1, EditOutcome::Cancel),
-        }
-    }
-
-    /// Handle a CSI/SS3 cursor-key sequence. `bytes[0..2]` is `ESC [` or
-    /// `ESC O`.
-    fn feed_csi(&mut self, bytes: &[u8]) -> (usize, EditOutcome) {
-        // Scan to the final byte (0x40..=0x7E) of the sequence.
-        let mut i = 2;
-        while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            // Incomplete in this read — drop the partial prefix rather
-            // than leak raw bytes; a split sequence is rare for these.
-            return (bytes.len(), EditOutcome::Noop);
-        }
-        let params = &bytes[2..i];
-        match bytes[i] {
-            b'C' => self.move_right(),         // Right
-            b'D' => self.move_left(),          // Left
-            b'H' => self.cursor = 0,           // Home
-            b'F' => self.cursor = self.char_count(), // End
-            b'~' => match params {
-                b"1" | b"7" => self.cursor = 0,
-                b"4" | b"8" => self.cursor = self.char_count(),
-                b"3" => self.delete_forward(), // Delete
-                _ => {}
-            },
-            _ => {}
-        }
-        (i + 1, EditOutcome::Redraw)
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Reusable list picker
@@ -2584,220 +1621,53 @@ enum PickerPayload {
     Pane(String),
 }
 
-/// One row in a picker list.
-#[derive(Debug, Clone)]
-struct PickerItem {
-    /// Primary text, left-aligned.
-    label: String,
-    /// Secondary text, right-aligned and dimmed (key, args, tab name).
-    hint: String,
-    /// Lowercased haystack the filter matches against.
-    filter_key: String,
-    payload: PickerPayload,
-}
+/// A picker row carrying one of vmux's payloads.
+type PickerItem = UiPickerItem<PickerPayload>;
 
-/// Result of feeding input to a [`Picker`].
-enum PickerOutcome {
-    Noop,
-    Redraw,
-    Commit,
-    Cancel,
-}
-
-/// A filterable, selectable modal list. Reused by the command palette and
-/// the tab / pane / move-pane pickers; the modal chrome is shared with the
-/// other overlays via [`MODAL_ELEMENT_ID`].
+/// The shared [`vge_ui::Picker`] plus the [`PickerKind`] that says how a
+/// commit is acted on. The widget itself is payload-agnostic; the kind
+/// is vmux's business, so it rides alongside rather than inside it.
 #[derive(Debug)]
 struct Picker {
     kind: PickerKind,
-    title: String,
-    /// Filter / command input (the same line editor the rename modal uses).
-    editor: LineEditor,
-    /// Full, unfiltered item list.
-    items: Vec<PickerItem>,
-    /// Indices into `items` passing the current filter, in item order.
-    matches: Vec<usize>,
-    /// Selection as an index into `matches`.
-    selected: usize,
+    ui: UiPicker<PickerPayload>,
 }
-
-/// Rows a PgUp / PgDn jump moves the selection through.
-const PICKER_PAGE: usize = 8;
 
 impl Picker {
     fn new(kind: PickerKind, title: String, items: Vec<PickerItem>) -> Self {
-        let mut p = Picker {
-            kind,
-            title,
-            editor: LineEditor::with_max(String::new(), COMMAND_MAX_CHARS),
-            items,
-            matches: Vec::new(),
-            selected: 0,
+        let mode = match kind {
+            PickerKind::Command => FilterMode::CommandLine,
+            _ => FilterMode::Whole,
         };
-        p.refilter();
-        p
-    }
-
-    /// The substring the list filters on: the first token for a command
-    /// line, the whole trimmed buffer otherwise.
-    fn filter_text(&self) -> String {
-        let buf = self.editor.buffer.trim_start();
-        match self.kind {
-            PickerKind::Command => buf.split_whitespace().next().unwrap_or("").to_string(),
-            _ => buf.trim_end().to_string(),
+        let mut ui = UiPicker::new(title, mode, items);
+        // In move-pane, a digit jumps to (and commits) that tab number,
+        // matching the "press the tab number" cue.
+        if matches!(kind, PickerKind::MovePaneTarget { .. }) {
+            ui = ui.with_digit_commit();
         }
+        Picker { kind, ui }
     }
 
-    /// Recompute `matches` for the current filter, keeping the previously
-    /// selected item selected when it survives, else clamping to the top.
-    fn refilter(&mut self) {
-        let prev = self.matches.get(self.selected).copied();
-        let needle = self.filter_text().to_lowercase();
-        self.matches = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| needle.is_empty() || it.filter_key.contains(&needle))
-            .map(|(i, _)| i)
-            .collect();
-        self.selected = prev
-            .and_then(|p| self.matches.iter().position(|&m| m == p))
-            .unwrap_or(0);
-        if self.selected >= self.matches.len() {
-            self.selected = self.matches.len().saturating_sub(1);
-        }
-    }
-
-    /// Move the selection by `delta`, clamped to the match list.
-    fn move_sel(&mut self, delta: i64) {
-        if self.matches.is_empty() {
-            return;
-        }
-        let last = self.matches.len() as i64 - 1;
-        self.selected = (self.selected as i64 + delta).clamp(0, last) as usize;
-    }
-
-    /// The selected item's index into `items`, if any.
-    fn current(&self) -> Option<usize> {
-        self.matches.get(self.selected).copied()
-    }
-
-    /// Tab-complete the input line to the current selection without
-    /// running it. For a command, replace the first token with the
-    /// selected command's name and leave a trailing space (preserving any
-    /// args already typed) so the user can fill in arguments. For the other
-    /// pickers, fill the filter with the selected item's label.
-    fn complete(&mut self) {
-        let Some(item) = self.current() else {
-            return;
-        };
-        let newbuf = match (&self.kind, &self.items[item].payload) {
-            (PickerKind::Command, PickerPayload::Command(ci)) => {
-                let rest: Vec<&str> = self.editor.buffer.split_whitespace().skip(1).collect();
-                let mut b = String::from(COMMANDS[*ci].name);
-                b.push(' ');
-                b.push_str(&rest.join(" "));
-                b
-            }
-            _ => self.items[item].label.clone(),
-        };
-        self.editor = LineEditor::with_max(newbuf, COMMAND_MAX_CHARS);
-        self.refilter();
-    }
-
-    /// Consume one keystroke from the front of `bytes`, returning how many
-    /// bytes were consumed and the resulting outcome. Navigation keys the
-    /// line editor doesn't use are intercepted here; everything else (text
-    /// edits, cursor motion) routes to the editor and triggers a refilter.
     fn picker_feed(&mut self, bytes: &[u8]) -> (usize, PickerOutcome) {
-        let Some(&b) = bytes.first() else {
-            return (1, PickerOutcome::Noop);
-        };
-        match b {
-            b'\r' | b'\n' => (1, PickerOutcome::Commit),
-            0x07 => (1, PickerOutcome::Cancel), // Ctrl+G
-            0x09 => {
-                self.complete(); // Tab: fill the input with the selection
-                (1, PickerOutcome::Redraw)
-            }
-            0x0E => {
-                self.move_sel(1); // Ctrl+N
-                (1, PickerOutcome::Redraw)
-            }
-            0x10 => {
-                self.move_sel(-1); // Ctrl+P
-                (1, PickerOutcome::Redraw)
-            }
-            // In move-pane, a digit jumps to (and commits) that tab number,
-            // matching the "press the tab number" cue. Other pickers treat
-            // digits as filter text.
-            b'1'..=b'9' if matches!(self.kind, PickerKind::MovePaneTarget { .. }) => {
-                let item = (b - b'1') as usize;
-                if let Some(pos) = self.matches.iter().position(|&m| m == item) {
-                    self.selected = pos;
-                    (1, PickerOutcome::Commit)
-                } else {
-                    (1, PickerOutcome::Noop)
-                }
-            }
-            0x1B => self.feed_escape(bytes),
-            _ => {
-                let (consumed, outcome) = self.editor.feed(bytes);
-                self.after_editor(consumed, outcome)
-            }
-        }
-    }
-
-    /// Handle an ESC-introduced sequence: Up/Down/PgUp/PgDn/BackTab drive
-    /// the selection, everything else (cursor motion, Alt-word, bare Esc)
-    /// routes to the editor.
-    fn feed_escape(&mut self, bytes: &[u8]) -> (usize, PickerOutcome) {
-        let Some(&next) = bytes.get(1) else {
-            return (1, PickerOutcome::Cancel); // lone Esc cancels
-        };
-        if next == b'[' || next == b'O' {
-            let mut i = 2;
-            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return (bytes.len(), PickerOutcome::Noop); // incomplete
-            }
-            let params = &bytes[2..i];
-            let nav = match (bytes[i], params) {
-                (b'A', _) => Some(-1),                       // Up
-                (b'B', _) => Some(1),                        // Down
-                (b'Z', _) => Some(-1),                       // BackTab
-                (b'~', b"5") => Some(-(PICKER_PAGE as i64)), // PgUp
-                (b'~', b"6") => Some(PICKER_PAGE as i64),    // PgDn
-                _ => None,
-            };
-            if let Some(delta) = nav {
-                self.move_sel(delta);
-                return (i + 1, PickerOutcome::Redraw);
-            }
-            // Cursor motion (Left/Right/Home/End/Delete) → editor.
-            let (consumed, outcome) = self.editor.feed(bytes);
-            return self.after_editor(consumed, outcome);
-        }
-        // Alt-<key> word motions etc.
-        let (consumed, outcome) = self.editor.feed(bytes);
-        self.after_editor(consumed, outcome)
-    }
-
-    /// Map a line-editor outcome to a picker outcome, refiltering on edits.
-    fn after_editor(&mut self, consumed: usize, outcome: EditOutcome) -> (usize, PickerOutcome) {
-        match outcome {
-            EditOutcome::Commit => (consumed, PickerOutcome::Commit),
-            EditOutcome::Cancel => (consumed, PickerOutcome::Cancel),
-            EditOutcome::Redraw => {
-                self.refilter();
-                (consumed, PickerOutcome::Redraw)
-            }
-            EditOutcome::Noop => (consumed, PickerOutcome::Noop),
-        }
+        self.ui.feed(bytes)
     }
 }
+
+// The wrapper is transparent: every field access (`items`, `matches`,
+// `selected`, `editor`) reads through to the widget.
+impl std::ops::Deref for Picker {
+    type Target = UiPicker<PickerPayload>;
+    fn deref(&self) -> &Self::Target {
+        &self.ui
+    }
+}
+
+impl std::ops::DerefMut for Picker {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ui
+    }
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // Command table
@@ -2855,12 +1725,8 @@ fn command_items() -> Vec<PickerItem> {
             }
             key.push(' ');
             key.push_str(c.summary);
-            PickerItem {
-                label: c.name.to_string(),
-                hint: c.args.to_string(),
-                filter_key: key.to_lowercase(),
-                payload: PickerPayload::Command(i),
-            }
+            PickerItem::new(c.name, c.args, PickerPayload::Command(i))
+                .with_filter_key(key.to_lowercase())
         })
         .collect()
 }
@@ -3762,7 +2628,7 @@ impl State {
                 let label = self.tab_effective_title(i);
                 let hint = format!("tab {}", i + 1);
                 let filter_key = format!("{label} {hint}").to_lowercase();
-                PickerItem { label, hint, filter_key, payload: PickerPayload::Tab(i) }
+                PickerItem::new(label, hint, PickerPayload::Tab(i)).with_filter_key(filter_key)
             })
             .collect()
     }
@@ -3791,7 +2657,10 @@ impl State {
                     .unwrap_or_else(|| pane_id.clone());
                 let hint = format!("{tab_label} · {pane_id}");
                 let filter_key = format!("{label} {hint}").to_lowercase();
-                items.push(PickerItem { label, hint, filter_key, payload: PickerPayload::Pane(pane_id) });
+                items.push(
+                    PickerItem::new(label, hint, PickerPayload::Pane(pane_id))
+                        .with_filter_key(filter_key),
+                );
             }
         }
         let picker = Picker::new(PickerKind::Pane, "Panes".to_string(), items);
@@ -4328,36 +3197,14 @@ impl State {
         let Mode::Help { offset, .. } = &self.mode else {
             return Vec::new();
         };
-        let inner_h = help_lines().len() as f32;
-        let box_h = (inner_h + 2.0).min(self.host_h.saturating_sub(2) as f32);
-        let (body_rows, max_offset) = help_body_window(box_h);
-        let body_lines = help_lines().len().saturating_sub(1);
-        if body_lines <= body_rows {
+        let cmds: Vec<(VgeCommand, u32)> = help_modal()
+            .scroll_commands(MODAL_IDS, self.host_w, self.host_h, *offset)
+            .into_iter()
+            .map(|c| (c, 0))
+            .collect();
+        if cmds.is_empty() {
             return Vec::new();
         }
-        let off = (*offset).min(max_offset);
-        let cmds = vec![
-            (
-                VgeCommand::UpdateOrigin {
-                    id: MODAL_BODY_LINES_ID.into(),
-                    origin: Point {
-                        x: 0.0,
-                        y: -(off as f32),
-                    },
-                },
-                0,
-            ),
-            (
-                VgeCommand::UpdateOrigin {
-                    id: MODAL_THUMB_ID.into(),
-                    origin: Point {
-                        x: 0.0,
-                        y: help_thumb_origin_y(box_h, off),
-                    },
-                },
-                0,
-            ),
-        ];
         build_vge_envelope(&cmds)
     }
 
@@ -4371,7 +3218,8 @@ impl State {
                     RenameTarget::Pane(_) => "Rename pane",
                     RenameTarget::Tab(_) => "Rename tab",
                 };
-                vec![build_modal_commands(
+                vec![prompt_element(
+                    MODAL_ELEMENT_ID,
                     self.host_w,
                     self.host_h,
                     title,
@@ -4379,16 +3227,20 @@ impl State {
                     self.cell_pw,
                     self.cell_ph,
                     Some(editor.cursor),
+                    MODAL_DRAW_ORDER,
                 )]
             }
-            Mode::Help { offset, .. } => build_help_modal_elements(
+            Mode::Help { offset, .. } => help_modal().elements(
+                MODAL_IDS,
                 self.host_w,
                 self.host_h,
                 *offset,
                 self.cell_pw,
                 self.cell_ph,
+                MODAL_DRAW_ORDER,
             ),
-            Mode::ConfirmQuit => vec![build_modal_commands(
+            Mode::ConfirmQuit => vec![prompt_element(
+                MODAL_ELEMENT_ID,
                 self.host_w,
                 self.host_h,
                 "Quit vmux?",
@@ -4396,10 +3248,17 @@ impl State {
                 self.cell_pw,
                 self.cell_ph,
                 None,
+                MODAL_DRAW_ORDER,
             )],
-            Mode::Picker(picker) => {
-                build_picker_elements(self.host_w, self.host_h, picker, self.cell_pw, self.cell_ph)
-            }
+            Mode::Picker(picker) => picker_element(
+                MODAL_ELEMENT_ID,
+                self.host_w,
+                self.host_h,
+                &picker.ui,
+                self.cell_pw,
+                self.cell_ph,
+                MODAL_DRAW_ORDER,
+            ),
             // Resize shows its cue in the focused pane's title, not a
             // center modal — a center box would hide the layout the user
             // is adjusting.
@@ -5231,51 +4090,10 @@ fn parse_cli_args() -> Result<CliOptions> {
     Ok(opts)
 }
 
-/// Named accent palette, packed `0xRRGGBBAA`. Muted shades that stay legible
-/// behind light foreground text. `blue` matches the compiled-in brand.
-fn named_color(name: &str) -> Option<u32> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "red" => 0xd0_5c_5c_ff,
-        "green" => 0x5c_a0_5c_ff,
-        "blue" => 0x56_79_9f_ff,
-        "yellow" => 0xc9_a8_4c_ff,
-        "orange" => 0xcf_7d_3c_ff,
-        "magenta" | "pink" => 0xb0_5c_9f_ff,
-        "cyan" | "teal" => 0x4c_9f_9f_ff,
-        "purple" | "violet" => 0x8c_6c_c0_ff,
-        "white" | "gray" | "grey" => 0x9a_9a_9a_ff,
-        _ => return None,
-    })
-}
-
-/// Parse an accent color into packed `0xRRGGBBAA`. Accepts a name from
-/// `named_color`, or hex `#rgb` / `#rrggbb` / `#rrggbbaa` (the leading `#`
-/// is optional). Missing alpha defaults to opaque.
+/// Parse an accent color into packed `0xRRGGBBAA`. Accepts a name or hex
+/// `#rgb` / `#rrggbb` / `#rrggbbaa`; see [`vge_ui::theme::parse_accent_color`].
 fn parse_accent_color(s: &str) -> Result<u32> {
-    let t = s.trim();
-    if let Some(rgba) = named_color(t) {
-        return Ok(rgba);
-    }
-    let hex = t.strip_prefix('#').unwrap_or(t);
-    let bad = || anyhow!("invalid color '{s}' (expected a name or #rgb/#rrggbb/#rrggbbaa)");
-    let bytes: [u8; 4] = match hex.len() {
-        3 => {
-            let mut rgb = [0u8; 3];
-            for (i, c) in hex.chars().enumerate() {
-                let d = c.to_digit(16).ok_or_else(bad)? as u8;
-                rgb[i] = d * 0x11; // expand nibble: 0xF → 0xFF
-            }
-            [rgb[0], rgb[1], rgb[2], 0xff]
-        }
-        6 => {
-            let v = u32::from_str_radix(hex, 16).map_err(|_| bad())?;
-            let [_, r, g, b] = v.to_be_bytes();
-            [r, g, b, 0xff]
-        }
-        8 => u32::from_str_radix(hex, 16).map_err(|_| bad())?.to_be_bytes(),
-        _ => return Err(bad()),
-    };
-    Ok(u32::from_be_bytes(bytes))
+    theme::parse_accent_color(s).map_err(|e| anyhow!("invalid color '{s}': {e}"))
 }
 
 /// Parse a prefix-key spec into its control byte. vmux's prefix is always a
@@ -5309,8 +4127,7 @@ fn main() -> Result<()> {
     use std::io::IsTerminal;
     let opts = parse_cli_args()?;
     if let Some(rgba) = opts.accent {
-        CLI_ACCENT_RGBA.store(rgba, Ordering::Relaxed);
-        CLI_ACCENT_SET.store(true, Ordering::Relaxed);
+        theme::set_cli_accent(theme::unpack(rgba));
     }
     if let Some(prefix) = opts.prefix {
         PREFIX_BYTE.store(prefix, Ordering::Relaxed);
@@ -5335,9 +4152,12 @@ fn main() -> Result<()> {
         Some(p) => (p.cell_pw as f32, p.cell_ph as f32),
         None => (9.0, 20.0),
     };
-    HOST_THEMED_STYLES.store(probe.host_themed_styles, Ordering::Relaxed);
-    if let Some(rgba) = probe.accent_rgba {
-        HOST_ACCENT_RGBA.store(u32::from_be_bytes(rgba), Ordering::Relaxed);
+    // Adopt the host's themed accent, so chrome references
+    // `host.accent` and locally-derived shades match what it resolves to.
+    if probe.host_themed_styles {
+        theme::set_host_accent(theme::unpack(
+            probe.accent_rgba.map(u32::from_be_bytes).unwrap_or(0),
+        ));
     }
 
     let (rows, cols) = get_host_winsize()?;
@@ -6662,11 +5482,7 @@ fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
         Dismiss,
     }
 
-    let max_offset = {
-        let inner_h = help_lines().len() as f32;
-        let box_h = (inner_h + 2.0).min(state.host_h.saturating_sub(2) as f32);
-        help_body_window(box_h).1
-    };
+    let max_offset = help_modal().max_offset(state.host_w, state.host_h);
 
     let action = {
         let Mode::Help { csi_buf, .. } = &mut state.mode else {
@@ -6915,21 +5731,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn darken_scales_channels_and_keeps_alpha() {
-        let c = Color { r: 0.2, g: 0.5, b: 0.9, a: 0.8 };
-        let d = darken(c, 0.4); // 40% darker → channels * 0.6
-        assert!((d.r - 0.12).abs() < 1e-6);
-        assert!((d.g - 0.30).abs() < 1e-6);
-        assert!((d.b - 0.54).abs() < 1e-6);
-        assert_eq!(d.a, c.a, "alpha untouched");
-
-        // 0.0 is identity; 1.0 collapses to black.
-        assert_eq!(darken(c, 0.0), c);
-        let black = darken(c, 1.0);
-        assert!(black.r == 0.0 && black.g == 0.0 && black.b == 0.0);
-    }
-
-    #[test]
     fn parse_prefix_key_variants() {
         // Ctrl+Space — the default — via several spellings.
         for s in ["space", "C-space", "ctrl+space", "@", "C-@", "^@"] {
@@ -6955,139 +5756,6 @@ mod tests {
         PREFIX_BYTE.store(0x01, Ordering::Relaxed);
         assert_eq!(prefix_name(), "Ctrl+A");
         PREFIX_BYTE.store(0x00, Ordering::Relaxed); // restore default
-    }
-
-    #[test]
-    fn parse_accent_color_variants() {
-        assert_eq!(parse_accent_color("blue").unwrap(), 0x56_79_9f_ff);
-        assert_eq!(parse_accent_color("#ff8800").unwrap(), 0xff_88_00_ff);
-        assert_eq!(parse_accent_color("ff8800").unwrap(), 0xff_88_00_ff);
-        assert_eq!(parse_accent_color("#f80").unwrap(), 0xff_88_00_ff);
-        assert_eq!(parse_accent_color("#11223344").unwrap(), 0x11_22_33_44);
-        assert!(parse_accent_color("nope").is_err());
-        assert!(parse_accent_color("#12345").is_err());
-        assert!(parse_accent_color("#zz0000").is_err());
-    }
-
-    /// Feed a whole keystroke string to a fresh editor seeded with
-    /// `start`, returning the final (buffer, cursor) and last outcome.
-    fn drive(start: &str, keys: &[u8]) -> (String, usize, &'static str) {
-        let mut ed = LineEditor::new(start.to_string());
-        let mut idx = 0;
-        let mut last = "noop";
-        while idx < keys.len() {
-            let (consumed, outcome) = ed.feed(&keys[idx..]);
-            last = match outcome {
-                EditOutcome::Noop => "noop",
-                EditOutcome::Redraw => "redraw",
-                EditOutcome::Commit => "commit",
-                EditOutcome::Cancel => "cancel",
-            };
-            idx += consumed.max(1);
-        }
-        (ed.buffer, ed.cursor, last)
-    }
-
-    #[test]
-    fn line_editor_new_puts_cursor_at_end() {
-        let ed = LineEditor::new("hello".to_string());
-        assert_eq!(ed.cursor, 5);
-        assert_eq!(ed.buffer, "hello");
-    }
-
-    #[test]
-    fn line_editor_inserts_at_cursor() {
-        // Ctrl+A (home) then type "X".
-        let (buf, cur, _) = drive("bc", &[0x01, b'X']);
-        assert_eq!(buf, "Xbc");
-        assert_eq!(cur, 1);
-    }
-
-    #[test]
-    fn line_editor_home_and_end() {
-        let (_, cur, _) = drive("hello", &[0x01]); // Ctrl+A
-        assert_eq!(cur, 0);
-        let (_, cur, _) = drive("hello", &[0x01, 0x05]); // Ctrl+A then Ctrl+E
-        assert_eq!(cur, 5);
-    }
-
-    #[test]
-    fn line_editor_char_motion_and_forward_delete() {
-        // Home, Ctrl+F twice, Ctrl+D removes the char under the cursor.
-        let (buf, cur, _) = drive("abcd", &[0x01, 0x06, 0x06, 0x04]);
-        assert_eq!(buf, "abd");
-        assert_eq!(cur, 2);
-    }
-
-    #[test]
-    fn line_editor_backspace() {
-        let (buf, cur, _) = drive("abc", &[0x7F]);
-        assert_eq!(buf, "ab");
-        assert_eq!(cur, 2);
-    }
-
-    #[test]
-    fn line_editor_kill_to_end_and_start() {
-        // Home, Ctrl+F (cursor=1), Ctrl+K kills the tail.
-        let (buf, _, _) = drive("abcd", &[0x01, 0x06, 0x0B]);
-        assert_eq!(buf, "a");
-        // Ctrl+E (end) then move left twice, Ctrl+U kills the head.
-        let (buf, cur, _) = drive("abcd", &[0x05, 0x02, 0x02, 0x15]);
-        assert_eq!(buf, "cd");
-        assert_eq!(cur, 0);
-    }
-
-    #[test]
-    fn line_editor_word_motion() {
-        // Alt+B from end jumps to the start of the last word.
-        let (_, cur, _) = drive("foo bar", &[0x1B, b'b']);
-        assert_eq!(cur, 4);
-        // Home, then Alt+F to the end of the first word.
-        let (_, cur, _) = drive("foo bar", &[0x01, 0x1B, b'f']);
-        assert_eq!(cur, 3);
-    }
-
-    #[test]
-    fn line_editor_kill_word_back_and_forward() {
-        // Ctrl+W at end deletes the last word (and its leading space).
-        let (buf, cur, _) = drive("foo bar", &[0x17]);
-        assert_eq!(buf, "foo ");
-        assert_eq!(cur, 4);
-        // Home, Alt+D deletes the first word forward.
-        let (buf, cur, _) = drive("foo bar", &[0x01, 0x1B, b'd']);
-        assert_eq!(buf, " bar");
-        assert_eq!(cur, 0);
-    }
-
-    #[test]
-    fn line_editor_arrow_keys_and_delete() {
-        // CSI Left twice from end, then CSI Delete (ESC [ 3 ~).
-        let keys = [0x1B, b'[', b'D', 0x1B, b'[', b'D', 0x1B, b'[', b'3', b'~'];
-        let (buf, cur, _) = drive("abcd", &keys);
-        assert_eq!(buf, "abd");
-        assert_eq!(cur, 2);
-    }
-
-    #[test]
-    fn line_editor_lone_esc_cancels_but_alt_does_not() {
-        let (_, _, last) = drive("abc", &[0x1B]);
-        assert_eq!(last, "cancel");
-        // ESC immediately followed by 'b' is Alt+B, not a cancel.
-        let (_, _, last) = drive("abc", &[0x1B, b'b']);
-        assert_eq!(last, "redraw");
-    }
-
-    #[test]
-    fn line_editor_enter_commits() {
-        let (_, _, last) = drive("abc", &[b'\r']);
-        assert_eq!(last, "commit");
-    }
-
-    #[test]
-    fn line_editor_respects_length_cap() {
-        let long = "x".repeat(RENAME_MAX_CHARS);
-        let (buf, _, _) = drive(&long, &[b'y']);
-        assert_eq!(buf.chars().count(), RENAME_MAX_CHARS);
     }
 
     #[test]
@@ -7493,47 +6161,6 @@ mod tests {
     }
 
     #[test]
-    fn picker_filters_and_navigates() {
-        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
-        let n_all = p.matches.len();
-        assert_eq!(n_all, COMMANDS.len());
-        assert_eq!(p.selected, 0);
-        // Down arrow advances the selection.
-        feed_picker(&mut p, b"\x1b[B");
-        assert_eq!(p.selected, 1);
-        // Up arrows clamp at the top.
-        feed_picker(&mut p, b"\x1b[A\x1b[A");
-        assert_eq!(p.selected, 0);
-        // Ctrl+N / Ctrl+P also move.
-        feed_picker(&mut p, b"\x0e\x0e");
-        assert_eq!(p.selected, 2);
-        feed_picker(&mut p, b"\x10");
-        assert_eq!(p.selected, 1);
-        // Typing filters the list to a strict subset.
-        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
-        feed_picker(&mut p, b"rename");
-        assert!(p.matches.len() < n_all);
-        assert!(p
-            .matches
-            .iter()
-            .all(|&m| p.items[m].filter_key.contains("rename")));
-        assert_eq!(p.editor.buffer, "rename");
-    }
-
-    #[test]
-    fn picker_refilter_clamps_selection() {
-        let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
-        for _ in 0..6 {
-            feed_picker(&mut p, b"\x1b[B");
-        }
-        assert!(p.selected >= 1);
-        // Narrow to a tiny match set — selection must stay in range.
-        feed_picker(&mut p, b"quit");
-        assert!(!p.matches.is_empty());
-        assert!(p.selected < p.matches.len());
-    }
-
-    #[test]
     fn picker_tab_completes_without_running() {
         let mut p = Picker::new(PickerKind::Command, "Command".into(), command_items());
         feed_picker(&mut p, b"rena");
@@ -7550,25 +6177,9 @@ mod tests {
     }
 
     #[test]
-    fn picker_commit_and_cancel() {
-        let items = vec![
-            PickerItem { label: "a".into(), hint: "".into(), filter_key: "a".into(), payload: PickerPayload::Tab(0) },
-            PickerItem { label: "b".into(), hint: "".into(), filter_key: "b".into(), payload: PickerPayload::Tab(1) },
-        ];
-        let mut p = Picker::new(PickerKind::Tab, "Tabs".into(), items);
-        assert_eq!(feed_picker(&mut p, b"\r"), "commit");
-        assert_eq!(feed_picker(&mut p, b"\x1b"), "cancel");
-    }
-
-    #[test]
     fn picker_move_pane_digit_jumps_and_commits() {
         let items: Vec<PickerItem> = (0..3)
-            .map(|i| PickerItem {
-                label: format!("t{i}"),
-                hint: format!("tab {}", i + 1),
-                filter_key: format!("t{i}"),
-                payload: PickerPayload::Tab(i),
-            })
+            .map(|i| PickerItem::new(format!("t{i}"), format!("tab {}", i + 1), PickerPayload::Tab(i)))
             .collect();
         let mut p =
             Picker::new(PickerKind::MovePaneTarget { pane: "p1".into() }, "Move".into(), items);

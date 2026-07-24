@@ -3108,6 +3108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vge-ui"
+version = "0.1.0"
+dependencies = [
+ "vge-protocol",
+]
+
+[[package]]
 name = "vmux"
 version = "0.1.0"
 dependencies = [
@@ -3117,6 +3124,7 @@ dependencies = [
  "prt-protocol",
  "ses-protocol",
  "vge-protocol",
+ "vge-ui",
 ]
 
 [[package]]
