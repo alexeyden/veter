@@ -135,6 +135,15 @@ safe to write to a cooked tty. The mark bytes (`H`/`N`/`R`) are
 themselves transport-clean and distinct from `0x1B`/`0x5C` and from the
 other marks.
 
+A receiver MUST bound how much of a single envelope it buffers. Nothing
+in the framing obliges a sender to ever emit the closing `ESC \`, so an
+unbounded receiver can be made to allocate without limit by a malformed
+or hostile stream. On exceeding its cap the receiver MUST discard the
+partial body and resynchronise at the envelope's end, and MUST NOT pass
+the partial body downstream. The cap is a memory backstop and sits
+*above* the advertised policy limits, so an over-limit body still gets a
+normal error response rather than vanishing.
+
 `payload_length` is computed on the *unstuffed* payload, so the
 receiver knows how much data to expect after unstuffing.
 

@@ -2595,6 +2595,17 @@ impl App {
                     let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
                     let ses_passthrough = ses.process_pty_chunk(&vss_passthrough);
                     vge::drive_terminal_stage(engine, parser, &ses_passthrough);
+                    // An over-cap envelope is dropped without a reply —
+                    // there is no request_id left to answer, and a
+                    // hostile stream should not get one. Say so, or the
+                    // sender's command just vanishes.
+                    let dropped = prt.take_apc_overflows() + engine.take_apc_overflows();
+                    if dropped > 0 {
+                        eprintln!(
+                            "veter: dropped {dropped} oversized APC envelope(s); \
+                             a client exceeded the payload cap"
+                        );
+                    }
                     // Apply any completed host-level VSS snapshots.
                     // A snapshot arriving at this level replaces the
                     // host's vt100 / VGE / PRT engines wholesale —

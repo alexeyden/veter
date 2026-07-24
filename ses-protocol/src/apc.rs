@@ -16,6 +16,17 @@ use super::frame::{
     ESC_MARK_XON, ESC_MARK_XOFF, LF, MARKER_C2H, ST_CLOSE, TAB, TILDE, XOFF, XON,
 };
 
+/// Default cap on a single envelope's **unstuffed** payload.
+///
+/// The parser buffers a body until `ESC \` closes it, so without a
+/// bound a malformed or hostile stream — one that opens an envelope
+/// and never closes it — makes the terminal allocate without limit.
+/// Over-cap bodies are dropped and the stream resynchronises at the
+/// envelope's end.
+///
+/// SES carries only session names and a detach command.
+pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
+
 #[derive(Debug)]
 enum State {
     /// Normal pass-through stream.
@@ -36,6 +47,13 @@ enum State {
     /// Saw 0x1B inside `ApcOther`; the next byte decides whether ST
     /// closes the envelope.
     ApcOtherEsc,
+    /// Body exceeded `max_payload`. The partial body is already
+    /// discarded; bytes are consumed — never passed through, they are
+    /// envelope payload, not text — until `ESC \` closes it.
+    ApcOverflow,
+    /// Saw 0x1B while discarding an over-cap body. Distinguishes the
+    /// stuffed `ESC ESC` from the `ESC \` that ends the envelope.
+    ApcOverflowEsc,
 }
 
 pub struct ApcStream {
@@ -45,6 +63,12 @@ pub struct ApcStream {
     /// `with_marker(*MARKER_H2C)` on the client to extract the host's
     /// lowercase `ses` responses.
     marker: [u8; 3],
+    /// Largest unstuffed body this stream will buffer.
+    max_payload: usize,
+    /// Envelopes dropped for exceeding `max_payload`. Read and
+    /// cleared by the host so a drop can be reported rather than
+    /// silently swallowing a sender's command.
+    overflows: u32,
 }
 
 #[derive(Default)]
@@ -74,6 +98,8 @@ impl ApcStream {
         Self {
             state: State::Idle,
             marker: *MARKER_C2H,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            overflows: 0,
         }
     }
 
@@ -81,7 +107,23 @@ impl ApcStream {
         Self {
             state: State::Idle,
             marker,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            overflows: 0,
         }
+    }
+
+    /// Override the per-envelope payload cap. Hosts set this from
+    /// their own advertised limits so the parser and the command
+    /// layer agree on what is too big.
+    pub fn with_max_payload(mut self, max_payload: usize) -> Self {
+        self.max_payload = max_payload;
+        self
+    }
+
+    /// Envelopes dropped for exceeding the cap since the last call.
+    /// Reading clears the counter.
+    pub fn take_overflows(&mut self) -> u32 {
+        std::mem::take(&mut self.overflows)
     }
 
     pub fn feed(&mut self, input: &[u8]) -> Output {
@@ -152,6 +194,23 @@ impl ApcStream {
                     State::ApcOther
                 }
             }
+            State::ApcOverflow => {
+                if b == ESC {
+                    State::ApcOverflowEsc
+                } else {
+                    State::ApcOverflow
+                }
+            }
+            State::ApcOverflowEsc => {
+                // Stuffing guarantees the only bare `ESC \` in an
+                // envelope is its terminator, so this resync is exact
+                // rather than best-effort.
+                if b == ST_CLOSE {
+                    State::Idle
+                } else {
+                    State::ApcOverflow
+                }
+            }
             State::ApcOtherEsc => {
                 out.push_pass(ESC);
                 out.push_pass(b);
@@ -164,55 +223,75 @@ impl ApcStream {
             State::ApcSes { mut body } => {
                 if b == ESC {
                     State::ApcSesEsc { body }
+                } else if body.len() >= self.max_payload {
+                    // Drop what we have and swallow the rest of the
+                    // envelope. Passing the partial body through
+                    // would spray binary at the vt100.
+                    self.overflows = self.overflows.saturating_add(1);
+                    State::ApcOverflow
                 } else {
                     body.push(b);
                     State::ApcSes { body }
                 }
             }
-            State::ApcSesEsc { mut body } => match b {
-                ESC => {
-                    body.push(ESC);
-                    State::ApcSes { body }
+            State::ApcSesEsc { mut body } => {
+                // The cap has to be enforced here as well as on the
+                // plain-byte path. Every byte of a body made entirely
+                // of stuffed escapes arrives through this arm, so
+                // checking only there let an all-`ESC ESC` stream
+                // buffer without bound — the exact shape a hostile
+                // sender would use. `ST_CLOSE` is exempt: it completes
+                // the envelope rather than appending to it.
+                if b != ST_CLOSE && body.len() >= self.max_payload {
+                    self.overflows = self.overflows.saturating_add(1);
+                    self.state = State::ApcOverflow;
+                    return;
                 }
-                ST_CLOSE => {
-                    out.payloads.push(body);
-                    State::Idle
+                match b {
+                    ESC => {
+                        body.push(ESC);
+                        State::ApcSes { body }
+                    }
+                    ST_CLOSE => {
+                        out.payloads.push(body);
+                        State::Idle
+                    }
+                    ESC_MARK_TILDE => {
+                        body.push(TILDE);
+                        State::ApcSes { body }
+                    }
+                    ESC_MARK_XON => {
+                        body.push(XON);
+                        State::ApcSes { body }
+                    }
+                    ESC_MARK_XOFF => {
+                        body.push(XOFF);
+                        State::ApcSes { body }
+                    }
+                    ESC_MARK_TAB => {
+                        body.push(TAB);
+                        State::ApcSes { body }
+                    }
+                    ESC_MARK_LF => {
+                        body.push(LF);
+                        State::ApcSes { body }
+                    }
+                    ESC_MARK_CR => {
+                        body.push(CR);
+                        State::ApcSes { body }
+                    }
+                    _ => {
+                        // Only the byte-stuffing escapes (ESC-double, the
+                        // transport marks) or ST close are valid inside the
+                        // envelope. Treat anything else as malformed: discard
+                        // the partial body, emit the stray ESC + byte to
+                        // passthrough, and resync.
+                        out.push_pass(ESC);
+                        out.push_pass(b);
+                        State::Idle
+                    }
                 }
-                ESC_MARK_TILDE => {
-                    body.push(TILDE);
-                    State::ApcSes { body }
-                }
-                ESC_MARK_XON => {
-                    body.push(XON);
-                    State::ApcSes { body }
-                }
-                ESC_MARK_XOFF => {
-                    body.push(XOFF);
-                    State::ApcSes { body }
-                }
-                ESC_MARK_TAB => {
-                    body.push(TAB);
-                    State::ApcSes { body }
-                }
-                ESC_MARK_LF => {
-                    body.push(LF);
-                    State::ApcSes { body }
-                }
-                ESC_MARK_CR => {
-                    body.push(CR);
-                    State::ApcSes { body }
-                }
-                _ => {
-                    // Only the byte-stuffing escapes (ESC-double, the
-                    // transport marks) or ST close are valid inside the
-                    // envelope. Treat anything else as malformed: discard
-                    // the partial body, emit the stray ESC + byte to
-                    // passthrough, and resync.
-                    out.push_pass(ESC);
-                    out.push_pass(b);
-                    State::Idle
-                }
-            },
+            }
         };
     }
 }
@@ -428,6 +507,66 @@ mod tests {
                     "round-trip failed (len {len}, round {round})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn over_cap_envelope_is_dropped_and_the_stream_resyncs() {
+        // An unbounded parser lets a malformed or hostile stream make
+        // the terminal allocate without limit. Over-cap bodies are
+        // dropped whole — never half-emitted, and never sprayed at the
+        // vt100 as passthrough — and the *next* envelope still parses,
+        // which is what makes the drop survivable.
+        let mut s = ApcStream::new().with_max_payload(64);
+        let mut input = envelope_c2h(&vec![b'x'; 65]);
+        input.extend(envelope_c2h(b"after"));
+        let out = s.feed(&input);
+        assert_eq!(out.payloads, vec![b"after".to_vec()], "resync failed");
+        assert!(out.passthrough.is_empty(), "dropped body leaked as text");
+        assert_eq!(s.take_overflows(), 1);
+        assert_eq!(s.take_overflows(), 0, "counter should clear on read");
+    }
+
+    #[test]
+    fn at_cap_envelope_still_parses() {
+        // Off-by-one guard: the cap is a maximum, not a strict bound.
+        let mut s = ApcStream::new().with_max_payload(64);
+        let body = vec![b'y'; 64];
+        let out = s.feed(&envelope_c2h(&body));
+        assert_eq!(out.payloads, vec![body]);
+        assert_eq!(s.take_overflows(), 0);
+    }
+
+    #[test]
+    fn over_cap_body_full_of_escapes_still_resyncs() {
+        // The discard path has to keep unstuffing well enough to tell a
+        // stuffed `ESC ESC` from the `ESC \` that ends the envelope,
+        // or it resynchronises in the middle of the body and emits
+        // garbage.
+        let mut s = ApcStream::new().with_max_payload(8);
+        let hostile: Vec<u8> = std::iter::repeat_n(ESC, 64).collect();
+        let mut input = envelope_c2h(&hostile);
+        input.extend(envelope_c2h(b"ok"));
+        let out = s.feed(&input);
+        assert_eq!(out.payloads, vec![b"ok".to_vec()]);
+        assert!(out.passthrough.is_empty());
+        assert_eq!(s.take_overflows(), 1);
+    }
+
+    #[test]
+    fn over_cap_envelope_split_across_reads_is_dropped_once() {
+        let mut input = envelope_c2h(&vec![b'z'; 300]);
+        input.extend(envelope_c2h(b"tail"));
+        for cut in 1..input.len() {
+            let mut s = ApcStream::new().with_max_payload(16);
+            let mut payloads = Vec::new();
+            for part in [&input[..cut], &input[cut..]] {
+                let out = s.feed(part);
+                payloads.extend(out.payloads);
+                assert!(out.passthrough.is_empty(), "cut {cut}: leaked text");
+            }
+            assert_eq!(payloads, vec![b"tail".to_vec()], "cut {cut}");
+            assert_eq!(s.take_overflows(), 1, "cut {cut}");
         }
     }
 }

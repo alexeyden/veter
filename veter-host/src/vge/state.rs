@@ -45,6 +45,25 @@ impl Default for Limits {
     }
 }
 
+/// Parser payload cap derived from an advertised policy limit.
+///
+/// The two serve different purposes and must not be the same number.
+/// The **policy** limit (`max_image_bytes`, `max_write_bytes`) is
+/// enforced by the command layer, which refuses an over-large body with
+/// a specific error code and the sender's `request_id`. The **parser**
+/// cap only bounds how much a single envelope may buffer before the
+/// terminal gives up; it can do nothing but drop, silently, because by
+/// then there is no `request_id` left to answer with.
+///
+/// So the parser cap sits well above the policy limit: double it, plus
+/// a fixed megabyte of slack that also covers envelope framing and
+/// keeps the cap sane when a caller configures a tiny policy limit.
+/// Bodies between the two get a clean protocol error; only grossly
+/// oversized ones — the unbounded-allocation case — are dropped.
+pub fn apc_payload_cap(policy_limit: usize) -> usize {
+    policy_limit.saturating_mul(2).saturating_add(1024 * 1024)
+}
+
 /// Opaque renderer-side image handle. The host engine assigns and
 /// stores these but never inspects them; the renderer maintains a
 /// private mapping from `GpuImageId` to its own GPU texture handle
@@ -482,10 +501,20 @@ pub struct VgeEngine {
 
 impl VgeEngine {
     pub fn new(cell_px: (u16, u16), scale_factor: f32) -> Self {
+        let limits = Limits::default();
         Self {
-            apc: ApcStream::new(),
+            // The parser cap is a *memory backstop*, not the policy
+            // limit. Policy belongs to the command layer, which
+            // answers an over-large upload with err_image_too_large
+            // and a request_id the client can correlate. The parser
+            // can only drop silently, so it must sit comfortably
+            // above the advertised cap — otherwise a body a little
+            // over the limit vanishes instead of being refused.
+            apc: ApcStream::new().with_max_payload(apc_payload_cap(
+                limits.max_image_bytes as usize,
+            )),
             state: VgeState::new(),
-            limits: Limits::default(),
+            limits,
             host_seed: None,
             cell_px,
             scale_factor,
@@ -706,6 +735,15 @@ impl VgeEngine {
         for id in to_delete {
             self.delete_subtree(&id);
         }
+    }
+
+    /// Envelopes this engine's parser dropped for exceeding its payload
+    /// cap since the last call. A drop is silent on the wire — there is
+    /// no `request_id` left to answer, and a malformed or hostile
+    /// stream should not get replies — so the host reads this to report
+    /// it instead of leaving the sender's command unexplained.
+    pub fn take_apc_overflows(&mut self) -> u32 {
+        self.apc.take_overflows()
     }
 
     /// Take queued response bytes (an APC envelope) ready to write to the

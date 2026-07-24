@@ -103,6 +103,21 @@ Decoding reverses each case; any other byte after a body `0x1B` (other
 than these marks or the `0x5C` ST close) is malformed. All other bytes
 pass through.
 
+A receiver MUST bound how much of a single envelope it buffers. Nothing
+in the framing obliges a sender to ever emit the closing `ESC \`, so an
+unbounded receiver can be made to allocate without limit by a malformed
+or hostile stream. On exceeding its cap the receiver MUST discard the
+partial body and resynchronise at the envelope's end — byte-stuffing
+guarantees the only bare `ESC \` inside an envelope is its terminator,
+so this resync is exact — and MUST NOT pass the partial body through to
+the text parser.
+
+This cap is a memory backstop, not a policy limit. It is distinct from,
+and sits above, the advertised caps of §11: a body that merely exceeds
+`max_image_bytes` gets a normal error response carrying its
+`request_id`, whereas an over-cap envelope can only be dropped
+silently, since by then there is no `request_id` left to answer with.
+
 The `~` / XON / XOFF rules exist because a VGE envelope can be relayed to
 an inner program through its **input** channel — e.g. a portal's
 `RawReply` forwarded into an `ssh` client. Such relays interpret these

@@ -316,7 +316,13 @@ impl PrtEngine {
         host_palette: crate::vge::HostThemePalette,
     ) -> Self {
         Self {
-            apc: ApcStream::new(),
+            // Backstop above the advertised WritePortal cap — see
+            // the note on `crate::vge::state::apc_payload_cap`. A
+            // body merely over `max_write_bytes` must reach the
+            // command layer so it can answer err_write_too_large.
+            apc: ApcStream::new().with_max_payload(
+                crate::vge::state::apc_payload_cap(limits.max_write_bytes as usize),
+            ),
             state: PrtState::new(),
             limits,
             depth,
@@ -505,6 +511,15 @@ impl PrtEngine {
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that
     /// should be forwarded to the next layer (VGE, then vt100).
     ///
+    /// Envelopes this engine's parser dropped for exceeding its payload
+    /// cap since the last call. A drop is silent on the wire — there is
+    /// no `request_id` left to answer, and a malformed or hostile
+    /// stream should not get replies — so the host reads this to report
+    /// it instead of leaving the sender's command unexplained.
+    pub fn take_apc_overflows(&mut self) -> u32 {
+        self.apc.take_overflows()
+    }
+
     /// Convenience wrapper around `process_pty_chunk_full` for callers
     /// that don't need the terminal-event surface — kept for API
     /// symmetry with the VGE engine; `main.rs` uses the `_full` variant
@@ -2221,6 +2236,42 @@ mod tests {
         let parsed = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 2, &body);
         assert_eq!(parsed.frame_type, RSP_ERR);
         assert_eq!(err_code(&parsed.body), ERR_WRITE_TOO_LARGE);
+    }
+
+    #[test]
+    fn over_policy_but_under_parser_cap_still_gets_a_clean_error() {
+        // The parser cap and the policy limit are different things: a
+        // body over `max_write_bytes` must reach the command layer so
+        // it can answer err_write_too_large with the sender's
+        // request_id. Only a grossly oversized body — the
+        // unbounded-allocation case — is dropped by the parser, and a
+        // drop is silent, which is exactly what a client must not get
+        // for an ordinary over-limit write.
+        let limits = Limits {
+            max_write_bytes: 4,
+            ..Limits::default()
+        };
+        let mut engine = PrtEngine::with_limits(limits, 0);
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 10, 10),
+        );
+        // Well over the 4-byte policy limit, far under the parser cap.
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: vec![0u8; 4096],
+        });
+        let parsed = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+        assert_eq!(parsed.frame_type, RSP_ERR);
+        assert_eq!(err_code(&parsed.body), ERR_WRITE_TOO_LARGE);
+        assert_eq!(
+            engine.take_apc_overflows(),
+            0,
+            "the parser must not have swallowed a body the command layer \
+             was supposed to refuse"
+        );
     }
 
     #[test]

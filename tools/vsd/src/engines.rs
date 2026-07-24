@@ -198,6 +198,15 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             // `veter_host::vge::drive_terminal_stage`.
             let ses_passthrough = ses.process_pty_chunk(&prt_chunk.passthrough);
             veter_host::vge::drive_terminal_stage(vge, parser, &ses_passthrough);
+            // See the matching note in veter's host loop: an over-cap
+            // envelope is dropped without a reply, so report it.
+            let dropped = prt.take_apc_overflows() + vge.take_apc_overflows();
+            if dropped > 0 {
+                eprintln!(
+                    "vsd: dropped {dropped} oversized APC envelope(s); \
+                     a client exceeded the payload cap"
+                );
+            }
             prt.handle_terminal_events(&prt_chunk.terminal_events);
             prt.after_vt100_process(parser);
             prt.flush_pending_events();
