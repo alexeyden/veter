@@ -76,10 +76,10 @@ pub struct ProbeOutcome {
     /// without re-running the probe.
     #[allow(dead_code)]
     pub prt: Option<PrtProbeData>,
-    /// (rows, cols) read via `TIOCGWINSZ` on the renderer's stdin.
-    /// `None` if the ioctl failed or returned an obviously empty
+    /// Grid + pixel dimensions read via `TIOCGWINSZ` on the renderer's
+    /// stdin. `None` if the ioctl failed or returned an obviously empty
     /// size — in which case the daemon keeps the 24×80 default.
-    pub winsize: Option<(u16, u16)>,
+    pub winsize: Option<Winsize>,
     /// Bytes received from stdin during the probe phase that weren't
     /// part of a probe response envelope. The attach handler must
     /// forward these to the inner PTY master before entering the
@@ -250,11 +250,25 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
     })
 }
 
+/// A renderer grid size, with the pixel dimensions a veter host
+/// reports alongside it. The inner PTY mirrors the renderer's grid
+/// one-to-one, so the pixel fields are forwarded verbatim rather than
+/// re-derived — unlike vmux, which has to multiply a cell size back
+/// out per pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Winsize {
+    pub rows: u16,
+    pub cols: u16,
+    /// Both zero when the renderer doesn't report pixel dimensions.
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
 /// Read `TIOCGWINSZ` on the given fd. Returns `None` if the ioctl
 /// fails or returns a zeroed winsize (which happens on non-tty fds
 /// and a few corner cases — we treat both as "size unknown, keep
 /// the existing one").
-pub fn read_winsize(fd: RawFd) -> Option<(u16, u16)> {
+pub fn read_winsize(fd: RawFd) -> Option<Winsize> {
     let mut ws = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -268,18 +282,23 @@ pub fn read_winsize(fd: RawFd) -> Option<(u16, u16)> {
     if ws.ws_row == 0 || ws.ws_col == 0 {
         return None;
     }
-    Some((ws.ws_row, ws.ws_col))
+    Some(Winsize {
+        rows: ws.ws_row,
+        cols: ws.ws_col,
+        xpixel: ws.ws_xpixel,
+        ypixel: ws.ws_ypixel,
+    })
 }
 
 /// `TIOCSWINSZ` on the inner PTY master so the child process sees a
 /// `SIGWINCH` with the renderer's actual grid dimensions. Best effort —
 /// a failure here is not fatal to the attach.
-pub fn set_inner_winsize(master_fd: RawFd, rows: u16, cols: u16) {
+pub fn set_inner_winsize(master_fd: RawFd, size: Winsize) {
     let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: size.xpixel,
+        ws_ypixel: size.ypixel,
     };
     unsafe {
         libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);

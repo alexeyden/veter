@@ -689,13 +689,26 @@ struct PanePty {
     out: OutQueue,
 }
 
+/// Pixel dimensions for a pane's winsize, from its inner grid and the
+/// host's cell size in device pixels. Panes are not the host grid, so
+/// the cell size has to be multiplied back out per pane rather than
+/// forwarding the host's own `ws_xpixel` / `ws_ypixel`. Saturating for
+/// the same reason veter's `pixel_size` is.
+fn pane_pixel_size(rows: u16, cols: u16, cell_px: (u16, u16)) -> (u16, u16) {
+    (
+        cols.saturating_mul(cell_px.0),
+        rows.saturating_mul(cell_px.1),
+    )
+}
+
 impl PanePty {
-    fn spawn(rows: u16, cols: u16) -> Result<Self> {
+    fn spawn(rows: u16, cols: u16, cell_px: (u16, u16)) -> Result<Self> {
+        let (xpixel, ypixel) = pane_pixel_size(rows.max(1), cols.max(1), cell_px);
         let winsize = Winsize {
             ws_row: rows.max(1),
             ws_col: cols.max(1),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
         let result =
             unsafe { forkpty(Some(&winsize), None) }.context("forkpty")?;
@@ -747,12 +760,13 @@ impl PanePty {
         self.out.pending() > 0
     }
 
-    fn resize(&self, rows: u16, cols: u16) {
+    fn resize(&self, rows: u16, cols: u16, cell_px: (u16, u16)) {
+        let (xpixel, ypixel) = pane_pixel_size(rows.max(1), cols.max(1), cell_px);
         let ws = libc::winsize {
             ws_row: rows.max(1),
             ws_col: cols.max(1),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
         unsafe {
             libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
@@ -812,6 +826,12 @@ struct Pane {
     /// `last_rect`, but tracked separately because the inner size is
     /// `outer_rect_size minus chrome`.
     last_inner: Option<(u32, u32)>,
+    /// Most recent `(cols, rows, cell_pw, cell_ph)` pushed to this
+    /// pane's PTY via `TIOCSWINSZ`. Tracked separately from
+    /// `last_inner` because the ioctl carries pixel dimensions too: a
+    /// font-size or DPI change alters the cell size without changing
+    /// the grid, and the inner program still has to hear about it.
+    last_winsize: Option<(u32, u32, u16, u16)>,
     /// Mouse-protocol mode the inner program last opted into, as
     /// reported by PRT `MouseModeChange` events (§8.9). 0 = off, 1
     /// = X10, 2 = normal, 3 = button, 4 = any. Used by the wheel
@@ -2117,7 +2137,8 @@ impl State {
             resize_drag: None,
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
-        let pty = PanePty::spawn(rows as u16, cols as u16)?;
+        let cell_px = s.cell_px();
+        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
         s.panes.insert(
             id.clone(),
             Pane {
@@ -2133,12 +2154,19 @@ impl State {
                 // bash with `checkwinsize`) to redraw their PS1 and leak an
                 // empty line into the pane.
                 last_inner: Some((cols, rows)),
+                last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 scroll: None,
                 activity: false,
             },
         );
         Ok(s)
+    }
+
+    /// Host cell size rounded to whole device pixels, the form
+    /// `TIOCSWINSZ` takes.
+    fn cell_px(&self) -> (u16, u16) {
+        (self.cell_pw.round() as u16, self.cell_ph.round() as u16)
     }
 
     fn full_bounds(&self) -> PaneRect {
@@ -2208,7 +2236,8 @@ impl State {
             .get(&new_id)
             .expect("new pane must appear in post-split layout");
         let (rows, cols) = inner_grid_for(rect);
-        let pty = PanePty::spawn(rows as u16, cols as u16)?;
+        let cell_px = self.cell_px();
+        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
         self.panes.insert(
             new_id.clone(),
             Pane {
@@ -2219,6 +2248,7 @@ impl State {
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
+                last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 scroll: None,
                 activity: false,
@@ -2528,7 +2558,8 @@ impl State {
         // tab so we don't trigger a spurious initial SIGWINCH.
         let bounds = self.full_bounds();
         let (rows, cols) = inner_grid_for(bounds);
-        let pty = PanePty::spawn(rows as u16, cols as u16)?;
+        let cell_px = self.cell_px();
+        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
         self.panes.insert(
             pane_id.clone(),
             Pane {
@@ -2539,6 +2570,7 @@ impl State {
                 pty,
                 last_rect: None,
                 last_inner: Some((cols, rows)),
+                last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 scroll: None,
                 activity: false,
@@ -2903,6 +2935,8 @@ impl State {
         // (there's nothing to disambiguate). A scroll indicator still
         // surfaces because `display_title != raw_title` in that case.
         let single_pane = ordered.len() <= 1;
+        // Hoisted: the per-pane loop borrows `self.panes` mutably.
+        let cell_px = self.cell_px();
 
         for pane_id in &ordered {
             let rect = rects[pane_id];
@@ -3023,16 +3057,21 @@ impl State {
                 0,
             ));
 
-            // Only signal SIGWINCH to the inner shell when the inner
-            // grid genuinely changed. Re-resizing on every focus or
-            // rename pass would re-fire SIGWINCH and prompt many shells
-            // to redraw their PS1, leaking an extra blank line into the
-            // pane after every command.
-            if pane.last_inner != Some((cols, rows)) {
-                pane.pty.resize(rows as u16, cols as u16);
+            // Only signal SIGWINCH to the inner shell when the winsize
+            // genuinely changed. Re-resizing on every focus or rename
+            // pass would re-fire SIGWINCH and prompt many shells to
+            // redraw their PS1, leaking an extra blank line into the
+            // pane after every command. The cell size is part of the
+            // comparison: a font-size or DPI change moves the pixel
+            // dimensions without touching the grid, and the inner
+            // program needs that pushed too.
+            let winsize = (cols, rows, cell_px.0, cell_px.1);
+            if pane.last_winsize != Some(winsize) {
+                pane.pty.resize(rows as u16, cols as u16, cell_px);
             }
             pane.last_rect = Some(rect);
             pane.last_inner = Some((cols, rows));
+            pane.last_winsize = Some(winsize);
         }
 
         // Hide any portal+chrome that was visible last time but isn't in
@@ -3801,7 +3840,18 @@ fn set_stdout_nonblocking(nonblocking: bool) -> Result<()> {
     Ok(())
 }
 
-fn get_host_winsize() -> Result<(u16, u16)> {
+/// The host grid as reported by `TIOCGWINSZ`, plus the cell size
+/// derived from its pixel dimensions when the host populates them.
+struct HostWinsize {
+    rows: u16,
+    cols: u16,
+    /// `Some` only when `ws_xpixel` / `ws_ypixel` are non-zero — a
+    /// veter host reports them, most other terminals leave them at 0.
+    /// Device pixels, matching the VGE probe's `cell_pixel_*` fields.
+    cell_px: Option<(f32, f32)>,
+}
+
+fn get_host_winsize() -> Result<HostWinsize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let fd = std::io::stdin().as_raw_fd();
     let r = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws as *mut _) };
@@ -3811,7 +3861,17 @@ fn get_host_winsize() -> Result<(u16, u16)> {
     if ws.ws_row == 0 || ws.ws_col == 0 {
         bail!("host reports zero rows/cols");
     }
-    Ok((ws.ws_row, ws.ws_col))
+    let cell_px = (ws.ws_xpixel != 0 && ws.ws_ypixel != 0).then(|| {
+        (
+            ws.ws_xpixel as f32 / ws.ws_col as f32,
+            ws.ws_ypixel as f32 / ws.ws_row as f32,
+        )
+    });
+    Ok(HostWinsize {
+        rows: ws.ws_row,
+        cols: ws.ws_col,
+        cell_px,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -4148,9 +4208,15 @@ fn main() -> Result<()> {
             "PRT probe timed out — host terminal does not advertise the Portal Extension"
         );
     }
-    let (cell_pw, cell_ph) = match &probe.vge {
-        Some(p) => (p.cell_pw as f32, p.cell_ph as f32),
-        None => (9.0, 20.0),
+    let host_ws = get_host_winsize()?;
+    // `TIOCGWINSZ` first: a veter host reports real pixel dimensions
+    // there, so the cell size costs no round-trip and stays correct
+    // through a font-size change. Fall back to the VGE probe (an older
+    // host, or one that leaves the fields zeroed), then to a guess.
+    let (cell_pw, cell_ph) = match (host_ws.cell_px, &probe.vge) {
+        (Some(cell), _) => cell,
+        (None, Some(p)) => (p.cell_pw as f32, p.cell_ph as f32),
+        (None, None) => (9.0, 20.0),
     };
     // Adopt the host's themed accent, so chrome references
     // `host.accent` and locally-derived shades match what it resolves to.
@@ -4160,11 +4226,10 @@ fn main() -> Result<()> {
         ));
     }
 
-    let (rows, cols) = get_host_winsize()?;
     tty.enter_alt_screen()?;
 
     let mut state =
-        State::new(cols as u32, rows as u32, cell_pw, cell_ph)?;
+        State::new(host_ws.cols as u32, host_ws.rows as u32, cell_pw, cell_ph)?;
     // A `vsd` session host answers the SES probe with its name; a
     // plain local `veter` host does not, leaving this `None`.
     state.session_name = probe.session_name;
@@ -4191,10 +4256,20 @@ fn main() -> Result<()> {
     while !state.quit {
         if WINCH_FLAG.swap(false, Ordering::SeqCst) || state.needs_resize_check {
             state.needs_resize_check = false;
-            let (rows, cols) = get_host_winsize()?;
-            if cols as u32 != state.host_w || rows as u32 != state.host_h {
-                state.host_w = cols as u32;
-                state.host_h = rows as u32;
+            let ws = get_host_winsize()?;
+            // A font-size / DPI change moves the cell size without
+            // touching rows/cols, so it has to be part of the "did
+            // anything change" test — otherwise the panes keep the
+            // stale pixel dimensions until the next real resize.
+            let new_cell = ws.cell_px.unwrap_or((state.cell_pw, state.cell_ph));
+            if ws.cols as u32 != state.host_w
+                || ws.rows as u32 != state.host_h
+                || new_cell != (state.cell_pw, state.cell_ph)
+            {
+                state.host_w = ws.cols as u32;
+                state.host_h = ws.rows as u32;
+                state.cell_pw = new_cell.0;
+                state.cell_ph = new_cell.1;
                 let env = state.relayout_and_render()?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
@@ -5729,6 +5804,26 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_pixels_multiply_cell_size_out_per_pane() {
+        // A pane's winsize is its own grid times the host cell size —
+        // not the host's ws_xpixel/ws_ypixel, which cover the whole
+        // window including other panes and the tab bar.
+        assert_eq!(pane_pixel_size(25, 83, (12, 28)), (996, 700));
+        // Round-tripping back through the division a client does
+        // recovers the host cell size exactly.
+        let (xp, yp) = pane_pixel_size(25, 83, (12, 28));
+        assert_eq!((xp / 83, yp / 25), (12, 28));
+    }
+
+    #[test]
+    fn pane_pixels_saturate_instead_of_wrapping() {
+        // Nothing renderable gets this big; clamping beats wrapping to
+        // a small value, which would look like a legitimate size.
+        assert_eq!(pane_pixel_size(u16::MAX, u16::MAX, (12, 28)), (u16::MAX, u16::MAX));
+        assert_eq!(pane_pixel_size(10, 10, (0, 0)), (0, 0));
+    }
 
     #[test]
     fn parse_prefix_key_variants() {

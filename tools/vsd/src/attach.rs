@@ -377,7 +377,7 @@ impl WinsizeWatcher {
         stdin_fd: &OwnedFd,
         master_fd: &OwnedFd,
         engines: Arc<Mutex<EngineState>>,
-        initial: Option<(u16, u16)>,
+        initial: Option<probe::Winsize>,
     ) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
@@ -422,7 +422,7 @@ fn winsize_main(
     stdin_fd: OwnedFd,
     master_fd: OwnedFd,
     engines: Arc<Mutex<EngineState>>,
-    initial: Option<(u16, u16)>,
+    initial: Option<probe::Winsize>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let raw_stdin = stdin_fd.as_raw_fd();
@@ -433,15 +433,18 @@ fn winsize_main(
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
-        let Some((rows, cols)) = probe::read_winsize(raw_stdin) else {
+        let Some(ws) = probe::read_winsize(raw_stdin) else {
             // ioctl failed (stdin closed?) — back off and let the
             // splice loop notice the disconnect.
             continue;
         };
-        if last == Some((rows, cols)) {
+        // Comparing the whole winsize (not just rows/cols) means a
+        // font-size or DPI change on the renderer, which moves the
+        // pixel dimensions alone, still reaches the inner program.
+        if last == Some(ws) {
             continue;
         }
-        last = Some((rows, cols));
+        last = Some(ws);
 
         // Apply: resize the parser, then SIGWINCH the inner program
         // via TIOCSWINSZ on the master. The inner program's redraw
@@ -449,9 +452,9 @@ fn winsize_main(
         // to the (still-attached) renderer.
         {
             let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
-            guard.parser.screen_mut().set_size(rows, cols);
+            guard.parser.screen_mut().set_size(ws.rows, ws.cols);
         }
-        probe::set_inner_winsize(raw_master, rows, cols);
+        probe::set_inner_winsize(raw_master, ws);
     }
 }
 
@@ -467,13 +470,13 @@ fn apply_probe(
 ) {
     let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
 
-    if let Some((rows, cols)) = outcome.winsize {
-        guard.parser.screen_mut().set_size(rows, cols);
+    if let Some(ws) = outcome.winsize {
+        guard.parser.screen_mut().set_size(ws.rows, ws.cols);
         // SIGWINCH the inner program so its next redraw is at the
         // right size. Best effort; the engines have already been
         // resized so a stale dimension on the slave's tty is the only
         // failure mode.
-        probe::set_inner_winsize(master_writer_fd.as_raw_fd(), rows, cols);
+        probe::set_inner_winsize(master_writer_fd.as_raw_fd(), ws);
     }
     if let Some(vge) = outcome.vge {
         let cell_px = (vge.cell_pixel_width, vge.cell_pixel_height);

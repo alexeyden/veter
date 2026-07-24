@@ -29,6 +29,24 @@ pub struct Pty {
     writer_tx: Sender<Vec<u8>>,
 }
 
+/// Pixel dimensions for `TIOCSWINSZ` from a grid size and the cell
+/// size in **device** pixels. xterm has reported real pixel dimensions
+/// in `ws_xpixel` / `ws_ypixel` for decades and most third-party image
+/// clients size their output from them, so a client that cannot read a
+/// VGE probe reply still learns the cell geometry. The units must match
+/// what the probe advertises in `cell_pixel_width` / `cell_pixel_height`
+/// — letting the two disagree would give clients a silent 2× error on
+/// HiDPI, which is worse than reporting nothing.
+///
+/// Saturating: a grid large enough to overflow `u16` is already beyond
+/// anything renderable, and clamping beats wrapping to a small value.
+fn pixel_size(rows: u16, cols: u16, cell_px: (u16, u16)) -> (u16, u16) {
+    (
+        cols.saturating_mul(cell_px.0),
+        rows.saturating_mul(cell_px.1),
+    )
+}
+
 /// Drain queued buffers to the master fd with blocking writes. Runs on
 /// its own thread so the caller (the event loop) never blocks. A single
 /// consumer of a FIFO channel preserves the byte ordering callers rely
@@ -55,12 +73,18 @@ impl Pty {
     /// vmux → `$SHELL` chain; with `Some(argv)` (from `veter -e …`) it
     /// execs that program directly instead — the standard terminal
     /// entry-point-command behaviour (`xterm -e`, `alacritty -e`).
-    pub fn new(rows: u16, cols: u16, command: Option<Vec<String>>) -> io::Result<Self> {
+    pub fn new(
+        rows: u16,
+        cols: u16,
+        cell_px: (u16, u16),
+        command: Option<Vec<String>>,
+    ) -> io::Result<Self> {
+        let (xpixel, ypixel) = pixel_size(rows, cols, cell_px);
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
 
         let result = unsafe { forkpty(Some(&winsize), None) }
@@ -148,12 +172,13 @@ impl Pty {
             .map_err(|_| io::Error::other("pty writer thread is gone"))
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) {
+    pub fn resize(&self, rows: u16, cols: u16, cell_px: (u16, u16)) {
+        let (xpixel, ypixel) = pixel_size(rows, cols, cell_px);
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
         unsafe {
             libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
@@ -170,5 +195,25 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         let _ = kill(self.child, Signal::SIGHUP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pixel_size;
+
+    #[test]
+    fn pixel_size_multiplies_grid_by_cell() {
+        // A client divides these back out to recover the cell size, so
+        // the product has to be exact — no rounding slop.
+        assert_eq!(pixel_size(26, 83, (12, 28)), (996, 728));
+        let (xp, yp) = pixel_size(26, 83, (12, 28));
+        assert_eq!((xp / 83, yp / 26), (12, 28));
+    }
+
+    #[test]
+    fn pixel_size_saturates() {
+        assert_eq!(pixel_size(u16::MAX, u16::MAX, (12, 28)), (u16::MAX, u16::MAX));
+        assert_eq!(pixel_size(24, 80, (0, 0)), (0, 0));
     }
 }

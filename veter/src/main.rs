@@ -2815,7 +2815,7 @@ impl ApplicationHandler for App {
             10000,
             clipboard::HostCallbacks::default(),
         );
-        let pty = pty::Pty::new(term_rows, term_cols, self.entry_command.clone())
+        let pty = pty::Pty::new(term_rows, term_cols, cell_px, self.entry_command.clone())
             .expect("Failed to create PTY");
 
         // Start PTY reader thread
@@ -2891,7 +2891,10 @@ impl ApplicationHandler for App {
                         }
                     }
                     if let Some(pty) = &self.pty {
-                        pty.resize(rows, cols);
+                        pty.resize(rows, cols, (
+                            tr.cell_width.round() as u16,
+                            tr.cell_height.round() as u16,
+                        ));
                     }
                 }
                 if let Some(w) = &self.window {
