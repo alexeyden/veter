@@ -937,17 +937,29 @@ impl PrtEngine {
         body: &[u8],
         out_frames: &mut Vec<u8>,
     ) {
+        // §1.2 — the sender's explicit "apply but don't ack" sentinel.
+        // Errors are suppressed along with successes: a sender that
+        // asked for silence cannot read an error either, and the bytes
+        // would land in the pane's input queue.
+        let quiet = request_id == REQ_ID_NO_RESPONSE;
         match command::parse(frame_type, body) {
             Err(code) => {
-                append_frame(out_frames, RSP_ERR, request_id, &err_body(code, ""));
+                if !quiet {
+                    append_frame(out_frames, RSP_ERR, request_id, &err_body(code, ""));
+                }
             }
             Ok(cmd) => match self.apply_command(cmd) {
                 Ok(rsp_body) => {
-                    let rsp_type = if frame_type == CMD_PROBE { RSP_PROBE } else { RSP_OK };
-                    append_frame(out_frames, rsp_type, request_id, &rsp_body);
+                    if !quiet {
+                        let rsp_type =
+                            if frame_type == CMD_PROBE { RSP_PROBE } else { RSP_OK };
+                        append_frame(out_frames, rsp_type, request_id, &rsp_body);
+                    }
                 }
                 Err((code, msg)) => {
-                    append_frame(out_frames, RSP_ERR, request_id, &err_body(code, msg));
+                    if !quiet {
+                        append_frame(out_frames, RSP_ERR, request_id, &err_body(code, msg));
+                    }
                 }
             },
         }
@@ -2272,6 +2284,40 @@ mod tests {
             "the parser must not have swallowed a body the command layer \
              was supposed to refuse"
         );
+    }
+
+    #[test]
+    fn no_response_sentinel_applies_without_acking() {
+        // The portal is created, but no Ok comes back — the sender
+        // asked for silence because it cannot read a reply.
+        let mut engine = PrtEngine::new();
+        let frames = dispatch_full(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            REQ_ID_NO_RESPONSE,
+            &make_create_body("quiet", 10, 10),
+        );
+        assert!(
+            frames.iter().all(|f| f.frame_type != RSP_OK && f.frame_type != RSP_ERR),
+            "sentinel must suppress the response frame"
+        );
+        assert!(
+            engine.state.current().portals.contains_key("quiet"),
+            "but the command still applied"
+        );
+    }
+
+    #[test]
+    fn no_response_sentinel_suppresses_errors_too() {
+        // A quiet sender cannot read an error either; emitting one
+        // would put stray bytes in its pane's input queue.
+        let mut engine = PrtEngine::new();
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "nope".into(),
+            data: vec![b'x'],
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, REQ_ID_NO_RESPONSE, &body);
+        assert!(frames.iter().all(|f| f.frame_type != RSP_ERR));
     }
 
     #[test]

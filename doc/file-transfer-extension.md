@@ -95,6 +95,17 @@ command's response.
 matching response. For event frames (host-originated, unsolicited)
 `request_id` MUST be `0` and the client MUST ignore it.
 
+One value is reserved: `request_id == 0xFFFFFFFF` (`REQ_ID_NO_RESPONSE`)
+is a "state-push" sentinel. The host MUST apply the command's effect but
+MUST NOT emit any frame for it, error responses included. A sender that
+asked for silence cannot read an error either, and the bytes would land
+in a pane's *input* queue where the foreground program consumes them.
+This is what lets a client that is not its pane's foreground program
+drive the host at all, and it is also what keeps a stateful middleman
+replaying state from having its acks round-trip back into the inner
+program's PTY. Senders that need acknowledgement MUST use any other
+value.
+
 ### 1.3 Byte stuffing
 
 All bytes of the payload (after computing `payload_length`, before

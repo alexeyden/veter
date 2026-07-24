@@ -10,7 +10,8 @@
 // report "not in a session".
 
 use ses_protocol::{
-    ERR_NOT_IN_SESSION, PROTOCOL_VERSION, apc::ApcStream, encode_host_frame, for_each_frame,
+    ERR_NOT_IN_SESSION, PROTOCOL_VERSION, REQ_ID_NO_RESPONSE, apc::ApcStream,
+    encode_host_frame, for_each_frame,
     frames::{Command, HostFrame},
 };
 
@@ -120,6 +121,12 @@ impl SesEngine {
                 msg: String::new(),
             },
         };
+        // §1.2 sentinel: apply, don't ack. `Detach` still counts above,
+        // so a quiet sender can still tear a session down — it just
+        // doesn't get told so.
+        if request_id == REQ_ID_NO_RESPONSE {
+            return;
+        }
         let env = encode_host_frame(&resp, request_id);
         self.pending_response_bytes.extend_from_slice(&env);
     }
@@ -200,6 +207,27 @@ mod tests {
             }]
         );
         assert_eq!(e.take_detach_requests(), 0);
+    }
+
+    #[test]
+    fn no_response_sentinel_applies_without_acking() {
+        // A sender that is not its pane's foreground program can never
+        // read the reply — it lands in the pane's input queue, where
+        // whoever the kernel wakes consumes it. The command must still
+        // take effect: the detach is counted, only the ack is dropped.
+        let mut e = SesEngine::with_session("cool");
+        e.process_pty_chunk(&encode_command(&Command::Detach, REQ_ID_NO_RESPONSE));
+        assert!(responses(&mut e).is_empty(), "sentinel must suppress the ack");
+        assert_eq!(e.take_detach_requests(), 1, "but the detach still happened");
+    }
+
+    #[test]
+    fn no_response_sentinel_suppresses_errors_too() {
+        // A quiet sender cannot read an error either, and stray bytes in
+        // its pane are exactly what the sentinel exists to prevent.
+        let mut e = SesEngine::new();
+        e.process_pty_chunk(&encode_command(&Command::Detach, REQ_ID_NO_RESPONSE));
+        assert!(responses(&mut e).is_empty());
     }
 
     #[test]

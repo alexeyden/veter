@@ -829,6 +829,13 @@ impl VftEngine {
     // -------- response queue helpers -----------------------------------
 
     fn push_ready(&mut self, rid: u32, frame_type: u8, body: Vec<u8>) {
+        if rid == REQ_ID_NO_RESPONSE {
+            // §1.2 sentinel: apply, don't ack. Suppressing at the queue
+            // rather than at each handler covers the async paths too —
+            // a worker thread finishing an upload later goes through
+            // here as well.
+            return;
+        }
         self.response_queue.push_back(ResponseSlot::Ready {
             frame_type,
             request_id: rid,
@@ -838,6 +845,11 @@ impl VftEngine {
     }
 
     fn push_pending(&mut self, rid: u32) {
+        if rid == REQ_ID_NO_RESPONSE {
+            // No slot means nothing to fill and nothing to flush, so
+            // the ordering machinery simply never sees this request.
+            return;
+        }
         self.response_queue
             .push_back(ResponseSlot::Pending { request_id: rid });
     }
@@ -1011,6 +1023,27 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn no_response_sentinel_suppresses_the_reply() {
+        // Suppression sits at the response queue rather than in each
+        // handler, so it covers the async paths too — a worker thread
+        // completing a transfer later goes through the same choke
+        // point and finds no slot to fill.
+        let mut e = VftEngine::new(|| {});
+        feed(&mut e, &[(Command::Probe, REQ_ID_NO_RESPONSE)]);
+        assert!(
+            explicit_frames(&mut e).is_empty(),
+            "sentinel must suppress the ProbeResponse"
+        );
+
+        // A normal request afterwards is unaffected — the queue is not
+        // left wedged by the skipped slot.
+        feed(&mut e, &[(Command::Probe, 7)]);
+        let frames = explicit_frames(&mut e);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, 7);
     }
 
     #[test]

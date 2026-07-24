@@ -48,6 +48,17 @@ Unlike VSS, SES **uses `request_id`**: a command carries a
 client-chosen id and its response echoes it, so pipelined commands can
 be correlated. Events do not exist in SES v0 (see §6).
 
+One value is reserved: `request_id == 0xFFFFFFFF` (`REQ_ID_NO_RESPONSE`)
+is a "state-push" sentinel. The host MUST apply the command's effect but
+MUST NOT emit any frame for it, error responses included. A sender that
+asked for silence cannot read an error either, and the bytes would land
+in a pane's *input* queue where the foreground program consumes them.
+This is what lets a client that is not its pane's foreground program
+drive the host at all, and it is also what keeps a stateful middleman
+replaying state from having its acks round-trip back into the inner
+program's PTY. Senders that need acknowledgement MUST use any other
+value.
+
 A host that does not implement SES emits no response; the client
 SHOULD time out (250–500 ms, shared with its PRT/VGE probe window) and
 treat the host as "no session".

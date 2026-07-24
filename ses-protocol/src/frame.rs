@@ -34,6 +34,17 @@ pub const ERR_INTERNAL: u16 = 0x00FF;
 // when the frame type is not recognised.
 pub const ERR_UNKNOWN_FRAME: u16 = 0x0003;
 
+/// Sentinel `request_id` value that asks the host to apply the
+/// command but not emit a response frame. The mirror of VGE's
+/// `REQ_ID_NO_RESPONSE` (see `doc/vector-graphics-extension.md` §1.2),
+/// and needed for the same reason: a sender that is not the pane's
+/// foreground program can never read the reply — it lands in the
+/// pane's input queue, where whoever the kernel wakes consumes it —
+/// and a stateful middleman replaying state would otherwise have its
+/// acks round-trip back into the inner program's PTY as keystrokes.
+/// Senders that need acknowledgement must use any other value.
+pub const REQ_ID_NO_RESPONSE: u32 = u32::MAX;
+
 // APC envelope markers.
 pub const MARKER_C2H: &[u8; 3] = b"SES"; // client → host (commands)
 pub const MARKER_H2C: &[u8; 3] = b"ses"; // host → client (responses)
