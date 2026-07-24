@@ -298,6 +298,22 @@ of the update.
 Origin `x` is plain horizontal cell offset; it does not interact with
 scrolling.
 
+**"At command-processing time" is normative about ordering.** A client
+routinely writes text and a command in one `write(2)`, and the terminal
+reads them in one chunk. `top_of_live_screen` MUST reflect every byte
+that preceded the command *in the stream*, not the state before the
+chunk began. A terminal that extracts all of a chunk's envelopes before
+handing any of that chunk's text to its text parser resolves anchors
+against the pre-chunk screen and is off by exactly the text that
+arrived alongside the command.
+
+The reference implementation satisfies this by making VGE the last
+stage before the text parser and having it consume the stream as
+ordered segments, interleaving text with command application
+(`veter_host::vge::drive_terminal_stage`). Extensions whose commands
+are cursor- or grid-dependent belong in that same stage; a stage placed
+after it cannot see the ordering.
+
 ### 5.3 Visibility versus the visible viewport
 
 An element with `is_visible = true` is still hidden if its `anchor_line`

@@ -191,17 +191,16 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
-            let vge_passthrough = vge.process_pty_chunk(&prt_chunk.passthrough);
-            // SES sits after VGE, before vt100 — the inner vmux is the
-            // SES client; vsd is its host.
-            let ses_passthrough = ses.process_pty_chunk(&vge_passthrough);
-            if !ses_passthrough.is_empty() {
-                parser.process(&ses_passthrough);
-            }
+            // SES is consumed here — the inner vmux is the SES client,
+            // vsd is its host — and VGE runs last as the terminal
+            // stage, driving the vt100 itself so element origins
+            // resolve against the screen the inner program saw. See
+            // `veter_host::vge::drive_terminal_stage`.
+            let ses_passthrough = ses.process_pty_chunk(&prt_chunk.passthrough);
+            veter_host::vge::drive_terminal_stage(vge, parser, &ses_passthrough);
             prt.handle_terminal_events(&prt_chunk.terminal_events);
             prt.after_vt100_process(parser);
             prt.flush_pending_events();
-            vge.after_vt100_process(parser);
             prt.drive_and_flush_vft();
 
             let mut out = prt.take_responses();

@@ -1275,19 +1275,11 @@ impl PrtEngine {
                 }
             }
 
-            // 2. §10 — per-portal VGE. Extract any ESC_VGE envelopes
-            //    from the bytes and apply them against the portal's
-            //    private VGE state. The engine internally handles its
-            //    own RIS/DECSTR/2J/3J reactions on its own apc, so
-            //    inside-portal scoping for VGE elements works the same
-            //    way it does for sub-portals.
-            let vge_passthrough = portal.vge.process_pty_chunk(&chunk.passthrough);
-
-            // 2b. §10 (vft-in-portal) — extract any ESC_VFT envelopes
-            //     from the post-VGE passthrough. VFT has no on-screen
-            //     state so it does not observe terminal events on its
-            //     own apc; the abort_all call above covers RIS/DECSTR.
-            let vft_passthrough = portal.vft.process_pty_chunk(&vge_passthrough);
+            // 2. §10 (vft-in-portal) — extract any ESC_VFT envelopes.
+            //    VFT has no on-screen state so it does not observe
+            //    terminal events on its own apc; the abort_all call
+            //    above covers RIS/DECSTR.
+            let vft_passthrough = portal.vft.process_pty_chunk(&chunk.passthrough);
 
             // Drain any worker events that arrived synchronously
             // during this command (e.g. a Finalised reply for an
@@ -1344,10 +1336,19 @@ impl PrtEngine {
             //     `ses` responses join the reverse channel below.
             let ses_passthrough = portal.ses.process_pty_chunk(&vss_passthrough);
 
-            // 3. Feed the remaining bytes into the portal's vt100. The
-            //    `PortalCallbacks` instance accumulates Bell / Title /
-            //    Icon / Clipboard / OSC events. The scroll counter and
-            //    cursor row are sampled around the call to derive the
+            // 3. §10 — per-portal VGE, the portal's terminal stage.
+            //    Same structure as the host pipeline: VGE runs last and
+            //    drives the portal's vt100 itself, interleaving text
+            //    with command application so element origins resolve
+            //    against the screen the inner program actually saw. The
+            //    engine handles its own RIS/DECSTR/2J/3J reactions on
+            //    its own apc, so inside-portal scoping for VGE elements
+            //    works the same way it does for sub-portals.
+            //
+            //    The `PortalCallbacks` instance accumulates Bell /
+            //    Title / Icon / Clipboard / OSC events throughout. The
+            //    scroll counter and cursor row are sampled around the
+            //    *whole* walk — not per text segment — to derive the
             //    activity signal (EVT_PORTAL_ACTIVITY): the portal
             //    committed a new line iff it scrolled, or the cursor
             //    advanced to a lower row (output filling a screen that
@@ -1356,7 +1357,11 @@ impl PrtEngine {
             //    line with CR, leaving the cursor row unchanged.
             let scroll_before = portal.vt.screen().scroll_committed();
             let (cursor_row_before, _) = portal.vt.screen().cursor_position();
-            portal.vt.process(&ses_passthrough);
+            crate::vge::drive_terminal_stage(
+                &mut portal.vge,
+                &mut portal.vt,
+                &ses_passthrough,
+            );
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
             let activity = portal.vt.screen().scroll_committed() != scroll_before
                 || cursor_row_after > cursor_row_before;
@@ -1365,12 +1370,11 @@ impl PrtEngine {
             // 4. Update the children engine's line tracker against the
             //    parent portal's vt100 (sub-portal anchoring is
             //    relative to that vt100), and run any pending alt-
-            //    screen / scrollback eviction logic. Then do the same
-            //    for the per-portal VGE engine, whose elements anchor
-            //    to the same vt100.
+            //    screen / scrollback eviction logic. The per-portal VGE
+            //    engine's own `after_vt100_process` already ran inside
+            //    `drive_terminal_stage`.
             portal.children.after_vt100_process(&mut portal.vt);
             portal.children.flush_pending_events();
-            portal.vge.after_vt100_process(&mut portal.vt);
 
             // 5. Snapshot polled state and detect deltas.
             let old_cache = portal.state_cache;

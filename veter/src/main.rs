@@ -2572,24 +2572,29 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(data) => {
-                    // Pipeline: PRT extracts ESC_PRT envelopes and observes
-                    // RIS/DECSTR/2J/3J events; VGE then extracts ESC_VGE
-                    // envelopes from PRT's passthrough; VFT does the same
-                    // for ESC_VFT; the rest goes to the host vt100. Each
-                    // engine's apc passes the others' markers through
-                    // verbatim, so order is independent of correctness.
+                    // Pipeline: a prefix of order-insensitive byte
+                    // filters, then one segment-aware terminal stage.
+                    //
+                    // PRT extracts ESC_PRT envelopes and observes
+                    // RIS/DECSTR/2J/3J; VFT extracts ESC_VFT from its
+                    // passthrough; VSS extracts ESC_VSS snapshot
+                    // frames; SES is consumed by the immediate host
+                    // (the local renderer is not a session, so it just
+                    // answers a vmux probe with "no session", and its
+                    // envelopes never reach the vt100). Each engine's
+                    // apc passes the others' markers through verbatim,
+                    // so their relative order is free.
+                    //
+                    // VGE is last and drives the vt100 itself, because
+                    // its element origins are viewport-relative at
+                    // command-processing time — see
+                    // `vge::drive_terminal_stage`. Nothing may be
+                    // inserted between it and the parser.
                     let prt_chunk = prt.process_pty_chunk_full(&data);
-                    let vge_passthrough = engine.process_pty_chunk(&prt_chunk.passthrough);
-                    let vft_passthrough = vft.process_pty_chunk(&vge_passthrough);
+                    let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
                     let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
-                    // SES is consumed by the immediate host. The local
-                    // renderer is not a session, so this just answers a
-                    // vmux probe with "no session"; envelopes never
-                    // reach the host vt100.
                     let ses_passthrough = ses.process_pty_chunk(&vss_passthrough);
-                    if !ses_passthrough.is_empty() {
-                        parser.process(&ses_passthrough);
-                    }
+                    vge::drive_terminal_stage(engine, parser, &ses_passthrough);
                     // Apply any completed host-level VSS snapshots.
                     // A snapshot arriving at this level replaces the
                     // host's vt100 / VGE / PRT engines wholesale —
@@ -2654,7 +2659,9 @@ impl App {
                     }
                     prt.after_vt100_process(parser);
                     prt.flush_pending_events();
-                    engine.after_vt100_process(parser);
+                    // VGE's own `after_vt100_process` already ran inside
+                    // `drive_terminal_stage`, at each command boundary
+                    // and once at the end of the chunk.
                     vft.drive();
                     // Drive every per-portal VFT engine and surface
                     // their async events as RawReply on each portal's

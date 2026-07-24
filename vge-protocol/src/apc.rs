@@ -10,6 +10,11 @@
 //                    in the stream (e.g. RIS, DECSTR). Bytes still pass
 //                    through to vt100 unchanged.
 //
+// `feed` returns those three as separate bags, which is all a byte
+// filter needs. `feed_segments` returns the same content as an ordered
+// `Vec<Segment>` instead — required by the terminal stage, which must
+// hand the vt100 the text preceding a command before applying it.
+//
 // Non-VGE APC sequences (e.g. iTerm-style `ESC _G...`) pass through verbatim
 // so the underlying VT parser can still handle them. A VGE envelope is
 // recognized by the 3-byte uppercase `VGE` marker that follows `ESC _`
@@ -98,9 +103,48 @@ pub struct Output {
     pub events: Vec<TerminalEvent>,
 }
 
-impl Output {
+/// One piece of the input stream, **in the order it arrived**.
+///
+/// [`Output`] answers "what was in this chunk"; `Segment` answers
+/// "in what order", which is what anything cursor- or grid-dependent
+/// needs. A `CreateElement` whose origin resolves against the cursor
+/// must see the text that preceded it in the same read, and only the
+/// sequence tells you where that boundary is. See
+/// `doc/client-integration-groundwork.md` item 5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    /// Bytes destined for the vt100, verbatim.
+    Pass(Vec<u8>),
+    /// One fully-received, un-stuffed VGE payload.
+    Payload(Vec<u8>),
+    /// A side-channel VT sequence observed at this point. The bytes
+    /// themselves are inside the immediately preceding `Pass`, so the
+    /// event must be applied *after* that text reaches the vt100.
+    Event(TerminalEvent),
+}
+
+/// Accumulator the parser writes into. Consecutive passthrough bytes
+/// coalesce into one `Pass`, so a chunk of plain text is a single
+/// segment rather than one per byte.
+#[derive(Default)]
+struct SegmentSink {
+    segments: Vec<Segment>,
+}
+
+impl SegmentSink {
     fn push_pass(&mut self, b: u8) {
-        self.passthrough.push(b);
+        match self.segments.last_mut() {
+            Some(Segment::Pass(v)) => v.push(b),
+            _ => self.segments.push(Segment::Pass(vec![b])),
+        }
+    }
+
+    fn push_payload(&mut self, payload: Vec<u8>) {
+        self.segments.push(Segment::Payload(payload));
+    }
+
+    fn push_event(&mut self, ev: TerminalEvent) {
+        self.segments.push(Segment::Event(ev));
     }
 }
 
@@ -125,10 +169,30 @@ impl ApcStream {
         }
     }
 
+    /// Split `input` into ordered segments. This is the form the
+    /// terminal stage — the engine sitting immediately before the
+    /// vt100 — consumes, so it can interleave `parser.process` with
+    /// command application exactly as the sender wrote them.
+    pub fn feed_segments(&mut self, input: &[u8]) -> Vec<Segment> {
+        let mut sink = SegmentSink::default();
+        for &b in input {
+            self.step(b, &mut sink);
+        }
+        sink.segments
+    }
+
+    /// Order-free view of the same extraction: everything the chunk
+    /// contained, grouped by kind. Correct for every engine that is a
+    /// plain byte filter, and for client-side parsing of the
+    /// terminal's replies.
     pub fn feed(&mut self, input: &[u8]) -> Output {
         let mut out = Output::default();
-        for &b in input {
-            self.step(b, &mut out);
+        for seg in self.feed_segments(input) {
+            match seg {
+                Segment::Pass(bytes) => out.passthrough.extend_from_slice(&bytes),
+                Segment::Payload(p) => out.payloads.push(p),
+                Segment::Event(e) => out.events.push(e),
+            }
         }
         out
     }
@@ -149,7 +213,7 @@ impl ApcStream {
         }
     }
 
-    fn step(&mut self, b: u8, out: &mut Output) {
+    fn step(&mut self, b: u8, out: &mut SegmentSink) {
         // Move out the current state so we can rebuild it without fighting
         // the borrow checker on the `body: Vec<u8>` ownership.
         let st = std::mem::replace(&mut self.state, State::Idle);
@@ -179,7 +243,7 @@ impl ApcStream {
                     // RIS — full terminal reset (§5.6).
                     out.push_pass(ESC);
                     out.push_pass(b'c');
-                    out.events.push(TerminalEvent::HardReset);
+                    out.push_event(TerminalEvent::HardReset);
                     State::Idle
                 }
                 ESC => {
@@ -250,7 +314,7 @@ impl ApcStream {
                 }
                 ST_CLOSE => {
                     // Envelope complete.
-                    out.payloads.push(body);
+                    out.push_payload(body);
                     State::Idle
                 }
                 ESC_MARK_TILDE => {
@@ -294,20 +358,20 @@ impl ApcStream {
                 if (0x40..=0x7E).contains(&b) {
                     // DECSTR is `ESC [ ! p`.
                     if buf.as_slice() == b"!" && b == b'p' {
-                        out.events.push(TerminalEvent::SoftReset);
+                        out.push_event(TerminalEvent::SoftReset);
                     }
                     // DSR cursor-position query is `ESC [ 6 n`.
                     if buf.as_slice() == b"6" && b == b'n' {
-                        out.events.push(TerminalEvent::CursorPositionQuery);
+                        out.push_event(TerminalEvent::CursorPositionQuery);
                     }
                     // Erase In Display:
                     //   `ESC [ 2 J` — wipe live region.
                     //   `ESC [ 3 J` — wipe scrollback.
                     if b == b'J' && buf.as_slice() == b"2" {
-                        out.events.push(TerminalEvent::EraseDisplay);
+                        out.push_event(TerminalEvent::EraseDisplay);
                     }
                     if b == b'J' && buf.as_slice() == b"3" {
-                        out.events.push(TerminalEvent::EraseScrollback);
+                        out.push_event(TerminalEvent::EraseScrollback);
                     }
                     State::Idle
                 } else {
@@ -603,6 +667,113 @@ mod tests {
                     "round-trip failed (len {len}, round {round})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn segments_preserve_stream_order() {
+        // The whole point of the segmented form: a command that arrived
+        // between two runs of text must be applied between them, not
+        // before both. `feed` alone cannot express this.
+        let mut s = ApcStream::new();
+        let mut input = b"line1\r\n".to_vec();
+        input.extend(envelope(b"cmd"));
+        input.extend(b"line2\r\n");
+        assert_eq!(
+            s.feed_segments(&input),
+            vec![
+                Segment::Pass(b"line1\r\n".to_vec()),
+                Segment::Payload(b"cmd".to_vec()),
+                Segment::Pass(b"line2\r\n".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn segments_place_events_after_their_bytes() {
+        // The CSI bytes themselves belong to the preceding Pass, so the
+        // event must follow them — an engine reacting to `2J` has to
+        // see the vt100 state the sequence produced, not the one before
+        // it.
+        let mut s = ApcStream::new();
+        let segs = s.feed_segments(b"a\x1b[2Jb");
+        assert_eq!(
+            segs,
+            vec![
+                Segment::Pass(b"a\x1b[2J".to_vec()),
+                Segment::Event(TerminalEvent::EraseDisplay),
+                Segment::Pass(b"b".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn segments_coalesce_runs_of_passthrough() {
+        // One segment per byte would make the caller re-enter the vt100
+        // parser for every character.
+        let mut s = ApcStream::new();
+        let segs = s.feed_segments(b"hello world");
+        assert_eq!(segs, vec![Segment::Pass(b"hello world".to_vec())]);
+    }
+
+    #[test]
+    fn feed_and_feed_segments_agree() {
+        // The two views must never disagree about content — only about
+        // whether order is preserved.
+        let mut input = b"before".to_vec();
+        input.extend(envelope(b"one"));
+        input.extend(b"\x1b[3Jmiddle");
+        input.extend(envelope(b"two"));
+        input.extend(b"after\x1bc");
+
+        let mut a = ApcStream::new();
+        let out = a.feed(&input);
+        let mut b = ApcStream::new();
+        let segs = b.feed_segments(&input);
+
+        let mut pass = Vec::new();
+        let mut payloads = Vec::new();
+        let mut events = Vec::new();
+        for seg in segs {
+            match seg {
+                Segment::Pass(v) => pass.extend_from_slice(&v),
+                Segment::Payload(p) => payloads.push(p),
+                Segment::Event(e) => events.push(e),
+            }
+        }
+        assert_eq!(out.passthrough, pass);
+        assert_eq!(out.payloads, payloads);
+        assert_eq!(out.events, events);
+    }
+
+    #[test]
+    fn segments_survive_a_split_envelope() {
+        // Read boundaries are the terminal's, not the client's, so an
+        // envelope routinely straddles two chunks. The segment on the
+        // far side must still land after the text that preceded it.
+        let env = envelope(b"body");
+        for split in 1..env.len() {
+            let mut s = ApcStream::new();
+            let mut first = b"pre".to_vec();
+            first.extend_from_slice(&env[..split]);
+            let mut segs = s.feed_segments(&first);
+            let mut rest = env[split..].to_vec();
+            rest.extend_from_slice(b"post");
+            segs.extend(s.feed_segments(&rest));
+            let payload_at = segs
+                .iter()
+                .position(|s| matches!(s, Segment::Payload(_)))
+                .unwrap_or_else(|| panic!("split {split}: no payload"));
+            let pre_at = segs
+                .iter()
+                .position(|s| matches!(s, Segment::Pass(v) if v.starts_with(b"pre")))
+                .unwrap();
+            let post_at = segs
+                .iter()
+                .rposition(|s| matches!(s, Segment::Pass(v) if v.ends_with(b"post")))
+                .unwrap();
+            assert!(pre_at < payload_at, "split {split}: payload before `pre`");
+            assert!(payload_at < post_at, "split {split}: payload after `post`");
         }
     }
 }

@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use rgb::RGBA8;
-use vge_protocol::apc::ApcStream;
+use vge_protocol::apc::{ApcStream, Segment};
 use vge_protocol::codec::{Point, Reader, Transform};
 use vge_protocol::command::{
     self, Command, ConcreteStyle, CreateElementBody, DrawCmd, UpdateCommandBody,
@@ -606,6 +606,25 @@ impl VgeEngine {
             self.handle_terminal_event(ev);
         }
         out.passthrough
+    }
+
+    /// Split a chunk into ordered segments without applying anything.
+    /// The caller — [`drive_terminal_stage`] — feeds the vt100 and
+    /// calls [`Self::apply_payload`] / [`Self::apply_terminal_event`]
+    /// as it walks them, so each command resolves against the screen
+    /// state the sender actually saw.
+    pub fn feed_segments(&mut self, input: &[u8]) -> Vec<Segment> {
+        self.apc.feed_segments(input)
+    }
+
+    /// Apply one payload extracted by [`Self::feed_segments`].
+    pub fn apply_payload(&mut self, payload: &[u8]) {
+        self.handle_envelope_payload(payload);
+    }
+
+    /// Apply one terminal event extracted by [`Self::feed_segments`].
+    pub fn apply_terminal_event(&mut self, ev: vge_protocol::TerminalEvent) {
+        self.handle_terminal_event(ev);
     }
 
     /// React to a side-channel terminal event observed in the byte

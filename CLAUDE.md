@@ -56,16 +56,19 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`veter-
 
 ## Host-side byte pipeline (veter)
 
-`veter/src/main.rs::App::process_pty_output` is the load-bearing path. Output from the child PTY is fed through, in order:
+`veter/src/main.rs::App::process_pty_output` is the load-bearing path. The pipeline is **a prefix of order-insensitive byte filters, then exactly one segment-aware terminal stage**. Output from the child PTY is fed through, in order:
 
 1. **PRT engine** — extracts `ESC _ PRT …` envelopes, dispatches portal commands, observes RIS / DECSTR / `2J` / `3J` for portal scope cleanup, and returns the leftover bytes as `passthrough`.
-2. **VGE engine** — extracts `ESC _ VGE …` envelopes from PRT's passthrough.
-3. **VFT engine** — extracts `ESC _ VFT …` envelopes from VGE's passthrough.
-4. **VSS engine** — extracts `ESC _ VSS …` snapshot frames; a completed host-level snapshot replaces the host's vt100 / VGE / PRT engines wholesale (the common case is per-portal snapshots handled recursively inside `prt::WritePortal`).
-5. **SES engine** — consumed by the immediate host; the local renderer is not a session, so it just answers a `vmux` probe with "no session". Envelopes never reach the host vt100.
-6. **Host vt100 parser** — receives whatever all engines passed through.
+2. **VFT engine** — extracts `ESC _ VFT …` envelopes from PRT's passthrough.
+3. **VSS engine** — extracts `ESC _ VSS …` snapshot frames; a completed host-level snapshot replaces the host's vt100 / VGE / PRT engines wholesale (the common case is per-portal snapshots handled recursively inside `prt::WritePortal`).
+4. **SES engine** — consumed by the immediate host; the local renderer is not a session, so it just answers a `vmux` probe with "no session". Envelopes never reach the host vt100.
+5. **VGE engine + host vt100 parser** — the terminal stage, driven together by `veter_host::vge::drive_terminal_stage`.
 
-Each engine's APC parser passes the *other* extensions' markers through verbatim, so the pipeline order is correctness-independent. After the host vt100 runs, the engines' `after_vt100_process` hooks observe the resulting screen state (scroll position, alt-screen swaps, scrollback eviction). Engine-generated responses/events are written back to the PTY master.
+Stages 1–4 are pure byte filters, and each one's APC parser passes the *other* extensions' markers through verbatim, so **their relative order is free**. Stage 5 is not interchangeable with them: VGE element origins are viewport-relative *at command-processing time* (`doc/vector-graphics-extension.md` §5.2), so a command must be applied against the screen the sender saw. `drive_terminal_stage` therefore consumes ordered `Segment`s (`vge_protocol::apc::feed_segments`) rather than a whole chunk's payloads at once, feeding the vt100 the text that preceded each command before applying it. **Nothing may be inserted between VGE and the parser**, and anything else that becomes cursor- or grid-dependent (e.g. kitty graphics) belongs *in* that stage rather than after it.
+
+After the chunk, the byte filters' `after_vt100_process` hooks observe the resulting screen state (scroll position, alt-screen swaps, scrollback eviction); VGE's already ran inside the terminal stage. Engine-generated responses/events are written back to the PTY master.
+
+The same shape repeats in the two other places the engines run: the per-portal path in `prt::PrtEngine::cmd_write_portal`, and `vsd`'s worker loop in `tools/vsd/src/engines.rs`.
 
 ## Portals are recursive
 
