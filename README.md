@@ -20,12 +20,15 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vmux` | Terminal multiplexer that runs *inside* `veter`, using PRT for panes and VGE for chrome. Default prefix `Ctrl+Space`. |
 | `vcat` | Display images inside a VGE-aware terminal. |
 | `vplay` | Interactive image and video viewer for VGE-aware terminals. |
+| `vdraw` | Interactive block-diagram editor; draws with VGE, stores `.excalidraw` documents. |
+| `vfm` | File browser: ranger-style column navigation with a thumbnail icon grid for the current directory. |
 | `vsend`, `vrecv` | Upload a local file to / pull a host-side file back from a VFT-aware terminal. |
 | `vsd` | Persistent session daemon — holds session state across renderer disconnects. |
 | `vssh` | SSH wrapper that keeps the veter tools fresh on remote hosts. |
 | `vge-cli`, `prt-cli` | Emit raw protocol envelopes for manual testing. |
 | `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
 | `vge-render` | Shared client-side image-rendering helpers (used by `vcat`, `vplay`). |
+| `vge-ui` | Shared client-side widget toolkit: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing (used by `vmux`, `vfm`). |
 | `vt100` | Vendored fork of the `vt100` parser (adds `clear_scrollback`, resize helpers, and binary snapshot/restore). |
 | `breakout`, `spinner` | VGE demos. |
 
@@ -41,7 +44,7 @@ cargo run -p veter
 ## Install
 
 ```sh
-make install      # veter + vcat, vplay, vmux, vsend, vrecv, vsd, vssh to $PREFIX/bin (default ~/.local) plus a desktop entry
+make install      # veter + vcat, vplay, vdraw, vfm, vmux, vsend, vrecv, vsd, vssh to $PREFIX/bin (default ~/.local) plus a desktop entry
 make uninstall
 ```
 

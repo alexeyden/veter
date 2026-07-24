@@ -1,4 +1,4 @@
-# Build and install veter, vcat, vplay, and vmux. Mirrors what
+# Build and install veter, vcat, vplay, vdraw, vfm, and vmux. Mirrors what
 # install.sh used to do — `make install` builds the binaries in release
 # mode and drops them into $(BINDIR), plus a desktop entry into $(APPDIR).
 #
@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vplay vdraw vmux vsend vrecv vsd vssh
+PACKAGES := veter vcat vplay vdraw vfm vmux vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg

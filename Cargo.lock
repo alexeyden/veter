@@ -3065,6 +3065,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "libc",
+ "nix 0.29.0",
+ "prt-protocol",
+ "vge-protocol",
+ "vge-render",
+ "vge-ui",
+]
+
+[[package]]
 name = "vft-client"
 version = "0.1.0"
 dependencies = [
