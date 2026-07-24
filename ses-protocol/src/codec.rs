@@ -2,7 +2,8 @@
 // extension specs — identical to PRT/VGE/VFT/VSS).
 
 use super::frame::{
-    ERR_BAD_PAYLOAD, ESC, ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, TILDE, XOFF, XON,
+    CR, ERR_BAD_PAYLOAD, ESC, ESC_MARK_CR, ESC_MARK_LF, ESC_MARK_TAB,
+    ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, LF, TAB, TILDE, XOFF, XON,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -154,10 +155,12 @@ impl Writer {
 }
 
 /// Byte-stuff a payload for the APC envelope body. `ESC` is doubled
-/// (`ESC ESC`); the transport-hostile bytes `~`, XON and XOFF are each
-/// replaced with `ESC <mark>`, so the emitted body is safe to cross an
-/// interactive relay (e.g. ssh) that would otherwise interpret them.
-/// Decoding (the APC parser) reverses all four cases.
+/// (`ESC ESC`); the transport-hostile bytes `~`, XON, XOFF, TAB, LF and
+/// CR are each replaced with `ESC <mark>`, so the emitted body is safe
+/// both to cross an interactive relay (e.g. ssh) that would interpret
+/// them and to be written to a cooked tty, whose output post-processing
+/// would rewrite the last three. Decoding (the APC parser) reverses
+/// every case.
 pub fn stuff(input: &[u8], out: &mut Vec<u8>) {
     for &b in input {
         match b {
@@ -176,6 +179,18 @@ pub fn stuff(input: &[u8], out: &mut Vec<u8>) {
             XOFF => {
                 out.push(ESC);
                 out.push(ESC_MARK_XOFF);
+            }
+            TAB => {
+                out.push(ESC);
+                out.push(ESC_MARK_TAB);
+            }
+            LF => {
+                out.push(ESC);
+                out.push(ESC_MARK_LF);
+            }
+            CR => {
+                out.push(ESC);
+                out.push(ESC_MARK_CR);
             }
             _ => out.push(b),
         }
@@ -255,21 +270,25 @@ mod tests {
 
     #[test]
     fn stuffed_output_is_transport_clean() {
-        // A stuffed body never contains a literal `~`, XON or XOFF — so
-        // `\n~` (ssh's escape trigger) can't appear and flow-control bytes
-        // can't pause an interactive relay. Exhaustive over every byte
-        // value, plus a newline-adjacency probe.
+        // A stuffed body never contains a byte that anything
+        // downstream rewrites: `~` (ssh's escape trigger, which
+        // therefore can never follow a newline — no newline
+        // survives either), XON/XOFF (flow control on an
+        // interactive relay), and TAB/LF/CR (output
+        // post-processing on a cooked tty). Exhaustive over every
+        // byte value.
         let all: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
         let mut out = Vec::new();
         stuff(&all, &mut out);
-        assert!(!out.contains(&TILDE), "literal ~ leaked");
-        assert!(!out.contains(&XON), "literal XON leaked");
-        assert!(!out.contains(&XOFF), "literal XOFF leaked");
-        for w in out.windows(2) {
-            assert!(
-                !((w[0] == b'\n' || w[0] == b'\r') && w[1] == TILDE),
-                "newline-adjacent ~ leaked"
-            );
+        for (b, name) in [
+            (TILDE, "~"),
+            (XON, "XON"),
+            (XOFF, "XOFF"),
+            (TAB, "TAB"),
+            (LF, "LF"),
+            (CR, "CR"),
+        ] {
+            assert!(!out.contains(&b), "literal {name} leaked");
         }
     }
 }

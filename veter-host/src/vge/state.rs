@@ -1493,7 +1493,8 @@ mod tests {
         assert_eq!(&env[2..5], marker);
         assert_eq!(&env[env.len() - 2..], &[ESC, ST_CLOSE]);
         use vge_protocol::frame::{
-            ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, TILDE, XOFF, XON,
+            CR, ESC_MARK_CR, ESC_MARK_LF, ESC_MARK_TAB, ESC_MARK_TILDE,
+            ESC_MARK_XON, ESC_MARK_XOFF, LF, TAB, TILDE, XOFF, XON,
         };
         let mut out = Vec::new();
         let mut i = 5;
@@ -1504,6 +1505,9 @@ mod tests {
                     ESC_MARK_TILDE => Some(TILDE),
                     ESC_MARK_XON => Some(XON),
                     ESC_MARK_XOFF => Some(XOFF),
+                    ESC_MARK_TAB => Some(TAB),
+                    ESC_MARK_LF => Some(LF),
+                    ESC_MARK_CR => Some(CR),
                     _ => None,
                 };
                 if let Some(b) = decoded {

@@ -33,7 +33,8 @@ does not speak SES" from "host is not a session" via a timeout.
 ## 2. Wire format
 
 Identical to PRT §1.1–1.4 (envelope, byte-stuffing — ESC plus the
-`~`/XON/XOFF transport escapes, payload framing, encoding primitives),
+`~`/XON/XOFF relay escapes and the TAB/LF/CR cooked-tty escapes,
+payload framing, encoding primitives),
 with these markers:
 
 - client → host: `ESC _ S E S <payload> ESC \`

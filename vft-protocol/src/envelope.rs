@@ -237,13 +237,17 @@ mod tests {
     #[test]
     fn download_chunk_envelope_is_transport_clean_and_round_trips() {
         // End-to-end: a DownloadChunk whose file bytes contain ssh's
-        // escape char after a newline (`\n~`) plus XON/XOFF, wrapped as a
-        // real H2C envelope, must be relayable through an interactive
-        // transport — no literal `~`, XON or XOFF on the wire — and the
-        // client's APC parser must recover the bytes exactly.
-        use crate::frame::{EVT_DOWNLOAD_CHUNK, MARKER_H2C, TILDE, XOFF, XON};
+        // escape char after a newline (`\n~`), XON/XOFF, and the TAB /
+        // LF / CR that a cooked tty's output post-processing rewrites,
+        // wrapped as a real H2C envelope. It must survive both an
+        // interactive relay and a tty with OPOST on — none of those six
+        // bytes may appear on the wire — and the client's APC parser
+        // must recover the file bytes exactly.
+        use crate::frame::{CR, EVT_DOWNLOAD_CHUNK, LF, MARKER_H2C, TAB, TILDE, XOFF, XON};
 
-        let data = [b'\n', TILDE, 0x00, XON, b'\r', TILDE, XOFF, 0xFF, 0x1B];
+        let data = [
+            LF, TILDE, 0x00, XON, CR, TILDE, XOFF, TAB, 0xFF, 0x1B,
+        ];
         let mut frames = Vec::new();
         append_frame(
             &mut frames,
@@ -253,14 +257,15 @@ mod tests {
         );
         let env = wrap_h2c_envelope(&frames);
 
-        assert!(!env.contains(&TILDE), "envelope leaked a literal ~");
-        assert!(!env.contains(&XON), "envelope leaked a literal XON");
-        assert!(!env.contains(&XOFF), "envelope leaked a literal XOFF");
-        for w in env.windows(2) {
-            assert!(
-                !((w[0] == b'\n' || w[0] == b'\r') && w[1] == TILDE),
-                "envelope leaked a newline-adjacent ~"
-            );
+        for (b, name) in [
+            (TILDE, "~"),
+            (XON, "XON"),
+            (XOFF, "XOFF"),
+            (TAB, "TAB"),
+            (LF, "LF"),
+            (CR, "CR"),
+        ] {
+            assert!(!env.contains(&b), "envelope leaked a literal {name}");
         }
 
         // Client-side parse recovers the chunk byte-for-byte.

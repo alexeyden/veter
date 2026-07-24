@@ -11,8 +11,8 @@
 // verbatim — including non-VFT APC sequences.
 
 use super::frame::{
-    APC_OPEN, ESC, ESC_MARK_TILDE, ESC_MARK_XON, ESC_MARK_XOFF, MARKER_C2H, ST_CLOSE, TILDE, XOFF,
-    XON,
+    APC_OPEN, CR, ESC, ESC_MARK_CR, ESC_MARK_LF, ESC_MARK_TAB, ESC_MARK_TILDE,
+    ESC_MARK_XON, ESC_MARK_XOFF, LF, MARKER_C2H, ST_CLOSE, TAB, TILDE, XOFF, XON,
 };
 
 #[derive(Debug)]
@@ -185,6 +185,18 @@ impl ApcStream {
                 }
                 ESC_MARK_XOFF => {
                     body.push(XOFF);
+                    State::ApcVft { body }
+                }
+                ESC_MARK_TAB => {
+                    body.push(TAB);
+                    State::ApcVft { body }
+                }
+                ESC_MARK_LF => {
+                    body.push(LF);
+                    State::ApcVft { body }
+                }
+                ESC_MARK_CR => {
+                    body.push(CR);
                     State::ApcVft { body }
                 }
                 _ => {
@@ -400,5 +412,53 @@ mod tests {
         // surface as passthrough.
         assert!(out.payloads.is_empty());
         assert_eq!(out.passthrough, b"\x1bXafter");
+    }
+
+    /// Deterministic xorshift. These crates carry no `rand`
+    /// dependency, and a fixed seed keeps a failure reproducible.
+    fn xorshift(state: &mut u64) -> u8 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state & 0xFF) as u8
+    }
+
+    #[test]
+    fn stuffing_round_trips_and_stays_transport_clean() {
+        // Property over arbitrary payloads: the on-wire body carries
+        // none of the six bytes a relay or a cooked tty would rewrite,
+        // and the parser recovers the payload byte-for-byte. Random
+        // payloads catch what an exhaustive single-byte sweep cannot —
+        // that the escape emitted for one byte is never misread as the
+        // mark belonging to the next.
+        use super::super::frame::{CR, LF, TAB, TILDE, XOFF, XON};
+        let hostile = [TAB, LF, CR, TILDE, XON, XOFF];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for len in [0usize, 1, 2, 3, 7, 64, 257, 1024] {
+            for round in 0..16 {
+                let body: Vec<u8> = (0..len).map(|_| xorshift(&mut state)).collect();
+                let env = envelope(&body);
+                // Envelope body only: `ESC _ <marker>` and the closing
+                // `ESC \` are framing, not payload.
+                let wire = &env[5..env.len() - 2];
+                for b in hostile {
+                    assert!(
+                        !wire.contains(&b),
+                        "byte {b:#04X} leaked (len {len}, round {round})"
+                    );
+                }
+                let mut s = ApcStream::new();
+                let out = s.feed(&env);
+                assert!(
+                    out.passthrough.is_empty(),
+                    "leaked passthrough (len {len}, round {round})"
+                );
+                assert_eq!(
+                    out.payloads,
+                    vec![body],
+                    "round-trip failed (len {len}, round {round})"
+                );
+            }
+        }
     }
 }

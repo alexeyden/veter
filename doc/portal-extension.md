@@ -106,6 +106,9 @@ placing in the envelope) are scanned and the following are replaced:
 | `0x7E` `~`      | `0x1B 0x54` (`ESC T`) | ssh escape character      |
 | `0x11` DC1      | `0x1B 0x51` (`ESC Q`) | XON (flow control)        |
 | `0x13` DC3      | `0x1B 0x53` (`ESC S`) | XOFF (flow control)       |
+| `0x09` HT       | `0x1B 0x48` (`ESC H`) | TAB (expanded by `TABDLY=XTABS`) |
+| `0x0A` NL       | `0x1B 0x4E` (`ESC N`) | LF (rewritten by `ONLCR`) |
+| `0x0D` CR       | `0x1B 0x52` (`ESC R`) | CR (rewritten by `OCRNL` / `ONLRET` / `ONOCR`) |
 
 Decoding reverses each case; any other byte after a body `0x1B` (other
 than these marks or the `0x5C` ST close) is malformed.
@@ -120,6 +123,17 @@ are software flow control. Stuffing them guarantees the on-wire
 envelope never contains a literal `~` (so `~` can never follow a
 newline), DC1 or DC3. The mark bytes (`T`/`Q`/`S`) are themselves
 transport-clean and distinct from `0x1B`/`0x5C`.
+
+The TAB / LF / CR rules exist because an envelope may also be written to
+a tty whose **output post-processing** is on — the normal state of a
+pane, and one an out-of-band client cannot change, since it does not own
+that pane's termios. `OPOST` with `ONLCR` (the default) rewrites every
+LF to CRLF; `OCRNL`, `ONLRET` and `ONOCR` rewrite CR; `TABDLY=XTABS`
+expands TAB into spaces. Any of these silently corrupts an envelope, and
+the corruption is invisible to the sender. Stuffing them makes the body
+safe to write to a cooked tty. The mark bytes (`H`/`N`/`R`) are
+themselves transport-clean and distinct from `0x1B`/`0x5C` and from the
+other marks.
 
 `payload_length` is computed on the *unstuffed* payload, so the
 receiver knows how much data to expect after unstuffing.

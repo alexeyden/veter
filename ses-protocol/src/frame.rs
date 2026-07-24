@@ -61,3 +61,18 @@ pub const XOFF: u8 = 0x13; // DC3  XOFF (pause) flow control
 pub const ESC_MARK_TILDE: u8 = b'T'; // 0x54 → TILDE
 pub const ESC_MARK_XON: u8 = b'Q'; // 0x51 → XON
 pub const ESC_MARK_XOFF: u8 = b'S'; // 0x53 → XOFF
+
+// Output post-processing rewrites three more bytes, so byte-stuffing
+// has to neutralise them as well. A pane's termios normally has
+// `OPOST` on, and with it `ONLCR` (LF -> CRLF) by default; `OCRNL`,
+// `ONLRET` and `ONOCR` rewrite CR, and `TABDLY=XTABS` expands TAB into
+// spaces. Any of those silently corrupts an envelope written to a
+// cooked tty -- the case an out-of-band client hits, since it cannot
+// change the termios of a pane it does not own.
+pub const TAB: u8 = 0x09; // HT   expanded by TABDLY=XTABS
+pub const LF: u8 = 0x0A; // NL   rewritten by ONLCR
+pub const CR: u8 = 0x0D; // CR   rewritten by OCRNL / ONLRET / ONOCR
+
+pub const ESC_MARK_TAB: u8 = b'H'; // 0x48 -> TAB
+pub const ESC_MARK_LF: u8 = b'N'; // 0x4E -> LF
+pub const ESC_MARK_CR: u8 = b'R'; // 0x52 -> CR
