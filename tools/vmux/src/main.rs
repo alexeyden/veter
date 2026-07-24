@@ -702,7 +702,7 @@ fn pane_pixel_size(rows: u16, cols: u16, cell_px: (u16, u16)) -> (u16, u16) {
 }
 
 impl PanePty {
-    fn spawn(rows: u16, cols: u16, cell_px: (u16, u16)) -> Result<Self> {
+    fn spawn(pane_id: &str, rows: u16, cols: u16, cell_px: (u16, u16)) -> Result<Self> {
         let (xpixel, ypixel) = pane_pixel_size(rows.max(1), cols.max(1), cell_px);
         let winsize = Winsize {
             ws_row: rows.max(1),
@@ -716,6 +716,23 @@ impl PanePty {
             ForkptyResult::Child => {
                 let shell = user_shell();
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
+                // Which pane a process occupies, without it having to
+                // walk `ps` ancestry to find its own pts — a heuristic
+                // that breaks under nested sessions or with several
+                // clients in one window. Combined with the pixel
+                // dimensions in `TIOCGWINSZ`, this gives an out-of-band
+                // client everything it needs to decide whether to draw
+                // and where to write, with no round-trip.
+                //
+                // `VETER` / `VETER_LIMITS` are inherited from the host
+                // unchanged; vmux adds no caps of its own.
+                unsafe { std::env::set_var("VMUX_PANE", pane_id) };
+                // fd 0 is this pane's pts slave, freshly installed by
+                // forkpty. A failure here just leaves the variable
+                // unset — the pane id above is the load-bearing one.
+                if let Ok(tty) = nix::unistd::ttyname(std::io::stdin()) {
+                    unsafe { std::env::set_var("VMUX_PANE_TTY", tty) };
+                }
                 let cshell = std::ffi::CString::new(shell.as_str()).unwrap();
                 let _ = execvp(&cshell, &[&cshell]);
                 // exec failed — exit child immediately so we don't run
@@ -2138,7 +2155,7 @@ impl State {
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let cell_px = s.cell_px();
-        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
+        let pty = PanePty::spawn(&id, rows as u16, cols as u16, cell_px)?;
         s.panes.insert(
             id.clone(),
             Pane {
@@ -2237,7 +2254,7 @@ impl State {
             .expect("new pane must appear in post-split layout");
         let (rows, cols) = inner_grid_for(rect);
         let cell_px = self.cell_px();
-        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
+        let pty = PanePty::spawn(&new_id, rows as u16, cols as u16, cell_px)?;
         self.panes.insert(
             new_id.clone(),
             Pane {
@@ -2559,7 +2576,7 @@ impl State {
         let bounds = self.full_bounds();
         let (rows, cols) = inner_grid_for(bounds);
         let cell_px = self.cell_px();
-        let pty = PanePty::spawn(rows as u16, cols as u16, cell_px)?;
+        let pty = PanePty::spawn(&pane_id, rows as u16, cols as u16, cell_px)?;
         self.panes.insert(
             pane_id.clone(),
             Pane {

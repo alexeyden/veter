@@ -313,6 +313,15 @@ fn spawn_inner_pty(argv: &[String]) -> Result<(OwnedFd, Pid)> {
     match fork {
         ForkptyResult::Parent { child, master } => Ok((master, child)),
         ForkptyResult::Child => {
+            // A session's children must look exactly like a direct
+            // veter child to an out-of-band client, so export the same
+            // discovery variables the GUI host sets. `vsd` links the
+            // same engines, so the caps it advertises are the same ones.
+            for (name, value) in
+                veter_host::env::host_vars(env!("CARGO_PKG_VERSION"))
+            {
+                unsafe { std::env::set_var(name, value) };
+            }
             // Build argv as C strings — alloc is non-signal-safe but
             // we're single-threaded past the fork, which Linux
             // tolerates.

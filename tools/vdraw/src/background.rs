@@ -230,7 +230,7 @@ mod tests {
         ProbeData {
             cell_pixel_width: 8,
             cell_pixel_height: 17,
-            scale_factor: 1.0,
+            scale_factor: Some(1.0),
             max_image_bytes,
             max_images: 16,
             supported_image_encodings: 0x01,

@@ -1369,6 +1369,49 @@ elements, 4096 commands per element, 1 MiB text per command, 32 MiB per
 image, 1024 concurrent images, 16 levels of parent nesting. These
 numbers can be tuned without breaking the protocol.
 
+### 11.1 Discovery without a round-trip
+
+A client that is not the foreground program of its pane cannot read the
+probe response: the reply lands in the pane's *input* queue, where the
+foreground program is blocked in `read()`, and whoever the kernel wakes
+gets the bytes. `REQ_ID_NO_RESPONSE` (§1.2) lets such a client push
+state silently, but it can never *ask* the terminal anything. Two
+non-round-trip sources exist for what it needs.
+
+**Live values — `TIOCGWINSZ`.** The terminal MUST populate `ws_xpixel`
+and `ws_ypixel` with the grid's size in **device** pixels, so that
+`ws_xpixel / ws_col` and `ws_ypixel / ws_row` equal the
+`cell_pixel_width` / `cell_pixel_height` this section's probe response
+advertises. The two sources disagreeing would give clients a silent 2×
+error on HiDPI. A multiplexer that owns sub-grids MUST multiply the
+cell size back out per pane rather than forwarding the host's own
+values. Cell dimensions are deliberately *only* here: they change with
+font size and DPI, and an environment variable would go stale silently.
+
+**Static values — the environment.** The terminal SHOULD export:
+
+| variable       | meaning                                                |
+|----------------|--------------------------------------------------------|
+| `VETER`        | terminal version; its presence means "running under veter" |
+| `VETER_LIMITS` | the caps below, as comma-separated `key=value` pairs   |
+
+`VETER_LIMITS` keys: `mib` = `max_image_bytes`, `mi` = `max_images`,
+`enc` = `supported_image_encodings`, `nest` = `max_nesting_depth`,
+`mwb` = PRT `max_write_bytes`. Readers MUST ignore unrecognised keys,
+so caps can be added without a format break, and MUST fall back to the
+recommended defaults above when the variable is absent or a value does
+not parse — never to zero, which would fail every upload.
+
+A multiplexer SHOULD additionally export `VMUX_PANE` (the pane's id)
+and `VMUX_PANE_TTY` (its pts path), so a client learns which pane it
+occupies without walking `ps` ancestry — a heuristic that breaks under
+nested sessions or with several clients in one window.
+
+`VETER` is **not** proof that the terminal reachable on stdout speaks
+this protocol: it is inherited by every descendant, including one
+behind an intermediary that does not relay APC envelopes. A client that
+*can* read replies SHOULD still probe.
+
 ## 12. Interaction with existing terminal state
 
 - A bell, scroll, or any normal text output does not affect VGE state.

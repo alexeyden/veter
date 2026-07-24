@@ -15,7 +15,7 @@ pub mod tty;
 pub mod upload;
 
 pub use placement::{Placement, compute_placement};
-pub use probe::{ProbeData, parse_probe_payload, run_probe};
+pub use probe::{ProbeData, parse_probe_payload, probe_or_environment, run_probe};
 pub use upload::{Encoding, choose_encoding, encode_payload};
 
 /// True if any of the standard sshd-set env vars is present in this

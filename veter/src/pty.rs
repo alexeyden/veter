@@ -94,6 +94,17 @@ impl Pty {
             ForkptyResult::Child => {
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 unsafe { std::env::set_var("COLORTERM", "truecolor") };
+                // Nothing in `TERM` tells a process it is running
+                // under veter, and an out-of-band client can't probe
+                // to find out — its reply would land in the pane's
+                // input queue. These two say "you are under veter" and
+                // carry the static protocol caps no ioctl reports; the
+                // live cell metrics come from `TIOCGWINSZ` instead.
+                for (name, value) in
+                    veter_host::env::host_vars(env!("CARGO_PKG_VERSION"))
+                {
+                    unsafe { std::env::set_var(name, value) };
+                }
                 // `veter -e <command>`: exec the requested program
                 // directly, bypassing vmux and the shell. On failure the
                 // child must exit — it must never fall through into
