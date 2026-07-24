@@ -202,6 +202,32 @@ pub enum DrawCmd {
     },
 }
 
+/// How a top-level element's `origin.y` is turned into an absolute
+/// scrollback line (§5.2, §9.4 bits 3–4).
+///
+/// The default is viewport-relative, which requires the client to know
+/// where the viewport is. A client that cannot read a DSR cursor report
+/// — anything that is not its pane's foreground program — can't, so the
+/// other two modes let it name a position the terminal resolves on its
+/// behalf.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum OriginAnchor {
+    /// Default (no flag bit): `origin.y` is relative to the top of the
+    /// live screen at command-processing time.
+    #[default]
+    Viewport,
+    /// `bit3`: relative to the cursor row, so negative `y` reaches the
+    /// lines above it. Simple, but the caller still has to know how far
+    /// the cursor has drifted from the rows it means.
+    Cursor,
+    /// `bit4`: the most recent live-screen row containing this
+    /// substring. The application prints a token on the first row it
+    /// reserved and the terminal, which owns the grid, resolves it — no
+    /// cursor arithmetic and no assumption about the application's
+    /// live-region height.
+    Marker(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateElementBody {
     pub id: String, // empty = anonymous
@@ -215,6 +241,9 @@ pub struct CreateElementBody {
     pub size: Option<Point>,
     /// If `Some`, this element's affine transform (§9.11).
     pub transform: Option<Transform>,
+    /// How `origin.y` resolves to a scrollback line (§9.4 bits 3–4).
+    /// Ignored for child elements, whose origin is parent-relative.
+    pub anchor: OriginAnchor,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +316,11 @@ pub enum Command {
     UpdateCommands(UpdateCommandsBody),
     UpdateCommand(UpdateCommandBody),
     UpdateText(UpdateTextBody),
-    UpdateOrigin { id: String, origin: Point },
+    UpdateOrigin {
+        id: String,
+        origin: Point,
+        anchor: OriginAnchor,
+    },
     UpdateVisibility { id: String, is_visible: bool },
     UpdateDrawOrder { id: String, draw_order: i32 },
     ClearAll,
@@ -608,10 +641,16 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             let mut parent: Option<String> = None;
             let mut size: Option<Point> = None;
             let mut transform: Option<Transform> = None;
+            let mut anchor = OriginAnchor::Viewport;
             if !r.at_end() {
                 let extra_flags = r.u8()?;
                 // Reserved bits must be zero.
-                if extra_flags & !0b111 != 0 {
+                if extra_flags & !0b11111 != 0 {
+                    return Err(ERR_BAD_PAYLOAD);
+                }
+                // bit3 and bit4 name the same thing two ways, so setting
+                // both is a client bug rather than a composition.
+                if extra_flags & 0b01000 != 0 && extra_flags & 0b10000 != 0 {
                     return Err(ERR_BAD_PAYLOAD);
                 }
                 if extra_flags & 0b001 != 0 {
@@ -631,6 +670,12 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                     }
                     transform = Some(t);
                 }
+                if extra_flags & 0b01000 != 0 {
+                    anchor = OriginAnchor::Cursor;
+                }
+                if extra_flags & 0b10000 != 0 {
+                    anchor = OriginAnchor::Marker(read_id(&mut r, false)?);
+                }
             }
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
@@ -644,6 +689,7 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 parent,
                 size,
                 transform,
+                anchor,
             }))
         }
         CMD_DELETE_ELEMENT => {
@@ -701,10 +747,30 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
         CMD_UPDATE_ORIGIN => {
             let id = read_id(&mut r, false)?;
             let origin = r.point()?;
+            // §6.6 — the same optional trailing flags byte CreateElement
+            // takes, decided by body length. Only the anchor bits are
+            // meaningful here; parent / size / transform are not
+            // re-pinnable through this command.
+            let mut anchor = OriginAnchor::Viewport;
+            if !r.at_end() {
+                let extra_flags = r.u8()?;
+                if extra_flags & !0b11000 != 0 {
+                    return Err(ERR_BAD_PAYLOAD);
+                }
+                if extra_flags & 0b01000 != 0 && extra_flags & 0b10000 != 0 {
+                    return Err(ERR_BAD_PAYLOAD);
+                }
+                if extra_flags & 0b01000 != 0 {
+                    anchor = OriginAnchor::Cursor;
+                }
+                if extra_flags & 0b10000 != 0 {
+                    anchor = OriginAnchor::Marker(read_id(&mut r, false)?);
+                }
+            }
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
             }
-            Ok(Command::UpdateOrigin { id, origin })
+            Ok(Command::UpdateOrigin { id, origin, anchor })
         }
         CMD_UPDATE_VISIBILITY => {
             let id = read_id(&mut r, false)?;
@@ -954,8 +1020,101 @@ mod tests {
     #[test]
     fn create_element_reserved_extra_flag_rejected() {
         let mut w = empty_element_prefix("resv");
-        w.u8(0b1000); // bit3 is reserved
+        w.u8(0b100000); // bit5 — still reserved (bits 3 and 4 are anchors)
         assert!(matches!(parse(CMD_CREATE_ELEMENT, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn create_element_default_anchor_is_viewport() {
+        // A body with no trailing block must keep meaning exactly what
+        // it meant before the anchor bits existed.
+        let w = empty_element_prefix("plain");
+        match parse(CMD_CREATE_ELEMENT, &w.buf).unwrap() {
+            Command::CreateElement(b) => assert_eq!(b.anchor, OriginAnchor::Viewport),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_element_cursor_anchor_parses() {
+        let mut w = empty_element_prefix("cur");
+        w.u8(0b01000);
+        match parse(CMD_CREATE_ELEMENT, &w.buf).unwrap() {
+            Command::CreateElement(b) => assert_eq!(b.anchor, OriginAnchor::Cursor),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_element_marker_anchor_parses_after_the_other_fields() {
+        // The marker string is the last optional field, so it has to
+        // survive the presence of the ones before it.
+        let mut w = empty_element_prefix("mark");
+        w.u8(0b10010); // has_size + marker
+        w.f32(4.0);
+        w.f32(2.0);
+        w.str("<<vge-anchor>>");
+        match parse(CMD_CREATE_ELEMENT, &w.buf).unwrap() {
+            Command::CreateElement(b) => {
+                assert_eq!(b.size.map(|p| (p.x, p.y)), Some((4.0, 2.0)));
+                assert_eq!(b.anchor, OriginAnchor::Marker("<<vge-anchor>>".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_element_rejects_both_anchor_bits() {
+        // Cursor and marker name the same thing two ways; asking for
+        // both is a client bug, not a composition.
+        let mut w = empty_element_prefix("both");
+        w.u8(0b11000);
+        w.str("tok");
+        assert!(matches!(parse(CMD_CREATE_ELEMENT, &w.buf), Err(ERR_BAD_PAYLOAD)));
+    }
+
+    #[test]
+    fn update_origin_carries_an_anchor() {
+        let mut w = Writer::new();
+        w.str("el");
+        w.f32(1.0);
+        w.f32(-3.0);
+        w.u8(0b10000);
+        w.str("tok");
+        match parse(CMD_UPDATE_ORIGIN, &w.buf).unwrap() {
+            Command::UpdateOrigin { id, origin, anchor } => {
+                assert_eq!(id, "el");
+                assert_eq!(origin.y, -3.0);
+                assert_eq!(anchor, OriginAnchor::Marker("tok".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_origin_without_flags_still_parses() {
+        let mut w = Writer::new();
+        w.str("el");
+        w.f32(0.0);
+        w.f32(2.0);
+        match parse(CMD_UPDATE_ORIGIN, &w.buf).unwrap() {
+            Command::UpdateOrigin { anchor, .. } => {
+                assert_eq!(anchor, OriginAnchor::Viewport)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_origin_rejects_non_anchor_flags() {
+        // parent / size / transform are not re-pinnable through
+        // UpdateOrigin, so their bits are meaningless here.
+        let mut w = Writer::new();
+        w.str("el");
+        w.f32(0.0);
+        w.f32(0.0);
+        w.u8(0b001);
+        assert!(matches!(parse(CMD_UPDATE_ORIGIN, &w.buf), Err(ERR_BAD_PAYLOAD)));
     }
 
     #[test]

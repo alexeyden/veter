@@ -6,7 +6,8 @@
 
 use crate::codec::{Point, Writer};
 use crate::command::{
-    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, Style, UpdateCommandBody,
+    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, OriginAnchor, Style,
+    UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
@@ -46,9 +47,16 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::UpdateCommands(b) => write_update_commands(&mut w, b),
         Command::UpdateCommand(b) => write_update_command(&mut w, b),
         Command::UpdateText(b) => write_update_text(&mut w, b),
-        Command::UpdateOrigin { id, origin } => {
+        Command::UpdateOrigin { id, origin, anchor } => {
             w.str(id);
             write_point(&mut w, *origin);
+            // §6.6 — omit the flags byte entirely for the default
+            // anchor so the body stays the base layout.
+            let bits = anchor_flag_bits(anchor);
+            if bits != 0 {
+                w.u8(bits);
+                write_anchor_tail(&mut w, anchor);
+            }
         }
         Command::UpdateVisibility { id, is_visible } => {
             w.str(id);
@@ -398,8 +406,9 @@ fn write_create_element(w: &mut Writer, b: &CreateElementBody) {
     let has_parent = b.parent.is_some();
     let has_size = b.size.is_some();
     let has_transform = b.transform.is_some();
-    if has_parent || has_size || has_transform {
-        let mut flags: u8 = 0;
+    let anchor_flag = anchor_flag_bits(&b.anchor);
+    if has_parent || has_size || has_transform || anchor_flag != 0 {
+        let mut flags: u8 = anchor_flag;
         if has_parent {
             flags |= 0b001;
         }
@@ -419,6 +428,25 @@ fn write_create_element(w: &mut Writer, b: &CreateElementBody) {
         if let Some(t) = &b.transform {
             w.transform(t);
         }
+        write_anchor_tail(w, &b.anchor);
+    }
+}
+
+/// `extra_flags` bits for an anchor mode (§9.4). Zero for the default,
+/// which is what keeps a body with no other optional field byte-identical
+/// to the base layout.
+fn anchor_flag_bits(anchor: &OriginAnchor) -> u8 {
+    match anchor {
+        OriginAnchor::Viewport => 0,
+        OriginAnchor::Cursor => 0b01000,
+        OriginAnchor::Marker(_) => 0b10000,
+    }
+}
+
+/// The marker string, which follows every other optional field.
+fn write_anchor_tail(w: &mut Writer, anchor: &OriginAnchor) {
+    if let OriginAnchor::Marker(m) = anchor {
+        w.str(m);
     }
 }
 
@@ -503,6 +531,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -523,6 +552,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -554,6 +584,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -584,6 +615,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -670,6 +702,7 @@ mod tests {
             parent: Some("root".into()),
             size: Some(Point { x: 40.0, y: 12.0 }),
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -684,6 +717,7 @@ mod tests {
             parent: Some("parent".into()),
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -698,6 +732,7 @@ mod tests {
             parent: None,
             size: Some(Point { x: 80.0, y: 24.0 }),
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -735,6 +770,7 @@ mod tests {
             parent: None,
             size: None,
             transform: Some(Transform::IDENTITY),
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -749,6 +785,7 @@ mod tests {
             parent: Some("root".into()),
             size: None,
             transform: Some(Transform::scale_about(2.0, 0.5, 1.0, 1.0)),
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -770,6 +807,7 @@ mod tests {
                 e: 0.0,
                 f: 3.0,
             }),
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -793,6 +831,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 
@@ -821,6 +860,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }));
     }
 

@@ -21,7 +21,7 @@ use anyhow::Result;
 
 use vge_protocol::codec::Point;
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -276,6 +276,7 @@ impl VgeProgress {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
         build_envelope(&[(create, REQ_ID_NO_RESPONSE)])
     }
@@ -722,6 +723,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
         let body = encode_command(&cmd);
         let parsed = parse(frame_type_for(&cmd), &body).expect("bar path must re-parse");
@@ -852,6 +854,7 @@ mod tests {
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
         let del = Command::DeleteElement { id: "p".into() };
         let env = build_envelope(&[

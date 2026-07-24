@@ -16,7 +16,9 @@
 //! drawn last.
 
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, Command, CreateElementBody, DrawCmd, FontStyle, Style};
+use vge_protocol::command::{
+    Align, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
+};
 
 use crate::picker::Picker;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
@@ -152,6 +154,7 @@ pub fn prompt_element(
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }
 }
 
@@ -311,6 +314,7 @@ pub fn picker_element<P>(
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }]
 }
 
@@ -468,6 +472,7 @@ impl ScrollModal {
                 y: box_h,
             }),
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
 
         // Body fill — full rounded rect underneath the scrolling lines.
@@ -485,6 +490,7 @@ impl ScrollModal {
             parent: Some(ids.root.into()),
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
 
         // Body lines — every line drawn at its natural y position; the
@@ -516,6 +522,7 @@ impl ScrollModal {
             parent: Some(ids.root.into()),
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         });
 
         if scrollable {
@@ -539,6 +546,7 @@ impl ScrollModal {
                 parent: Some(ids.root.into()),
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             });
 
             // The thumb command is anchored at local (box_w-1, 0); the
@@ -564,6 +572,7 @@ impl ScrollModal {
                 parent: Some(ids.root.into()),
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             });
         }
 
@@ -593,6 +602,7 @@ impl ScrollModal {
                     x: 0.0,
                     y: -(off as f32),
                 },
+                anchor: OriginAnchor::Viewport,
             },
             Command::UpdateOrigin {
                 id: ids.thumb.into(),
@@ -600,6 +610,7 @@ impl ScrollModal {
                     x: 0.0,
                     y: self.thumb_origin_y(box_h, off),
                 },
+                anchor: OriginAnchor::Viewport,
             },
         ]
     }

@@ -16,8 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::{Point, Reader, Rect, Transform};
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
-    UpdateTextBody, UpdateTextRange,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandBody, UpdateTextBody, UpdateTextRange,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
@@ -255,6 +254,7 @@ impl Game {
                 parent: None,
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             }),
             0,
         ));
@@ -272,6 +272,7 @@ impl Game {
                     parent: None,
                     size: None,
                     transform: None,
+                    anchor: OriginAnchor::Viewport,
                 }),
                 0,
             ));
@@ -291,6 +292,7 @@ impl Game {
                 parent: None,
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             }),
             0,
         ));
@@ -309,6 +311,7 @@ impl Game {
                 parent: None,
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             }),
             0,
         ));
@@ -333,6 +336,7 @@ impl Game {
                 parent: None,
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             }),
             0,
         ));
@@ -357,6 +361,7 @@ impl Game {
                 parent: None,
                 size: None,
                 transform: None,
+                anchor: OriginAnchor::Viewport,
             }),
             0,
         ));
@@ -462,6 +467,7 @@ impl Game {
                         parent: None,
                         size: None,
                         transform: Some(tumble),
+                        anchor: OriginAnchor::Viewport,
                     }),
                     0,
                 ));
@@ -474,6 +480,7 @@ impl Game {
                     Command::UpdateOrigin {
                         id: s.id.clone(),
                         origin: Point { x: s.x, y: s.y },
+                        anchor: OriginAnchor::Viewport,
                     },
                     0,
                 ));
@@ -498,6 +505,7 @@ impl Game {
                         x: self.ball_x,
                         y: self.ball_y,
                     },
+                    anchor: OriginAnchor::Viewport,
                 },
                 0,
             ));
@@ -511,6 +519,7 @@ impl Game {
                         x: self.paddle_x,
                         y: PADDLE_Y,
                     },
+                    anchor: OriginAnchor::Viewport,
                 },
                 0,
             ));

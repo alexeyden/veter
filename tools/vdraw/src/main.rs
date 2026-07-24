@@ -51,8 +51,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use vge_protocol::codec::Point;
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandsBody,
-    UpdateTextBody, UpdateTextRange,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandsBody, UpdateTextBody, UpdateTextRange,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -549,6 +548,7 @@ fn main() -> Result<()> {
                                         Command::UpdateOrigin {
                                             id: document.elements[i].id.clone(),
                                             origin: render::element_origin(&document.elements[i], &cam),
+                                            anchor: OriginAnchor::Viewport,
                                         },
                                         REQ_ID_NO_RESPONSE,
                                     ));
@@ -575,6 +575,7 @@ fn main() -> Result<()> {
                                         Command::UpdateOrigin {
                                             id: el.id.clone(),
                                             origin: body.origin,
+                                            anchor: OriginAnchor::Viewport,
                                         },
                                         REQ_ID_NO_RESPONSE,
                                     ));
@@ -617,6 +618,7 @@ fn main() -> Result<()> {
                         Command::UpdateOrigin {
                             id: STATUS_ID.into(),
                             origin: status_origin(rows),
+                            anchor: OriginAnchor::Viewport,
                         },
                         REQ_ID_NO_RESPONSE,
                     )])?;
@@ -669,6 +671,7 @@ fn main() -> Result<()> {
                         Command::UpdateOrigin {
                             id: PREVIEW_ID.into(),
                             origin: body.origin,
+                            anchor: OriginAnchor::Viewport,
                         },
                         REQ_ID_NO_RESPONSE,
                     ));
@@ -835,6 +838,7 @@ fn push_element_update(
         Command::UpdateOrigin {
             id: e.id.clone(),
             origin: body.origin,
+            anchor: OriginAnchor::Viewport,
         },
         REQ_ID_NO_RESPONSE,
     ));
@@ -918,6 +922,7 @@ fn chrome_element(bar: &chrome::Chrome, cam: &Camera) -> Command {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -983,6 +988,7 @@ fn status_element(cam: &Camera, cursor: (u16, u16), state: &ToolState, rows: u16
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 

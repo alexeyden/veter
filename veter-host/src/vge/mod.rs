@@ -53,7 +53,11 @@ pub fn drive_terminal_stage<CB: vt100::Callbacks>(
                     engine.after_vt100_process(parser);
                     text_pending = false;
                 }
-                engine.apply_payload(&payload);
+                // The parser is the live screen a cursor- or
+                // marker-anchored origin resolves against (§9.4), and
+                // it is up to date here precisely because the sync
+                // above already ran.
+                engine.apply_payload(&payload, Some(parser as &dyn state::ScreenAnchor));
             }
             Segment::Event(ev) => {
                 if text_pending {
@@ -74,6 +78,7 @@ pub fn drive_terminal_stage<CB: vt100::Callbacks>(
 mod tests {
     use super::*;
     use vge_protocol::codec::Writer;
+    use vge_protocol::command::OriginAnchor;
     use vge_protocol::frame::*;
 
     /// Minimal `CreateElement` envelope for a 1x1 rect at `origin_y`,
@@ -207,5 +212,130 @@ mod tests {
             "element created after the erase must survive"
         );
     }
-}
 
+    /// `CreateElement` with an anchor mode, built by the encoder so the
+    /// test exercises the same bytes a client would send.
+    fn create_anchored(id: &str, origin_y: f32, anchor: OriginAnchor) -> Vec<u8> {
+        use vge_protocol::codec::Point;
+        use vge_protocol::command::{Command, CreateElementBody, DrawCmd};
+        use vge_protocol::encode::build_envelope;
+        build_envelope(&[(
+            Command::CreateElement(CreateElementBody {
+                id: id.to_string(),
+                commands: vec![DrawCmd::FillRectangles {
+                    fill: vge_protocol::command::Style::Flat(
+                        vge_protocol::command::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 },
+                    ),
+                    rects: vec![vge_protocol::codec::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }],
+                }],
+                origin: Point { x: 0.0, y: origin_y },
+                is_visible: true,
+                draw_order: 0,
+                parent: None,
+                size: None,
+                transform: None,
+                anchor,
+            }),
+            1,
+        )])
+    }
+
+    #[test]
+    fn cursor_anchor_resolves_against_the_live_cursor_row() {
+        // The whole point: a client that cannot read a DSR reply names
+        // "where the cursor is" and the terminal resolves it.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"a\r\nb\r\n".to_vec(); // cursor lands on row 2
+        chunk.extend(create_anchored("cur", 0.0, OriginAnchor::Cursor));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+
+        let top = engine.top_of_live_screen();
+        assert_eq!(parser.screen().cursor_position().0, 2);
+        assert_eq!(engine.state.elements()["cur"].anchor_line, top + 2);
+    }
+
+    #[test]
+    fn cursor_anchor_accepts_negative_offsets() {
+        // Negative `y` is how a client reaches the rows *above* the
+        // cursor — the reserved space it just printed into.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"a\r\nb\r\n".to_vec();
+        chunk.extend(create_anchored("up", -2.0, OriginAnchor::Cursor));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        let top = engine.top_of_live_screen();
+        assert_eq!(engine.state.elements()["up"].anchor_line, top);
+    }
+
+    #[test]
+    fn marker_anchor_finds_the_token_row() {
+        // The application prints a token on the first row it reserved;
+        // the terminal, which owns the grid, resolves it. No cursor
+        // arithmetic and no assumption about the live-region height.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"x\r\n<<tok>>\r\ny\r\n".to_vec();
+        chunk.extend(create_anchored(
+            "m",
+            0.0,
+            OriginAnchor::Marker("<<tok>>".into()),
+        ));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        let top = engine.top_of_live_screen();
+        // Rows: 0 = "x", 1 = "<<tok>>", 2 = "y".
+        assert_eq!(engine.state.elements()["m"].anchor_line, top + 1);
+    }
+
+    #[test]
+    fn marker_anchor_takes_the_most_recent_occurrence() {
+        // An application that reprints its token every frame must
+        // anchor to the latest one, not the first.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"<<tok>>\r\nmid\r\n<<tok>>\r\n".to_vec();
+        chunk.extend(create_anchored(
+            "m",
+            0.0,
+            OriginAnchor::Marker("<<tok>>".into()),
+        ));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        let top = engine.top_of_live_screen();
+        assert_eq!(engine.state.elements()["m"].anchor_line, top + 2);
+    }
+
+    #[test]
+    fn unmatched_marker_falls_back_to_the_viewport() {
+        // Wrong-but-sane beats silently off by an unpredictable amount.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"nothing here\r\n".to_vec();
+        chunk.extend(create_anchored(
+            "m",
+            1.0,
+            OriginAnchor::Marker("absent".into()),
+        ));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        let top = engine.top_of_live_screen();
+        assert_eq!(engine.state.elements()["m"].anchor_line, top + 1);
+    }
+
+    #[test]
+    fn anchor_modes_are_exact_only_because_the_stage_is_ordered() {
+        // Ties phases 3 and 5 together: the cursor a command resolves
+        // against is the one produced by the text that preceded it in
+        // the same read. Applying commands before that text — what a
+        // byte-filter engine does — gives a different answer.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"a\r\nb\r\nc\r\n".to_vec();
+        chunk.extend(create_anchored("cur", 0.0, OriginAnchor::Cursor));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        let ordered = engine.state.elements()["cur"].anchor_line;
+
+        let (mut naive, mut naive_parser) = engine_and_parser();
+        let passthrough = naive.process_pty_chunk(&chunk);
+        naive_parser.process(&passthrough);
+        naive.after_vt100_process(&mut naive_parser);
+        let unordered = naive.state.elements()["cur"].anchor_line;
+
+        assert_ne!(
+            ordered, unordered,
+            "ordering is what makes cursor anchoring exact"
+        );
+    }
+}

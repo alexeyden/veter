@@ -32,8 +32,7 @@ use clap::{ArgGroup, Parser, ValueEnum};
 use image::ImageReader;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
-    UpdateCommandsBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandBody, UpdateCommandsBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
@@ -388,6 +387,7 @@ fn upload_one(
                     parent: None,
                     size: None,
                     transform: None,
+                    anchor: OriginAnchor::Viewport,
                 }),
                 REQ_ID_NO_RESPONSE,
             ));
@@ -432,6 +432,7 @@ fn upload_one(
                     parent: None,
                     size: None,
                     transform: None,
+                    anchor: OriginAnchor::Viewport,
                 })
             };
             frames.push((final_element, REQ_ID_NO_RESPONSE));

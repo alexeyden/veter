@@ -28,8 +28,7 @@ use clap::{Parser, Subcommand};
 use vge_protocol::apc::ApcStream;
 use vge_protocol::codec::{Point, Reader, Rect};
 use vge_protocol::command::{
-    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FontStyle, Style,
-    UpdateImageBody, UploadImageBody,
+    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateImageBody, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
@@ -619,7 +618,11 @@ fn build_command(cmd: Cmd) -> Result<Command> {
         Cmd::Probe => Command::Probe,
         Cmd::ClearAll => Command::ClearAll,
         Cmd::Delete { id } => Command::DeleteElement { id },
-        Cmd::SetOrigin { id, origin } => Command::UpdateOrigin { id, origin },
+        Cmd::SetOrigin { id, origin } => Command::UpdateOrigin {
+            id,
+            origin,
+            anchor: OriginAnchor::Viewport,
+        },
         Cmd::SetVisible { id, visible } => Command::UpdateVisibility {
             id,
             is_visible: visible,
@@ -654,6 +657,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::CreateText(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -670,6 +674,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::FillPolygon(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -683,6 +688,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::DrawLines(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -697,6 +703,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::DrawLineStrip(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
@@ -711,6 +718,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::UploadRaw(a) => {
             let data =
@@ -773,6 +781,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: a.tree.parent,
             size: a.tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::UpdateImage { id, index, image } => Command::UpdateImage(UpdateImageBody {
             id,
@@ -793,6 +802,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             parent: tree.parent,
             size: tree.clip_size,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         Cmd::UpdateSize { id, size } => Command::UpdateSize { id, new_size: size },
     })

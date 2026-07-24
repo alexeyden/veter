@@ -8,7 +8,7 @@
 
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
 };
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_protocol::path::{PathNode, PathSegment};
@@ -42,6 +42,7 @@ pub fn canvas_element(cam: &Camera) -> Command {
         parent: None,
         size: None,
         transform: Some(cam.transform()),
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -58,6 +59,7 @@ pub fn preview_element() -> Command {
         parent: Some(CANVAS_ID.into()),
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -74,6 +76,7 @@ pub fn selection_element() -> Command {
         parent: Some(CANVAS_ID.into()),
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -305,6 +308,7 @@ fn finish(e: &Element, mut cmds: Vec<DrawCmd>, order: i32, cam: &Camera) -> Crea
         parent: Some(CANVAS_ID.into()),
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }
 }
 

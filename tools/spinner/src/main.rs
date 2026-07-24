@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use vge_protocol::codec::{Point, Transform};
-use vge_protocol::command::{Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style};
+use vge_protocol::command::{
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
+};
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_protocol::path::{PathNode, PathSegment};
@@ -84,6 +86,7 @@ fn main() -> Result<()> {
                         Command::UpdateOrigin {
                             id: "spinner".into(),
                             origin: center(cols, rows),
+                            anchor: OriginAnchor::Viewport,
                         },
                         REQ_ID_NO_RESPONSE,
                     ),
@@ -91,6 +94,7 @@ fn main() -> Result<()> {
                         Command::UpdateOrigin {
                             id: "hint".into(),
                             origin: hint_origin(cols, rows),
+                            anchor: OriginAnchor::Viewport,
                         },
                         REQ_ID_NO_RESPONSE,
                     ),
@@ -213,6 +217,7 @@ fn spinner_body(cols: u16, rows: u16, cw: f32, ch: f32) -> CreateElementBody {
         parent: None,
         size: None,
         transform: Some(Transform::IDENTITY),
+        anchor: OriginAnchor::Viewport,
     }
 }
 
@@ -255,6 +260,7 @@ fn hint_body(cols: u16, rows: u16) -> CreateElementBody {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }
 }
 

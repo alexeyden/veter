@@ -10,6 +10,7 @@ use vge_protocol::codec::{Point, Reader, Transform};
 use vge_protocol::command::{
     self, Command, ConcreteStyle, CreateElementBody, DrawCmd, UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
+    OriginAnchor,
 };
 use vge_protocol::codec::Point as ProtoPoint;
 use vge_protocol::envelope::{
@@ -42,6 +43,44 @@ impl Default for Limits {
             supported_image_encodings: 0b11, // bit0 Raw, bit1 WebP
             max_nesting_depth: 16,
         }
+    }
+}
+
+/// Live-screen facts that §9.4's cursor- and marker-anchored origins
+/// resolve against.
+///
+/// A trait rather than the parser itself so the resolution path stays
+/// free of vt100's generic callback parameter, and so it can be
+/// threaded down as `Option<&dyn ScreenAnchor>` — `None` for callers
+/// with no live screen, where both modes fall back to the default
+/// viewport-relative anchoring rather than guessing.
+pub trait ScreenAnchor {
+    /// Cursor row, 0-based, within the live screen.
+    fn cursor_row(&self) -> u16;
+    /// The bottom-most live-screen row whose text contains `needle`,
+    /// 0-based. Searched from the bottom because the marker names the
+    /// *most recent* occurrence — an application that reprints its
+    /// token each frame must anchor to the latest one.
+    fn last_row_containing(&self, needle: &str) -> Option<u16>;
+}
+
+impl<CB: vt100::Callbacks> ScreenAnchor for vt100::Parser<CB> {
+    fn cursor_row(&self) -> u16 {
+        self.screen().cursor_position().0
+    }
+
+    fn last_row_containing(&self, needle: &str) -> Option<u16> {
+        if needle.is_empty() {
+            return None;
+        }
+        let (_, cols) = self.screen().size();
+        let mut found = None;
+        for (row, text) in self.screen().rows(0, cols).enumerate() {
+            if text.contains(needle) {
+                found = Some(row as u16);
+            }
+        }
+        found
     }
 }
 
@@ -655,7 +694,10 @@ impl VgeEngine {
     pub fn process_pty_chunk(&mut self, input: &[u8]) -> Vec<u8> {
         let out = self.apc.feed(input);
         for payload in out.payloads {
-            self.handle_envelope_payload(&payload);
+            // No live screen here: this entry point exists for callers
+            // that have none (client-side helpers and tests), so §9.4's
+            // cursor and marker anchors fall back to viewport-relative.
+            self.handle_envelope_payload(&payload, None);
         }
         for ev in out.events {
             self.handle_terminal_event(ev);
@@ -673,8 +715,8 @@ impl VgeEngine {
     }
 
     /// Apply one payload extracted by [`Self::feed_segments`].
-    pub fn apply_payload(&mut self, payload: &[u8]) {
-        self.handle_envelope_payload(payload);
+    pub fn apply_payload(&mut self, payload: &[u8], screen: Option<&dyn ScreenAnchor>) {
+        self.handle_envelope_payload(payload, screen);
     }
 
     /// Apply one terminal event extracted by [`Self::feed_segments`].
@@ -823,7 +865,7 @@ impl VgeEngine {
         }
     }
 
-    fn handle_envelope_payload(&mut self, payload: &[u8]) {
+    fn handle_envelope_payload(&mut self, payload: &[u8], screen: Option<&dyn ScreenAnchor>) {
         let mut frames_buf: Vec<u8> = Vec::new();
 
         let mut r = Reader::new(payload);
@@ -873,7 +915,7 @@ impl VgeEngine {
                 Err(_) => break,
             };
 
-            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf);
+            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf, screen);
         }
 
         if !frames_buf.is_empty() {
@@ -887,6 +929,7 @@ impl VgeEngine {
         request_id: u32,
         body: &[u8],
         out_frames: &mut Vec<u8>,
+        screen: Option<&dyn ScreenAnchor>,
     ) {
         // `REQ_ID_NO_RESPONSE` (see vge-protocol §4) is the sender's
         // explicit "apply but don't ack" sentinel — used by
@@ -901,7 +944,7 @@ impl VgeEngine {
                 }
             }
             Ok(cmd) => {
-                let result = self.apply_command(cmd);
+                let result = self.apply_command(cmd, screen);
                 if quiet {
                     // State changes are already applied; skip the
                     // response frame entirely.
@@ -936,7 +979,11 @@ impl VgeEngine {
         }
     }
 
-    fn apply_command(&mut self, cmd: Command) -> Result<Vec<u8>, (u16, &'static str)> {
+    fn apply_command(
+        &mut self,
+        cmd: Command,
+        screen: Option<&dyn ScreenAnchor>,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
         match cmd {
             Command::Probe => {
                 // dispatch_frame already swallowed the envelope if
@@ -957,12 +1004,14 @@ impl VgeEngine {
                 };
                 Ok(pb.encode())
             }
-            Command::CreateElement(b) => self.cmd_create_element(b),
+            Command::CreateElement(b) => self.cmd_create_element(b, screen),
             Command::DeleteElement { id } => self.cmd_delete_element(&id),
             Command::UpdateCommands(b) => self.cmd_update_commands(b),
             Command::UpdateCommand(b) => self.cmd_update_command(b),
             Command::UpdateText(b) => self.cmd_update_text(b),
-            Command::UpdateOrigin { id, origin } => self.cmd_update_origin(&id, origin),
+            Command::UpdateOrigin { id, origin, anchor } => {
+                self.cmd_update_origin(&id, origin, anchor, screen)
+            }
             Command::UpdateVisibility { id, is_visible } => {
                 self.cmd_update_visibility(&id, is_visible)
             }
@@ -1269,6 +1318,7 @@ impl VgeEngine {
     fn cmd_create_element(
         &mut self,
         b: CreateElementBody,
+        screen: Option<&dyn ScreenAnchor>,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         if !b.id.is_empty() && self.state.elements().contains_key(&b.id) {
             return Err((ERR_DUPLICATE_ID, "id in use"));
@@ -1304,7 +1354,7 @@ impl VgeEngine {
         // For top-level elements, anchor to scrollback. For children,
         // store origin verbatim (parent-relative).
         let (anchor, sub) = if b.parent.is_none() {
-            self.anchor_from_origin(b.origin)
+            self.anchor_from_origin(b.origin, &b.anchor, screen)
         } else {
             (0, 0.0)
         };
@@ -1359,10 +1409,36 @@ impl VgeEngine {
         depth
     }
 
-    fn anchor_from_origin(&self, origin: Point) -> (i64, f32) {
+    /// Resolve `origin.y` to an absolute scrollback line and a sub-row
+    /// fraction (§5.2), under the requested anchoring mode (§9.4).
+    ///
+    /// All three modes share the same shape — pick a base row on the
+    /// live screen, then offset by `floor(origin.y)` — and differ only
+    /// in which row is the base. The sub-row fraction is the same in
+    /// every mode, so a client can still place at half-cell precision.
+    ///
+    /// Cursor and marker modes need the live screen. Without one
+    /// (`screen: None`, or a marker that matches nothing) they fall
+    /// back to the viewport base rather than guessing: the element
+    /// lands where a default-anchored one would, which is visibly
+    /// wrong-but-sane instead of silently off by an unpredictable
+    /// amount.
+    fn anchor_from_origin(
+        &self,
+        origin: Point,
+        anchor: &OriginAnchor,
+        screen: Option<&dyn ScreenAnchor>,
+    ) -> (i64, f32) {
+        let base_row: i64 = match (anchor, screen) {
+            (OriginAnchor::Viewport, _) | (_, None) => 0,
+            (OriginAnchor::Cursor, Some(s)) => i64::from(s.cursor_row()),
+            (OriginAnchor::Marker(needle), Some(s)) => {
+                s.last_row_containing(needle).map_or(0, i64::from)
+            }
+        };
         let floor = origin.y.floor();
         (
-            self.line_tracker.top_of_live_screen + floor as i64,
+            self.line_tracker.top_of_live_screen + base_row + floor as i64,
             origin.y - floor,
         )
     }
@@ -1600,6 +1676,8 @@ impl VgeEngine {
         &mut self,
         id: &str,
         origin: Point,
+        anchor: OriginAnchor,
+        screen: Option<&dyn ScreenAnchor>,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         let is_top_level = self
             .state
@@ -1610,13 +1688,13 @@ impl VgeEngine {
         // Re-anchor only for top-level elements (origin.y is
         // scrollback-relative); for children, origin is parent-relative
         // and stored verbatim.
-        let (anchor, sub) = if is_top_level {
-            self.anchor_from_origin(origin)
+        let (line, sub) = if is_top_level {
+            self.anchor_from_origin(origin, &anchor, screen)
         } else {
             (0, 0.0)
         };
         let el = self.state.elements_mut().get_mut(id).unwrap();
-        el.anchor_line = anchor;
+        el.anchor_line = line;
         el.sub_row = sub;
         el.origin_x = origin.x;
         el.origin_y = origin.y;

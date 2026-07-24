@@ -19,8 +19,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use vge_protocol::codec::{Point, Rect, Transform};
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, Style, UpdateCommandBody,
-    UpdateTextBody, UpdateTextRange, UploadImageBody,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -140,6 +139,7 @@ fn create_image_el(target: Rect, id: &str, source: Option<Rect>) -> Command {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -237,6 +237,7 @@ fn create_bg(cols: u16, media_rows: u16) -> Command {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -271,6 +272,7 @@ fn create_status(cols: u16, rows: u16) -> Command {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -333,6 +335,7 @@ fn create_seek(cols: u16, rows: u16, frac: f32) -> Command {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     })
 }
 
@@ -401,6 +404,7 @@ fn create_spinner(cols: u16, media_rows: u16, cell_pw: f32, cell_ph: f32) -> Com
         parent: None,
         size: None,
         transform: Some(Transform::IDENTITY),
+        anchor: OriginAnchor::Viewport,
     })
 }
 

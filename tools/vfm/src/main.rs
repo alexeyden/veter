@@ -35,7 +35,7 @@ use anyhow::{Result, anyhow, bail};
 
 use vge_protocol::codec::Point;
 use vge_protocol::command::{
-    Color, Command as VgeCommand, CreateElementBody, DrawCmd, UpdateCommandsBody, UploadImageBody,
+    Color, Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, UpdateCommandsBody, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -1185,6 +1185,7 @@ fn create(id: &str, commands: Vec<DrawCmd>, draw_order: i32) -> (VgeCommand, u32
             parent: None,
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         }),
         REQ_ID_NO_RESPONSE,
     )

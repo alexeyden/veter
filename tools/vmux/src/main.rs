@@ -61,7 +61,7 @@ use ses_protocol::{
 use vge_protocol::apc::ApcStream as VgeApcStream;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Align, Command as VgeCommand, CreateElementBody, DrawCmd, FontStyle, Style,
+    Align, Command as VgeCommand, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
 };
 use vge_protocol::encode::build_envelope as build_vge_envelope;
 use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PROBE};
@@ -452,6 +452,7 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }
 }
 
@@ -1425,6 +1426,7 @@ fn build_tabbar_commands(
         parent: None,
         size: None,
         transform: None,
+        anchor: OriginAnchor::Viewport,
     }
 }
 
@@ -3070,6 +3072,7 @@ impl State {
                     parent: None,
                     size: None,
                     transform: None,
+                    anchor: OriginAnchor::Viewport,
                 }),
                 0,
             ));
@@ -3524,6 +3527,7 @@ impl State {
                     parent: None,
                     size: None,
                     transform: None,
+                    anchor: OriginAnchor::Viewport,
                 }),
                 0,
             ),

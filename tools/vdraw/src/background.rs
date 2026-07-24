@@ -18,7 +18,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use image::ImageReader;
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Command, CreateElementBody, DrawCmd, UploadImageBody};
+use vge_protocol::command::{
+    Command, CreateElementBody, DrawCmd, OriginAnchor, UploadImageBody,
+};
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_render::is_ssh_session;
 use vge_render::probe::ProbeData;
@@ -136,6 +138,7 @@ impl Background {
             parent: Some(CANVAS_ID.into()),
             size: None,
             transform: None,
+            anchor: OriginAnchor::Viewport,
         };
 
         Ok((Self { element }, uploads))

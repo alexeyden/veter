@@ -551,11 +551,21 @@ On any error the underlying `DrawImage` is unchanged.
 
 ```
 UpdateOrigin:     string     id, point new_origin
+                  [u8        extra_flags]   ; anchor bits only, see below
+                  [string    marker]        ; if bit4
 UpdateVisibility: string     id, u8 is_visible
 UpdateDrawOrder:  string     id, i32 draw_order
 ```
 
-`UpdateOrigin` re-anchors per §5.2.
+`UpdateOrigin` re-anchors per §5.2, and takes the same optional trailing
+flags byte `CreateElement` does — presence decided strictly by body
+length, so a body ending after `new_origin` is the base layout and means
+viewport-relative exactly as before.
+
+Only the anchor bits (`bit3` cursor-relative, `bit4` marker-anchored;
+§9.4) are meaningful here. `parent`, `size` and `transform` are not
+re-pinnable through this command, so `bit0`–`bit2` and the reserved bits
+are `err_bad_payload`, as is setting both anchor bits.
 
 ### 6.7 ClearAll (0x0E)
 
@@ -1121,7 +1131,9 @@ CreateElement (with parent / clip):
   u8            extra_flags          ; bit0 = has_parent
                                      ; bit1 = has_size
                                      ; bit2 = has_transform
-                                     ; bits 3..7 reserved (must be 0)
+                                     ; bit3 = cursor-relative origin
+                                     ; bit4 = marker-anchored origin
+                                     ; bits 5..7 reserved (must be 0)
   ; if bit0 (has_parent):
   string        parent_id
   ; if bit1 (has_size):
@@ -1132,7 +1144,54 @@ CreateElement (with parent / clip):
                                      ; for top-level)
   ; if bit2 (has_transform):
   transform     transform            ; 6×f32, see §9.11
+  ; if bit4 (marker-anchored):
+  string        marker               ; substring to search for
 ```
+
+#### Anchor modes (bits 3 and 4)
+
+By default `origin.y` is viewport-relative (§5.2), which requires the
+client to know where the viewport is. A client that cannot read a DSR
+cursor report — anything that is not its pane's foreground program —
+cannot, so these two bits let it name a position the terminal resolves
+on its behalf. Both are ignored for child elements, whose origin is
+parent-relative.
+
+- **`bit3` — cursor-relative.** `anchor_line = cursor_row +
+  floor(origin.y)`, where `cursor_row` is the cursor's row within the
+  live screen at command-processing time. Negative `origin.y` is
+  permitted and reaches the rows above the cursor. Simple, but the
+  caller still has to know how far the cursor has drifted from the rows
+  it means.
+- **`bit4` — marker-anchored.** The trailing `marker` string is searched
+  for in the live screen's rows; `anchor_line` is derived from the
+  **bottom-most** row whose text contains it, so an application that
+  reprints its token each frame anchors to the latest one. This is the
+  better fit for the driving case: the application prints a token on the
+  first row it reserved, and the terminal — which owns the grid —
+  resolves it. No cursor arithmetic and no assumption about the
+  application's live-region height.
+
+The sub-row fraction (§5.2) is unchanged in both modes, so half-cell
+placement still works.
+
+Setting both bits is `err_bad_payload`: they name the same thing two
+ways. If the marker matches no row, or the terminal has no live screen
+to resolve against, the origin falls back to viewport-relative rather
+than failing — the element lands where a default-anchored one would,
+which is visibly wrong rather than silently displaced.
+
+**Space is reserved in-band, by the application.** These modes only let
+a client *name* a location; they do not create room for it. A client
+that emits newlines to reserve vertical space desynchronises the
+foreground program's renderer, which dead-reckons its frame position —
+scrolling underneath it strands the old frame and misplaces the next.
+The application must emit the blank rows as part of its own output, so
+its renderer accounts for them; the client then anchors into that space.
+
+Resolution happens at command-processing time, which per §5.2 means
+after every byte that preceded the command in the stream has reached the
+text parser.
 
 Validation:
 
@@ -1147,7 +1206,10 @@ Validation:
   permitted and render degenerate (collapsed) geometry.
 - If the resulting tree depth would exceed advertised
   `max_nesting_depth` (§9.7), → `err_max_nesting_depth`, atomic.
-- Any reserved bit set in `extra_flags` → `err_bad_payload`.
+- Any reserved bit (5..7) set in `extra_flags` → `err_bad_payload`.
+- Both `bit3` and `bit4` set → `err_bad_payload`.
+- If `bit4` is set, `marker` MUST be present and non-empty, else
+  `err_bad_payload`.
 - Trailing-byte presence is decided strictly by body length. If the
   body ends after `draw_order` there is no `extra_flags`. Trailing
   bytes that don't form a complete optional block are
