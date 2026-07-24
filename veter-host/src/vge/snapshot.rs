@@ -218,6 +218,10 @@ fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError>
         gpu: Cell::new(None),
         source_encoding,
         source_data,
+        // Recomputed by the caller once the element tables
+        // are in place; see `recompute_image_refs`.
+        refs: 0,
+        was_referenced: false,
     })
 }
 

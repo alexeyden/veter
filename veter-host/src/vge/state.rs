@@ -83,6 +83,26 @@ pub struct UploadedImage {
     /// matches what `pixels` was decoded from byte-for-byte; for WebP
     /// it's the much smaller compressed form.
     pub source_data: Vec<u8>,
+    /// Number of `DrawImage` commands currently naming this image,
+    /// counted across **both** screen element sets — the image table is
+    /// shared between main and alt (§5.4), so an image drawn only on
+    /// main must survive a trip to the alt screen.
+    ///
+    /// Reaching zero drops the image, but only once
+    /// [`Self::was_referenced`] is set. Without refcounting, a client
+    /// that uploads one image per element and lets those elements
+    /// scroll out of scrollback leaks table slots until `max_images`
+    /// is exhausted and every further upload fails with
+    /// `err_too_many_images`.
+    pub refs: u32,
+    /// `false` for an image that has never been named by any
+    /// `DrawImage`. Upload-then-create is a normal sequence — the
+    /// element referencing an image is often built in a later command,
+    /// sometimes a later envelope — so a fresh upload sitting at zero
+    /// references must not be collected. Only a count that has been
+    /// positive and fallen back to zero means "nothing wants this any
+    /// more".
+    pub was_referenced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +609,12 @@ impl VgeEngine {
         // engine's own parser scrollback.
         self.line_tracker = LineTracker::new();
         self.line_tracker.top_of_live_screen = decoded.top_of_live_screen;
+        // Image reference counts are derived, not serialized — the
+        // snapshot carries the element tables, and those are the only
+        // truth about what references what. Recomputing here keeps the
+        // wire format unchanged and makes it impossible for a stale
+        // count to survive a restore.
+        self.recompute_image_refs();
         Ok(())
     }
 
@@ -721,7 +747,10 @@ impl VgeEngine {
         if now_alt && !self.state.on_alt() {
             self.state.enter_alt_screen();
         } else if !now_alt && self.state.on_alt() {
+            // Discards the whole alt element set, so every image those
+            // elements held goes with it. Recount rather than unwind.
             self.state.leave_alt_screen();
+            self.recompute_image_refs();
         }
 
         // Reply to DSR queries (cursor position is now post-process).
@@ -904,6 +933,9 @@ impl VgeEngine {
             }
             Command::ClearAll => {
                 self.state.elements_mut().clear();
+                // Wholesale drop of one screen's elements — recount
+                // rather than unwind each one.
+                self.recompute_image_refs();
                 Ok(Vec::new())
             }
             Command::SetGlobalStyle { id, style } => self.cmd_set_global_style(id, style),
@@ -1103,6 +1135,8 @@ impl VgeEngine {
                 gpu: Cell::new(None),
                 source_encoding,
                 source_data,
+                refs: 0,
+                was_referenced: false,
             },
         );
         Ok(ChunkAckBody {
@@ -1154,14 +1188,21 @@ impl VgeEngine {
         if !self.state.shared.images.contains_key(&b.new_image_id) {
             return Err((ERR_UNKNOWN_IMAGE, "new_image_id not found"));
         }
+        // Retain-then-release so re-pointing a command at the image it
+        // already names is a no-op rather than a collect-and-fail.
+        self.retain_image(&b.new_image_id);
         let el = self.state.elements_mut().get_mut(&b.id).unwrap();
+        let mut old_id = None;
         if let DrawCmd::DrawImage {
             image_id,
             target_rect: _,
             source_rect: _,
         } = &mut el.commands[b.command_index]
         {
-            *image_id = b.new_image_id;
+            old_id = Some(std::mem::replace(image_id, b.new_image_id));
+        }
+        if let Some(old) = old_id {
+            self.release_image(&old);
         }
         Ok(Vec::new())
     }
@@ -1218,6 +1259,9 @@ impl VgeEngine {
         };
         let id_field = if b.id.is_empty() { None } else { Some(b.id) };
         let seq = self.state.current_mut().next_seq();
+        // Past every validation gate, so no early return can leave these
+        // references taken on an element that was never inserted.
+        self.retain_commands(&b.commands);
 
         // For top-level elements, anchor to scrollback. For children,
         // store origin verbatim (parent-relative).
@@ -1303,17 +1347,122 @@ impl VgeEngine {
         Ok(Vec::new())
     }
 
-    /// Remove `id` and all its descendants from the element table.
-    /// Queues GPU image handles for deletion if any descendant held one
-    /// (currently only DrawImage references images, but images live in
-    /// the shared image table — element deletion does not free them).
+    /// Remove `id` and all its descendants from the element table,
+    /// releasing each one's image references as it goes. An image whose
+    /// last reference disappears is dropped from the shared table and
+    /// its GPU handle queued for deletion (§8).
     fn delete_subtree(&mut self, id: &str) {
         let el = match self.state.elements_mut().remove(id) {
             Some(e) => e,
             None => return,
         };
+        self.release_commands(&el.commands);
         for child in el.children {
             self.delete_subtree(&child);
+        }
+    }
+
+    // ---- image reference counting (§8) --------------------------------
+
+    /// Image ids named by the `DrawImage` commands in `cmds`, with
+    /// duplicates preserved — an element that draws the same image
+    /// twice holds two references.
+    fn image_ids_in(cmds: &[DrawCmd]) -> impl Iterator<Item = &str> {
+        cmds.iter().filter_map(|c| match c {
+            DrawCmd::DrawImage { image_id, .. } => Some(image_id.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Take one reference on `id`. Unknown ids are ignored: command
+    /// validation has already rejected those, and silently doing
+    /// nothing is better than panicking on a path the renderer drives.
+    fn retain_image(&mut self, id: &str) {
+        if let Some(img) = self.state.shared.images.get_mut(id) {
+            img.refs = img.refs.saturating_add(1);
+            img.was_referenced = true;
+        }
+    }
+
+    /// Release one reference on `id`, dropping the image when the last
+    /// one goes. Never collects an image that has never been
+    /// referenced — see [`UploadedImage::was_referenced`].
+    fn release_image(&mut self, id: &str) {
+        let Some(img) = self.state.shared.images.get_mut(id) else {
+            return;
+        };
+        img.refs = img.refs.saturating_sub(1);
+        if img.refs == 0 && img.was_referenced {
+            self.drop_image_entry(id);
+        }
+    }
+
+    fn retain_commands(&mut self, cmds: &[DrawCmd]) {
+        let ids: Vec<String> = Self::image_ids_in(cmds).map(str::to_owned).collect();
+        for id in ids {
+            self.retain_image(&id);
+        }
+    }
+
+    fn release_commands(&mut self, cmds: &[DrawCmd]) {
+        let ids: Vec<String> = Self::image_ids_in(cmds).map(str::to_owned).collect();
+        for id in ids {
+            self.release_image(&id);
+        }
+    }
+
+    /// Remove an image from the shared table and queue its GPU handle
+    /// for deletion on the next frame.
+    fn drop_image_entry(&mut self, id: &str) {
+        if let Some(img) = self.state.shared.images.remove(id)
+            && let Some(gpu) = img.gpu.get()
+        {
+            self.pending_image_deletes.push(gpu);
+        }
+    }
+
+    /// Recount every image from scratch by walking both screens' element
+    /// tables, then collect whatever is now unreferenced.
+    ///
+    /// Used for the bulk transitions where tracking deltas would be
+    /// both fiddly and pointless: `ClearAll`, leaving the alt screen
+    /// (which discards a whole element set), and snapshot restore
+    /// (which replaces everything). Those happen a handful of times per
+    /// session, so an O(elements x commands) sweep is far cheaper than
+    /// the risk of a leaked or double-released count. The hot paths —
+    /// create, delete, update — stay incremental.
+    fn recompute_image_refs(&mut self) {
+        for img in self.state.shared.images.values_mut() {
+            img.refs = 0;
+        }
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        let sets = [Some(&self.state.main), self.state.alt.as_ref()];
+        for set in sets.into_iter().flatten() {
+            for el in set.elements.values() {
+                for id in Self::image_ids_in(&el.commands) {
+                    *counts.entry(id.to_owned()).or_default() += 1;
+                }
+            }
+        }
+        for (id, n) in counts {
+            if let Some(img) = self.state.shared.images.get_mut(&id) {
+                img.refs = n;
+                // Deliberately only ever set: an image that was
+                // referenced in the past and is not now must stay
+                // collectable.
+                img.was_referenced = true;
+            }
+        }
+        let dead: Vec<String> = self
+            .state
+            .shared
+            .images
+            .iter()
+            .filter(|(_, img)| img.refs == 0 && img.was_referenced)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in dead {
+            self.drop_image_entry(&id);
         }
     }
 
@@ -1325,8 +1474,13 @@ impl VgeEngine {
             return Err((ERR_UNKNOWN_ELEMENT, "id not found"));
         }
         self.validate_commands(&b.commands)?;
+        // Retain before releasing: an update that keeps drawing the same
+        // image must not let the count touch zero in between, which
+        // would collect the image out from under the new commands.
+        self.retain_commands(&b.commands);
         let el = self.state.elements_mut().get_mut(&b.id).unwrap();
-        el.commands = b.commands;
+        let old = std::mem::replace(&mut el.commands, b.commands);
+        self.release_commands(&old);
         Ok(Vec::new())
     }
 
@@ -1356,8 +1510,11 @@ impl VgeEngine {
         {
             return Err((ERR_UNKNOWN_IMAGE, "DrawImage references unknown image"));
         }
+        // Retain-then-release, same reasoning as `cmd_update_commands`.
+        self.retain_commands(std::slice::from_ref(&b.command));
         let el = self.state.elements_mut().get_mut(&b.id).unwrap();
-        el.commands[b.index] = b.command;
+        let old = std::mem::replace(&mut el.commands[b.index], b.command);
+        self.release_commands(std::slice::from_ref(&old));
         Ok(Vec::new())
     }
 
@@ -3212,5 +3369,265 @@ mod tests {
             "{err:?}",
         );
     }
-}
 
+    // ---- image refcounting (§8) ---------------------------------------
+
+    #[test]
+    fn scrolled_away_elements_release_their_images() {
+        // The leak this exists to fix: one image per element, elements
+        // scrolling out of scrollback. Before refcounting the table
+        // filled up and every upload past `max_images` failed with
+        // err_too_many_images.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.limits.max_images = 4;
+        let mut parser = vt100::Parser::new(2, 20, 0); // no scrollback: evicts at once
+        engine.after_vt100_process(&mut parser);
+
+        for i in 0..20 {
+            let img = format!("img{i}");
+            let el = format!("el{i}");
+            let mut frames = Vec::new();
+            append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2(&img));
+            append_command(
+                &mut frames,
+                CMD_CREATE_ELEMENT,
+                2,
+                &create_element_with_draw_image(&el, &img),
+            );
+            engine.process_pty_chunk(&build_envelope(&frames));
+            assert!(
+                engine.state.shared.images.contains_key(&img),
+                "upload {i} was rejected — the table filled up"
+            );
+            // Scroll the element off the end of (zero-length) scrollback.
+            parser.process(b"x\r\nx\r\nx\r\n");
+            engine.after_vt100_process(&mut parser);
+        }
+        assert!(
+            engine.state.shared.images.len() <= 4,
+            "images outlived their elements: {} left",
+            engine.state.shared.images.len()
+        );
+    }
+
+    #[test]
+    fn uploaded_but_unreferenced_image_survives() {
+        // Upload-then-create is normal: the element naming an image is
+        // often built by a later command. A fresh upload sits at zero
+        // references and must not be collected.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.shared.images.contains_key("logo"));
+
+        // Still there after unrelated churn that triggers a recount.
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_CLEAR_ALL, 2, &[]);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(
+            engine.state.shared.images.contains_key("logo"),
+            "a never-referenced image must not be collected"
+        );
+
+        // And it is still usable once something finally draws it.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_element_with_draw_image("widget", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(engine.state.elements().contains_key("widget"));
+    }
+
+    #[test]
+    fn image_survives_while_any_element_still_draws_it() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_element_with_draw_image("a", "logo"),
+        );
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_element_with_draw_image("b", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert_eq!(engine.state.shared.images["logo"].refs, 2);
+
+        let mut del = Writer::new();
+        del.str("a");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_DELETE_ELEMENT, 4, &del.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(
+            engine.state.shared.images.contains_key("logo"),
+            "one element gone, one still drawing it"
+        );
+
+        let mut del = Writer::new();
+        del.str("b");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_DELETE_ELEMENT, 5, &del.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert!(
+            !engine.state.shared.images.contains_key("logo"),
+            "last reference gone, image should be collected"
+        );
+    }
+
+    #[test]
+    fn update_image_to_the_same_id_is_not_a_collect() {
+        // Naive release-then-retain would let the count touch zero and
+        // collect the image out from under the command being updated.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_element_with_draw_image("widget", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        let mut w = Writer::new();
+        w.str("widget");
+        w.varu(0); // command_index
+        w.str("logo"); // same image
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPDATE_IMAGE, 3, &w.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        assert!(engine.state.shared.images.contains_key("logo"));
+        assert_eq!(engine.state.shared.images["logo"].refs, 1);
+    }
+
+    #[test]
+    fn update_image_releases_the_previous_image() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("old"));
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 2, &upload_raw_2x2("new"));
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            3,
+            &create_element_with_draw_image("widget", "old"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        let mut w = Writer::new();
+        w.str("widget");
+        w.varu(0);
+        w.str("new");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPDATE_IMAGE, 4, &w.buf);
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        assert!(
+            !engine.state.shared.images.contains_key("old"),
+            "the replaced image lost its last reference"
+        );
+        assert_eq!(engine.state.shared.images["new"].refs, 1);
+    }
+
+    #[test]
+    fn image_drawn_only_on_main_survives_the_alt_screen() {
+        // The image table is shared across screens (§5.4) but element
+        // tables are not. A trip to the alt screen must not collect an
+        // image the main screen is still drawing.
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(10, 20, 100);
+        engine.after_vt100_process(&mut parser);
+
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_element_with_draw_image("widget", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        parser.process(b"\x1b[?1049h"); // enter alt
+        engine.after_vt100_process(&mut parser);
+        assert!(
+            engine.state.shared.images.contains_key("logo"),
+            "main-screen reference must keep the image alive on alt"
+        );
+
+        parser.process(b"\x1b[?1049l"); // back to main
+        engine.after_vt100_process(&mut parser);
+        assert!(engine.state.shared.images.contains_key("logo"));
+        assert_eq!(engine.state.shared.images["logo"].refs, 1);
+    }
+
+    #[test]
+    fn leaving_alt_screen_collects_images_only_it_referenced() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(10, 20, 100);
+        engine.after_vt100_process(&mut parser);
+
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        engine.process_pty_chunk(&build_envelope(&frames));
+
+        parser.process(b"\x1b[?1049h");
+        engine.after_vt100_process(&mut parser);
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_element_with_draw_image("altonly", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        assert_eq!(engine.state.shared.images["logo"].refs, 1);
+
+        parser.process(b"\x1b[?1049l");
+        engine.after_vt100_process(&mut parser);
+        assert!(
+            !engine.state.shared.images.contains_key("logo"),
+            "the alt element set was discarded with the only reference"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_rebuilds_reference_counts() {
+        // Counts are derived, not serialized. A restored engine must
+        // agree with the one it came from, or the image is collected
+        // early (or never).
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload_raw_2x2("logo"));
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            2,
+            &create_element_with_draw_image("widget", "logo"),
+        );
+        engine.process_pty_chunk(&build_envelope(&frames));
+        let snapshot = engine.binary_snapshot();
+
+        let mut restored = VgeEngine::new((9, 20), 1.0);
+        restored.restore_from_binary_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.state.shared.images["logo"].refs, 1);
+
+        // And the restored engine collects on the same schedule.
+        let mut del = Writer::new();
+        del.str("widget");
+        let mut frames = Vec::new();
+        append_command(&mut frames, CMD_DELETE_ELEMENT, 3, &del.buf);
+        restored.process_pty_chunk(&build_envelope(&frames));
+        assert!(!restored.state.shared.images.contains_key("logo"));
+    }
+}

@@ -377,9 +377,11 @@ screen. The terminal's underlying text grid + scrollback go with them
 (the host terminal must implement `3J` for the text side; see the
 notes for veter's vendored vt100 fork in `vt100/src/screen.rs`).
 
-The shared image and style tables are not affected; only the element
-table. Partial erases (`ESC [ J` / `ESC [ 0 J` / `ESC [ 1 J`) are
-cursor-relative and do not trigger this cleanup.
+The style table is not affected; only the element table. Images are not
+erased *directly* either, but an erase releases the references the
+dropped elements held, so an image nothing else draws is collected as a
+consequence (§8.0). Partial erases (`ESC [ J` / `ESC [ 0 J` /
+`ESC [ 1 J`) are cursor-relative and do not trigger this cleanup.
 
 ## 6. Elements
 
@@ -865,6 +867,35 @@ image fits in a single chunk (offset=0, is_last=true) while a large
 image streams across many envelopes. The terminal answers each chunk
 with a `ChunkAck` carrying `bytes_received` so the sender can surface
 byte-level progress to the user (e.g. over SSH).
+
+### 8.0 Lifetime
+
+Within that session scope, an image is **reference-counted against the
+`DrawImage` commands naming it**. The count spans both screens' element
+tables, since the image table is shared and the element tables are not
+(§5.4). When the count falls to zero the terminal drops the image and
+frees its memory.
+
+Two rules make this safe for the ordinary upload-then-draw sequence:
+
+- An image that has **never** been referenced is never collected. A
+  fresh upload sits at zero references, often across several envelopes,
+  until the element that draws it is created.
+- A count only reaches zero by losing a reference it once had. Deleting
+  an element, replacing its commands, re-pointing a `DrawImage` with
+  `UpdateImage`, `ClearAll`, an erase (§5.7), scrollback eviction
+  (§5.2) and leaving the alternate screen all release references.
+
+`DropImage` (§8.2) is unaffected and still means "remove now, whatever
+is referencing it" — elements holding the id keep rendering their
+fallback.
+
+Without this, a client that uploads one image per element and lets
+those elements scroll out of scrollback leaks table slots until
+`max_images` is exhausted and every further upload fails with
+`err_too_many_images`. Clients that deliberately keep an image across
+element churn should either hold one element referencing it or re-upload
+under a content-addressed id.
 
 ### 8.1 ImageData encoding
 
