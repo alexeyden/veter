@@ -1522,19 +1522,13 @@ fn build_tabbar_commands(
         let name_text = format!(" {} ", slot.label);
         let is_active = i == active;
 
-        // Number sub-rect, top-left corner rounded. Dim modal background
-        // normally; a 40%-darker accent fill when the tab has unseen
-        // background activity — muted so it stays distinct from the
-        // full-accent active-tab name badge.
+        // Number sub-rect ("tag"), top-left corner rounded. Always the dim
+        // modal background — activity lights up the name rect instead, so
+        // the tag stays a stable anchor at the head of every pill.
         let has_activity = activity.get(i).copied().unwrap_or(false);
-        let num_bg = if has_activity {
-            activity_style()
-        } else {
-            surface_style()
-        };
         let (num_rx, num_ry) = chrome_corner_radii(num_w, 1.0, cell_pw, cell_ph);
         cmds.push(DrawCmd::FillPath {
-            fill: num_bg,
+            fill: surface_style(),
             segments: rounded_rect_path_corners(
                 x,
                 0.0,
@@ -1557,13 +1551,23 @@ fn build_tabbar_commands(
             text: num_text,
         });
 
-        // Name sub-rect: brand-color fill only on the active tab; top-
-        // right corner rounded so the tab silhouette has a tab shape.
+        // Name sub-rect — the body of the pill. Full accent on the active
+        // tab; the 40%-darker accent when an inactive tab has unseen
+        // background activity, so the whole pill lights up rather than just
+        // the tag. Top-right corner rounded so the silhouette reads as a tab.
         let name_x0 = x + num_w;
-        if is_active {
+        let name_bg = if is_active {
+            Some(accent_style())
+        } else if has_activity {
+            Some(activity_style())
+        } else {
+            None
+        };
+        let name_lit = name_bg.is_some();
+        if let Some(name_fill) = name_bg {
             let (name_rx, name_ry) = chrome_corner_radii(name_w, 1.0, cell_pw, cell_ph);
             cmds.push(DrawCmd::FillPath {
-                fill: accent_style(),
+                fill: name_fill,
                 segments: rounded_rect_path_corners(
                     name_x0,
                     0.0,
@@ -1578,10 +1582,13 @@ fn build_tabbar_commands(
                 ),
             });
         }
+        // Light text wherever the pill body is filled (active or activity),
+        // so the label stays legible on the accent; dim only on a bare pill.
+        // Bold still marks the active tab specifically.
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: name_x0, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(if is_active {
+            fill: Style::Flat(if name_lit {
                 COLOR_TAB_ACTIVE_TEXT
             } else {
                 COLOR_TAB_INACTIVE_TEXT
