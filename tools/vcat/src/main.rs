@@ -9,15 +9,21 @@
 //!      its visual aspect ratio on this terminal's anisotropic cell
 //!      grid, then flow the images left-to-right with wrap-around —
 //!      like words in a paragraph, bottom-aligned within each row.
-//!   5. Resize each to exact pixel dimensions matching its cell
-//!      footprint (Lanczos), upload as a Raw RGBA8 / WebP VGE image,
-//!      and create elements placed where the next prompt would have
-//!      been.
+//!   5. Reserve the block's rows by printing newlines, then resize each
+//!      image to exact pixel dimensions matching its cell footprint
+//!      (Lanczos), upload as a Raw RGBA8 / WebP VGE image, and create
+//!      elements anchored to the cursor those newlines left behind.
+//!
+//! Placement costs no round-trip: the elements carry cursor-relative
+//! origins (spec §9.4 bit3) with a negative `y`, so the terminal
+//! resolves them against the cursor at command-processing time. vcat
+//! reserves the space itself, which is legitimate precisely because it
+//! *is* its pane's foreground program — a client that isn't must let
+//! the application make the room and anchor to a marker instead.
 //!
 //! The terminal handshake, placement math, encoding, and response
 //! parsing live in the shared `vge-render` crate; this binary owns the
-//! CLI, the flow layout, the cursor-anchoring, and the upload progress
-//! bar.
+//! CLI, the flow layout, and the upload progress bar.
 //!
 //! Run inside veter:
 //!     vcat ~/Downloads/photo.jpg
@@ -25,7 +31,7 @@
 //!     vcat *.png
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, ValueEnum};
@@ -41,9 +47,7 @@ use vge_render::is_ssh_session;
 use vge_render::placement::{Placement, compute_placement};
 use vge_render::probe::run_probe;
 use vge_render::response::wait_for_chunk_ack;
-use vge_render::tty::{
-    RawTty, drain_stale_stdin, poll_stdin_until, read_stdin, winsize_cols, winsize_rows,
-};
+use vge_render::tty::{RawTty, drain_stale_stdin, winsize_cols};
 use vge_render::upload::{Encoding, choose_encoding, encode_payload};
 
 #[derive(Parser, Debug)]
@@ -69,11 +73,12 @@ struct Cli {
     #[arg(long)]
     width: Option<u32>,
 
-    /// Milliseconds to wait for the terminal's probe / cursor
-    /// responses before giving up. 2000 ms covers nested chains
+    /// Milliseconds to wait for the terminal's probe response and
+    /// upload chunk acks before giving up. 2000 ms covers nested chains
     /// (e.g. vmux-over-ssh-over-vmux-over-veter) where each layer
     /// adds a poll-cadence boundary plus SSH round-trip; bump higher
-    /// if the chain is deeper still.
+    /// if the chain is deeper still. Placement no longer depends on
+    /// this — the terminal resolves it from the cursor.
     #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
 
@@ -218,40 +223,29 @@ fn main() -> Result<()> {
     }
     trace!(v, "block: {} rows total", layout.total_rows);
 
-    // Reserve vertical space for the whole block and read back the
-    // cursor's new row.
+    // Reserve vertical space for the whole block. vcat is its pane's
+    // foreground program, so printing the newlines itself is exactly
+    // right: its own output scrolls the screen and its own placement
+    // accounts for it.
     let mut stdout = std::io::stdout().lock();
     for _ in 0..layout.total_rows {
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
-    trace!(v, "querying cursor");
-    stdout.write_all(b"\x1b[6n")?;
-    stdout.flush()?;
-    let cursor_row = match read_cursor_row(Duration::from_millis(cli.timeout_ms))? {
-        Some(r) => r,
-        None => {
-            // DSR timed out. Common cause is a multi-hop chain
-            // (vmux-in-vmux over ssh) where the round trip exceeds
-            // the configured timeout. Fall back to TIOCGWINSZ.
-            let rows = winsize_rows().unwrap_or(24) as u32;
-            eprintln!(
-                "vcat: cursor-position query timed out at {}ms; falling \
-                 back to row {} (TIOCGWINSZ). If the placement looks off, \
-                 retry with --timeout-ms <larger>.",
-                cli.timeout_ms, rows
-            );
-            rows
-        }
-    };
-    trace!(v, "cursor row={cursor_row}");
-    // After printing total_rows newlines the cursor is at row C
-    // (1-indexed, top of screen = 1). The block should occupy rows
-    // [C - total_rows, C) in 1-indexed terms, which is a block top of
-    // C - total_rows - 1 in VGE 0-indexed cells from the live screen
-    // top. For tall blocks the top may go negative — VGE anchors those
-    // to scrollback and clips automatically (§5.2). Don't clamp to 0.
-    let block_top_y = (cursor_row as i32 - layout.total_rows as i32 - 1) as f32;
+    // The block occupies the `total_rows` rows immediately above the
+    // cursor we just left there, so the block top is `-total_rows`
+    // relative to it — no DSR round-trip, no timeout to tune, and no
+    // TIOCGWINSZ guess when a multi-hop chain (vmux-in-vmux over ssh)
+    // is slower than the timeout allows.
+    //
+    // This is exact only because the terminal applies a command against
+    // the screen produced by the bytes that preceded it in the stream
+    // (§5.2), so the newlines above are already in when the origin
+    // resolves — even though both land in one read.
+    //
+    // For tall blocks the top goes negative, which anchors into
+    // scrollback and clips automatically (§5.2). Don't clamp.
+    let block_top_y = -(layout.total_rows as f32);
 
     // Upload each image and create its element, left-to-right in flow
     // order. req_ids stay monotonic across images so chunk acks never
@@ -381,13 +375,15 @@ fn upload_one(
                 Command::CreateElement(CreateElementBody {
                     id: elem_id.to_string(),
                     commands: placeholder_cmds.clone(),
+                    // `element_origin.y` is negative: the block sits
+                    // above the cursor left by the reserved newlines.
                     origin: element_origin,
                     is_visible: true,
                     draw_order: 0,
                     parent: None,
                     size: None,
                     transform: None,
-                    anchor: OriginAnchor::Viewport,
+                    anchor: OriginAnchor::Cursor,
                 }),
                 REQ_ID_NO_RESPONSE,
             ));
@@ -426,13 +422,17 @@ fn upload_one(
                 Command::CreateElement(CreateElementBody {
                     id: elem_id.to_string(),
                     commands: vec![final_draw.clone()],
+                    // Same anchor as the placeholder above. vcat prints
+                    // nothing between the reserved newlines and this
+                    // command, so the cursor — and therefore the
+                    // resolved line — is the same for both.
                     origin: element_origin,
                     is_visible: true,
                     draw_order: 0,
                     parent: None,
                     size: None,
                     transform: None,
-                    anchor: OriginAnchor::Viewport,
+                    anchor: OriginAnchor::Cursor,
                 })
             };
             frames.push((final_element, REQ_ID_NO_RESPONSE));
@@ -625,78 +625,9 @@ fn progress_text(acked: u32, total: u32, total_mb: f32) -> String {
     )
 }
 
-/// Read bytes from stdin until we see a CSI cursor-position-report
-/// terminator (`ESC [ <row> ; <col> R`). Returns the row, 1-indexed.
-fn read_cursor_row(timeout: Duration) -> Result<Option<u32>> {
-    let deadline = Instant::now() + timeout;
-    let mut accum: Vec<u8> = Vec::with_capacity(32);
-    let mut buf = [0u8; 64];
-    loop {
-        if !poll_stdin_until(deadline)? {
-            return Ok(None);
-        }
-        let n = read_stdin(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        accum.extend_from_slice(&buf[..n]);
-        if let Some(row) = parse_cursor_position(&accum)? {
-            return Ok(Some(row));
-        }
-    }
-}
-
-/// Look for `ESC [ <row> ; <col> R` somewhere in `buf`. Returns the
-/// 1-indexed row if found.
-fn parse_cursor_position(buf: &[u8]) -> Result<Option<u32>> {
-    let Some(esc_pos) = buf.iter().position(|&b| b == 0x1B) else {
-        return Ok(None);
-    };
-    if esc_pos + 1 >= buf.len() {
-        return Ok(None);
-    }
-    if buf[esc_pos + 1] != b'[' {
-        return Ok(None);
-    }
-    let body_start = esc_pos + 2;
-    let r_off = match buf[body_start..].iter().position(|&b| b == b'R') {
-        Some(off) => off,
-        None => return Ok(None),
-    };
-    let body = &buf[body_start..body_start + r_off];
-    let body_str =
-        std::str::from_utf8(body).map_err(|_| anyhow!("cursor-position body not valid UTF-8"))?;
-    let (row_str, _col) = body_str
-        .split_once(';')
-        .ok_or_else(|| anyhow!("cursor-position body lacks ';'"))?;
-    let row: u32 = row_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("cursor-position row not a u32: {body_str:?}"))?;
-    Ok(Some(row))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cursor_position_parses() {
-        let buf = b"\x1b[24;1R";
-        assert_eq!(parse_cursor_position(buf).unwrap(), Some(24));
-    }
-
-    #[test]
-    fn cursor_position_with_leading_garbage() {
-        let buf = b"hello\x1b[42;7Rworld";
-        assert_eq!(parse_cursor_position(buf).unwrap(), Some(42));
-    }
-
-    #[test]
-    fn cursor_position_partial_returns_none() {
-        let buf = b"\x1b[24;";
-        assert_eq!(parse_cursor_position(buf).unwrap(), None);
-    }
 
     fn placement(w_cells: u32, target_rect_h: f32) -> Placement {
         Placement {
