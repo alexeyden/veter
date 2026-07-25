@@ -177,9 +177,6 @@ impl<P: ProgressUI> ProgressUI for DelayedProgress<P> {
 
 pub struct VgeProgress {
     element_id: String,
-    /// Row at which the bar is drawn (0-indexed for VGE, derived from
-    /// the 1-indexed DSR-CPR result minus one).
-    origin_y: f32,
     bar_w: f32,
     /// Corner x-radius in cells. The y-radius is always `BAR_H / 2`
     /// (fully rounded pill ends); this is its width-compensated
@@ -193,17 +190,20 @@ pub struct VgeProgress {
 }
 
 impl VgeProgress {
+    /// The bar draws on the cursor's own row, which it names with a
+    /// cursor-relative origin (spec §9.4 bit3) rather than asking where
+    /// the cursor is. The client is its pane's foreground program and
+    /// prints nothing between here and the `CreateElement`, so the row
+    /// the terminal resolves is the one the caller meant.
     pub fn new(
         element_id: String,
         label: String,
-        cursor_row_1based: u32,
         term_cols: u32,
         cell_px: (u16, u16),
     ) -> Self {
         let bar_w = bar_width_cells(term_cols);
         Self {
             element_id,
-            origin_y: cursor_row_1based.saturating_sub(1) as f32,
             bar_w: bar_w as f32,
             corner_rx: corner_rx_cells(cell_px.0, cell_px.1),
             label,
@@ -267,16 +267,15 @@ impl VgeProgress {
         let create = Command::CreateElement(CreateElementBody {
             id: self.element_id.clone(),
             commands: vec![bg, fg, text],
-            origin: Point {
-                x: 0.0,
-                y: self.origin_y,
-            },
+            // Cursor-relative with zero offset: the bar occupies the
+            // row the cursor is on.
+            origin: Point { x: 0.0, y: 0.0 },
             is_visible: true,
             draw_order: 0,
             parent: None,
             size: None,
             transform: None,
-            anchor: OriginAnchor::Viewport,
+            anchor: OriginAnchor::Cursor,
         });
         build_envelope(&[(create, REQ_ID_NO_RESPONSE)])
     }
@@ -709,7 +708,7 @@ mod tests {
         use vge_protocol::command::parse;
         use vge_protocol::encode::{encode_command, frame_type_for};
 
-        let bar = VgeProgress::new("p".into(), "vsend: f".into(), 5, 80, (10, 20));
+        let bar = VgeProgress::new("p".into(), "vsend: f".into(), 80, (10, 20));
         let segments = bar.bar_path(bar.bar_w * 0.45);
         let cmd = Command::CreateElement(CreateElementBody {
             id: "p".into(),
@@ -841,7 +840,7 @@ mod tests {
 
         // Reach past `write_envelope` (which goes to the real stdout) and
         // assert on the encoder the way the host's parser would see it.
-        let bar = VgeProgress::new("p".into(), "vsend: f".into(), 5, 80, (10, 20));
+        let bar = VgeProgress::new("p".into(), "vsend: f".into(), 80, (10, 20));
         let create = Command::CreateElement(CreateElementBody {
             id: "p".into(),
             commands: vec![DrawCmd::FillPath {
@@ -898,7 +897,7 @@ mod tests {
         use veter_host::vge::VgeEngine;
 
         let mut engine = VgeEngine::new((10, 20), 1.0);
-        let mut bar = VgeProgress::new("vsend-progress-1".into(), "vsend: f".into(), 5, 80, (10, 20));
+        let mut bar = VgeProgress::new("vsend-progress-1".into(), "vsend: f".into(), 80, (10, 20));
 
         engine.process_pty_chunk(&bar.create_envelope());
         assert!(

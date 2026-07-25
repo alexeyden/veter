@@ -161,81 +161,8 @@ fn parse_vge_probe(payload: &[u8]) -> Result<VgeProbeData> {
     })
 }
 
-/// Read the current cursor row by emitting `ESC [ 6 n` and parsing the
-/// `ESC [ <row> ; <col> R` reply. The row is 1-indexed.
-pub fn read_cursor_row(timeout: Duration) -> Result<Option<u32>> {
-    {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(b"\x1b[6n")?;
-        stdout.flush()?;
-    }
-    let deadline = Instant::now() + timeout;
-    let mut accum: Vec<u8> = Vec::with_capacity(32);
-    let mut buf = [0u8; 64];
-    loop {
-        if !poll_stdin_until(deadline)? {
-            return Ok(None);
-        }
-        let n = read_stdin(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        accum.extend_from_slice(&buf[..n]);
-        if let Some(row) = parse_cursor_position(&accum)? {
-            return Ok(Some(row));
-        }
-    }
-}
-
-/// Look for `ESC [ <row> ; <col> R` somewhere in `buf`. Returns the
-/// 1-indexed row if found.
-fn parse_cursor_position(buf: &[u8]) -> Result<Option<u32>> {
-    let Some(esc_pos) = buf.iter().position(|&b| b == 0x1B) else {
-        return Ok(None);
-    };
-    if esc_pos + 1 >= buf.len() {
-        return Ok(None);
-    }
-    if buf[esc_pos + 1] != b'[' {
-        return Ok(None);
-    }
-    let body_start = esc_pos + 2;
-    let r_off = match buf[body_start..].iter().position(|&b| b == b'R') {
-        Some(off) => off,
-        None => return Ok(None),
-    };
-    let body = &buf[body_start..body_start + r_off];
-    let body_str = std::str::from_utf8(body)
-        .map_err(|_| anyhow!("cursor-position body not valid UTF-8"))?;
-    let (row_str, _col) = body_str
-        .split_once(';')
-        .ok_or_else(|| anyhow!("cursor-position body lacks ';'"))?;
-    let row: u32 = row_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("cursor-position row not a u32: {body_str:?}"))?;
-    Ok(Some(row))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn cursor_position_parses() {
-        assert_eq!(parse_cursor_position(b"\x1b[24;1R").unwrap(), Some(24));
-    }
-
-    #[test]
-    fn cursor_position_with_leading_garbage() {
-        assert_eq!(
-            parse_cursor_position(b"hello\x1b[42;7Rworld").unwrap(),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn cursor_position_partial_returns_none() {
-        assert_eq!(parse_cursor_position(b"\x1b[24;").unwrap(), None);
-    }
 }

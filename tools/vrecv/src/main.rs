@@ -33,7 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use vft_client::cancel::{cancel_and_drain, CancelGuard};
-use vft_client::probe::{read_cursor_row, run_vft_probe, run_vge_probe};
+use vft_client::probe::{run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
 use vft_client::tty::{drain_stale_stdin, winsize_cols, RawTty};
@@ -111,7 +111,6 @@ fn main() -> Result<()> {
         bail!("host does not advertise download support");
     }
     let vge_probe = run_vge_probe(timeout)?;
-    let cursor_row = read_cursor_row(timeout)?.unwrap_or(1);
     let term_cols = winsize_cols().unwrap_or(80) as u32;
 
     let stream = ResponseStream::spawn();
@@ -146,7 +145,6 @@ fn main() -> Result<()> {
             VgeProgress::new(
                 format!("vrecv-progress-{}", std::process::id()),
                 format!("vrecv: {local_label}"),
-                cursor_row,
                 term_cols,
                 (vge.cell_pixel_width, vge.cell_pixel_height),
             ),
