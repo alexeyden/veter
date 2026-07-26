@@ -777,16 +777,39 @@ impl App {
             }
             return;
         }
-        // A click in an ancestor column navigates to that directory.
+        // A click in an ancestor column navigates to the entry it lands
+        // on: into a clicked directory, or — for a file — into the
+        // column's own directory with the cursor put on that file. A
+        // click in the padding below the last row falls back to the
+        // column's directory (one step up the trail).
         for (i, area) in self.layout.ancestors.iter().enumerate() {
-            if area.contains(c, r) {
-                let Some(column) = self.columns.get(i) else {
-                    return;
-                };
-                let path = column.path.clone();
-                self.cd(path);
-                return;
+            if !area.contains(c, r) {
+                continue;
             }
+            let Some(column) = self.columns.get(i) else {
+                return;
+            };
+            match render::column_row_at(*area, column.entries.len(), column.selected, r) {
+                Some(idx) => {
+                    let entry = &column.entries[idx];
+                    if entry.is_dir() {
+                        let path = entry.path.clone();
+                        self.cd(path);
+                    } else {
+                        let dir = column.path.clone();
+                        let file = entry.path.clone();
+                        self.cd(dir);
+                        if let Some(pos) = self.entries.iter().position(|e| e.path == file) {
+                            self.cursor_to(pos);
+                        }
+                    }
+                }
+                None => {
+                    let path = column.path.clone();
+                    self.cd(path);
+                }
+            }
+            return;
         }
     }
 
@@ -1706,6 +1729,49 @@ mod tests {
         assert_eq!(app.cursor, 1);
         app.on_event(click);
         assert!(matches!(app.mode, Mode::Overlay { .. }), "opened a preview");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_sibling_in_an_ancestor_column_navigates_into_it() {
+        let d = tmpdir("ancestor-click");
+        // cwd = d/one; the parent column (d) lists `one`, `sib`, `zzz`.
+        std::fs::create_dir_all(d.join("one")).unwrap();
+        std::fs::create_dir(d.join("sib")).unwrap();
+        std::fs::write(d.join("zzz.txt"), b"x").unwrap();
+        let mut app = app_in(&d.join("one"));
+
+        let (i, idx) = app
+            .columns
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| {
+                c.entries
+                    .iter()
+                    .position(|e| e.name == "sib")
+                    .map(|idx| (i, idx))
+            })
+            .expect("`sib` is listed in an ancestor column");
+        let area = app.layout.ancestors[i];
+        // Find the on-screen cell whose hit-test resolves to `sib`'s row,
+        // then click it — exercising the same geometry the handler uses.
+        let cell = (0..app.rows)
+            .find(|cell| {
+                render::column_row_at(
+                    area,
+                    app.columns[i].entries.len(),
+                    app.columns[i].selected,
+                    *cell as f32,
+                ) == Some(idx)
+            })
+            .expect("`sib`'s row is on screen");
+
+        app.on_event(Event::MouseDown {
+            button: Button::Left,
+            col: area.x as u16,
+            row: cell as u16,
+        });
+        assert_eq!(app.cwd, d.join("sib"), "clicked into the sibling, not up to its parent");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -81,6 +81,33 @@ fn column_window(rows: usize, total: usize, selected: Option<usize>) -> usize {
     sel.saturating_sub(half).min(total - rows)
 }
 
+/// The entry index in an ancestor column under a click at cell-row
+/// `click_row`, or `None` if the click missed a row (the top margin or
+/// the empty space below the last entry). Mirrors the row geometry
+/// [`column_commands`] draws, so a click lands on the row it looks like
+/// it lands on.
+pub fn column_row_at(
+    area: Area,
+    total: usize,
+    selected: Option<usize>,
+    click_row: f32,
+) -> Option<usize> {
+    let rows = (area.h as usize).saturating_sub(1).max(1);
+    let start = column_window(rows, total, selected);
+    // Rows are drawn at `y = area.y + 0.5 + row`; the leading 0.5 is a
+    // top margin, so a click above the first row's band misses.
+    let rel = click_row - (area.y + 0.5);
+    if rel < 0.0 {
+        return None;
+    }
+    let row = rel.floor() as usize;
+    if row >= rows {
+        return None;
+    }
+    let idx = start + row;
+    (idx < total).then_some(idx)
+}
+
 pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
     let a = v.area;
     let (rx, ry) = chrome_corner_radii(a.w, a.h, cell_pw, cell_ph);
@@ -519,6 +546,24 @@ mod tests {
         assert_eq!(column_window(10, 100, Some(50)), 45, "centered");
         assert_eq!(column_window(10, 100, Some(99)), 90, "clamped at the end");
         assert_eq!(column_window(10, 100, None), 0);
+    }
+
+    #[test]
+    fn a_column_click_maps_to_the_row_it_lands_on() {
+        let area = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 12.0,
+            h: 6.0, // 5 drawable rows (h - 1)
+        };
+        // Rows drawn at y = 0.5, 1.5, 2.5, …; a click at cell 1 hits row 0.
+        assert_eq!(column_row_at(area, 5, None, 1.0), Some(0));
+        assert_eq!(column_row_at(area, 5, None, 2.0), Some(1));
+        // The top-margin half-cell and the space past the last entry miss.
+        assert_eq!(column_row_at(area, 5, None, 0.0), None);
+        assert_eq!(column_row_at(area, 3, None, 4.0), None, "below the list");
+        // With a long list, the click resolves through the scroll window.
+        assert_eq!(column_row_at(area, 100, Some(50), 1.0), Some(48));
     }
 
     #[test]
