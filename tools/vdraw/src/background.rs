@@ -210,6 +210,7 @@ fn chunk_uploads(
             let end = (offset + chunk_size).min(total_bytes);
             (
                 Command::UploadImage(UploadImageBody {
+                    retention: vge_protocol::command::Retention::Auto,
                     id: id.to_string(),
                     encoding,
                     width,

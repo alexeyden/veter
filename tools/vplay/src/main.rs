@@ -162,6 +162,7 @@ fn upload_cmd(
     let enc = choose_encoding(supported, ssh, 80.0);
     let (encoding, payload) = encode_payload(rgba, w, h, enc)?;
     Ok(Command::UploadImage(UploadImageBody {
+        retention: vge_protocol::command::Retention::Auto,
         id: id.into(),
         encoding,
         width: w,
@@ -201,6 +202,7 @@ impl ChunkedUpload {
         let end = (self.offset + UPLOAD_CHUNK_BYTES).min(self.payload.len());
         let is_last = end == self.payload.len();
         let mut cmds = vec![np(Command::UploadImage(UploadImageBody {
+            retention: vge_protocol::command::Retention::Auto,
             id: self.id.clone(),
             encoding: self.encoding,
             width: self.width,

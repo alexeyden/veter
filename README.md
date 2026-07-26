@@ -21,13 +21,13 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vcat` | Display images inside a VGE-aware terminal. |
 | `vplay` | Interactive image and video viewer for VGE-aware terminals. |
 | `vdraw` | Interactive block-diagram editor; draws with VGE, stores `.excalidraw` documents. |
-| `vfm` | File browser: ranger-style column navigation with a thumbnail icon grid for the current directory. |
+| `vfm` | File browser with picture previews: ranger-style column navigation and a Dolphin-style thumbnail icon grid for the current directory, plus copy/move/delete/rename and full-file previews. |
 | `vsend`, `vrecv` | Upload a local file to / pull a host-side file back from a VFT-aware terminal. |
 | `vsd` | Persistent session daemon — holds session state across renderer disconnects. |
 | `vssh` | SSH wrapper that keeps the veter tools fresh on remote hosts. |
 | `vge-cli`, `prt-cli` | Emit raw protocol envelopes for manual testing. |
 | `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
-| `vge-render` | Shared client-side image-rendering helpers (used by `vcat`, `vplay`). |
+| `vge-render` | Shared client-side image-rendering + raw-TTY / probe helpers (used by `vcat`, `vplay`, `vdraw`, `vfm`). |
 | `vge-ui` | Shared client-side widget toolkit: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing (used by `vmux`, `vfm`). |
 | `vt100` | Vendored fork of the `vt100` parser (adds `clear_scrollback`, resize helpers, and binary snapshot/restore). |
 | `breakout`, `spinner` | VGE demos. |

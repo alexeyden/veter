@@ -895,13 +895,15 @@ byte-level progress to the user (e.g. over SSH).
 
 ### 8.0 Lifetime
 
-Within that session scope, an image is **reference-counted against the
-`DrawImage` commands naming it**. The count spans both screens' element
-tables, since the image table is shared and the element tables are not
-(§5.4). When the count falls to zero the terminal drops the image and
-frees its memory.
+Every uploaded image carries a **retention** policy (§8.2), chosen by
+the uploader, that decides how it is reclaimed.
 
-Two rules make this safe for the ordinary upload-then-draw sequence:
+**Auto (the default) — reference-counted.** The image is reference-counted
+against the `DrawImage` commands naming it. The count spans both screens'
+element tables, since the image table is shared and the element tables
+are not (§5.4). When the count falls to zero the terminal drops the image
+and frees its memory. Two rules make this safe for the ordinary
+upload-then-draw sequence:
 
 - An image that has **never** been referenced is never collected. A
   fresh upload sits at zero references, often across several envelopes,
@@ -911,16 +913,32 @@ Two rules make this safe for the ordinary upload-then-draw sequence:
   `UpdateImage`, `ClearAll`, an erase (§5.7), scrollback eviction
   (§5.2) and leaving the alternate screen all release references.
 
-`DropImage` (§8.2) is unaffected and still means "remove now, whatever
-is referencing it" — elements holding the id keep rendering their
-fallback.
+This is what a one-shot display wants: draw it, scroll it away, and the
+slot is reclaimed with no bookkeeping. But it makes an image unusable as
+a *cache* — a client that references an image intermittently (a
+thumbnail grid paging images on and off screen, say) would have it
+collected the instant it leaves view, and re-referencing it then fails
+with `err_unknown_image` (§7.5, resolution is atomic at command time).
 
-Without this, a client that uploads one image per element and lets
-those elements scroll out of scrollback leaks table slots until
-`max_images` is exhausted and every further upload fails with
-`err_too_many_images`. Clients that deliberately keep an image across
-element churn should either hold one element referencing it or re-upload
-under a content-addressed id.
+**Manual — client-managed.** The terminal never auto-collects the image:
+it survives any number of periods with no `DrawImage` referencing it, and
+is removed only by an explicit `DropImage` (or a whole-table reset —
+`RIS`). Reference counting still runs (so the count is correct if the
+image is later re-uploaded as Auto, and for diagnostics), but a count of
+zero does not trigger collection. This is the policy for a caching
+client; the cost is that bounding the table is now the client's job —
+it must `DropImage` what it no longer wants, and an unmanaged flood of
+Manual uploads will hit `max_images` and fail further uploads with
+`err_too_many_images` rather than being reclaimed for it.
+
+`DropImage` (§8.2) means "remove now, whatever is referencing it" under
+both policies — elements holding the id keep rendering their fallback.
+
+Neither policy reclaims an image under table pressure: there is no
+LRU/eviction. `max_images` is a hard ceiling; when it is reached the
+next upload fails with `err_too_many_images`, and freeing space is the
+sender's responsibility (let an Auto image go unreferenced, or
+`DropImage` a Manual one).
 
 ### 8.1 ImageData encoding
 
@@ -952,6 +970,10 @@ UploadImage:
                            ; runs encoding-specific validation
                            ; (§8.1) and registers the image only on
                            ; this transition.
+  u8     retention         ; 0 = Auto (reference-counted, default),
+                           ; 1 = Manual (client-managed) — see §8.0.
+                           ; Repeated in every chunk; applied on the
+                           ; last. Unknown values → err_bad_payload.
   bytes  data              ; chunk bytes (varu length prefix); NOT
                            ; the full image — see `total_bytes`.
 

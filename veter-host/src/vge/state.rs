@@ -8,7 +8,7 @@ use rgb::RGBA8;
 use vge_protocol::apc::{ApcStream, Segment};
 use vge_protocol::codec::{Point, Reader, Transform};
 use vge_protocol::command::{
-    self, Command, ConcreteStyle, CreateElementBody, DrawCmd, UpdateCommandBody,
+    self, Command, ConcreteStyle, CreateElementBody, DrawCmd, Retention, UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
     OriginAnchor,
 };
@@ -161,6 +161,13 @@ pub struct UploadedImage {
     /// positive and fallen back to zero means "nothing wants this any
     /// more".
     pub was_referenced: bool,
+    /// Retention policy (§8.2). When `true` (uploaded with
+    /// `Retention::Manual`), the image is client-managed: the refcount GC
+    /// never collects it, so it survives periods with no `DrawImage`
+    /// referencing it. Only an explicit `DropImage` (or a table reset)
+    /// removes it. Lets a caching client page images on and off screen
+    /// without the host GC'ing one between uses.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -444,6 +451,8 @@ struct PendingUpload {
     total_bytes: u32,
     buf: Vec<u8>,
     bytes_received: u32,
+    /// Retention from the first chunk (§8.2); applied when finalized.
+    pinned: bool,
 }
 
 /// Host-provided accent palette seeded into the reserved `host.*`
@@ -1145,6 +1154,7 @@ impl VgeEngine {
                 total_bytes: b.total_bytes,
                 buf: vec![0; b.total_bytes as usize],
                 bytes_received: 0,
+                pinned: b.retention == Retention::Manual,
             };
             pending.buf[..data_len as usize].copy_from_slice(&b.data);
             pending.bytes_received = data_len;
@@ -1224,6 +1234,7 @@ impl VgeEngine {
                 source_data,
                 refs: 0,
                 was_referenced: false,
+                pinned: pending.pinned,
             },
         );
         Ok(ChunkAckBody {
@@ -1506,7 +1517,9 @@ impl VgeEngine {
             return;
         };
         img.refs = img.refs.saturating_sub(1);
-        if img.refs == 0 && img.was_referenced {
+        // A pinned (client-managed, §8.2) image is never auto-collected —
+        // only an explicit `DropImage` removes it.
+        if img.refs == 0 && img.was_referenced && !img.pinned {
             self.drop_image_entry(id);
         }
     }
@@ -2167,6 +2180,7 @@ mod tests {
         w.u32(pixels.len() as u32); // total_bytes
         w.u32(0); // chunk_offset
         w.bool(true); // is_last
+        w.u8(0); // retention: Auto (§8.2)
         w.bytes(&pixels);
         w.buf
     }
@@ -2200,6 +2214,7 @@ mod tests {
         w.u32(64); // total_bytes
         w.u32(0);
         w.bool(true); // is_last with not enough data
+        w.u8(0); // retention: Auto (§8.2)
         w.bytes(&[0u8; 16]);
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
@@ -2230,6 +2245,7 @@ mod tests {
         w.u32(4);
         w.u32(0);
         w.bool(true);
+        w.u8(0); // retention: Auto (§8.2)
         w.bytes(&[0u8; 4]);
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &w.buf);
@@ -2287,6 +2303,7 @@ mod tests {
         w.u32(total_bytes);
         w.u32(chunk_offset);
         w.bool(is_last);
+        w.u8(0); // retention: Auto (§8.2)
         w.bytes(data);
         w.buf
     }
@@ -3318,6 +3335,7 @@ mod tests {
         w.u32(data.len() as u32);
         w.u32(0);
         w.bool(true);
+        w.u8(0); // retention: Auto (§8.2)
         w.bytes(&data);
         w.buf
     }
@@ -3556,6 +3574,97 @@ mod tests {
         );
         engine.process_pty_chunk(&build_envelope(&frames));
         assert!(engine.state.elements().contains_key("widget"));
+    }
+
+    #[test]
+    fn pinned_image_survives_going_unreferenced_but_auto_does_not() {
+        use vge_protocol::codec::{Point, Rect};
+        use vge_protocol::command::{
+            Command, CreateElementBody, DrawCmd, OriginAnchor, Retention, UpdateCommandsBody,
+            UploadImageBody,
+        };
+        use vge_protocol::encode::build_envelope as enc;
+        use vge_protocol::frame::REQ_ID_NO_RESPONSE as NR;
+
+        let upload = |id: &str, r: Retention| {
+            Command::UploadImage(UploadImageBody {
+                id: id.into(),
+                encoding: 0x01,
+                retention: r,
+                width: 2,
+                height: 2,
+                total_bytes: 16,
+                chunk_offset: 0,
+                is_last: true,
+                data: vec![255u8; 16],
+            })
+        };
+        let draw = |img: &str| DrawCmd::DrawImage {
+            target_rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
+            image_id: img.into(),
+            source_rect: None,
+        };
+        let elem = |id: &str, img: &str| {
+            Command::CreateElement(CreateElementBody {
+                id: id.into(),
+                commands: vec![draw(img)],
+                origin: Point { x: 0.0, y: 0.0 },
+                is_visible: true,
+                draw_order: 0,
+                parent: None,
+                size: None,
+                transform: None,
+                anchor: OriginAnchor::Viewport,
+            })
+        };
+        let clear = |id: &str| {
+            Command::UpdateCommands(UpdateCommandsBody { id: id.into(), commands: vec![] })
+        };
+
+        let mut e = VgeEngine::new((9, 20), 1.0);
+        e.process_pty_chunk(&enc(&[
+            (upload("pin", Retention::Manual), NR),
+            (upload("auto", Retention::Auto), NR),
+            (elem("a", "pin"), NR),
+            (elem("b", "auto"), NR),
+        ]));
+        // Both drawn: both alive.
+        assert!(e.state.shared.images.contains_key("pin"));
+        assert!(e.state.shared.images.contains_key("auto"));
+
+        // Navigate away: neither element draws its image any more.
+        e.process_pty_chunk(&enc(&[(clear("a"), NR), (clear("b"), NR)]));
+        assert!(e.state.shared.images.contains_key("pin"), "pinned survives");
+        assert!(
+            !e.state.shared.images.contains_key("auto"),
+            "auto is GC'd once unreferenced"
+        );
+
+        // Navigate back: the pinned image re-references cleanly; the auto
+        // one is gone, so drawing it again is rejected (atomic, §7.5) and
+        // the element keeps its empty command list.
+        e.process_pty_chunk(&enc(&[
+            (Command::UpdateCommands(UpdateCommandsBody {
+                id: "a".into(),
+                commands: vec![draw("pin")],
+            }), NR),
+            (Command::UpdateCommands(UpdateCommandsBody {
+                id: "b".into(),
+                commands: vec![draw("auto")],
+            }), NR),
+        ]));
+        assert_eq!(e.state.elements().get("a").unwrap().commands.len(), 1);
+        assert!(e.state.elements().get("b").unwrap().commands.is_empty());
+
+        // A pinned image is still explicitly droppable.
+        e.process_pty_chunk(&enc(&[(Command::DropImage { id: "pin".into() }, NR)]));
+        // "a" still references it, so the DropImage is refused while in use
+        // (§8) — the image stays. Drop the referencing element first.
+        e.process_pty_chunk(&enc(&[
+            (Command::DeleteElement { id: "a".into() }, NR),
+            (Command::DropImage { id: "pin".into() }, NR),
+        ]));
+        assert!(!e.state.shared.images.contains_key("pin"), "explicit drop frees a pin");
     }
 
     #[test]

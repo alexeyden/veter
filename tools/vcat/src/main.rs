@@ -356,6 +356,7 @@ fn upload_one(
         let is_last = i == num_chunks - 1;
         let chunk_data = payload[offset as usize..end as usize].to_vec();
         let chunk_cmd = Command::UploadImage(UploadImageBody {
+            retention: vge_protocol::command::Retention::Auto,
             id: img_id.to_string(),
             encoding,
             width: placement.target_px_w,

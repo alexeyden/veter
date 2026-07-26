@@ -273,6 +273,43 @@ pub struct UpdateTextBody {
     pub replacement: String,
 }
 
+/// Image lifetime policy (§8.2), chosen by the uploader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Retention {
+    /// Reference-counted: the terminal drops the image automatically once
+    /// no element draws it — i.e. the moment its reference count falls to
+    /// zero after having been positive. The right choice for a one-shot
+    /// display that scrolls away and is never referenced again.
+    #[default]
+    Auto,
+    /// Client-managed: never auto-dropped. The image lives until an
+    /// explicit `DropImage` (or a table reset). For clients that keep a
+    /// cache of images and reference them intermittently — a thumbnail
+    /// grid that pages images on and off screen, say — where auto-GC
+    /// would collect an image between the moment it leaves view and the
+    /// moment it comes back, failing the re-reference.
+    Manual,
+}
+
+impl Retention {
+    /// Wire byte (§8.2): 0 = Auto, 1 = Manual.
+    pub fn wire(self) -> u8 {
+        match self {
+            Retention::Auto => 0,
+            Retention::Manual => 1,
+        }
+    }
+
+    /// Decode a wire byte, or `None` for an unknown value.
+    pub fn from_wire(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Retention::Auto),
+            1 => Some(Retention::Manual),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadImageBody {
     pub id: String,
@@ -280,6 +317,9 @@ pub struct UploadImageBody {
     /// decide whether the encoding is supported and surface
     /// `err_image_decode` / `err_bad_payload` cleanly.
     pub encoding: u8,
+    /// Lifetime policy (§8.2). Read from every chunk; the terminal
+    /// applies it when the image is finalized on the last chunk.
+    pub retention: Retention,
     pub width: u32,
     pub height: u32,
     /// Total payload size in bytes (all chunks summed). Repeated in
@@ -810,6 +850,7 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             let total_bytes = r.u32()?;
             let chunk_offset = r.u32()?;
             let is_last = r.bool()?;
+            let retention = Retention::from_wire(r.u8()?).ok_or(ERR_BAD_PAYLOAD)?;
             let data = r.bytes()?.to_vec();
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
@@ -817,6 +858,7 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             Ok(Command::UploadImage(UploadImageBody {
                 id,
                 encoding,
+                retention,
                 width,
                 height,
                 total_bytes,

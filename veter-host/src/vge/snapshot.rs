@@ -190,6 +190,11 @@ fn encode_uploaded_image(img: &UploadedImage, w: &mut Writer) {
     w.u32(img.width);
     w.u32(img.height);
     w.u8(img.source_encoding);
+    // Retention is intrinsic to the image (unlike `refs`, which is
+    // recomputed from the element tables on restore), so it must ride
+    // the snapshot or a reattached renderer would auto-GC a pinned
+    // cache. One byte, before the payload.
+    w.u8(if img.pinned { 1 } else { 0 });
     w.bytes(&img.source_data);
     // GPU handle is renderer-private. `pixels` is the decoded form of
     // `source_data` and the renderer recomputes it lazily — we don't
@@ -200,6 +205,7 @@ fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError>
     let width = r.u32()?;
     let height = r.u32()?;
     let source_encoding = r.u8()?;
+    let pinned = r.u8()? != 0;
     let source_data = r.bytes()?.to_vec();
     // Decode the bytes to populate `pixels` on the receiving side so the
     // renderer doesn't have to redo it from scratch the first time it
@@ -222,6 +228,7 @@ fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError>
         // are in place; see `recompute_image_refs`.
         refs: 0,
         was_referenced: false,
+        pinned,
     })
 }
 

@@ -203,9 +203,15 @@ impl Thumbs {
             .insert(path, (stamp, Slot::Ready { image_id, w, h }));
     }
 
-    /// Image ids to `DropImage` because the cache is over budget. Tiles
-    /// currently on screen (`keep`) are never evicted, so scrolling back
-    /// and forth over a small directory never thrashes.
+    /// Image ids to `DropImage` because the cache is over budget. The
+    /// thumbnails are uploaded with `Retention::Manual`, so the host
+    /// keeps them across navigation/scroll and never GCs them — which is
+    /// what makes paging them on and off screen work, but also means
+    /// their lifetime is ours to manage: this LRU frees the coldest once
+    /// past `max_live`. Tiles currently on screen (`keep`) are never
+    /// evicted, so scrolling back and forth over a small directory never
+    /// thrashes; a thumbnail dropped here is simply re-decoded and
+    /// re-uploaded if the user revisits it.
     pub fn evict(&mut self, keep: &[PathBuf]) -> Vec<String> {
         let mut drops = Vec::new();
         let live = self
@@ -234,7 +240,6 @@ impl Thumbs {
         }
         drops
     }
-
 }
 
 /// Decode `path` (or one frame of it, for video) and downscale it so its

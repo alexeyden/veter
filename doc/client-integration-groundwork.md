@@ -197,6 +197,18 @@ drop at zero; or add an explicit "drop when unreferenced" flag on
 the client's responsibility, which in practice means content-addressed
 image IDs so re-display reuses one slot.
 
+**Resolved.** Refcount-and-drop-at-zero shipped first, which fixed the
+leak but broke *caching* clients: a refcounted image is collected the
+instant it goes unreferenced, so a thumbnail grid (vfm) paging images on
+and off screen had its `UpdateCommands` rejected with `err_unknown_image`
+the moment a tile left and re-entered view. The fix is a per-upload
+**retention** policy (VGE §8.0/§8.2): `Auto` keeps the refcount-drop
+default (one-shot clients, zero bookkeeping); `Manual` pins the image so
+only an explicit `DropImage` removes it (caching clients own their
+lifetime). There is deliberately no pressure-based eviction — `max_images`
+stays a hard ceiling — so a Manual client must `DropImage` its own cold
+entries (vfm does, via an LRU keyed on what is on screen).
+
 ## 7. Limits discovery for clients that cannot read replies
 
 `max_image_bytes`, `max_images`, `supported_image_encodings` and

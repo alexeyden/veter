@@ -21,6 +21,6 @@ pub use apc::TerminalEvent;
 pub use codec::{Point, Reader, Rect, Transform, Writer};
 pub use command::{
     Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FontStyle, Style,
-    UpdateCommandBody, UpdateCommandsBody, UpdateTextBody, UpdateTextRange,
+    Retention, UpdateCommandBody, UpdateCommandsBody, UpdateTextBody, UpdateTextRange,
 };
 pub use path::{PathNode, PathSegment};

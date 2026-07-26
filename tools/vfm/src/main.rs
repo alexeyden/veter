@@ -35,7 +35,8 @@ use anyhow::{Result, anyhow, bail};
 
 use vge_protocol::codec::Point;
 use vge_protocol::command::{
-    Color, Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, UpdateCommandsBody, UploadImageBody,
+    Color, Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, Retention,
+    UpdateCommandsBody, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -212,6 +213,7 @@ struct Column {
 /// Which panes need their command list pushed this frame.
 #[derive(Default, Clone, Copy)]
 struct Dirty {
+    bg: bool,
     columns: bool,
     grid: bool,
     status: bool,
@@ -221,6 +223,7 @@ struct Dirty {
 impl Dirty {
     fn all() -> Self {
         Dirty {
+            bg: true,
             columns: true,
             grid: true,
             status: true,
@@ -976,6 +979,11 @@ impl App {
                 VgeCommand::UploadImage(UploadImageBody {
                     id: id.clone(),
                     encoding,
+                    // Manual retention: the host keeps the thumbnail across
+                    // navigation and scroll (no auto-GC when it leaves
+                    // view), so re-referencing it never fails. We free the
+                    // coldest ones ourselves via the LRU `DropImage` below.
+                    retention: Retention::Manual,
                     width: d.w,
                     height: d.h,
                     total_bytes: payload.len() as u32,
@@ -1032,7 +1040,11 @@ impl App {
         self.rebuild_columns();
         self.relayout();
         self.clamp_cursor();
-        self.needs_rebuild = true;
+        // Every pane is a top-level element drawing at absolute cell
+        // coordinates, so a resize is just fresh command lists — no
+        // recreate, and crucially no `ClearAll`, which (under image
+        // refcounting) would drop every cached thumbnail by deleting the
+        // keeper along with everything else.
         self.dirty = Dirty::all();
     }
 
@@ -1152,8 +1164,10 @@ impl App {
         if self.needs_rebuild {
             self.needs_rebuild = false;
             self.modal_live.clear();
-            // ClearAll drops elements, not uploaded images, so the
-            // thumbnail cache survives a resize.
+            // One-time element creation. `ClearAll` is safe here (nothing
+            // is uploaded yet); afterwards the panes are only updated in
+            // place, never recreated — a resize is just fresh command
+            // lists — so pinned thumbnails are never disturbed.
             cmds.push((VgeCommand::ClearAll, REQ_ID_NO_RESPONSE));
             cmds.push(create(ID_BG, render::backdrop(&self.layout), ORDER_BG));
             for (i, id) in ID_COLS.iter().enumerate() {
@@ -1167,6 +1181,9 @@ impl App {
             };
         }
 
+        if self.dirty.bg {
+            cmds.push(update(ID_BG, render::backdrop(&self.layout)));
+        }
         if self.dirty.columns {
             for (i, id) in ID_COLS.iter().enumerate() {
                 cmds.push(update(id, self.column_commands(i)));
@@ -1802,13 +1819,17 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_rebuilds_the_element_tree() {
+    fn a_resize_relayouts_and_repaints_in_place() {
         let d = tmpdir("resize");
         let mut app = app_in(&d);
-        app.needs_rebuild = false;
+        app.needs_rebuild = false; // past the one-time startup build
+        app.dirty = Dirty::default();
         app.resize(80, 24);
-        assert!(app.needs_rebuild);
         assert_eq!(app.layout.cols, 80);
+        // No recreate — the panes (and any pinned thumbnails) survive; a
+        // resize is just fresh command lists for the existing elements.
+        assert!(!app.needs_rebuild);
+        assert!(app.dirty.bg && app.dirty.grid && app.dirty.columns);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -381,6 +381,7 @@ fn write_upload_image(w: &mut Writer, b: &UploadImageBody) {
     w.u32(b.total_bytes);
     w.u32(b.chunk_offset);
     w.bool(b.is_last);
+    w.u8(b.retention.wire());
     w.bytes(&b.data);
 }
 
@@ -634,6 +635,7 @@ mod tests {
             0xFF, 0xFF,
         ];
         roundtrip(Command::UploadImage(UploadImageBody {
+            retention: crate::command::Retention::Auto,
             id: "logo".into(),
             encoding: 0x01,
             width: 2,
@@ -651,6 +653,7 @@ mod tests {
         // fake byte buffer; round-trip just compares bytes.
         let data: Vec<u8> = (0..200).map(|i| (i & 0xFF) as u8).collect();
         roundtrip(Command::UploadImage(UploadImageBody {
+            retention: crate::command::Retention::Auto,
             id: "frame".into(),
             encoding: 0x02,
             width: 16,
@@ -666,6 +669,7 @@ mod tests {
     fn upload_image_chunked_roundtrip() {
         // Mid-stream chunk: not first (offset > 0), not last.
         roundtrip(Command::UploadImage(UploadImageBody {
+            retention: crate::command::Retention::Auto,
             id: "stream".into(),
             encoding: 0x01,
             width: 100,

@@ -733,6 +733,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
             }
             let total = data.len() as u32;
             Command::UploadImage(UploadImageBody {
+                retention: vge_protocol::command::Retention::Auto,
                 id: a.id,
                 encoding: 0x01,
                 width: a.width,
@@ -751,6 +752,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
                 .context("decoding WebP for dimension check")?;
             let total = data.len() as u32;
             Command::UploadImage(UploadImageBody {
+                retention: vge_protocol::command::Retention::Auto,
                 id: a.id,
                 encoding: 0x02,
                 width: img.width(),
