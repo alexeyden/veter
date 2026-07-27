@@ -1585,7 +1585,11 @@ impl VgeEngine {
             .shared
             .images
             .iter()
-            .filter(|(_, img)| img.refs == 0 && img.was_referenced)
+            // A pinned (client-managed, §8.2) image is never auto-collected,
+            // same rule as `release_image` — otherwise a `ClearAll` (which
+            // recomputes every image to zero refs) would drop a cache the
+            // client still intends to reuse.
+            .filter(|(_, img)| img.refs == 0 && img.was_referenced && !img.pinned)
             .map(|(k, _)| k.clone())
             .collect();
         for id in dead {
@@ -3655,6 +3659,19 @@ mod tests {
         ]));
         assert_eq!(e.state.elements().get("a").unwrap().commands.len(), 1);
         assert!(e.state.elements().get("b").unwrap().commands.is_empty());
+
+        // A pinned image also survives `ClearAll` (which recomputes every
+        // image to zero refs) — the case that broke vfm's suspend/restore
+        // when opening a file: the grid was cleared, the pin collected,
+        // then the rebuilt grid could not re-reference it.
+        e.process_pty_chunk(&enc(&[(Command::ClearAll, NR)]));
+        assert!(
+            e.state.shared.images.contains_key("pin"),
+            "pinned survives ClearAll"
+        );
+        // Rebuild an element that draws it — must still resolve.
+        e.process_pty_chunk(&enc(&[(elem("a", "pin"), NR)]));
+        assert_eq!(e.state.elements().get("a").unwrap().commands.len(), 1);
 
         // A pinned image is still explicitly droppable.
         e.process_pty_chunk(&enc(&[(Command::DropImage { id: "pin".into() }, NR)]));
