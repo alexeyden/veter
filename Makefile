@@ -25,6 +25,13 @@ EXAMPLE_CONFIG_SRC := $(CURDIR)/assets/config.toml
 EXAMPLE_CONFIG_DST := $(PREFIX)/share/veter/config.example.toml
 USER_CONFIG_DST := $(CONFIGDIR)/config.toml
 
+# vfm has its own config (file-open rules), same install rules: reference
+# copy always refreshed, live copy only written when absent.
+VFM_CONFIGDIR ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/vfm
+VFM_EXAMPLE_CONFIG_SRC := $(CURDIR)/assets/vfm-config.toml
+VFM_EXAMPLE_CONFIG_DST := $(PREFIX)/share/vfm/config.example.toml
+VFM_USER_CONFIG_DST := $(VFM_CONFIGDIR)/config.toml
+
 # Raster sizes installed for desktop menus that don't pick up the
 # scalable SVG (KDE Plasma's menu cache, GTK older versions, etc).
 ICON_PNG_SIZES := 16 32 48 64 128 256
@@ -169,6 +176,16 @@ install-config:
 	    $(INSTALL) -m 0644 "$(EXAMPLE_CONFIG_SRC)" "$(USER_CONFIG_DST)"; \
 	    echo "    config.toml -> $(USER_CONFIG_DST)"; \
 	fi
+	@$(INSTALL) -d "$(dir $(VFM_EXAMPLE_CONFIG_DST))"
+	@$(INSTALL) -m 0644 "$(VFM_EXAMPLE_CONFIG_SRC)" "$(VFM_EXAMPLE_CONFIG_DST)"
+	@echo "    vfm config.example.toml -> $(VFM_EXAMPLE_CONFIG_DST)"
+	@if [ -f "$(VFM_USER_CONFIG_DST)" ]; then \
+	    echo "    vfm config.toml already at $(VFM_USER_CONFIG_DST) (left unchanged)"; \
+	else \
+	    $(INSTALL) -d "$(VFM_CONFIGDIR)"; \
+	    $(INSTALL) -m 0644 "$(VFM_EXAMPLE_CONFIG_SRC)" "$(VFM_USER_CONFIG_DST)"; \
+	    echo "    vfm config.toml -> $(VFM_USER_CONFIG_DST)"; \
+	fi
 
 uninstall:
 	@for pkg in $(PACKAGES); do \
@@ -181,8 +198,14 @@ uninstall:
 	@if [ -f "$(EXAMPLE_CONFIG_DST)" ]; then \
 	    rm -f "$(EXAMPLE_CONFIG_DST)" && echo "    removed $(EXAMPLE_CONFIG_DST)"; \
 	fi
+	@if [ -f "$(VFM_EXAMPLE_CONFIG_DST)" ]; then \
+	    rm -f "$(VFM_EXAMPLE_CONFIG_DST)" && echo "    removed $(VFM_EXAMPLE_CONFIG_DST)"; \
+	fi
 	@if [ -f "$(USER_CONFIG_DST)" ]; then \
 	    echo "    kept user config $(USER_CONFIG_DST) (remove by hand if unwanted)"; \
+	fi
+	@if [ -f "$(VFM_USER_CONFIG_DST)" ]; then \
+	    echo "    kept user config $(VFM_USER_CONFIG_DST) (remove by hand if unwanted)"; \
 	fi
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"

@@ -18,10 +18,12 @@
 //! worker runs copies/moves/deletes ([`ops`]), so neither a directory of
 //! 4000 JPEGs nor a multi-gigabyte copy stops the grid repainting.
 
+mod config;
 mod entry;
 mod icons;
 mod layout;
 mod ops;
+mod open;
 mod preview;
 mod render;
 mod thumbs;
@@ -51,6 +53,7 @@ use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
 use vge_ui::picker::{FilterMode, Picker, PickerItem, PickerOutcome};
 use vge_ui::theme;
 
+use config::{Config, ResolvedOpen};
 use entry::{Entry, ListOpts, Sort, read_dir};
 use layout::{DEFAULT_TILE_ZOOM, Layout, TILE_WIDTHS};
 use ops::{Op, Runner};
@@ -132,6 +135,7 @@ enum Cmd {
     Reload,
     ZoomIn,
     ZoomOut,
+    Open,
     Preview,
     MarkAll,
     MarkInvert,
@@ -163,7 +167,8 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("reload", "Ctrl+R", Cmd::Reload),
     ("zoom-in", "+", Cmd::ZoomIn),
     ("zoom-out", "-", Cmd::ZoomOut),
-    ("preview", "Enter", Cmd::Preview),
+    ("open", "Enter", Cmd::Open),
+    ("preview", "i", Cmd::Preview),
     ("mark-all", "V", Cmd::MarkAll),
     ("mark-invert", "v", Cmd::MarkInvert),
     ("mark-clear", "U", Cmd::MarkClear),
@@ -246,6 +251,12 @@ struct App {
     memory: HashMap<PathBuf, PathBuf>,
     opts: ListOpts,
     zoom: usize,
+    config: Config,
+    /// An open the event loop should perform: `main` owns the terminal,
+    /// so it drains this after handling input (an in-terminal open needs
+    /// to suspend/restore raw mode + the VGE UI, which the App can't do
+    /// itself).
+    pending_open: Option<ResolvedOpen>,
 
     cols: u32,
     rows: u32,
@@ -268,7 +279,15 @@ struct App {
 }
 
 impl App {
-    fn new(cwd: PathBuf, opts: ListOpts, cols: u32, rows: u32, cell_pw: f32, cell_ph: f32) -> Self {
+    fn new(
+        cwd: PathBuf,
+        opts: ListOpts,
+        config: Config,
+        cols: u32,
+        rows: u32,
+        cell_pw: f32,
+        cell_ph: f32,
+    ) -> Self {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).clamp(1, 4))
             .unwrap_or(2);
@@ -285,6 +304,8 @@ impl App {
             memory: HashMap::new(),
             opts,
             zoom: DEFAULT_TILE_ZOOM,
+            config,
+            pending_open: None,
             cols,
             rows,
             cell_pw,
@@ -474,15 +495,53 @@ impl App {
         self.reload();
     }
 
-    /// `l` / Enter: descend into a directory, preview anything else.
+    /// `l` / Enter: descend into a directory, open anything else with
+    /// its configured program (`i` is the in-app preview).
     fn activate(&mut self) {
         let Some(e) = self.current() else { return };
         if e.is_dir() {
             let path = e.path.clone();
             self.cd(path);
         } else {
-            self.open_preview();
+            self.open_file();
         }
+    }
+
+    /// Queue an external open for the entry under the cursor. `main`
+    /// performs it after the event loop (it owns the terminal). A file
+    /// type with no handler is a no-op.
+    fn open_file(&mut self) {
+        let Some(e) = self.current() else { return };
+        match self.config.resolve(e) {
+            Some(open) => self.pending_open = Some(open),
+            None => self.warn("nothing to open".into()),
+        }
+    }
+
+    /// Palette `:open` handler. With no arguments it opens via the config
+    /// (like Enter). With arguments it's a one-off: `open <cmd>` runs the
+    /// command detached, `open -t <cmd>` in this terminal; `%` expands to
+    /// the file (appended if omitted), e.g. `open mpv`, `open -t vim`,
+    /// `open feh -. %`.
+    fn open_with_args(&mut self, args: &[String]) {
+        if args.is_empty() {
+            self.open_file();
+            return;
+        }
+        let Some(e) = self.current().cloned() else {
+            self.warn("nothing to open".into());
+            return;
+        };
+        let (terminal, rest) = match args.split_first() {
+            Some((flag, rest)) if flag == "-t" => (true, rest),
+            _ => (false, args),
+        };
+        if rest.is_empty() {
+            self.warn("open -t needs a command".into());
+            return;
+        }
+        let template = rest.join(" ");
+        self.pending_open = Some(config::resolve_command(&template, terminal, &e.path));
     }
 
     // ── modes ────────────────────────────────────────────────────────
@@ -539,6 +598,7 @@ impl App {
         match cmd {
             Cmd::Quit => self.quit = true,
             Cmd::Help => self.open_help(),
+            Cmd::Open => self.open_file(),
             Cmd::Preview => self.open_preview(),
             Cmd::Reload => {
                 self.reload();
@@ -725,6 +785,7 @@ impl App {
 
             Event::Key('h') | Event::Backspace => self.go_parent(),
             Event::Key('l') | Event::Enter => self.activate(),
+            Event::Key('i') => self.run_cmd(Cmd::Preview),
             Event::Key('~') => self.run_cmd(Cmd::GoHome),
 
             Event::Key(' ') => {
@@ -913,9 +974,14 @@ impl App {
             PickerOutcome::Cancel => self.set_mode(Mode::Normal),
             PickerOutcome::Commit => {
                 let cmd = picker.current_item().map(|it| it.payload);
+                // `:open` consumes the rest of the line as a one-off
+                // command; every other command ignores its args.
+                let args = picker.args();
                 self.set_mode(Mode::Normal);
-                if let Some(cmd) = cmd {
-                    self.run_cmd(cmd);
+                match cmd {
+                    Some(Cmd::Open) => self.open_with_args(&args),
+                    Some(other) => self.run_cmd(other),
+                    None => {}
                 }
             }
         }
@@ -1274,7 +1340,8 @@ fn help_lines() -> Vec<String> {
         "",
         "Navigate",
         "  h / Backspace   go to the parent directory",
-        "  l / Enter       enter a directory, or preview a file",
+        "  l / Enter       enter a directory, or open a file",
+        "  i               preview the file in-app (no external program)",
         "  ← / →           previous / next entry",
         "  j / k, ↑ / ↓    down / up one row of tiles",
         "  PgUp / PgDn     one screen of tiles",
@@ -1303,6 +1370,8 @@ fn help_lines() -> Vec<String> {
         "",
         "Other",
         "  :               command palette (type to filter, Enter runs)",
+        "  :open CMD       open the file with a one-off command (detached)",
+        "  :open -t CMD    …run it in this terminal (editor / TUI); % = the file",
         "  ?               this help",
         "  q               quit",
         "",
@@ -1326,6 +1395,7 @@ options:
   -a, --hidden          show dotfiles from the start
   -A, --accent COLOR    chrome accent (name or #rrggbb); overrides the
                         terminal's themed accent
+  -c, --config PATH     config file (default: ~/.config/vfm/config.toml)
   -h, --help            show this help
 ";
 
@@ -1333,12 +1403,14 @@ struct Args {
     path: PathBuf,
     hidden: bool,
     accent: Option<u32>,
+    config: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Option<Args>> {
     let mut path: Option<PathBuf> = None;
     let mut hidden = false;
     let mut accent = None;
+    let mut config = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1356,6 +1428,13 @@ fn parse_args() -> Result<Option<Args>> {
                     theme::parse_accent_color(&s["--accent=".len()..]).map_err(|e| anyhow!(e))?,
                 );
             }
+            "-c" | "--config" => {
+                let v = it.next().ok_or_else(|| anyhow!("--config needs a path"))?;
+                config = Some(PathBuf::from(v));
+            }
+            s if s.starts_with("--config=") => {
+                config = Some(PathBuf::from(&s["--config=".len()..]));
+            }
             s if s.starts_with('-') => bail!("unknown option: {s}"),
             s if path.is_none() => path = Some(PathBuf::from(s)),
             s => bail!("unexpected extra argument: {s}"),
@@ -1369,6 +1448,7 @@ fn parse_args() -> Result<Option<Args>> {
         path,
         hidden,
         accent,
+        config,
     }))
 }
 
@@ -1475,13 +1555,13 @@ fn main() -> Result<()> {
         bail!("not a directory: {}", args.path.display());
     }
 
-    let _raw = RawTty::enable()?;
+    // `raw` is an Option so an in-terminal open can drop it (cooked mode
+    // for the child) and re-enable it afterward. `TermGuard` still does
+    // the final restore regardless of how we leave.
+    let mut raw = Some(RawTty::enable()?);
     let winch = install_sigwinch();
     let mut out = std::io::stdout();
-    // Alt screen, hidden cursor, cleared grid, then button-event mouse
-    // tracking (?1002) in SGR encoding (?1006) — the pair vplay and
-    // vdraw use.
-    out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h")?;
+    out.write_all(ENTER_UI)?;
     out.flush()?;
     let _term = TermGuard;
 
@@ -1495,6 +1575,13 @@ fn main() -> Result<()> {
         theme::set_host_accent(accent);
     }
 
+    let config = match args.config {
+        Some(p) => Config::load(&p),
+        None => config::config_path()
+            .map(|p| Config::load(&p))
+            .unwrap_or_default(),
+    };
+
     let (cols, rows) = term_size();
     let opts = ListOpts {
         show_hidden: args.hidden,
@@ -1503,6 +1590,7 @@ fn main() -> Result<()> {
     let mut app = App::new(
         args.path,
         opts,
+        config,
         cols,
         rows,
         probe.cell_pixel_width.max(1) as f32,
@@ -1539,6 +1627,62 @@ fn main() -> Result<()> {
         app.expire_message();
         app.pump_thumbnails(&mut out)?;
         app.render(&mut out)?;
+
+        if let Some(open) = app.pending_open.take() {
+            perform_open(&mut app, &mut raw, &mut out, &mut parser, open)?;
+        }
+    }
+    Ok(())
+}
+
+/// The escape block that sets vfm's screen up: alt screen, hidden
+/// cursor, clear+home, button-event mouse tracking (?1002) in SGR
+/// encoding (?1006) — the pair vplay/vdraw use.
+const ENTER_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h";
+/// Its inverse: drop VGE elements (caller writes ClearAll separately),
+/// mouse off, cursor on, leave alt screen. Same as `TermGuard::drop`.
+const LEAVE_UI: &[u8] = b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+
+/// Run a resolved open. Detached opens just spawn and return; an
+/// in-terminal open suspends vfm's whole UI (VGE cleared, alt screen and
+/// raw mode dropped so the child owns the tty), waits, then restores and
+/// forces a full repaint. Pinned thumbnails survive the `ClearAll`
+/// (Manual retention), so the rebuilt grid re-references them cleanly.
+fn perform_open(
+    app: &mut App,
+    raw: &mut Option<RawTty>,
+    out: &mut std::io::Stdout,
+    parser: &mut InputParser,
+    open: ResolvedOpen,
+) -> Result<()> {
+    if !open.terminal {
+        if let Err(e) = open::spawn_detached(&open.command) {
+            app.warn(format!("open failed: {e}"));
+        }
+        return Ok(());
+    }
+
+    // Suspend: hand a clean, cooked terminal to the child.
+    out.write_all(&build_envelope(&[(VgeCommand::ClearAll, REQ_ID_NO_RESPONSE)]))?;
+    out.write_all(LEAVE_UI)?;
+    out.flush()?;
+    *raw = None; // restore cooked mode
+
+    let status = open::run_in_terminal(&open.command);
+
+    // Resume: raw mode, our screen, and a full rebuild.
+    *raw = Some(RawTty::enable()?);
+    out.write_all(ENTER_UI)?;
+    out.flush()?;
+    drain_stale_stdin();
+    *parser = InputParser::new();
+    let (cols, rows) = term_size();
+    app.resize(cols, rows);
+    app.needs_rebuild = true;
+    match status {
+        Ok(s) if !s.success() => app.warn(format!("exited with status {s}")),
+        Err(e) => app.warn(format!("open failed: {e}")),
+        _ => {}
     }
     Ok(())
 }
@@ -1555,7 +1699,15 @@ mod tests {
     }
 
     fn app_in(dir: &Path) -> App {
-        App::new(dir.to_path_buf(), ListOpts::default(), 120, 40, 9.0, 20.0)
+        App::new(
+            dir.to_path_buf(),
+            ListOpts::default(),
+            Config::default(),
+            120,
+            40,
+            9.0,
+            20.0,
+        )
     }
 
     #[test]
@@ -1697,11 +1849,11 @@ mod tests {
     }
 
     #[test]
-    fn preview_opens_for_a_file_and_scrolls() {
+    fn i_opens_the_preview_overlay_and_it_scrolls() {
         let d = tmpdir("preview");
         std::fs::write(d.join("a.txt"), "line\n".repeat(200)).unwrap();
         let mut app = app_in(&d);
-        app.on_event(Event::Enter);
+        app.on_event(Event::Key('i'));
         assert!(matches!(app.mode, Mode::Overlay { .. }));
         app.on_event(Event::Key('j'));
         let Mode::Overlay { offset, .. } = &app.mode else {
@@ -1710,6 +1862,66 @@ mod tests {
         assert_eq!(*offset, 1);
         app.on_event(Event::Key('q'));
         assert!(matches!(app.mode, Mode::Normal));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_file_queues_an_open_not_a_preview() {
+        let d = tmpdir("open");
+        std::fs::write(d.join("a.txt"), b"x").unwrap();
+        let mut app = app_in(&d);
+        app.on_event(Event::Enter);
+        assert!(matches!(app.mode, Mode::Normal), "no overlay");
+        let open = app.pending_open.take().expect("an open was queued");
+        // Default text handler runs $EDITOR/vi on the shell-quoted path;
+        // don't assert the editor name (a sibling test mutates $EDITOR).
+        assert!(open.command.ends_with("a.txt'"), "{}", open.command);
+        assert!(open.terminal, "an editor runs in this terminal");
+    }
+
+    #[test]
+    fn palette_open_with_a_one_off_command() {
+        let d = tmpdir("open-with");
+        std::fs::write(d.join("a.bin"), b"x").unwrap();
+        let mut app = app_in(&d);
+
+        // `:open mpv` → detached one-off on the file.
+        app.open_with_args(&["mpv".into()]);
+        let o = app.pending_open.take().unwrap();
+        assert!(o.command.ends_with("a.bin'") && o.command.starts_with("mpv "));
+        assert!(!o.terminal);
+
+        // `:open -t vim` → in-terminal one-off.
+        app.open_with_args(&["-t".into(), "vim".into()]);
+        let o = app.pending_open.take().unwrap();
+        assert!(o.command.starts_with("vim "));
+        assert!(o.terminal);
+
+        // An explicit `%` is honoured, extra args preserved.
+        app.open_with_args(&["feh".into(), "--".into(), "%".into()]);
+        let o = app.pending_open.take().unwrap();
+        assert!(o.command.starts_with("feh -- '") && o.command.ends_with("a.bin'"));
+
+        // `:open` with no args falls back to the config (binary → xdg-open).
+        app.open_with_args(&[]);
+        let o = app.pending_open.take().unwrap();
+        assert!(o.command.starts_with("xdg-open "));
+
+        // `-t` with nothing after it is a no-op with a warning.
+        app.open_with_args(&["-t".into()]);
+        assert!(app.pending_open.is_none());
+        assert!(app.message.as_ref().unwrap().1, "warned");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_directory_navigates_and_queues_nothing() {
+        let d = tmpdir("open-dir");
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let mut app = app_in(&d);
+        app.on_event(Event::Enter); // cursor is on `sub`
+        assert_eq!(app.cwd, d.join("sub"));
+        assert!(app.pending_open.is_none());
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -1745,7 +1957,7 @@ mod tests {
         app.on_event(click);
         assert_eq!(app.cursor, 1);
         app.on_event(click);
-        assert!(matches!(app.mode, Mode::Overlay { .. }), "opened a preview");
+        assert!(app.pending_open.is_some(), "second click queued an open");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

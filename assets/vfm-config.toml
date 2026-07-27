@@ -1,0 +1,65 @@
+# vfm configuration.
+#
+# Location: $XDG_CONFIG_HOME/vfm/config.toml
+#           (falls back to ~/.config/vfm/config.toml)
+#           override with `vfm --config PATH`
+#
+# Every setting is optional. Anything left commented keeps its built-in
+# default — the value shown after each `#` below. A missing file is
+# silent; a malformed one logs one line to stderr and falls back to the
+# built-in defaults, so a typo never stops vfm from starting.
+
+# ---------------------------------------------------------------------------
+# Opening files
+# ---------------------------------------------------------------------------
+# Pressing Enter / `l` (or clicking a selected tile) opens the file under
+# the cursor with the program chosen here. (`i` still previews in-app; a
+# directory is entered, not opened.)
+#
+# For a one-off program without touching this file, use the command
+# palette: `:open mpv` (detached), `:open -t vim` (in this terminal). The
+# same `%` rule applies; with no argument `:open` uses the rules below.
+#
+# Each rule is `{ command = "...", terminal = true|false }`:
+#
+#   command   A shell command line (run via `$SHELL -c`, so $EDITOR,
+#             pipes and globs work). Each `%` is replaced by the file
+#             path, shell-quoted; if there is no `%`, the path is
+#             appended. e.g. "mpv %", "feh --", "gimp %".
+#
+#   terminal  true  → run in this terminal: vfm tears down its UI, hands
+#                     the terminal to the program, and restores when it
+#                     exits. Use for editors, pagers, vplay, mpv --vo=tct.
+#             false → launch detached (its own session, no terminal). Use
+#                     for GUI apps and xdg-open. Default: false.
+#
+# Resolution order for a file:  [open.ext].<extension>
+#                             → [open].<media category>
+#                             → a built-in for that category
+#                             → [open].default
+#                             → xdg-open (detached).
+#
+# The built-in defaults (used when a category is left unset) are:
+#
+#   [open]
+#   image = { command = "vplay %", terminal = true }
+#   video = { command = "vplay %", terminal = true }
+#   text  = { command = "$EDITOR %", terminal = true }   # $VISUAL, $EDITOR, else vi
+#   # audio / archive / binary / anything else:
+#   default = { command = "xdg-open %", terminal = false }
+
+# [open]
+# image   = { command = "vplay %",    terminal = true }
+# video   = { command = "mpv %",      terminal = false }
+# audio   = { command = "mpv %",      terminal = false }
+# text    = { command = "$EDITOR %",  terminal = true }
+# archive = { command = "xdg-open %", terminal = false }
+# binary  = { command = "xdg-open %", terminal = false }
+# default = { command = "xdg-open %", terminal = false }
+
+# Per-extension overrides win over the category rules above. Keys are
+# lowercase extensions without the dot.
+# [open.ext]
+# pdf  = { command = "zathura %",         terminal = false }
+# md   = { command = "glow -p %",         terminal = true  }
+# html = { command = "xdg-open %",        terminal = false }

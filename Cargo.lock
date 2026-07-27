@@ -3073,6 +3073,8 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "prt-protocol",
+ "serde",
+ "toml",
  "vge-protocol",
  "vge-render",
  "vge-ui",
