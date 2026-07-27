@@ -1525,7 +1525,7 @@ with the relevant error code. A non-exhaustive list:
   parenting unsupported.
 
 The reference implementation in this repo SHOULD start with: 4096
-elements, 4096 commands per element, 1 MiB text per command, 32 MiB per
+elements, 4096 commands per element, 1 MiB text per command, 256 MiB per
 image, 1024 concurrent images, 16 levels of parent nesting. These
 numbers can be tuned without breaking the protocol.
 

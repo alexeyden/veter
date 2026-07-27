@@ -29,7 +29,7 @@ use vge_render::tty::{
     RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_and, poll_stdin_until, read_stdin,
     take_sigwinch, winsize,
 };
-use vge_render::upload::{Encoding, choose_encoding, encode_payload};
+use vge_render::upload::{Encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
@@ -151,6 +151,34 @@ fn update_image_el(target: Rect, id: &str, source: Option<Rect>) -> Command {
     })
 }
 
+/// Pick an encoding that also respects the host's advertised
+/// `max_image_bytes` (0 = no limit): raw locally, but fall back to lossy
+/// WebP when a raw payload would exceed the limit — a full-resolution
+/// still or frame can (raw RGBA is `w*h*4` bytes). Errors only if raw is
+/// over-limit and the host does not support WebP.
+fn pick_encoding(
+    w: u32,
+    h: u32,
+    supported: u8,
+    ssh: bool,
+    max_image_bytes: u32,
+) -> Result<Encoding> {
+    let raw_bytes = w as usize * h as usize * 4;
+    let limit = max_image_bytes as usize;
+    let raw_fits = limit == 0 || raw_bytes <= limit;
+    let webp_ok = supported & 0x02 != 0;
+    if (ssh || !raw_fits) && webp_ok {
+        Ok(Encoding::WebpLossy(80.0))
+    } else if raw_fits {
+        Ok(Encoding::Raw)
+    } else {
+        bail!(
+            "raw {w}x{h} image ({raw_bytes} bytes) exceeds the host limit of \
+             {limit} bytes and the host does not support WebP"
+        )
+    }
+}
+
 fn upload_cmd(
     id: &str,
     w: u32,
@@ -158,9 +186,17 @@ fn upload_cmd(
     rgba: Vec<u8>,
     supported: u8,
     ssh: bool,
+    max_image_bytes: u32,
 ) -> Result<Command> {
-    let enc = choose_encoding(supported, ssh, 80.0);
+    let enc = pick_encoding(w, h, supported, ssh, max_image_bytes)?;
     let (encoding, payload) = encode_payload(rgba, w, h, enc)?;
+    if max_image_bytes > 0 && payload.len() > max_image_bytes as usize {
+        bail!(
+            "encoded {w}x{h} image ({} bytes) exceeds the host limit of {} bytes",
+            payload.len(),
+            max_image_bytes
+        );
+    }
     Ok(Command::UploadImage(UploadImageBody {
         retention: vge_protocol::command::Retention::Auto,
         id: id.into(),
@@ -480,32 +516,17 @@ fn queue_frame_upload<W: Write>(
         send(out, &[np(Command::DropImage { id: old.id })]);
     }
 
-    // Raw locally, WebP over SSH — same policy as choose_encoding — but
-    // a full-resolution frame must also fit the host's advertised
-    // max_image_bytes (e.g. raw 4K RGBA is ~33 MB, over the 32 MiB
-    // default), so an over-limit raw payload falls back to WebP too.
-    let raw_bytes = full.w as usize * full.h as usize * 4;
-    let limit = max_image_bytes as usize; // 0 = host advertised no limit
-    let raw_fits = limit == 0 || raw_bytes <= limit;
-    let webp_ok = supported & 0x02 != 0;
-    let enc = if (ssh || !raw_fits) && webp_ok {
-        Encoding::WebpLossy(80.0)
-    } else if raw_fits {
-        Encoding::Raw
-    } else {
-        bail!(
-            "raw {}x{} frame ({raw_bytes} bytes) exceeds the host limit of {limit} bytes and the host does not support WebP",
-            full.w,
-            full.h
-        );
-    };
+    // Same size-aware choice as the still path: raw locally, WebP when a
+    // full-resolution frame would exceed the host's advertised limit.
+    let enc = pick_encoding(full.w, full.h, supported, ssh, max_image_bytes)?;
     let (encoding, payload) = encode_payload(full.rgba.clone(), full.w, full.h, enc)?;
-    if limit > 0 && payload.len() > limit {
+    if max_image_bytes > 0 && payload.len() > max_image_bytes as usize {
         bail!(
-            "encoded {}x{} frame ({} bytes) exceeds the host limit of {limit} bytes",
+            "encoded {}x{} frame ({} bytes) exceeds the host limit of {} bytes",
             full.w,
             full.h,
-            payload.len()
+            payload.len(),
+            max_image_bytes
         );
     }
 
@@ -657,7 +678,15 @@ fn main() -> Result<()> {
         // Upload the native image once; pan/zoom is source_rect-only.
         send(
             &mut out,
-            &[np(upload_cmd(IMG_ID, f.w, f.h, f.rgba, supported, ssh)?)],
+            &[np(upload_cmd(
+                IMG_ID,
+                f.w,
+                f.h,
+                f.rgba,
+                supported,
+                ssh,
+                max_image_bytes,
+            )?)],
         );
         render_image_mode(&mut out, &vp, &mut created_img);
     }

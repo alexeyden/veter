@@ -38,7 +38,11 @@ impl Default for Limits {
             max_elements: 4096,
             max_commands_per_element: 4096,
             max_text_bytes: 1_048_576,
-            max_image_bytes: 32 * 1024 * 1024,
+            // 256 MiB: enough for a full-resolution raw upload of a big
+            // photo (e.g. 8000×8000 RGBA ≈ 244 MB) so an image viewer
+            // needn't re-encode to WebP just to fit. Clients still fall
+            // back to WebP past this.
+            max_image_bytes: 256 * 1024 * 1024,
             max_images: 1024,
             supported_image_encodings: 0b11, // bit0 Raw, bit1 WebP
             max_nesting_depth: 16,
@@ -1757,6 +1761,75 @@ mod tests {
     use super::*;
     use vge_protocol::codec::{stuff, Reader, Writer};
 
+    // Engine-level contract behind vplay's "view an image, quit, view
+    // another" flow: it reuses fixed image ids (`vplay-tex`, …) across
+    // separate runs, dropping them on exit. Reusing an id after a
+    // DropImage + ClearAll — including across the alt-screen round trip —
+    // must leave the second run's image present and drawable. (This
+    // covers the host engine only; the GPU-texture side lives in the
+    // `veter` renderer.)
+    #[test]
+    fn image_id_reused_across_drop_and_alt_screen_stays_drawable() {
+        use vge_protocol::codec::{Point, Rect};
+        use vge_protocol::command::{
+            Command, CreateElementBody, DrawCmd, OriginAnchor, Retention, UploadImageBody,
+        };
+        use vge_protocol::encode::build_envelope as enc;
+        use vge_protocol::frame::REQ_ID_NO_RESPONSE as NR;
+
+        let upload = || Command::UploadImage(UploadImageBody {
+            id: "vplay-tex".into(), encoding: 0x01, retention: Retention::Auto,
+            width: 2, height: 2, total_bytes: 16, chunk_offset: 0, is_last: true,
+            data: vec![255u8; 16],
+        });
+        let img_el = || Command::CreateElement(CreateElementBody {
+            id: "vplay-img".into(),
+            commands: vec![DrawCmd::DrawImage {
+                target_rect: Rect { x: 0.0, y: 0.0, w: 2.0, h: 2.0 },
+                image_id: "vplay-tex".into(), source_rect: None,
+            }],
+            origin: Point { x: 0.0, y: 0.0 }, is_visible: true, draw_order: 1,
+            parent: None, size: None, transform: None, anchor: OriginAnchor::Viewport,
+        });
+        let exit = || enc(&[
+            (Command::DropImage { id: "vplay-tex".into() }, NR),
+            (Command::DropImage { id: "vplay-fa".into() }, NR),
+            (Command::DropImage { id: "vplay-fb".into() }, NR),
+            (Command::ClearAll, NR),
+        ]);
+
+        let mut e = VgeEngine::new((9, 20), 1.0);
+        let mut parser = vt100::Parser::new(20, 40, 100);
+        e.after_vt100_process(&mut parser);
+
+        let mut run = |e: &mut VgeEngine, parser: &mut vt100::Parser<_>| {
+            // vplay startup: enter alt screen (its own flushed write).
+            parser.process(b"\x1b[?1049h");
+            e.after_vt100_process(parser);
+            // then upload + create the image element.
+            e.process_pty_chunk(&enc(&[(upload(), NR), (img_el(), NR)]));
+        };
+
+        // --- run 1 ---
+        run(&mut e, &mut parser);
+        assert!(e.state.shared.images.contains_key("vplay-tex"), "run1 uploaded");
+        assert_eq!(e.state.elements().get("vplay-img").map(|el| el.commands.len()), Some(1));
+        // exit: DropImage + ClearAll (still on alt), then leave alt.
+        e.process_pty_chunk(&exit());
+        parser.process(b"\x1b[?1049l");
+        e.after_vt100_process(&mut parser);
+        assert!(!e.state.shared.images.contains_key("vplay-tex"), "run1 dropped its image");
+
+        // --- run 2 (fresh vplay, same ids) ---
+        run(&mut e, &mut parser);
+        assert!(
+            e.state.shared.images.contains_key("vplay-tex"),
+            "run2 image must be present"
+        );
+        let el = e.state.elements().get("vplay-img").expect("run2 element exists");
+        assert_eq!(el.commands.len(), 1, "run2 image element has its DrawImage");
+    }
+
     fn build_envelope(frames_buf: &[u8]) -> Vec<u8> {
         // Mimics what a client would write to its PTY: ESC _ V G E ...
         // (uppercase marker) with the unstuffed payload byte-stuffed.
@@ -1914,7 +1987,7 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 4096); // max_elements
         assert_eq!(r.u32().unwrap(), 4096); // max_commands_per_element
         assert_eq!(r.u32().unwrap(), 1_048_576); // max_text_bytes
-        assert_eq!(r.u32().unwrap(), 32 * 1024 * 1024); // max_image_bytes
+        assert_eq!(r.u32().unwrap(), 256 * 1024 * 1024); // max_image_bytes
         assert_eq!(r.u32().unwrap(), 1024); // max_images
         assert_eq!(r.u8().unwrap(), 0b11); // supported_image_encodings (Raw|WebP)
     }
