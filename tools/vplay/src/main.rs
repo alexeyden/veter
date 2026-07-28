@@ -20,7 +20,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use vge_protocol::codec::{Point, Rect, Transform};
 use vge_protocol::command::{
-    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style, UpdateCommandBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
+    Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Retention, Style, UpdateCommandBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
@@ -48,6 +48,32 @@ const IMG_ID_A: &str = "vplay-fa";
 const IMG_ID_B: &str = "vplay-fb";
 
 const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
+
+/// Retention for every texture vplay uploads (§8.2).
+///
+/// Manual — vplay owns its textures' lifetimes, because the host's `Auto`
+/// refcount does not survive either of the two things vplay does to a
+/// picture:
+///
+/// * **A resize.** The `SIGWINCH` path sends `ClearAll` and recreates the
+///   chrome, then recreates the image element over the texture it already
+///   uploaded. But `ClearAll` recomputes every `Auto` image to zero refs
+///   and collects it, so the recreate names a texture the host has just
+///   thrown away — `ERR_UNKNOWN_IMAGE`, silent (§4: unrequested commands
+///   get no response), and a blank picture.
+/// * **A same-id swap.** Cycling stills reuses the one still id
+///   (`DropImage`, `UploadImage`, retarget, one envelope) and the
+///   retarget releases the *old* `DrawImage` — which, under `Auto`,
+///   collects the pixels that landed under that id moments earlier. The
+///   video path ping-pongs between two ids instead, so there `Auto`
+///   collects the correct (outgoing) slot, and it is only the explicit
+///   `DropImage` that ends up a no-op.
+///
+/// In exchange every id must be released by hand — which vplay already
+/// does: a swap drops the id it supersedes, `queue_frame_upload` drops a
+/// superseded in-flight upload, and `TermExit` drops all three ids on the
+/// way out. At most two frame textures and one still are ever live.
+const RETENTION: Retention = Retention::Manual;
 
 /// Spinner angular speed, rad/s (§9.12 UpdateTransform). Time-based so
 /// the rotation rate is independent of the loop's variable tick.
@@ -191,16 +217,7 @@ fn pick_encoding(
 }
 
 /// The single-shot upload of a still, under the one still texture id.
-///
-/// Retention is **Manual** (§8.2): the still is client-managed, and the
-/// host's `Auto` refcount is wrong for it twice over. Swapping to a
-/// sibling image re-uses the id — `DropImage`, `UploadImage`, retarget,
-/// one envelope — and the retarget's release of the *old* command would
-/// collect the texture that just landed under that id. And the resize
-/// path's `ClearAll` recomputes every `Auto` image to zero refs, which
-/// collects the texture the element is about to be recreated over.
-/// Pinning is what makes both work; `TermExit` and each swap release the
-/// id explicitly, so nothing leaks.
+/// Pinned — see [`RETENTION`].
 fn upload_cmd(
     id: &str,
     w: u32,
@@ -220,7 +237,7 @@ fn upload_cmd(
         );
     }
     Ok(Command::UploadImage(UploadImageBody {
-        retention: vge_protocol::command::Retention::Manual,
+        retention: RETENTION,
         id: id.into(),
         encoding,
         width: w,
@@ -260,7 +277,10 @@ impl ChunkedUpload {
         let end = (self.offset + UPLOAD_CHUNK_BYTES).min(self.payload.len());
         let is_last = end == self.payload.len();
         let mut cmds = vec![np(Command::UploadImage(UploadImageBody {
-            retention: vge_protocol::command::Retention::Auto,
+            // Pinned, like the still (see `RETENTION`). Only the first
+            // chunk's flag is read by the host, but every chunk carries
+            // the same value so the body is self-consistent.
+            retention: RETENTION,
             id: self.id.clone(),
             encoding: self.encoding,
             width: self.width,
@@ -1111,7 +1131,10 @@ fn main() -> Result<()> {
                 } else if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
                     // After a resize ClearAll the element is gone but the
                     // texture survives in the session image table —
-                    // recreate the element over it, no re-upload.
+                    // recreate the element over it, no re-upload. This is
+                    // the reason frames are pinned: ClearAll's ref
+                    // recompute would collect an `Auto` texture and this
+                    // would name a dead id (see `RETENTION`).
                     send(
                         &mut out,
                         &[np(create_image_el(l.target, &cur_id, Some(l.source)))],
@@ -1143,7 +1166,10 @@ fn main() -> Result<()> {
                 created_img = true;
                 // Retire the texture the element previously referenced
                 // (also covers the one surviving a resize ClearAll), or
-                // the next A/B flip would collide with it.
+                // the next A/B flip would collide with it. Now that
+                // frames are pinned this drop *is* the reclamation —
+                // under `Auto` the retarget above already collected the
+                // outgoing slot and this was a silent no-op.
                 if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
                     fu.push(Command::DropImage { id: cur_id.clone() });
                 }
