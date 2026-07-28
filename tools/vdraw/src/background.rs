@@ -129,6 +129,7 @@ impl Background {
         let mut uploads = vec![(
             Command::DropImage {
                 id: BACKGROUND_ID.into(),
+                by_prefix: false,
             },
             REQ_ID_NO_RESPONSE,
         )];

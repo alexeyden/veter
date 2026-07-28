@@ -322,6 +322,7 @@ impl VgeProgress {
     fn delete_envelope(&self) -> Vec<u8> {
         let del = Command::DeleteElement {
             id: self.element_id.clone(),
+            by_prefix: false,
         };
         build_envelope(&[(del, REQ_ID_NO_RESPONSE)])
     }
@@ -855,7 +856,10 @@ mod tests {
             transform: None,
             anchor: OriginAnchor::Viewport,
         });
-        let del = Command::DeleteElement { id: "p".into() };
+        let del = Command::DeleteElement {
+            id: "p".into(),
+            by_prefix: false,
+        };
         let env = build_envelope(&[
             (create, REQ_ID_NO_RESPONSE),
             (del, REQ_ID_NO_RESPONSE),

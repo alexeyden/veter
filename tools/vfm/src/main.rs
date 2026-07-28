@@ -1068,7 +1068,7 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
         for id in self.thumbs.evict(&keep) {
-            cmds.push((VgeCommand::DropImage { id }, REQ_ID_NO_RESPONSE));
+            cmds.push((VgeCommand::DropImage { id, by_prefix: false }, REQ_ID_NO_RESPONSE));
         }
         if !cmds.is_empty() {
             out.write_all(&build_envelope(&cmds))?;
@@ -1263,7 +1263,7 @@ impl App {
         }
         if self.dirty.modal {
             for id in std::mem::take(&mut self.modal_live) {
-                cmds.push((VgeCommand::DeleteElement { id }, REQ_ID_NO_RESPONSE));
+                cmds.push((VgeCommand::DeleteElement { id, by_prefix: false }, REQ_ID_NO_RESPONSE));
             }
             for el in self.modal_elements() {
                 self.modal_live.push(el.id.clone());

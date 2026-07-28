@@ -352,7 +352,11 @@ pub struct UpdateImageBody {
 pub enum Command {
     Probe,
     CreateElement(CreateElementBody),
-    DeleteElement { id: String },
+    /// §6.2. `by_prefix` reinterprets `id` as an id prefix: every element
+    /// on the current screen whose id starts with it is deleted, subtree
+    /// included. An empty prefix matches everything (this is what retired
+    /// `ClearAll`); an empty id is a parse error in the exact form.
+    DeleteElement { id: String, by_prefix: bool },
     UpdateCommands(UpdateCommandsBody),
     UpdateCommand(UpdateCommandBody),
     UpdateText(UpdateTextBody),
@@ -363,10 +367,16 @@ pub enum Command {
     },
     UpdateVisibility { id: String, is_visible: bool },
     UpdateDrawOrder { id: String, draw_order: i32 },
+    /// Retired (§6.7) — superseded by `DeleteElement` with `by_prefix`
+    /// and an empty prefix. Kept only until every client is migrated.
     ClearAll,
     SetGlobalStyle { id: String, style: ConcreteStyle },
     UploadImage(UploadImageBody),
-    DropImage { id: String },
+    /// §8.2. `by_prefix` reinterprets `id` as an id prefix, sweeping
+    /// finalized images and aborting in-progress uploads alike. An empty
+    /// prefix matches the whole table — which both screens share, so it
+    /// reaches further than an element delete does.
+    DropImage { id: String, by_prefix: bool },
     UpdateImage(UpdateImageBody),
     UpdateSize { id: String, new_size: Point },
     UpdateTransform { id: String, transform: Transform },
@@ -383,6 +393,31 @@ fn read_id(r: &mut Reader<'_>, allow_empty: bool) -> DecodeResult<String> {
         return Err(DecodeError::bad_payload());
     }
     Ok(s.to_owned())
+}
+
+/// `bit0` of the flags byte the two prefix-capable commands lead with
+/// (§6.2 / §8.2): the id names a prefix rather than one entry.
+pub const FLAG_BY_PREFIX: u8 = 0b1;
+
+/// Body shared by `DeleteElement` (§6.2) and `DropImage` (§8.2):
+/// a mandatory flags byte, then the id it qualifies.
+///
+/// The byte leads rather than trailing (unlike `CreateElement`'s optional
+/// `extra_flags` block, §9.4) because it decides how the *next* field is
+/// validated: an empty id is legal as a match-everything prefix but a
+/// parse error in the exact form (§6.8). Reading flags first keeps that a
+/// single forward pass with no re-validation.
+fn read_targeted_id(r: &mut Reader<'_>) -> DecodeResult<(String, bool)> {
+    let flags = r.u8()?;
+    if flags & !FLAG_BY_PREFIX != 0 {
+        return Err(DecodeError::bad_payload());
+    }
+    let by_prefix = flags & FLAG_BY_PREFIX != 0;
+    let id = read_id(r, by_prefix)?;
+    if !r.at_end() {
+        return Err(DecodeError::bad_payload());
+    }
+    Ok((id, by_prefix))
 }
 
 fn read_color(r: &mut Reader<'_>) -> DecodeResult<Color> {
@@ -733,11 +768,8 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             }))
         }
         CMD_DELETE_ELEMENT => {
-            let id = read_id(&mut r, false)?;
-            if !r.at_end() {
-                return Err(ERR_BAD_PAYLOAD);
-            }
-            Ok(Command::DeleteElement { id })
+            let (id, by_prefix) = read_targeted_id(&mut r)?;
+            Ok(Command::DeleteElement { id, by_prefix })
         }
         CMD_UPDATE_COMMANDS => {
             let id = read_id(&mut r, false)?;
@@ -868,11 +900,8 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
             }))
         }
         CMD_DROP_IMAGE => {
-            let id = read_id(&mut r, false)?;
-            if !r.at_end() {
-                return Err(ERR_BAD_PAYLOAD);
-            }
-            Ok(Command::DropImage { id })
+            let (id, by_prefix) = read_targeted_id(&mut r)?;
+            Ok(Command::DropImage { id, by_prefix })
         }
         CMD_UPDATE_IMAGE => {
             let id = read_id(&mut r, false)?;

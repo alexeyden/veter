@@ -2356,6 +2356,7 @@ impl State {
                 out.extend(build_vge_envelope(&[(
                     VgeCommand::DeleteElement {
                         id: chrome_element_id(target),
+                        by_prefix: false,
                     },
                     0,
                 )]));
@@ -2393,6 +2394,7 @@ impl State {
                 out.extend(build_vge_envelope(&[(
                     VgeCommand::DeleteElement {
                         id: chrome_element_id(target),
+                        by_prefix: false,
                     },
                     0,
                 )]));
@@ -2826,7 +2828,10 @@ impl State {
                 0,
             )]));
             out.extend(build_vge_envelope(&[(
-                VgeCommand::DeleteElement { id: chrome_element_id(pane) },
+                VgeCommand::DeleteElement {
+                    id: chrome_element_id(pane),
+                    by_prefix: false,
+                },
                 0,
             )]));
         }
@@ -3056,6 +3061,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: chrome_id.clone(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3150,6 +3156,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: SEPARATORS_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3176,6 +3183,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: TABBAR_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3189,6 +3197,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3200,6 +3209,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3225,6 +3235,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3236,6 +3247,7 @@ impl State {
             vge_cmds.push((
                 VgeCommand::DeleteElement {
                     id: MODAL_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));
@@ -3511,6 +3523,7 @@ impl State {
             (
                 VgeCommand::DeleteElement {
                     id: chrome_id.clone(),
+                    by_prefix: false,
                 },
                 0,
             ),
@@ -3624,6 +3637,7 @@ impl State {
             cmds.push((
                 VgeCommand::DeleteElement {
                     id: TABBAR_ELEMENT_ID.into(),
+                    by_prefix: false,
                 },
                 0,
             ));

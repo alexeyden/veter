@@ -617,7 +617,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
     Ok(match cmd {
         Cmd::Probe => Command::Probe,
         Cmd::ClearAll => Command::ClearAll,
-        Cmd::Delete { id } => Command::DeleteElement { id },
+        Cmd::Delete { id } => Command::DeleteElement { id, by_prefix: false },
         Cmd::SetOrigin { id, origin } => Command::UpdateOrigin {
             id,
             origin,
@@ -763,7 +763,7 @@ fn build_command(cmd: Cmd) -> Result<Command> {
                 data,
             })
         }
-        Cmd::DropImage { id } => Command::DropImage { id },
+        Cmd::DropImage { id } => Command::DropImage { id, by_prefix: false },
         Cmd::CreateImage(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
             commands: vec![DrawCmd::DrawImage {

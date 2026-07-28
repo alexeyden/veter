@@ -435,7 +435,7 @@ impl Game {
 
         // Drain brick destructions surfaced during physics.
         for id in self.pending_brick_deletes.drain(..) {
-            cmds.push((Command::DeleteElement { id }, 0));
+            cmds.push((Command::DeleteElement { id, by_prefix: false }, 0));
         }
 
         // Spark update / cleanup. Newly-spawned sparks emit
@@ -474,7 +474,13 @@ impl Game {
                 s.just_spawned = false;
                 alive_sparks.push(s);
             } else if s.life == 0 {
-                cmds.push((Command::DeleteElement { id: s.id.clone() }, 0));
+                cmds.push((
+                    Command::DeleteElement {
+                        id: s.id.clone(),
+                        by_prefix: false,
+                    },
+                    0,
+                ));
             } else {
                 cmds.push((
                     Command::UpdateOrigin {

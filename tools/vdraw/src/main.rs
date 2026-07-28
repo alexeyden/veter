@@ -249,7 +249,7 @@ fn main() -> Result<()> {
                         el.is_deleted = true;
                         let id = el.id.clone();
                         frame_extra
-                            .push((Command::DeleteElement { id }, REQ_ID_NO_RESPONSE));
+                            .push((Command::DeleteElement { id, by_prefix: false }, REQ_ID_NO_RESPONSE));
                         selected = None;
                     }
                     editing = None;
@@ -377,7 +377,7 @@ fn main() -> Result<()> {
                         // the element to still be there.
                         document.elements[i].is_deleted = true;
                         frame_extra
-                            .push((Command::DeleteElement { id }, REQ_ID_NO_RESPONSE));
+                            .push((Command::DeleteElement { id, by_prefix: false }, REQ_ID_NO_RESPONSE));
                         selection_dirty = true;
                     }
                 }
@@ -1122,6 +1122,7 @@ impl Drop for TermExit {
             cmds.push((
                 Command::DropImage {
                     id: background::BACKGROUND_ID.into(),
+                    by_prefix: false,
                 },
                 REQ_ID_NO_RESPONSE,
             ));

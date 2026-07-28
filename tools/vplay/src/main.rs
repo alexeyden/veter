@@ -611,7 +611,7 @@ fn queue_frame_upload<W: Write>(
     // id. Its element retarget never went out, so there is nothing to
     // roll back.
     if let Some(old) = upload.take() {
-        send(out, &[np(Command::DropImage { id: old.id })]);
+        send(out, &[np(Command::DropImage { id: old.id, by_prefix: false })]);
     }
 
     // Same size-aware choice as the still path: raw locally, WebP when a
@@ -994,7 +994,10 @@ fn main() -> Result<()> {
                             send(
                                 &mut out,
                                 &[
-                                    np(Command::DropImage { id: IMG_ID.into() }),
+                                    np(Command::DropImage {
+                                        id: IMG_ID.into(),
+                                        by_prefix: false,
+                                    }),
                                     np(up),
                                     np(el),
                                 ],
@@ -1171,7 +1174,10 @@ fn main() -> Result<()> {
                 // under `Auto` the retarget above already collected the
                 // outgoing slot and this was a silent no-op.
                 if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
-                    fu.push(Command::DropImage { id: cur_id.clone() });
+                    fu.push(Command::DropImage {
+                        id: cur_id.clone(),
+                        by_prefix: false,
+                    });
                 }
                 fu
             } else {
@@ -1370,7 +1376,13 @@ impl Drop for TermExit {
         // therefore silent.
         let env = build_envelope(
             &[IMG_ID, IMG_ID_A, IMG_ID_B]
-                .map(|id| (Command::DropImage { id: id.into() }, REQ_ID_NO_RESPONSE))
+                .map(|id| (
+                    Command::DropImage {
+                        id: id.into(),
+                        by_prefix: false,
+                    },
+                    REQ_ID_NO_RESPONSE,
+                ))
                 .into_iter()
                 .chain([(Command::ClearAll, REQ_ID_NO_RESPONSE)])
                 .collect::<Vec<_>>(),

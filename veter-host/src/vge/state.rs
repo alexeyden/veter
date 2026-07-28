@@ -1018,7 +1018,13 @@ impl VgeEngine {
                 Ok(pb.encode())
             }
             Command::CreateElement(b) => self.cmd_create_element(b, screen),
-            Command::DeleteElement { id } => self.cmd_delete_element(&id),
+            Command::DeleteElement { id, by_prefix } => {
+                if by_prefix {
+                    self.cmd_delete_elements_by_prefix(&id)
+                } else {
+                    self.cmd_delete_element(&id)
+                }
+            }
             Command::UpdateCommands(b) => self.cmd_update_commands(b),
             Command::UpdateCommand(b) => self.cmd_update_command(b),
             Command::UpdateText(b) => self.cmd_update_text(b),
@@ -1040,7 +1046,13 @@ impl VgeEngine {
             }
             Command::SetGlobalStyle { id, style } => self.cmd_set_global_style(id, style),
             Command::UploadImage(b) => self.cmd_upload_image(b),
-            Command::DropImage { id } => self.cmd_drop_image(&id),
+            Command::DropImage { id, by_prefix } => {
+                if by_prefix {
+                    self.cmd_drop_images_by_prefix(&id)
+                } else {
+                    self.cmd_drop_image(&id)
+                }
+            }
             Command::UpdateImage(b) => self.cmd_update_image(b),
             Command::UpdateSize { id, new_size } => self.cmd_update_size(&id, new_size),
             Command::UpdateTransform { id, transform } => {
@@ -1271,6 +1283,40 @@ impl VgeEngine {
         }
     }
 
+    /// §8.2 prefix form: remove every image whose id starts with `prefix`,
+    /// finalized entries and in-progress uploads alike — each pending
+    /// match aborted exactly as an exact `DropImage` aborts one.
+    ///
+    /// An empty prefix matches the whole table. Note that unlike the
+    /// element table this one is shared by both screens (§5.4), so an
+    /// empty prefix reaches further than an element delete does; the spec
+    /// tells clients to use a prefix they own. Matching nothing is `Ok`,
+    /// not `err_unknown_image`, for the same idempotence reason as §6.2.
+    ///
+    /// `DropImage` means "remove now, whatever is referencing it" (§8.0),
+    /// so this ignores retention: a pinned image goes too. Elements still
+    /// naming a dropped id degrade to §7.5 debug fills.
+    fn cmd_drop_images_by_prefix(
+        &mut self,
+        prefix: &str,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        let matches = |id: &String| prefix.is_empty() || id.starts_with(prefix);
+
+        let live: Vec<String> = self
+            .state
+            .shared
+            .images
+            .keys()
+            .filter(|id| matches(id))
+            .cloned()
+            .collect();
+        for id in live {
+            self.drop_image_entry(&id);
+        }
+        self.pending_uploads.retain(|id, _| !matches(id));
+        Ok(Vec::new())
+    }
+
     fn cmd_update_image(
         &mut self,
         b: UpdateImageBody,
@@ -1473,6 +1519,54 @@ impl VgeEngine {
             parent.children.retain(|c| c != id);
         }
         self.delete_subtree(id);
+        Ok(Vec::new())
+    }
+
+    /// §6.2 prefix form: delete every element on the current screen whose
+    /// client id starts with `prefix`, each with its subtree.
+    ///
+    /// An empty prefix matches everything, anonymous elements included —
+    /// the spelling that retired `ClearAll` (§6.7). A non-empty prefix can
+    /// never match an anonymous element, which has no client id to compare
+    /// (`Element::id` is `None`; its storage key is synthetic).
+    ///
+    /// Matching nothing is `Ok`, not `err_unknown_element`: prefix cleanup
+    /// is meant to be idempotent so a client can send it on startup and on
+    /// exit without tracking what it created.
+    ///
+    /// References unwind incrementally through `delete_subtree` rather
+    /// than by `recompute_image_refs`, matching `cmd_delete_element`. Same
+    /// net effect on the image table as the old wholesale recount, and it
+    /// keeps `release_image`'s pinned guard (§8.2) in the path, so a
+    /// `Manual`-retention image survives having its last drawer deleted.
+    fn cmd_delete_elements_by_prefix(
+        &mut self,
+        prefix: &str,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        let matched: Vec<String> = self
+            .state
+            .elements()
+            .iter()
+            .filter(|(_, el)| {
+                prefix.is_empty() || el.id.as_deref().is_some_and(|id| id.starts_with(prefix))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in matched {
+            // A match can be the child of a *non*-matching parent (say
+            // `app.bar` under `app`, deleted by prefix `app.`), so detach
+            // before cascading or the parent keeps a dangling child key.
+            // Both the element and its parent may already be gone via an
+            // earlier iteration's cascade — hence the `if let`s, and
+            // `delete_subtree` returning early on a missing key.
+            let parent_key = self.state.elements().get(&key).and_then(|e| e.parent.clone());
+            if let Some(p) = parent_key
+                && let Some(parent) = self.state.elements_mut().get_mut(&p)
+            {
+                parent.children.retain(|c| c != &key);
+            }
+            self.delete_subtree(&key);
+        }
         Ok(Vec::new())
     }
 
@@ -1792,9 +1886,9 @@ mod tests {
             parent: None, size: None, transform: None, anchor: OriginAnchor::Viewport,
         });
         let exit = || enc(&[
-            (Command::DropImage { id: "vplay-tex".into() }, NR),
-            (Command::DropImage { id: "vplay-fa".into() }, NR),
-            (Command::DropImage { id: "vplay-fb".into() }, NR),
+            (Command::DropImage { id: "vplay-tex".into(), by_prefix: false }, NR),
+            (Command::DropImage { id: "vplay-fa".into(), by_prefix: false }, NR),
+            (Command::DropImage { id: "vplay-fb".into(), by_prefix: false }, NR),
             (Command::ClearAll, NR),
         ]);
 
@@ -2032,6 +2126,7 @@ mod tests {
 
         // Now delete it.
         let mut body = Writer::new();
+        body.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         body.str("rect");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 2, &body.buf);
@@ -2433,6 +2528,7 @@ mod tests {
         // (§8.2: abort). The slot is released and the id is reusable.
         let chunk_a = upload_chunk_body("part", 0x01, 2, 2, 16, 0, false, &[0u8; 8]);
         let mut drop_body = Writer::new();
+        drop_body.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         drop_body.str("part");
         let restart = upload_raw_2x2("part");
 
@@ -2486,6 +2582,7 @@ mod tests {
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &body);
         let mut drop_body = Writer::new();
+        drop_body.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         drop_body.str("logo");
         append_command(&mut frames, CMD_DROP_IMAGE, 2, &drop_body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
@@ -2496,6 +2593,7 @@ mod tests {
     fn drop_unknown_image_errors() {
         let mut engine = VgeEngine::new((9, 20), 1.0);
         let mut w = Writer::new();
+        w.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         w.str("nope");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DROP_IMAGE, 1, &w.buf);
@@ -2630,6 +2728,7 @@ mod tests {
         append_command(&mut frames, CMD_UPLOAD_IMAGE, 1, &upload);
         append_command(&mut frames, CMD_CREATE_ELEMENT, 2, &create);
         let mut drop_body = Writer::new();
+        drop_body.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         drop_body.str("logo");
         append_command(&mut frames, CMD_DROP_IMAGE, 3, &drop_body.buf);
         engine.process_pty_chunk(&build_envelope(&frames));
@@ -2756,6 +2855,7 @@ mod tests {
         assert_eq!(engine.state.elements().len(), 4);
 
         let mut del = Writer::new();
+        del.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         del.str("root");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 5, &del.buf);
@@ -3013,6 +3113,7 @@ mod tests {
 
         // Drop image while on alt; main shouldn't see it on return either.
         let mut drop_body = Writer::new();
+        drop_body.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         drop_body.str("logo");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DROP_IMAGE, 3, &drop_body.buf);
@@ -3747,12 +3848,12 @@ mod tests {
         assert_eq!(e.state.elements().get("a").unwrap().commands.len(), 1);
 
         // A pinned image is still explicitly droppable.
-        e.process_pty_chunk(&enc(&[(Command::DropImage { id: "pin".into() }, NR)]));
+        e.process_pty_chunk(&enc(&[(Command::DropImage { id: "pin".into(), by_prefix: false }, NR)]));
         // "a" still references it, so the DropImage is refused while in use
         // (§8) — the image stays. Drop the referencing element first.
         e.process_pty_chunk(&enc(&[
-            (Command::DeleteElement { id: "a".into() }, NR),
-            (Command::DropImage { id: "pin".into() }, NR),
+            (Command::DeleteElement { id: "a".into(), by_prefix: false }, NR),
+            (Command::DropImage { id: "pin".into(), by_prefix: false }, NR),
         ]));
         assert!(!e.state.shared.images.contains_key("pin"), "explicit drop frees a pin");
     }
@@ -3778,6 +3879,7 @@ mod tests {
         assert_eq!(engine.state.shared.images["logo"].refs, 2);
 
         let mut del = Writer::new();
+        del.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         del.str("a");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 4, &del.buf);
@@ -3788,6 +3890,7 @@ mod tests {
         );
 
         let mut del = Writer::new();
+        del.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         del.str("b");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 5, &del.buf);
@@ -3939,10 +4042,284 @@ mod tests {
 
         // And the restored engine collects on the same schedule.
         let mut del = Writer::new();
+        del.u8(0); // flags: exact id, not a prefix (§6.2/§8.2)
         del.str("widget");
         let mut frames = Vec::new();
         append_command(&mut frames, CMD_DELETE_ELEMENT, 3, &del.buf);
         restored.process_pty_chunk(&build_envelope(&frames));
         assert!(!restored.state.shared.images.contains_key("logo"));
+    }
+
+    // ---- §6.2 / §8.2 prefix forms ------------------------------------
+
+    /// Typed-command helpers for the prefix tests — the hand-rolled
+    /// bodies above predate `encode`, and these read better.
+    mod prefix {
+        use super::*;
+        use vge_protocol::codec::{Point, Rect};
+        use vge_protocol::command::{
+            Command, CreateElementBody, DrawCmd, OriginAnchor, Retention, UploadImageBody,
+        };
+        use vge_protocol::encode::build_envelope as enc;
+
+        /// Send `cmds` with real request ids and return the response
+        /// frame types, so `Ok` (0x01) vs `Err` (0x02) is checkable.
+        fn run(engine: &mut VgeEngine, cmds: Vec<Command>) -> Vec<u8> {
+            let env = enc(&cmds
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (c, i as u32 + 1))
+                .collect::<Vec<_>>());
+            engine.process_pty_chunk(&env);
+            let payload = unwrap_t2c_envelope(&engine.take_responses());
+            let mut r = Reader::new(&payload);
+            let _version = r.u8();
+            let _payload_len = r.u32();
+            let mut types = Vec::new();
+            while r.remaining() >= 9 {
+                let ty = r.u8().unwrap();
+                let _rid = r.u32().unwrap();
+                let len = r.u32().unwrap() as usize;
+                let _ = r.take(len);
+                types.push(ty);
+            }
+            types
+        }
+
+        fn element(id: &str, parent: Option<&str>, image: Option<&str>) -> Command {
+            Command::CreateElement(CreateElementBody {
+                id: id.into(),
+                commands: image
+                    .map(|img| {
+                        vec![DrawCmd::DrawImage {
+                            target_rect: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
+                            image_id: img.into(),
+                            source_rect: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                origin: Point { x: 0.0, y: 0.0 },
+                is_visible: true,
+                draw_order: 0,
+                parent: parent.map(Into::into),
+                size: None,
+                transform: None,
+                anchor: OriginAnchor::Viewport,
+            })
+        }
+
+        fn upload(id: &str, retention: Retention) -> Command {
+            Command::UploadImage(UploadImageBody {
+                id: id.into(),
+                encoding: 0x01,
+                retention,
+                width: 2,
+                height: 2,
+                total_bytes: 16,
+                chunk_offset: 0,
+                is_last: true,
+                data: vec![255u8; 16],
+            })
+        }
+
+        fn delete(id: &str, by_prefix: bool) -> Command {
+            Command::DeleteElement { id: id.into(), by_prefix }
+        }
+
+        fn drop_image(id: &str, by_prefix: bool) -> Command {
+            Command::DropImage { id: id.into(), by_prefix }
+        }
+
+        fn ids(engine: &VgeEngine) -> Vec<String> {
+            let mut v: Vec<String> = engine
+                .state
+                .elements()
+                .values()
+                .map(|e| e.id.clone().unwrap_or_else(|| "<anon>".into()))
+                .collect();
+            v.sort();
+            v
+        }
+
+        #[test]
+        fn prefix_delete_spares_ids_that_do_not_match() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    element("app.one", None, None),
+                    element("app.two", None, None),
+                    element("other.one", None, None),
+                    // A near-miss: shares "app" but not "app." — a prefix
+                    // is a plain byte compare, no word boundaries (§6.8).
+                    element("appendix", None, None),
+                ],
+            );
+            assert_eq!(run(&mut e, vec![delete("app.", true)]), vec![RSP_OK]);
+            assert_eq!(ids(&e), vec!["appendix", "other.one"]);
+        }
+
+        #[test]
+        fn prefix_delete_cascades_over_non_matching_descendants() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    element("app.root", None, None),
+                    // Children whose ids the client never chose — the
+                    // vdraw case, where document ids come from the file.
+                    element("xY7k", Some("app.root"), None),
+                    element("zQ1p", Some("xY7k"), None),
+                    element("keep", None, None),
+                ],
+            );
+            run(&mut e, vec![delete("app.", true)]);
+            assert_eq!(ids(&e), vec!["keep"], "the whole subtree goes with its root");
+        }
+
+        #[test]
+        fn prefix_delete_detaches_from_a_surviving_parent() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    element("root", None, None),
+                    element("root.child", Some("root"), None),
+                ],
+            );
+            // Deletes the child but not the parent, so the parent's
+            // children list must not keep a dangling key.
+            run(&mut e, vec![delete("root.", true)]);
+            assert_eq!(ids(&e), vec!["root"]);
+            assert!(
+                e.state.elements()["root"].children.is_empty(),
+                "surviving parent must not keep a dangling child key"
+            );
+            // Recreating the same id must work — it would not if the
+            // stale key were still listed.
+            assert_eq!(
+                run(&mut e, vec![element("root.child", Some("root"), None)]),
+                vec![RSP_OK]
+            );
+            assert_eq!(e.state.elements()["root"].children.len(), 1);
+        }
+
+        #[test]
+        fn empty_prefix_wipes_the_screen_including_anonymous_elements() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    element("named", None, None),
+                    // Anonymous (§6.1): no id, so no non-empty prefix can
+                    // ever name it. The empty prefix is its only reaper
+                    // short of eviction or reset.
+                    element("", None, None),
+                ],
+            );
+            assert_eq!(e.state.elements().len(), 2);
+            run(&mut e, vec![delete("nam", true)]);
+            assert_eq!(ids(&e), vec!["<anon>"], "a non-empty prefix cannot match it");
+            assert_eq!(run(&mut e, vec![delete("", true)]), vec![RSP_OK]);
+            assert!(e.state.elements().is_empty(), "empty prefix takes everything");
+        }
+
+        #[test]
+        fn prefix_forms_answer_ok_when_nothing_matches() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            // Idempotent cleanup: a client may send these on startup,
+            // before it has created anything at all.
+            assert_eq!(
+                run(&mut e, vec![delete("app.", true), drop_image("app.", true)]),
+                vec![RSP_OK, RSP_OK]
+            );
+            // The exact forms still report a miss, because naming one id
+            // that does not exist is a client bug.
+            assert_eq!(
+                run(&mut e, vec![delete("app.x", false), drop_image("app.x", false)]),
+                vec![RSP_ERR, RSP_ERR]
+            );
+        }
+
+        #[test]
+        fn empty_prefix_delete_reclaims_images_exactly_as_clear_all_did() {
+            // ClearAll cleared the table and recounted; the prefix form
+            // unwinds each element's references incrementally. The net
+            // effect on the image table must be identical: Auto images
+            // that lose their last drawer go, pinned ones stay, and a
+            // never-referenced upload is untouched by either.
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    upload("auto", Retention::Auto),
+                    upload("pinned", Retention::Manual),
+                    upload("fresh", Retention::Auto),
+                    element("a", None, Some("auto")),
+                    element("p", None, Some("pinned")),
+                ],
+            );
+            assert_eq!(e.state.shared.images.len(), 3);
+
+            run(&mut e, vec![delete("", true)]);
+            assert!(e.state.elements().is_empty());
+            assert!(
+                !e.state.shared.images.contains_key("auto"),
+                "Auto image loses its last reference and is collected"
+            );
+            assert!(
+                e.state.shared.images.contains_key("pinned"),
+                "Manual retention is never auto-collected (§8.0)"
+            );
+            assert!(
+                e.state.shared.images.contains_key("fresh"),
+                "a never-referenced upload is not collectable (§8.0)"
+            );
+        }
+
+        #[test]
+        fn prefix_drop_image_sweeps_live_and_in_flight_uploads() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            run(
+                &mut e,
+                vec![
+                    upload("app.a", Retention::Manual),
+                    upload("app.b", Retention::Auto),
+                    upload("other", Retention::Manual),
+                ],
+            );
+            // A chunked upload that has not finalized yet.
+            run(
+                &mut e,
+                vec![Command::UploadImage(UploadImageBody {
+                    id: "app.streaming".into(),
+                    encoding: 0x01,
+                    retention: Retention::Manual,
+                    width: 2,
+                    height: 2,
+                    total_bytes: 16,
+                    chunk_offset: 0,
+                    is_last: false,
+                    data: vec![255u8; 8],
+                })],
+            );
+            assert_eq!(e.pending_uploads.len(), 1);
+
+            assert_eq!(run(&mut e, vec![drop_image("app.", true)]), vec![RSP_OK]);
+            assert_eq!(
+                e.state.shared.images.keys().collect::<Vec<_>>(),
+                vec!["other"],
+                "pinned matches go too — DropImage ignores retention (§8.0)"
+            );
+            assert!(
+                e.pending_uploads.is_empty(),
+                "an in-flight upload under the prefix is aborted (§8.2)"
+            );
+            // The id is released, so the same one can be uploaded again.
+            assert_eq!(
+                run(&mut e, vec![upload("app.streaming", Retention::Auto)]),
+                vec![RSP_CHUNK_ACK]
+            );
+        }
     }
 }

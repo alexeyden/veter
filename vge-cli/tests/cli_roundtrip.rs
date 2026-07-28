@@ -224,7 +224,7 @@ fn drop_image_round_trip() {
     assert_eq!(*ty, CMD_DROP_IMAGE);
     let cmd = parse(*ty, body).unwrap();
     match cmd {
-        Command::DropImage { id } => assert_eq!(id, "demo"),
+        Command::DropImage { id, .. } => assert_eq!(id, "demo"),
         _ => panic!("expected DropImage"),
     }
 }

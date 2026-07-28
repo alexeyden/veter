@@ -6,8 +6,8 @@
 
 use crate::codec::{Point, Writer};
 use crate::command::{
-    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, OriginAnchor, Style,
-    UpdateCommandBody,
+    Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FLAG_BY_PREFIX, OriginAnchor,
+    Style, UpdateCommandBody,
     UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
@@ -43,7 +43,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Probe => {}
         Command::CreateElement(b) => write_create_element(&mut w, b),
-        Command::DeleteElement { id } => w.str(id),
+        Command::DeleteElement { id, by_prefix } => write_targeted_id(&mut w, id, *by_prefix),
         Command::UpdateCommands(b) => write_update_commands(&mut w, b),
         Command::UpdateCommand(b) => write_update_command(&mut w, b),
         Command::UpdateText(b) => write_update_text(&mut w, b),
@@ -74,7 +74,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             write_concrete_style(&mut w, style);
         }
         Command::UploadImage(b) => write_upload_image(&mut w, b),
-        Command::DropImage { id } => w.str(id),
+        Command::DropImage { id, by_prefix } => write_targeted_id(&mut w, id, *by_prefix),
         Command::UpdateImage(b) => write_update_image(&mut w, b),
         Command::UpdateSize { id, new_size } => {
             w.str(id);
@@ -100,6 +100,14 @@ pub fn build_envelope(commands: &[(Command, u32)]) -> Vec<u8> {
 }
 
 // --- helpers ---
+
+/// The `DeleteElement` (§6.2) / `DropImage` (§8.2) body: a mandatory flags
+/// byte ahead of the id it qualifies. Mandatory rather than an omit-when-
+/// zero tail, because the flag decides whether an empty id is legal.
+fn write_targeted_id(w: &mut Writer, id: &str, by_prefix: bool) {
+    w.u8(if by_prefix { FLAG_BY_PREFIX } else { 0 });
+    w.str(id);
+}
 
 fn write_point(w: &mut Writer, p: Point) {
     w.f32(p.x);
@@ -683,7 +691,74 @@ mod tests {
 
     #[test]
     fn drop_image_roundtrip() {
-        roundtrip(Command::DropImage { id: "logo".into() });
+        roundtrip(Command::DropImage {
+            id: "logo".into(),
+            by_prefix: false,
+        });
+    }
+
+    // --- §6.2 / §8.2 prefix forms ---
+
+    #[test]
+    fn targeted_id_roundtrips_both_forms() {
+        for by_prefix in [false, true] {
+            roundtrip(Command::DeleteElement {
+                id: "myapp.thing".into(),
+                by_prefix,
+            });
+            roundtrip(Command::DropImage {
+                id: "myapp.".into(),
+                by_prefix,
+            });
+        }
+    }
+
+    #[test]
+    fn empty_prefix_roundtrips_but_empty_exact_id_is_rejected() {
+        // An empty prefix is the match-everything form (§6.2) — the
+        // spelling that retired ClearAll.
+        roundtrip(Command::DeleteElement {
+            id: String::new(),
+            by_prefix: true,
+        });
+        roundtrip(Command::DropImage {
+            id: String::new(),
+            by_prefix: true,
+        });
+        // Without the flag, §6.8's "empty id is a parse error" still holds.
+        for ty in [CMD_DELETE_ELEMENT, CMD_DROP_IMAGE] {
+            let body = [0x00, 0x00]; // flags = 0, zero-length id
+            assert!(matches!(parse(ty, &body), Err(ERR_BAD_PAYLOAD)));
+        }
+    }
+
+    #[test]
+    fn targeted_id_rejects_reserved_flag_bits() {
+        for ty in [CMD_DELETE_ELEMENT, CMD_DROP_IMAGE] {
+            for flags in [0b10, 0b100, 0x80, 0xFF] {
+                let mut body = vec![flags];
+                body.extend_from_slice(&[0x02, b'i', b'd']);
+                assert!(
+                    matches!(parse(ty, &body), Err(ERR_BAD_PAYLOAD)),
+                    "flags {flags:#04b} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_id_rejects_truncated_and_trailing_bodies() {
+        for ty in [CMD_DELETE_ELEMENT, CMD_DROP_IMAGE] {
+            // Flags byte with no id at all.
+            assert!(matches!(parse(ty, &[0x00]), Err(ERR_BAD_PAYLOAD)));
+            // Empty body — the flags byte is mandatory.
+            assert!(matches!(parse(ty, &[]), Err(ERR_BAD_PAYLOAD)));
+            // Junk after the id.
+            assert!(matches!(
+                parse(ty, &[0x00, 0x02, b'i', b'd', 0x99]),
+                Err(ERR_BAD_PAYLOAD)
+            ));
+        }
     }
 
     #[test]
