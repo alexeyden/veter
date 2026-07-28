@@ -3144,6 +3144,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vplace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "libc",
+ "veter-host",
+ "vge-protocol",
+ "vge-render",
+ "vt100",
+]
+
+[[package]]
 name = "vplay"
 version = "0.1.0"
 dependencies = [
