@@ -219,9 +219,11 @@ later sections.
 | 0x0B | UpdateDrawOrder    | §6.6         |
 | 0x0C | UploadImage        | §8.2         |
 | 0x0D | DropImage          | §8.2         |
-| 0x0E | ClearAll           | §6.7         |
 | 0x0F | UpdateSize         | §9.5         |
 | 0x10 | UpdateTransform    | §9.12        |
+
+`0x0E` is **retired**. It was `ClearAll`, whose job is now done by
+`DeleteElement` with an empty prefix (§6.2, §6.7).
 
 All other frame_type values are reserved and MUST be rejected with
 `err_unknown_command`.
@@ -420,9 +422,10 @@ i32           draw_order
 Behavior:
 
 - If `id` is empty, the element is anonymous: it renders normally but
-  cannot be the target of any subsequent update or delete. It will be
-  cleaned up only by scrollback eviction (§5.2), `ClearAll` (§6.7), or
-  reset (§5.6).
+  cannot be the target of any subsequent update or delete. Because it has
+  no ID, no non-empty prefix can ever name it either: it is cleaned up
+  only by scrollback eviction (§5.2), an empty-prefix `DeleteElement`
+  (§6.2), or reset (§5.6).
 - If `id` is non-empty and already in use, the entire command fails with
   `err_duplicate_id`. (Client-side replace = explicit `DeleteElement`
   followed by `CreateElement`.)
@@ -442,11 +445,42 @@ ID in a single envelope without waiting for the create's response.
 
 ### 6.2 DeleteElement (0x04)
 
-Body: `string id`. Response: empty Ok.
+```
+u8      flags        ; bit0 = by_prefix
+                     ; bits 1..7 reserved, must be 0
+string  id           ; exact ID, or an ID prefix when bit0 is set
+```
 
-Unknown ID → `err_unknown_element`. If the deleted element has
-descendants (§9), they are deleted too — the response is `Ok`
-regardless of how many were destroyed.
+Response: empty Ok. A reserved bit set → `err_bad_payload`.
+
+**Exact form (`flags = 0`).** `id` MUST be non-empty (§6.8). Unknown ID →
+`err_unknown_element`.
+
+**Prefix form (`bit0` set).** Deletes every element on the current screen
+whose ID starts with `id`, compared bytewise. `id` MAY be empty, in which
+case it matches *every* element on the screen, anonymous ones included
+(§6.1) — this is how a client wipes the screen wholesale, and it is what
+retired `ClearAll` (§6.7). A non-empty prefix never matches an anonymous
+element, which has no ID to compare.
+
+Matching nothing is **not** an error: the prefix form always answers `Ok`.
+That asymmetry with the exact form is deliberate — naming a single ID that
+does not exist is a client bug worth reporting, whereas prefix cleanup is
+meant to be idempotent, so a client can send it on exit, on startup, or
+twice, without having to track what it actually created.
+
+In both forms, deleting an element deletes its descendants (§9) too — the
+response is `Ok` regardless of how many were destroyed. In the prefix form
+this means a **matching parent takes non-matching children with it**: a
+client that parents its content to one element it owns can name that
+parent and reach a whole subtree of IDs it never chose (a document
+renderer whose shape IDs come from the file it loaded, say).
+
+Only the current screen's element table is touched (§5.4). Compare
+`DropImage`'s prefix form (§8.2), which reaches a table shared by both
+screens.
+
+Prefix deletion is the reason to namespace IDs; see §6.8.
 
 ### 6.3 UpdateCommands (0x05) / UpdateCommand (0x06)
 
@@ -567,11 +601,20 @@ Only the anchor bits (`bit3` cursor-relative, `bit4` marker-anchored;
 re-pinnable through this command, so `bit0`–`bit2` and the reserved bits
 are `err_bad_payload`, as is setting both anchor bits.
 
-### 6.7 ClearAll (0x0E)
+### 6.7 ClearAll — retired (was 0x0E)
 
-Body: empty. Removes every element from the *current* screen buffer. Does
-not touch the image table or global style table. Useful for "shutdown" by
-the client without issuing a full terminal reset.
+Removed. `DeleteElement` (§6.2) with `by_prefix` set and an empty prefix
+does the same job — every element on the current screen, anonymous ones
+included, and still nothing to the image or global style tables.
+
+It went because it was the *only* cleanup primitive and it was unscoped: a
+client that wanted to remove its own elements had either to enumerate every
+ID it had created or to wipe the screen, a neighbour's elements included.
+A prefix names exactly one client's worth of state, and the empty prefix
+keeps the wholesale case available for anyone who genuinely wants it.
+
+Section number retained so §6.8 and later cross-references keep their
+numbering.
 
 ### 6.8 Element IDs
 
@@ -580,12 +623,27 @@ A string ID:
 - Is at most 64 bytes of UTF-8.
 - In `CreateElement`: MAY be empty, meaning "anonymous, not addressable
   later" (§6.1).
+- In a prefix-matching command (`DeleteElement` §6.2, `DropImage` §8.2):
+  MAY be empty, meaning "match everything".
 - In every other command: MUST be non-empty; an empty ID is a parse error
   (`err_bad_payload`).
-- Is opaque to the terminal beyond byte equality.
+- Is opaque to the terminal beyond byte equality and, for the prefix forms,
+  bytewise `starts_with`. The terminal ascribes no structure to an ID: any
+  separator convention is the client's own, and a prefix may end mid-word.
 
 There is no rename command. Reusing an ID requires `DeleteElement`
 followed by `CreateElement`.
+
+**Namespacing.** Because the element and image tables outlive any one
+client — a session's tables persist across client runs, and several clients
+may share a screen — a client SHOULD prefix every ID it creates with a name
+it owns, e.g. `myapp.thing`. That single convention buys three things: it
+can clean up after itself with one command per table (§6.2, §8.2), on
+startup as well as exit, so a run is not confused by a previous run's
+leftovers; it cannot collide with another client's IDs; and it never
+destroys state it does not own. Note that a prefix is a plain byte
+comparison, so pick a separator and keep it: `myapp.` matches `myapp.a` but
+also `myapp-old`, and `img` matches `images.big`.
 
 ## 7. Draw commands
 
@@ -910,8 +968,10 @@ upload-then-draw sequence:
   until the element that draws it is created.
 - A count only reaches zero by losing a reference it once had. Deleting
   an element, replacing its commands, re-pointing a `DrawImage` with
-  `UpdateImage`, `ClearAll`, an erase (§5.7), scrollback eviction
-  (§5.2) and leaving the alternate screen all release references.
+  `UpdateImage`, an erase (§5.7), scrollback eviction (§5.2) and leaving
+  the alternate screen all release references. Deleting by prefix (§6.2)
+  releases the references of every element it removes, descendants
+  included.
 
 This is what a one-shot display wants: draw it, scroll it away, and the
 slot is reclaimed with no bookkeeping. But it makes an image unusable as
@@ -978,7 +1038,9 @@ UploadImage:
                            ; the full image — see `total_bytes`.
 
 DropImage:
-  string id
+  u8     flags             ; bit0 = by_prefix
+                           ; bits 1..7 reserved, must be 0
+  string id                ; exact ID, or an ID prefix when bit0 is set
 ```
 
 Single-shot uploads (small images) set `chunk_offset = 0`,
@@ -1036,12 +1098,32 @@ Lifecycle:
    (decode failure) or `err_bad_payload` (length mismatch).
 
 `DropImage` removes a finalized entry; on an in-progress `id` it
-also aborts the upload. Unknown ID → `err_unknown_image`. Live
-`DrawImage` references to a dropped ID degrade to magenta debug fills
-per §7.5; the elements themselves are not modified. Drawing against
-an in-progress `id` yields `err_unknown_image` until finalize — the
-image is not addressable for rendering before that point. Response:
-empty Ok.
+also aborts the upload. It means "remove now, whatever is referencing
+it", under either retention policy (§8.0). Live `DrawImage` references
+to a dropped ID degrade to magenta debug fills per §7.5; the elements
+themselves are not modified. Drawing against an in-progress `id` yields
+`err_unknown_image` until finalize — the image is not addressable for
+rendering before that point. Response: empty Ok. A reserved bit set →
+`err_bad_payload`.
+
+**Exact form (`flags = 0`).** `id` MUST be non-empty. Unknown ID →
+`err_unknown_image`.
+
+**Prefix form (`bit0` set).** Removes every image whose ID starts with
+`id`, compared bytewise, finalized entries and in-progress uploads alike;
+each in-progress match is aborted as the exact form would abort it.
+Matching nothing answers `Ok`, not `err_unknown_image` — same reasoning as
+§6.2's prefix form: cleanup should be idempotent so a client can run it on
+startup and on exit without tracking what it uploaded. This is the intended
+way to bound a `Manual`-retention cache (§8.0), which the terminal never
+reclaims on the client's behalf.
+
+`id` MAY be empty, matching every image in the table, but **think before
+using it**: unlike the element table, the image table is shared by both
+screen buffers (§5.4, §8.0). A full-screen client on the alternate screen
+that drops every image also destroys images another client left inline on
+the main screen. Use a prefix you own (§6.8); the empty prefix is for a
+client that is certain it owns the whole table.
 
 Multiple chunked uploads can be in progress concurrently against
 distinct `id`s, bounded only by `max_images`. Clients interleaving
@@ -1261,8 +1343,9 @@ Response: empty Ok.
 ### 9.6 Lifecycle and cascading
 
 - `DeleteElement` (§6.2) on any element deletes its entire subtree.
-- `ClearAll` (§6.7) wipes every element on the current screen including
-  parents and descendants.
+- `DeleteElement` by prefix (§6.2) deletes the subtree of every match, so a
+  matching parent takes non-matching descendants with it. An empty prefix
+  wipes every element on the current screen, parents and descendants alike.
 - Scrollback eviction (§5.2) of a top-level element cascades to its
   subtree.
 - Reset (§5.6) wipes everything.
