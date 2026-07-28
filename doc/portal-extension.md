@@ -848,16 +848,41 @@ compute this itself: it forwards raw bytes and has no vt100 to tell a
 log line scrolling past from a spinner redrawing one cell in place.
 The host runs the portal's vt100 and so can.
 
-The heuristic: the event fires when, during a `WritePortal`, the
-portal's *main* (non-alternate) grid committed at least one new line
-— either its content scrolled, or the cursor advanced to a lower row
-(output filling a screen that is not yet full). In-place updates
-(spinners, progress bars, clocks) rewrite a line with a carriage
-return, leaving the cursor row unchanged; full-screen TUIs run on the
-alternate screen. Neither triggers the event. It is **edge-triggered**:
-at most one per `WritePortal` regardless of how many lines scrolled;
-the client keeps its own sticky per-portal flag and clears it when
-the user next views that portal.
+The heuristic has two halves, both evaluated against the portal's
+*main* (non-alternate) grid during a `WritePortal`. Full-screen TUIs
+run on the alternate screen and never fire either.
+
+1. **New line committed** — the grid scrolled, or the cursor advanced
+   to a lower row (output filling a screen that is not yet full).
+   This is the plain-output case: logs, build chatter, a shell prompt.
+
+2. **Damage burst** — the write committed no new line, but rewrote
+   more than two rows of the visible grid with different *content*
+   (cell attributes are ignored: a colour-only rewrite is not new
+   output). This is the in-place-repaint case. A TUI that redraws by
+   moving the cursor up over its previous frame, rewriting it, and
+   returning to where it started never scrolls and never advances the
+   cursor, so rule 1 is blind to it — and that is how essentially
+   every modern framework-driven CLI renders once its frame stops
+   growing. Without rule 2 such a pane reports activity while its
+   frame is still growing and then goes permanently silent.
+
+   The two-row allowance is what keeps in-place *updates* — spinners,
+   progress bars, clocks, a keystroke echoed into an input box —
+   below the bar: they touch one row, or two when a status line is
+   paired with a counter beneath it. A repaint carrying new content
+   rewrites most of its region.
+
+The event is **edge-triggered**: at most one per `WritePortal`
+regardless of how many lines scrolled or rows changed; the client
+keeps its own sticky per-portal flag and clears it when the user next
+views that portal.
+
+Rule 2 needs a fingerprint of the previous grid to diff against. A
+host MAY drop that fingerprint whenever it likes — after a write that
+already fired via rule 1, or when the portal is resized (a resize
+rewrites everything and must not read as new output) — at the cost of
+one missed detection round while it is re-established.
 
 The host SHOULD suppress the event for the currently focused portal
 (per `SetFocus`, §9.1) — the client is already looking at it, and
@@ -865,9 +890,8 @@ this also cuts event volume for the pane most output lands in.
 Correctness does not depend on this; a client that receives activity
 for a portal it considers "in view" simply ignores it.
 
-The heuristic is host-internal and MAY be refined (e.g. a damage
-burst rule) without a protocol change — the wire contract is only
-"PortalActivity fired".
+The heuristic is host-internal and MAY be refined further without a
+protocol change — the wire contract is only "PortalActivity fired".
 
 Gated by `emit_activity_events` (features bit 7, §2.1).
 

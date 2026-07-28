@@ -362,6 +362,10 @@ fn decode_portal(
         ses,
         pre_attach_backup: None,
         state_cache,
+        // Not carried on the wire: the §8.10 damage baseline is a
+        // local diffing aid, and the first quiet write after the
+        // attach re-establishes it against the restored grid.
+        damage_baseline: None,
         pending_cursor_queries,
     })
 }

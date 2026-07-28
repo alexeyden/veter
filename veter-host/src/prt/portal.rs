@@ -92,6 +92,70 @@ pub struct PreAttachBackup {
     pub prt: Vec<u8>,
 }
 
+/// Per-row content fingerprint of a portal's visible grid — the
+/// baseline the §8.10 damage rule diffs against.
+///
+/// A TUI that repaints in place (cursor-up, rewrite, cursor-down)
+/// neither scrolls nor leaves the cursor lower than it started, so the
+/// scroll/cursor-advance half of the activity heuristic is blind to it.
+/// Comparing row fingerprints across writes tells a spinner tick (one
+/// or two rows differ) from a repaint that actually carries new content
+/// (most of the region differs).
+///
+/// Cell *attributes* are deliberately excluded: a colour- or bold-only
+/// rewrite — a selection highlight, a cursor-line tint — is not new
+/// output.
+pub struct RowDamage {
+    rows: u16,
+    cols: u16,
+    hashes: Vec<u64>,
+}
+
+impl RowDamage {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// FNV-1a over each visible row's cell contents.
+    pub fn from_screen(screen: &Screen) -> Self {
+        let (rows, cols) = screen.size();
+        let hashes = (0..rows)
+            .map(|r| {
+                let mut h = Self::FNV_OFFSET;
+                for c in 0..cols {
+                    let contents = screen.cell(r, c).map_or("", vt100::Cell::contents);
+                    for b in contents.as_bytes() {
+                        h ^= u64::from(*b);
+                        h = h.wrapping_mul(Self::FNV_PRIME);
+                    }
+                    // Cell terminator, so "ab" + "" and "a" + "b" in
+                    // adjacent cells don't collide.
+                    h ^= 0xff;
+                    h = h.wrapping_mul(Self::FNV_PRIME);
+                }
+                h
+            })
+            .collect();
+        Self { rows, cols, hashes }
+    }
+
+    /// Number of rows whose content differs from `prev`, or `None` when
+    /// the two fingerprints were taken at different grid sizes — a
+    /// resize rewrites everything, and reading that as new output would
+    /// fire activity on every relayout.
+    pub fn changed_rows(&self, prev: &Self) -> Option<usize> {
+        if self.rows != prev.rows || self.cols != prev.cols {
+            return None;
+        }
+        Some(
+            self.hashes
+                .iter()
+                .zip(&prev.hashes)
+                .filter(|(a, b)| a != b)
+                .count(),
+        )
+    }
+}
+
 /// Snapshot of polled vt100 state for delta detection (§8.5–§8.9).
 ///
 /// `MouseModeChange` events are coalesced by spec: comparing snapshots
@@ -187,6 +251,14 @@ pub struct Portal {
     /// Restored on `DetachNotify`. `None` between attaches.
     pub pre_attach_backup: Option<PreAttachBackup>,
     pub state_cache: PolledStateCache,
+    /// Row fingerprints of the visible grid as of the last
+    /// `WritePortal` that ended without scrolling or advancing the
+    /// cursor — the baseline for the §8.10 damage rule. `None` before
+    /// the first such write, and cleared by any write that already
+    /// reported activity the cheap way (the fingerprints would be
+    /// stale, and re-deriving them on bulk output is exactly the cost
+    /// the cheap rule exists to avoid).
+    pub damage_baseline: Option<RowDamage>,
     /// DSR cursor-position queries observed on inbound bytes that
     /// haven't yet been answered. Drained after `vt.process` so the
     /// reply reflects post-process cursor state (§13.4).

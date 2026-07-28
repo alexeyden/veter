@@ -28,6 +28,7 @@ use prt_protocol::frame::*;
 
 use super::portal::{
     Portal, PortalAnchor, PortalCallbacks, PortalSet, PolledStateCache, RawCallbackEvent,
+    RowDamage,
 };
 use crate::line_tracker::LineTracker;
 
@@ -1113,6 +1114,7 @@ impl PrtEngine {
             ses: crate::ses::SesEngine::new(),
             pre_attach_backup: None,
             state_cache: initial_cache,
+            damage_baseline: None,
             pending_cursor_queries: 0,
         };
         set.portals.insert(b.id, portal);
@@ -1242,6 +1244,43 @@ impl PrtEngine {
                 .extend(portal.drain_for_destroy());
         }
         Ok(Vec::new())
+    }
+
+    /// §8.10 activity heuristic, second half. `committed_line` is the
+    /// cheap rule — the portal scrolled or the cursor ended lower than
+    /// it started — and short-circuits everything below.
+    ///
+    /// When it doesn't fire, the write was an in-place repaint, and the
+    /// question becomes *how much* of the screen it rewrote. A spinner,
+    /// a clock, a progress bar or a keystroke echoed into a TUI's input
+    /// box touches a row or two; a repaint that carries new content
+    /// (a finished response scrolling a full-screen TUI's transcript, a
+    /// prompt replacing the input box) rewrites most of the region.
+    /// Frameworks that redraw with cursor-up / rewrite / cursor-down —
+    /// Ink and friends, which is what most modern CLI agents are built
+    /// on — produce *only* this shape once their frame stops growing,
+    /// so without the damage rule such a pane never reports activity at
+    /// all.
+    ///
+    /// Suppressed on the alt screen for the same reason the event is
+    /// (§8.10: full-screen TUIs run there and repaint constantly).
+    fn portal_activity(portal: &mut Portal, committed_line: bool) -> bool {
+        /// Rows an in-place update may rewrite without counting as new
+        /// output. Two, not one: a status line paired with a counter or
+        /// hint line below it is still one logical widget ticking.
+        const MAX_IN_PLACE_ROWS: usize = 2;
+
+        if committed_line || portal.vt.screen().alternate_screen() {
+            portal.damage_baseline = None;
+            return committed_line;
+        }
+        let now = RowDamage::from_screen(portal.vt.screen());
+        let changed = portal
+            .damage_baseline
+            .as_ref()
+            .and_then(|prev| now.changed_rows(prev));
+        portal.damage_baseline = Some(now);
+        changed.is_some_and(|n| n > MAX_IN_PLACE_ROWS)
     }
 
     fn cmd_write_portal(
@@ -1379,9 +1418,9 @@ impl PrtEngine {
             //    activity signal (EVT_PORTAL_ACTIVITY): the portal
             //    committed a new line iff it scrolled, or the cursor
             //    advanced to a lower row (output filling a screen that
-            //    is not yet full). In-place redraws — spinners,
-            //    progress bars, clocks — do neither: they rewrite a
-            //    line with CR, leaving the cursor row unchanged.
+            //    is not yet full). Writes that did neither go on to the
+            //    damage rule in `portal_activity`, which separates an
+            //    in-place update from an in-place *repaint*.
             let scroll_before = portal.vt.screen().scroll_committed();
             let (cursor_row_before, _) = portal.vt.screen().cursor_position();
             crate::vge::drive_terminal_stage(
@@ -1390,8 +1429,9 @@ impl PrtEngine {
                 &ses_passthrough,
             );
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
-            let activity = portal.vt.screen().scroll_committed() != scroll_before
+            let committed_line = portal.vt.screen().scroll_committed() != scroll_before
                 || cursor_row_after > cursor_row_before;
+            let activity = Self::portal_activity(portal, committed_line);
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
             // 4. Update the children engine's line tracker against the
@@ -2524,6 +2564,112 @@ mod tests {
         // a spinner / progress-bar style update. No scroll, no event.
         let mut engine = PrtEngine::new();
         let frames = create_and_write(&mut engine, "p", 20, 3, b"aaaa\rbbbb\rcccc");
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
+    }
+
+    /// One frame of a TUI that repaints in place: move the cursor up
+    /// over the old frame, rewrite every row, end where it started.
+    /// Neither the scroll counter nor the cursor row moves, so only the
+    /// damage rule can see it.
+    fn in_place_frame(height: usize, tag: char) -> Vec<u8> {
+        let mut v = Vec::new();
+        for _ in 0..height.saturating_sub(1) {
+            v.extend_from_slice(b"\x1b[1A");
+        }
+        for i in 0..height {
+            if i > 0 {
+                // Cursor-down rather than LF: at the bottom row LF
+                // would scroll, and an in-place repaint never does.
+                v.extend_from_slice(b"\x1b[1B");
+            }
+            v.extend_from_slice(b"\r\x1b[2K");
+            v.extend_from_slice(format!("{tag} row {i}").as_bytes());
+        }
+        v
+    }
+
+    /// Bring a portal to the steady state the damage rule needs: a
+    /// frame on screen and a fingerprint of it recorded. Returns the
+    /// engine with portal "p" ready for the write under test.
+    fn portal_painting_in_place(height: usize) -> PrtEngine {
+        let mut engine = PrtEngine::new();
+        let _ = create_and_write(&mut engine, "p", 20, 12, &in_place_frame(height, 'a'));
+        // The first quiet write only establishes the baseline — there
+        // is nothing to diff against before it.
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(height, 'a'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+        assert_eq!(
+            event_count(&frames, EVT_PORTAL_ACTIVITY),
+            0,
+            "baseline round must not fire"
+        );
+        engine
+    }
+
+    #[test]
+    fn in_place_widget_tick_emits_no_activity() {
+        // Two rows of an eight-row frame change — a spinner plus the
+        // counter line under it. One logical widget ticking, not new
+        // output: no event.
+        let mut engine = portal_painting_in_place(8);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            // Up to the top of the frame, rewrite two rows, back down.
+            data: b"\x1b[7A\r\x1b[2Kspin-1\x1b[1B\r\x1b[2K12s\x1b[6B".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 4, &body);
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
+    }
+
+    #[test]
+    fn identical_in_place_repaint_emits_no_activity() {
+        let mut engine = portal_painting_in_place(8);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(8, 'a'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 4, &body);
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
+    }
+
+    #[test]
+    fn in_place_repaint_with_new_content_emits_activity() {
+        // The case the cheap rule is blind to: a frame that repaints in
+        // place — no scroll, cursor back where it started — but whose
+        // content genuinely changed. This is how an Ink-style TUI
+        // renders a finished response or a prompt replacing its input
+        // box, and it must light up a background pane.
+        let mut engine = portal_painting_in_place(8);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(8, 'b'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 4, &body);
+        assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 1);
+        let act = first_event(&frames, EVT_PORTAL_ACTIVITY).unwrap();
+        let mut r = Reader::new(&act.body);
+        assert_eq!(r.string().unwrap(), "p");
+    }
+
+    #[test]
+    fn resize_between_repaints_emits_no_activity() {
+        // A resize rewrites the whole grid. Reading that as new output
+        // would fire activity on every relayout, so a fingerprint taken
+        // at a different size is discarded rather than diffed.
+        let mut engine = portal_painting_in_place(8);
+        let resize = encode::update_size_body("p", 40, 12);
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_UPDATE_SIZE, 4, &resize).frame_type,
+            RSP_OK
+        );
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(8, 'b'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 5, &body);
         assert_eq!(event_count(&frames, EVT_PORTAL_ACTIVITY), 0);
     }
 
