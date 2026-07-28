@@ -23,7 +23,7 @@ pub const CMD_UPDATE_VISIBILITY: u8 = 0x0A;
 pub const CMD_UPDATE_DRAW_ORDER: u8 = 0x0B;
 pub const CMD_UPLOAD_IMAGE: u8 = 0x0C;
 pub const CMD_DROP_IMAGE: u8 = 0x0D;
-pub const CMD_CLEAR_ALL: u8 = 0x0E;
+// 0x0E retired — was ClearAll, now DeleteElement with an empty prefix (§6.2).
 pub const CMD_UPDATE_SIZE: u8 = 0x0F;
 pub const CMD_UPDATE_TRANSFORM: u8 = 0x10;
 

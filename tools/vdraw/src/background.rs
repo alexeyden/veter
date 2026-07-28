@@ -13,14 +13,15 @@
 //!
 //! The picture is uploaded once and re-created as an element by every
 //! later `full_render` (undo/redo, resize). That makes it a *cache* in
-//! §8.2's sense, so it is uploaded with **Manual** retention. `ClearAll`
-//! does not touch the image table (§6.7), but it does release every
-//! reference (§8.2), and an `Auto` image whose count falls to zero is
-//! collected there and then — the next `full_render`'s `CreateElement`
-//! would name a dead id, fail with `err_unknown_image`, and (validation
-//! being atomic, §7.5) drop the whole background element. Manual
-//! retention means vdraw releases the id itself: `load` drops it before
-//! uploading and `TermExit` drops it on the way out.
+//! §8.2's sense, so it is uploaded with **Manual** retention: each
+//! `full_render` opens by deleting every `vdraw.` element, which releases
+//! the background element's reference, and an `Auto` image whose count
+//! falls to zero is collected there and then — the next `full_render`'s
+//! `CreateElement` would name a dead id, fail with `err_unknown_image`,
+//! and (validation being atomic, §7.5) drop the whole background element.
+//! Manual retention means vdraw releases the id itself: `load` drops it
+//! before uploading and `TermExit` sweeps the `vdraw.` image prefix on
+//! the way out.
 
 use std::path::Path;
 
@@ -38,7 +39,7 @@ use vge_render::upload::{choose_encoding, encode_payload};
 use crate::camera::Camera;
 use crate::render::CANVAS_ID;
 
-pub const BACKGROUND_ID: &str = "canvas.background";
+pub const BACKGROUND_ID: &str = "vdraw.canvas.background";
 /// Below every shape (document elements start at draw order 1) but above
 /// the canvas anchor itself (order 0, which carries no geometry).
 pub const BACKGROUND_ORDER: i32 = -1;
@@ -66,7 +67,7 @@ impl Background {
     /// visual aspect ratio, and return the background plus the image
     /// upload commands. The upload commands MUST be sent before the
     /// element (and before the first `full_render`); the image then
-    /// survives every later `ClearAll`.
+    /// survives every later element wipe.
     pub fn load(
         path: &Path,
         cam: &Camera,

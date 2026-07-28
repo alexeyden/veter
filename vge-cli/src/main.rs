@@ -12,7 +12,9 @@
 //!   vge-cli draw-lines plot --line-width 0.1 --color 00ff00ff \
 //!       --segments 0,0:5,5 5,5:10,0
 //!   vge-cli delete myrect
-//!   vge-cli clear-all
+//!   vge-cli delete myapp. --prefix
+//!   vge-cli delete "" --prefix          # every element on the screen
+//!   vge-cli drop-image myapp. --prefix
 //!
 //! All bytes are written raw to stdout. Outside a VGE-aware terminal
 //! the bytes appear as a stray APC sequence which most terminals
@@ -59,11 +61,14 @@ enum Cmd {
     /// Send a Probe (§2.1). The terminal responds with its limits.
     Probe,
 
-    /// Clear all elements on the current screen (§6.7).
-    ClearAll,
-
-    /// Delete a single element by ID (§6.2).
-    Delete { id: String },
+    /// Delete an element by ID, or every element whose ID starts with
+    /// it (§6.2). `--prefix ""` clears the screen — what ClearAll did.
+    Delete {
+        id: String,
+        /// Treat ID as a prefix rather than one exact element.
+        #[arg(long)]
+        prefix: bool,
+    },
 
     /// Re-anchor an element's origin (§6.6).
     SetOrigin {
@@ -115,7 +120,12 @@ enum Cmd {
     UploadWebp(UploadWebpArgs),
 
     /// Drop an uploaded image from the table (§8.2).
-    DropImage { id: String },
+    DropImage {
+        id: String,
+        /// Treat ID as a prefix rather than one exact image.
+        #[arg(long)]
+        prefix: bool,
+    },
 
     /// CreateElement with a single DrawImage command (§7.5).
     CreateImage(CreateImageArgs),
@@ -616,8 +626,10 @@ fn print_probe_body(req_id: u32, body: &[u8]) {
 fn build_command(cmd: Cmd) -> Result<Command> {
     Ok(match cmd {
         Cmd::Probe => Command::Probe,
-        Cmd::ClearAll => Command::ClearAll,
-        Cmd::Delete { id } => Command::DeleteElement { id, by_prefix: false },
+        Cmd::Delete { id, prefix } => Command::DeleteElement {
+            id,
+            by_prefix: prefix,
+        },
         Cmd::SetOrigin { id, origin } => Command::UpdateOrigin {
             id,
             origin,
@@ -763,7 +775,10 @@ fn build_command(cmd: Cmd) -> Result<Command> {
                 data,
             })
         }
-        Cmd::DropImage { id } => Command::DropImage { id, by_prefix: false },
+        Cmd::DropImage { id, prefix } => Command::DropImage {
+            id,
+            by_prefix: prefix,
+        },
         Cmd::CreateImage(a) => Command::CreateElement(CreateElementBody {
             id: a.id,
             commands: vec![DrawCmd::DrawImage {

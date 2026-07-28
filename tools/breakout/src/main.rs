@@ -22,6 +22,11 @@ use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::*;
 use vge_protocol::path::{PathNode, PathSegment};
 
+/// Namespace every element id shares (§6.8): the field, bricks, paddle,
+/// ball, score, message and spark particles. One prefix sweep replaces
+/// them all on a restart.
+const ID_PREFIX: &str = "breakout.";
+
 const FRAME_DT: Duration = Duration::from_millis(33); // ~30 Hz
 const TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -140,9 +145,9 @@ struct Game {
     /// next tick (collected during physics, drained when emitting
     /// the frame's command diff).
     pending_brick_deletes: Vec<String>,
-    /// Set by `restart()`. The next `tick()` emits `ClearAll` +
-    /// `initial_commands()` to bring the engine in sync with the
-    /// freshly-rebuilt game state, then clears the flag.
+    /// Set by `restart()`. The next `tick()` wipes the `breakout.`
+    /// prefix and re-emits `initial_commands()` to bring the engine in
+    /// sync with the freshly-rebuilt game state, then clears the flag.
     needs_full_resync: bool,
 }
 
@@ -220,7 +225,7 @@ impl Game {
                 let x = col as f32 * BRICK_W;
                 let y = BRICK_TOP + row as f32 * BRICK_H;
                 self.bricks.push(Brick {
-                    id: format!("br-{row}-{col}"),
+                    id: format!("{ID_PREFIX}br-{row}-{col}"),
                     x,
                     y,
                     w: BRICK_W,
@@ -238,7 +243,7 @@ impl Game {
         // Background field (dim panel).
         cmds.push((
             Command::CreateElement(CreateElementBody {
-                id: "field".into(),
+                id: format!("{ID_PREFIX}field"),
                 commands: vec![DrawCmd::FillRectangles {
                     fill: Style::Flat(color(0x12_18_26_FF)),
                     rects: vec![Rect {
@@ -281,7 +286,7 @@ impl Game {
         // Paddle.
         cmds.push((
             Command::CreateElement(CreateElementBody {
-                id: "paddle".into(),
+                id: format!("{ID_PREFIX}paddle"),
                 commands: vec![paddle_drawcmd()],
                 origin: Point {
                     x: self.paddle_x,
@@ -300,7 +305,7 @@ impl Game {
         // Ball.
         cmds.push((
             Command::CreateElement(CreateElementBody {
-                id: "ball".into(),
+                id: format!("{ID_PREFIX}ball"),
                 commands: vec![ball_drawcmd(self.cell_pw, self.cell_ph)],
                 origin: Point {
                     x: self.ball_x,
@@ -319,7 +324,7 @@ impl Game {
         // Score text — right-aligned at top-right of the field.
         cmds.push((
             Command::CreateElement(CreateElementBody {
-                id: "score".into(),
+                id: format!("{ID_PREFIX}score"),
                 commands: vec![DrawCmd::DrawText {
                     origin: Point {
                         x: FIELD_W - 0.5,
@@ -344,7 +349,7 @@ impl Game {
         // Centered message — invisible until game over / win.
         cmds.push((
             Command::CreateElement(CreateElementBody {
-                id: "msg".into(),
+                id: format!("{ID_PREFIX}msg"),
                 commands: vec![DrawCmd::DrawText {
                     origin: Point {
                         x: FIELD_W * 0.5,
@@ -422,7 +427,13 @@ impl Game {
             self.paddle_dirty = false;
             self.pending_brick_deletes.clear();
             let mut cmds: Vec<(Command, u32)> = Vec::new();
-            cmds.push((Command::ClearAll, 0));
+            cmds.push((
+                Command::DeleteElement {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                0,
+            ));
             cmds.extend(self.initial_commands());
             return cmds;
         }
@@ -506,7 +517,7 @@ impl Game {
         if matches!(self.state, GameState::Playing) {
             cmds.push((
                 Command::UpdateOrigin {
-                    id: "ball".into(),
+                    id: format!("{ID_PREFIX}ball"),
                     origin: Point {
                         x: self.ball_x,
                         y: self.ball_y,
@@ -520,7 +531,7 @@ impl Game {
         if self.paddle_dirty {
             cmds.push((
                 Command::UpdateOrigin {
-                    id: "paddle".into(),
+                    id: format!("{ID_PREFIX}paddle"),
                     origin: Point {
                         x: self.paddle_x,
                         y: PADDLE_Y,
@@ -544,7 +555,7 @@ impl Game {
             };
             cmds.push((
                 Command::UpdateTransform {
-                    id: "paddle".into(),
+                    id: format!("{ID_PREFIX}paddle"),
                     transform: t,
                 },
                 0,
@@ -554,7 +565,7 @@ impl Game {
         if self.score_dirty {
             cmds.push((
                 Command::UpdateText(UpdateTextBody {
-                    id: "score".into(),
+                    id: format!("{ID_PREFIX}score"),
                     command_index: 0,
                     range: UpdateTextRange::Whole,
                     replacement: format!("Score: {}", self.score),
@@ -573,7 +584,7 @@ impl Game {
             };
             cmds.push((
                 Command::UpdateCommand(UpdateCommandBody {
-                    id: "msg".into(),
+                    id: format!("{ID_PREFIX}msg"),
                     index: 0,
                     command: DrawCmd::DrawText {
                         origin: Point {
@@ -590,7 +601,7 @@ impl Game {
             ));
             cmds.push((
                 Command::UpdateVisibility {
-                    id: "msg".into(),
+                    id: format!("{ID_PREFIX}msg"),
                     is_visible: true,
                 },
                 0,
@@ -600,7 +611,7 @@ impl Game {
             // After a restart.
             cmds.push((
                 Command::UpdateVisibility {
-                    id: "msg".into(),
+                    id: format!("{ID_PREFIX}msg"),
                     is_visible: false,
                 },
                 0,
@@ -721,7 +732,7 @@ impl Game {
             let speed = 0.25 + 0.18 * pseudo_rand(self.next_spark_id as u32);
             let vx = theta.cos() * speed;
             let vy = theta.sin() * speed - 0.05;
-            let id = format!("sp-{}", self.next_spark_id);
+            let id = format!("{ID_PREFIX}sp-{}", self.next_spark_id);
             self.next_spark_id += 1;
             self.sparks.push(Spark {
                 id,

@@ -16,6 +16,12 @@ use vge_protocol::command::{
 };
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
+
+/// Namespace both element ids share (§6.8), so teardown is one prefix
+/// sweep instead of naming each one.
+const ID_PREFIX: &str = "spinner.";
+const EL_WHEEL: &str = "spinner.wheel";
+const EL_HINT: &str = "spinner.hint";
 use vge_protocol::path::{PathNode, PathSegment};
 use vge_render::probe::run_probe;
 use vge_render::tty::{
@@ -71,7 +77,7 @@ fn main() -> Result<()> {
         let t = Transform::rotate_about(theta, 0.0, 0.0, cw, ch);
         send(&[(
             Command::UpdateTransform {
-                id: "spinner".into(),
+                id: EL_WHEEL.into(),
                 transform: t,
             },
             REQ_ID_NO_RESPONSE,
@@ -84,7 +90,7 @@ fn main() -> Result<()> {
                 send(&[
                     (
                         Command::UpdateOrigin {
-                            id: "spinner".into(),
+                            id: EL_WHEEL.into(),
                             origin: center(cols, rows),
                             anchor: OriginAnchor::Viewport,
                         },
@@ -92,7 +98,7 @@ fn main() -> Result<()> {
                     ),
                     (
                         Command::UpdateOrigin {
-                            id: "hint".into(),
+                            id: EL_HINT.into(),
                             origin: hint_origin(cols, rows),
                             anchor: OriginAnchor::Viewport,
                         },
@@ -115,7 +121,13 @@ fn main() -> Result<()> {
                 .iter()
                 .any(|&b| b == b'q' || b == b'Q' || b == 0x1B || b == 0x03)
             {
-                send(&[(Command::ClearAll, REQ_ID_NO_RESPONSE)])?;
+                send(&[(
+                    Command::DeleteElement {
+                        id: ID_PREFIX.into(),
+                        by_prefix: true,
+                    },
+                    REQ_ID_NO_RESPONSE,
+                )])?;
                 return Ok(());
             }
         }
@@ -209,7 +221,7 @@ fn spinner_body(cols: u16, rows: u16, cw: f32, ch: f32) -> CreateElementBody {
     });
 
     CreateElementBody {
-        id: "spinner".into(),
+        id: EL_WHEEL.into(),
         commands,
         origin: center(cols, rows),
         is_visible: true,
@@ -246,7 +258,7 @@ fn circle_segment(c: Point, r: f32, cw: f32, ch: f32) -> PathSegment {
 
 fn hint_body(cols: u16, rows: u16) -> CreateElementBody {
     CreateElementBody {
-        id: "hint".into(),
+        id: EL_HINT.into(),
         commands: vec![DrawCmd::DrawText {
             origin: Point { x: 0.0, y: 0.0 },
             align: Align::Center,

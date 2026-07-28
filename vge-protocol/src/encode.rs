@@ -27,7 +27,6 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::UpdateOrigin { .. } => CMD_UPDATE_ORIGIN,
         Command::UpdateVisibility { .. } => CMD_UPDATE_VISIBILITY,
         Command::UpdateDrawOrder { .. } => CMD_UPDATE_DRAW_ORDER,
-        Command::ClearAll => CMD_CLEAR_ALL,
         Command::SetGlobalStyle { .. } => CMD_SET_GLOBAL_STYLE,
         Command::UploadImage(_) => CMD_UPLOAD_IMAGE,
         Command::DropImage { .. } => CMD_DROP_IMAGE,
@@ -68,7 +67,6 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
                 w.u8(b);
             }
         }
-        Command::ClearAll => {}
         Command::SetGlobalStyle { id, style } => {
             w.str(id);
             write_concrete_style(&mut w, style);
@@ -517,11 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_roundtrip() {
-        roundtrip(Command::ClearAll);
-    }
-
-    #[test]
     fn create_element_with_rect_roundtrip() {
         roundtrip(Command::CreateElement(CreateElementBody {
             id: "foo".into(),
@@ -950,7 +943,13 @@ mod tests {
 
         let env = build_envelope(&[
             (Command::Probe, 1),
-            (Command::ClearAll, 2),
+            (
+                Command::DeleteElement {
+                    id: "el".into(),
+                    by_prefix: false,
+                },
+                2,
+            ),
         ]);
         let mut s = ApcStream::new();
         let out = s.feed(&env);
@@ -966,10 +965,13 @@ mod tests {
         assert_eq!(r.u8().unwrap(), CMD_PROBE);
         assert_eq!(r.u32().unwrap(), 1);
         assert_eq!(r.u32().unwrap(), 0);
-        // Frame 2: ClearAll, request_id 2, empty body.
-        assert_eq!(r.u8().unwrap(), CMD_CLEAR_ALL);
+        // Frame 2: DeleteElement, request_id 2, body = flags byte then
+        // the varu-prefixed id (§6.2).
+        assert_eq!(r.u8().unwrap(), CMD_DELETE_ELEMENT);
         assert_eq!(r.u32().unwrap(), 2);
-        assert_eq!(r.u32().unwrap(), 0);
+        assert_eq!(r.u32().unwrap(), 4);
+        assert_eq!(r.u8().unwrap(), 0); // flags: exact id
+        assert_eq!(r.string().unwrap(), "el");
         assert!(r.at_end());
     }
 }

@@ -16,15 +16,21 @@ use vge_protocol::path::{PathNode, PathSegment};
 use crate::camera::Camera;
 use crate::doc::{Document, Element, Shape};
 
-pub const CANVAS_ID: &str = "canvas";
+/// Namespace every vdraw-owned element and image id shares (§6.8), so
+/// cleanup is one prefix sweep per table. Document elements keep their
+/// Excalidraw ids — they are children of `CANVAS_ID`, so the prefix
+/// delete reaches them through the subtree cascade (§9.6).
+pub const ID_PREFIX: &str = "vdraw.";
+
+pub const CANVAS_ID: &str = "vdraw.canvas";
 pub const CANVAS_ORDER: i32 = 0;
 /// Live drag preview. Parented to the canvas so it pans and zooms with
 /// the document, and drawn above every committed shape.
-pub const PREVIEW_ID: &str = "canvas.preview";
+pub const PREVIEW_ID: &str = "vdraw.canvas.preview";
 pub const PREVIEW_ORDER: i32 = 900;
 /// Selection outline and handles. Parented to the canvas so it tracks
 /// the shape it decorates, and drawn above the preview.
-pub const SELECTION_ID: &str = "canvas.selection";
+pub const SELECTION_ID: &str = "vdraw.canvas.selection";
 pub const SELECTION_ORDER: i32 = 950;
 /// Chrome sits above the canvas and is *not* parented to it, so the
 /// camera transform never touches it.

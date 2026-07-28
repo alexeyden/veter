@@ -18,7 +18,7 @@ use crate::tools::{
     COLORS, FILLS, LINE_TYPES, LineType, THICKNESSES, TOOLS, Tool, ToolState,
 };
 
-pub const CHROME_ID: &str = "chrome.bar";
+pub const CHROME_ID: &str = "vdraw.chrome.bar";
 
 const BTN_W: f32 = 5.0;
 const BTN_H: f32 = 2.0;

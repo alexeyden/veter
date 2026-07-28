@@ -1037,13 +1037,6 @@ impl VgeEngine {
             Command::UpdateDrawOrder { id, draw_order } => {
                 self.cmd_update_draw_order(&id, draw_order)
             }
-            Command::ClearAll => {
-                self.state.elements_mut().clear();
-                // Wholesale drop of one screen's elements — recount
-                // rather than unwind each one.
-                self.recompute_image_refs();
-                Ok(Vec::new())
-            }
             Command::SetGlobalStyle { id, style } => self.cmd_set_global_style(id, style),
             Command::UploadImage(b) => self.cmd_upload_image(b),
             Command::DropImage { id, by_prefix } => {
@@ -1650,9 +1643,12 @@ impl VgeEngine {
     /// tables, then collect whatever is now unreferenced.
     ///
     /// Used for the bulk transitions where tracking deltas would be
-    /// both fiddly and pointless: `ClearAll`, leaving the alt screen
-    /// (which discards a whole element set), and snapshot restore
-    /// (which replaces everything). Those happen a handful of times per
+    /// both fiddly and pointless: leaving the alt screen (which discards
+    /// a whole element set) and snapshot restore (which replaces
+    /// everything). Deletes — including the prefix form (§6.2), however
+    /// many elements it takes — unwind incrementally instead, through
+    /// `release_commands`. Those bulk transitions happen a handful of
+    /// times per
     /// session, so an O(elements x commands) sweep is far cheaper than
     /// the risk of a leaked or double-released count. The hot paths —
     /// create, delete, update — stay incremental.
@@ -1684,9 +1680,9 @@ impl VgeEngine {
             .images
             .iter()
             // A pinned (client-managed, §8.2) image is never auto-collected,
-            // same rule as `release_image` — otherwise a `ClearAll` (which
-            // recomputes every image to zero refs) would drop a cache the
-            // client still intends to reuse.
+            // same rule as `release_image` — otherwise a transition that
+            // recomputes every image to zero refs (an alt-screen swap,
+            // say) would drop a cache the client still intends to reuse.
             .filter(|(_, img)| img.refs == 0 && img.was_referenced && !img.pinned)
             .map(|(k, _)| k.clone())
             .collect();
@@ -1857,9 +1853,9 @@ mod tests {
 
     // Engine-level contract behind vplay's "view an image, quit, view
     // another" flow: it reuses fixed image ids (`vplay-tex`, …) across
-    // separate runs, dropping them on exit. Reusing an id after a
-    // DropImage + ClearAll — including across the alt-screen round trip —
-    // must leave the second run's image present and drawable. (This
+    // separate runs, sweeping its whole `vplay-` prefix on exit. Reusing
+    // an id after that sweep — including across the alt-screen round trip
+    // — must leave the second run's image present and drawable. (This
     // covers the host engine only; the GPU-texture side lives in the
     // `veter` renderer.)
     #[test]
@@ -1886,10 +1882,8 @@ mod tests {
             parent: None, size: None, transform: None, anchor: OriginAnchor::Viewport,
         });
         let exit = || enc(&[
-            (Command::DropImage { id: "vplay-tex".into(), by_prefix: false }, NR),
-            (Command::DropImage { id: "vplay-fa".into(), by_prefix: false }, NR),
-            (Command::DropImage { id: "vplay-fb".into(), by_prefix: false }, NR),
-            (Command::ClearAll, NR),
+            (Command::DeleteElement { id: "vplay-".into(), by_prefix: true }, NR),
+            (Command::DropImage { id: "vplay-".into(), by_prefix: true }, NR),
         ]);
 
         let mut e = VgeEngine::new((9, 20), 1.0);
@@ -1908,7 +1902,7 @@ mod tests {
         run(&mut e, &mut parser);
         assert!(e.state.shared.images.contains_key("vplay-tex"), "run1 uploaded");
         assert_eq!(e.state.elements().get("vplay-img").map(|el| el.commands.len()), Some(1));
-        // exit: DropImage + ClearAll (still on alt), then leave alt.
+        // exit: the two prefix sweeps (still on alt), then leave alt.
         e.process_pty_chunk(&exit());
         parser.process(b"\x1b[?1049l");
         e.after_vt100_process(&mut parser);
@@ -1940,6 +1934,16 @@ mod tests {
         env.push(ESC);
         env.push(ST_CLOSE);
         env
+    }
+
+    /// `DeleteElement` / `DropImage` body in prefix form (§6.2 / §8.2):
+    /// the flags byte with `by_prefix` set, then the prefix. Empty
+    /// matches everything.
+    fn prefix_body(prefix: &str) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(vge_protocol::command::FLAG_BY_PREFIX);
+        w.str(prefix);
+        w.buf
     }
 
     fn append_command(buf: &mut Vec<u8>, frame_type: u8, request_id: u32, body: &[u8]) {
@@ -3733,9 +3737,9 @@ mod tests {
         engine.process_pty_chunk(&build_envelope(&frames));
         assert!(engine.state.shared.images.contains_key("logo"));
 
-        // Still there after unrelated churn that triggers a recount.
+        // Still there after an unrelated screen-wide element wipe.
         let mut frames = Vec::new();
-        append_command(&mut frames, CMD_CLEAR_ALL, 2, &[]);
+        append_command(&mut frames, CMD_DELETE_ELEMENT, 2, &prefix_body(""));
         engine.process_pty_chunk(&build_envelope(&frames));
         assert!(
             engine.state.shared.images.contains_key("logo"),
@@ -3834,14 +3838,17 @@ mod tests {
         assert_eq!(e.state.elements().get("a").unwrap().commands.len(), 1);
         assert!(e.state.elements().get("b").unwrap().commands.is_empty());
 
-        // A pinned image also survives `ClearAll` (which recomputes every
-        // image to zero refs) — the case that broke vfm's suspend/restore
-        // when opening a file: the grid was cleared, the pin collected,
-        // then the rebuilt grid could not re-reference it.
-        e.process_pty_chunk(&enc(&[(Command::ClearAll, NR)]));
+        // A pinned image also survives a screen-wide element wipe (which
+        // releases every reference at once) — the case that broke vfm's
+        // suspend/restore when opening a file: the grid was cleared, the
+        // pin collected, then the rebuilt grid could not re-reference it.
+        e.process_pty_chunk(&enc(&[(
+            Command::DeleteElement { id: String::new(), by_prefix: true },
+            NR,
+        )]));
         assert!(
             e.state.shared.images.contains_key("pin"),
-            "pinned survives ClearAll"
+            "pinned survives an empty-prefix element wipe"
         );
         // Rebuild an element that draws it — must still resolve.
         e.process_pty_chunk(&enc(&[(elem("a", "pin"), NR)]));

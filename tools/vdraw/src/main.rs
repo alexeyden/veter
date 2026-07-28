@@ -83,7 +83,7 @@ enum Interaction {
 
 const FRAME_DT: Duration = Duration::from_millis(16); // ~60 Hz
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const STATUS_ID: &str = "chrome.status";
+const STATUS_ID: &str = "vdraw.chrome.status";
 /// Arrow-key pan step, in screen cells.
 const PAN_STEP: f32 = 2.0;
 
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     // (?1002) in SGR encoding (?1006) — the same pair vplay uses.
     out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h")?;
     out.flush()?;
-    let mut term = TermExit { drop_background: false };
+    let _term = TermExit;
 
     drain_stale_stdin();
     let probe = run_probe(PROBE_TIMEOUT)?.ok_or_else(|| {
@@ -124,15 +124,15 @@ fn main() -> Result<()> {
     let (mut cols, mut rows) = term_size()?;
 
     // Optional reference image, fitted to the pane on open. Uploaded once
-    // here, pinned so it survives every later `ClearAll`, so `full_render`
-    // only re-creates the element (see `background.rs`).
+    // here, pinned so it survives every later element wipe, so
+    // `full_render` only re-creates the element (see `background.rs`).
     let background = match &background {
         Some(p) => {
             let (bg, uploads) = Background::load(p, &cam, cols, rows, &probe)?;
             send(&uploads)?;
-            // Release the image on exit so it doesn't linger in the
-            // (portal-owned) image table after vdraw quits.
-            term.drop_background = true;
+            // `TermExit` sweeps the `vdraw.` image prefix unconditionally,
+            // so the image doesn't linger in the (portal-owned) table
+            // after vdraw quits.
             Some(bg)
         }
         None => None,
@@ -779,13 +779,23 @@ fn full_render(
     background: Option<&Background>,
 ) -> Vec<(Command, u32)> {
     let mut out = vec![
-        (Command::ClearAll, REQ_ID_NO_RESPONSE),
+        // Elements only. Deleting `vdraw.canvas` cascades over the
+        // document shapes, whose ids come from the loaded file and which
+        // no prefix could otherwise name (§9.6).
+        (
+            Command::DeleteElement {
+                id: render::ID_PREFIX.into(),
+                by_prefix: true,
+            },
+            REQ_ID_NO_RESPONSE,
+        ),
         (render::canvas_element(cam), REQ_ID_NO_RESPONSE),
     ];
     // Behind every shape, but a child of the canvas so it pans and zooms
-    // with the drawing. The image itself outlives the `ClearAll` above
-    // because it is pinned — an `Auto` upload would be collected by that
-    // very `ClearAll` and this element would fail to resolve it.
+    // with the drawing. The image itself outlives the wipe above because
+    // it is pinned — deleting the element that drew it releases the last
+    // reference, and an `Auto` upload would be collected right there,
+    // leaving this element naming a dead id.
     if let Some(bg) = background {
         out.push((bg.element(), REQ_ID_NO_RESPONSE));
     }
@@ -1109,25 +1119,31 @@ fn send(cmds: &[(Command, u32)]) -> Result<()> {
     Ok(())
 }
 
-struct TermExit {
-    /// Whether a background image was uploaded and should be released.
-    drop_background: bool,
-}
+struct TermExit;
 
 impl Drop for TermExit {
     fn drop(&mut self) {
         let mut o = std::io::stdout();
-        let mut cmds = vec![(Command::ClearAll, REQ_ID_NO_RESPONSE)];
-        if self.drop_background {
-            cmds.push((
-                Command::DropImage {
-                    id: background::BACKGROUND_ID.into(),
-                    by_prefix: false,
+        // Everything vdraw owns, in two sweeps (§6.2 / §8.2): every
+        // `vdraw.` element — document shapes included, via the canvas
+        // cascade — and the background image if one was ever uploaded.
+        // Matching nothing is `Ok`, so no "did we upload it?" flag.
+        let env = build_envelope(&[
+            (
+                Command::DeleteElement {
+                    id: render::ID_PREFIX.into(),
+                    by_prefix: true,
                 },
                 REQ_ID_NO_RESPONSE,
-            ));
-        }
-        let env = build_envelope(&cmds);
+            ),
+            (
+                Command::DropImage {
+                    id: render::ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ),
+        ]);
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();

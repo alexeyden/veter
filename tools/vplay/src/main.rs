@@ -38,6 +38,10 @@ use playlist::Playlist;
 use video::{Decode, DecodeState, VideoMeta, grab_one_frame, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
 
+/// Namespace every element and image id shares (§6.8), so cleanup is one
+/// prefix sweep per table rather than a list of ids to keep in step.
+const ID_PREFIX: &str = "vplay-";
+
 const EL_BG: &str = "vplay-bg";
 const EL_IMG: &str = "vplay-img";
 const EL_STATUS: &str = "vplay-status";
@@ -55,12 +59,13 @@ const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
 /// refcount does not survive either of the two things vplay does to a
 /// picture:
 ///
-/// * **A resize.** The `SIGWINCH` path sends `ClearAll` and recreates the
-///   chrome, then recreates the image element over the texture it already
-///   uploaded. But `ClearAll` recomputes every `Auto` image to zero refs
-///   and collects it, so the recreate names a texture the host has just
-///   thrown away — `ERR_UNKNOWN_IMAGE`, silent (§4: unrequested commands
-///   get no response), and a blank picture.
+/// * **A resize.** The `SIGWINCH` path deletes every `vplay-` element and
+///   recreates the chrome, then recreates the image element over the
+///   texture it already uploaded. But deleting an element releases its
+///   `DrawImage` reference (§8.0), and an `Auto` image at zero refs is
+///   collected there and then — so the recreate would name a texture the
+///   host had just thrown away: `ERR_UNKNOWN_IMAGE`, silent (§4:
+///   unrequested commands get no response), and a blank picture.
 /// * **A same-id swap.** Cycling stills reuses the one still id
 ///   (`DropImage`, `UploadImage`, retarget, one envelope) and the
 ///   retarget releases the *old* `DrawImage` — which, under `Auto`,
@@ -71,8 +76,9 @@ const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
 ///
 /// In exchange every id must be released by hand — which vplay already
 /// does: a swap drops the id it supersedes, `queue_frame_upload` drops a
-/// superseded in-flight upload, and `TermExit` drops all three ids on the
-/// way out. At most two frame textures and one still are ever live.
+/// superseded in-flight upload, and `TermExit` sweeps the whole
+/// `vplay-` prefix (§8.2) on the way out. At most two frame textures and
+/// one still are ever live.
 const RETENTION: Retention = Retention::Manual;
 
 /// Spinner angular speed, rad/s (§9.12 UpdateTransform). Time-based so
@@ -840,7 +846,15 @@ fn main() -> Result<()> {
             rows = ws.ws_row.max(min_rows);
             media_rows = rows - if is_video { 2 } else { 1 };
             vp.set_viewport(0.0, 0.0, cols as f32, media_rows as f32);
-            send(&mut out, &[np(Command::ClearAll)]);
+            // Elements only — the textures must survive, and the loop
+            // recreates the image element over the live one below.
+            send(
+                &mut out,
+                &[np(Command::DeleteElement {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                })],
+            );
             created_img = false;
             send(
                 &mut out,
@@ -857,8 +871,8 @@ fn main() -> Result<()> {
                         np(create_spinner(cols, media_rows, cell_pw, cell_ph)),
                     ],
                 );
-                // ClearAll wiped the spinner; let the loop re-show it if a
-                // decode is still pending.
+                // The wipe took the spinner with it; let the loop
+                // re-show it if a decode is still pending.
                 spinner_visible = false;
             }
             dirty_media = true;
@@ -1132,11 +1146,11 @@ fn main() -> Result<()> {
                         &[np(update_image_el(l.target, &cur_id, Some(l.source)))],
                     );
                 } else if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
-                    // After a resize ClearAll the element is gone but the
-                    // texture survives in the session image table —
-                    // recreate the element over it, no re-upload. This is
-                    // the reason frames are pinned: ClearAll's ref
-                    // recompute would collect an `Auto` texture and this
+                    // After a resize the element is gone but the texture
+                    // survives in the session image table — recreate the
+                    // element over it, no re-upload. This is the reason
+                    // frames are pinned: releasing the deleted element's
+                    // reference would collect an `Auto` texture and this
                     // would name a dead id (see `RETENTION`).
                     send(
                         &mut out,
@@ -1168,11 +1182,11 @@ fn main() -> Result<()> {
                 }];
                 created_img = true;
                 // Retire the texture the element previously referenced
-                // (also covers the one surviving a resize ClearAll), or
-                // the next A/B flip would collide with it. Now that
-                // frames are pinned this drop *is* the reclamation —
-                // under `Auto` the retarget above already collected the
-                // outgoing slot and this was a silent no-op.
+                // (also covers the one surviving a resize), or the next
+                // A/B flip would collide with it. Now that frames are
+                // pinned this drop *is* the reclamation — under `Auto`
+                // the retarget above already collected the outgoing slot
+                // and this was a silent no-op.
                 if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
                     fu.push(Command::DropImage {
                         id: cur_id.clone(),
@@ -1370,23 +1384,27 @@ struct TermExit;
 impl Drop for TermExit {
     fn drop(&mut self) {
         let mut o = std::io::stdout();
-        // ClearAll wipes elements only — images are session-scoped, so
-        // drop our textures (and abort any in-flight chunked upload,
-        // §8.2) explicitly. Unknown-id errors are unrequested and
-        // therefore silent.
-        let env = build_envelope(
-            &[IMG_ID, IMG_ID_A, IMG_ID_B]
-                .map(|id| (
-                    Command::DropImage {
-                        id: id.into(),
-                        by_prefix: false,
-                    },
-                    REQ_ID_NO_RESPONSE,
-                ))
-                .into_iter()
-                .chain([(Command::ClearAll, REQ_ID_NO_RESPONSE)])
-                .collect::<Vec<_>>(),
-        );
+        // Two prefix sweeps (§6.2 / §8.2) take everything vplay owns:
+        // every element, and every texture — the live one, whichever A/B
+        // slot is stale, and any in-flight chunked upload (§8.2). Naming
+        // the ids individually meant two of the three drops always failed,
+        // since only one texture is ever live.
+        let env = build_envelope(&[
+            (
+                Command::DeleteElement {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ),
+            (
+                Command::DropImage {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ),
+        ]);
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();

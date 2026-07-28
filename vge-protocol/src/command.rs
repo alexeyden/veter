@@ -367,9 +367,6 @@ pub enum Command {
     },
     UpdateVisibility { id: String, is_visible: bool },
     UpdateDrawOrder { id: String, draw_order: i32 },
-    /// Retired (§6.7) — superseded by `DeleteElement` with `by_prefix`
-    /// and an empty prefix. Kept only until every client is migrated.
-    ClearAll,
     SetGlobalStyle { id: String, style: ConcreteStyle },
     UploadImage(UploadImageBody),
     /// §8.2. `by_prefix` reinterprets `id` as an id prefix, sweeping
@@ -859,12 +856,6 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 return Err(ERR_BAD_PAYLOAD);
             }
             Ok(Command::UpdateDrawOrder { id, draw_order })
-        }
-        CMD_CLEAR_ALL => {
-            if !r.at_end() {
-                return Err(ERR_BAD_PAYLOAD);
-            }
-            Ok(Command::ClearAll)
         }
         CMD_SET_GLOBAL_STYLE => {
             let id = read_id(&mut r, false)?;

@@ -73,6 +73,11 @@ const MAX_LIVE_THUMBS: usize = 192;
 /// How long a status message stays up before the path returns.
 const MESSAGE_TTL: Duration = Duration::from_secs(4);
 
+/// Namespace every element and image id shares (§6.8): cleanup is one
+/// prefix sweep per table, and — because the image table outlives any one
+/// vfm run — a sweep at *startup* reclaims a previous run's thumbnails.
+const ID_PREFIX: &str = "vfm.";
+
 const ID_BG: &str = "vfm.bg";
 const ID_COLS: [&str; 2] = ["vfm.col0", "vfm.col1"];
 const ID_GRID: &str = "vfm.grid";
@@ -1108,7 +1113,7 @@ impl App {
         self.clamp_cursor();
         // Every pane is a top-level element drawing at absolute cell
         // coordinates, so a resize is just fresh command lists — no
-        // recreate, and crucially no `ClearAll`, which (under image
+        // recreate, and crucially no element wipe, which (under image
         // refcounting) would drop every cached thumbnail by deleting the
         // keeper along with everything else.
         self.dirty = Dirty::all();
@@ -1230,11 +1235,18 @@ impl App {
         if self.needs_rebuild {
             self.needs_rebuild = false;
             self.modal_live.clear();
-            // One-time element creation. `ClearAll` is safe here (nothing
-            // is uploaded yet); afterwards the panes are only updated in
-            // place, never recreated — a resize is just fresh command
-            // lists — so pinned thumbnails are never disturbed.
-            cmds.push((VgeCommand::ClearAll, REQ_ID_NO_RESPONSE));
+            // One-time element creation. Elements only — the pinned
+            // thumbnails (§8.0) must survive, and they do because this
+            // touches the element table alone. Afterwards the panes are
+            // only updated in place, never recreated — a resize is just
+            // fresh command lists — so nothing disturbs them either.
+            cmds.push((
+                VgeCommand::DeleteElement {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ));
             cmds.push(create(ID_BG, render::backdrop(&self.layout), ORDER_BG));
             for (i, id) in ID_COLS.iter().enumerate() {
                 cmds.push(create(id, self.column_commands(i), ORDER_PANE));
@@ -1458,11 +1470,28 @@ struct TermGuard;
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let mut out = std::io::stdout();
-        // Drop every element we created, then put the screen back.
-        let _ = out.write_all(&build_envelope(&[(
-            VgeCommand::ClearAll,
-            REQ_ID_NO_RESPONSE,
-        )]));
+        // Drop everything we created — elements *and* thumbnails —
+        // then put the screen back. The images matter: they are pinned
+        // (§8.0), so nothing reclaims them on our behalf, and the table
+        // belongs to the session, not to this process. Leaving them
+        // behind used to strand up to MAX_LIVE_THUMBS images and make the
+        // *next* vfm run collide with its own predecessor's ids.
+        let _ = out.write_all(&build_envelope(&[
+            (
+                VgeCommand::DeleteElement {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ),
+            (
+                VgeCommand::DropImage {
+                    id: ID_PREFIX.into(),
+                    by_prefix: true,
+                },
+                REQ_ID_NO_RESPONSE,
+            ),
+        ]));
         let _ = out.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = out.flush();
     }
@@ -1569,6 +1598,31 @@ fn main() -> Result<()> {
     let probe = run_probe(PROBE_TIMEOUT)?.ok_or_else(|| {
         anyhow!("VGE probe timed out — this terminal does not appear to support VGE")
     })?;
+
+    // Reclaim anything a previous vfm left in this session's tables — a
+    // vmux portal outlives any one run, and thumbnail ids restart from
+    // `vfm.t1` every time, so a leftover would win the id and the grid
+    // would draw the *previous* run's picture. `TermGuard` sweeps on the
+    // way out too; this covers the run that was killed before it could.
+    // Matching nothing is `Ok` (§8.2), so the first run pays nothing.
+    out.write_all(&build_envelope(&[
+        (
+            VgeCommand::DeleteElement {
+                id: ID_PREFIX.into(),
+                by_prefix: true,
+            },
+            REQ_ID_NO_RESPONSE,
+        ),
+        (
+            VgeCommand::DropImage {
+                id: ID_PREFIX.into(),
+                by_prefix: true,
+            },
+            REQ_ID_NO_RESPONSE,
+        ),
+    ]))?;
+    out.flush()?;
+
     if let Some(rgba) = args.accent {
         theme::set_cli_accent(theme::unpack(rgba));
     } else if let Some(accent) = probe_host_accent(PROBE_TIMEOUT) {
@@ -1639,15 +1693,17 @@ fn main() -> Result<()> {
 /// cursor, clear+home, button-event mouse tracking (?1002) in SGR
 /// encoding (?1006) — the pair vplay/vdraw use.
 const ENTER_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h";
-/// Its inverse: drop VGE elements (caller writes ClearAll separately),
-/// mouse off, cursor on, leave alt screen. Same as `TermGuard::drop`.
+/// Its inverse: mouse off, cursor on, leave alt screen. The VGE
+/// cleanup is a separate envelope the caller writes. Same as
+/// `TermGuard::drop`.
 const LEAVE_UI: &[u8] = b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
 /// Run a resolved open. Detached opens just spawn and return; an
 /// in-terminal open suspends vfm's whole UI (VGE cleared, alt screen and
 /// raw mode dropped so the child owns the tty), waits, then restores and
-/// forces a full repaint. Pinned thumbnails survive the `ClearAll`
-/// (Manual retention), so the rebuilt grid re-references them cleanly.
+/// forces a full repaint. Only elements are wiped, so the pinned
+/// thumbnails (Manual retention) are still there and the rebuilt grid
+/// re-references them cleanly.
 fn perform_open(
     app: &mut App,
     raw: &mut Option<RawTty>,
@@ -1662,8 +1718,15 @@ fn perform_open(
         return Ok(());
     }
 
-    // Suspend: hand a clean, cooked terminal to the child.
-    out.write_all(&build_envelope(&[(VgeCommand::ClearAll, REQ_ID_NO_RESPONSE)]))?;
+    // Suspend: hand a clean, cooked terminal to the child. Elements
+    // only — the thumbnail cache has to be there when we resume.
+    out.write_all(&build_envelope(&[(
+        VgeCommand::DeleteElement {
+            id: ID_PREFIX.into(),
+            by_prefix: true,
+        },
+        REQ_ID_NO_RESPONSE,
+    )]))?;
     out.write_all(LEAVE_UI)?;
     out.flush()?;
     *raw = None; // restore cooked mode

@@ -905,6 +905,10 @@ const PORTAL_SCROLLBACK_LINES: u32 = 5_000;
 /// the right pane.
 const SCROLL_REQUEST_ID_BASE: u32 = 0x5C_00_00_00;
 
+/// Namespace every VGE element id shares (§6.8), so teardown is one
+/// prefix sweep. vmux uploads no images, so only the element table.
+const ID_PREFIX: &str = "vmux-";
+
 /// VGE element ID used for a pane's chrome (title thumb + scroll thumb).
 fn chrome_element_id(pane_id: &str) -> String {
     format!("vmux-chrome-{pane_id}")
@@ -4494,7 +4498,16 @@ fn main() -> Result<()> {
         ),
         (PrtCommand::ClearAll, 0),
     ];
-    let vge_cleanup = [(VgeCommand::ClearAll, 0)];
+    // One sweep for every `vmux-` element: per-pane chrome, separators,
+    // tab bar, modal. Still exactly one frame, so the response count
+    // `await_cleanup_responses` expects is unchanged.
+    let vge_cleanup = [(
+        VgeCommand::DeleteElement {
+            id: ID_PREFIX.into(),
+            by_prefix: true,
+        },
+        0,
+    )];
     let _ = write_all_stdout(&build_prt_envelope(&prt_cleanup));
     let _ = write_all_stdout(&build_vge_envelope(&vge_cleanup));
 
