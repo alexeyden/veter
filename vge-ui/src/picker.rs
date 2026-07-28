@@ -135,6 +135,18 @@ impl<P> Picker<P> {
             .collect()
     }
 
+    /// Everything after the command name, verbatim (bar the surrounding
+    /// whitespace) — what a single argument that may itself contain
+    /// spaces needs, a path being the obvious one. [`Self::args`] is the
+    /// tokenised view of the same text.
+    pub fn arg_line(&self) -> &str {
+        let buf = self.editor.buffer.trim_start();
+        match buf.find(char::is_whitespace) {
+            Some(i) => buf[i..].trim(),
+            None => "",
+        }
+    }
+
     /// Recompute `matches` for the current filter, keeping the
     /// previously selected item selected when it survives, else clamping
     /// to the top.
@@ -378,6 +390,25 @@ mod tests {
         assert_eq!(p.filter_text(), "rename-tab");
         assert_eq!(p.args(), vec!["2".to_string(), "build".to_string()]);
         assert_eq!(p.matches.len(), 1, "args must not narrow the filter");
+    }
+
+    #[test]
+    fn arg_line_keeps_spaces_that_belong_to_the_argument() {
+        let mut p = Picker::new("Command", FilterMode::CommandLine, items());
+        // A path argument: tokenising would tear it in half.
+        feed(&mut p, b"zoom /home/me/My Pictures ");
+        assert_eq!(p.arg_line(), "/home/me/My Pictures");
+        assert_eq!(p.filter_text(), "zoom", "the command token is unaffected");
+    }
+
+    #[test]
+    fn arg_line_is_empty_without_arguments() {
+        let mut p = Picker::new("Command", FilterMode::CommandLine, items());
+        feed(&mut p, b"zoom");
+        assert_eq!(p.arg_line(), "");
+        // Trailing whitespace alone is not an argument.
+        feed(&mut p, b"   ");
+        assert_eq!(p.arg_line(), "");
     }
 
     #[test]

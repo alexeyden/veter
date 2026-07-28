@@ -104,7 +104,7 @@ enum PromptKind {
     Rename,
     Mkdir,
     Filter,
-    Goto,
+    Cd,
 }
 
 impl PromptKind {
@@ -113,7 +113,7 @@ impl PromptKind {
             PromptKind::Rename => "Rename",
             PromptKind::Mkdir => "New directory",
             PromptKind::Filter => "Filter",
-            PromptKind::Goto => "Go to path",
+            PromptKind::Cd => "Change directory",
         }
     }
 }
@@ -148,7 +148,7 @@ enum Cmd {
     GoParent,
     GoHome,
     GoRoot,
-    Goto,
+    Cd,
     Help,
     Quit,
 }
@@ -180,7 +180,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("go-parent", "h", Cmd::GoParent),
     ("go-home", "~", Cmd::GoHome),
     ("go-root", "", Cmd::GoRoot),
-    ("go-to", "", Cmd::Goto),
+    ("cd", "[PATH]", Cmd::Cd),
     ("help", "?", Cmd::Help),
     ("quit", "q", Cmd::Quit),
 ];
@@ -557,7 +557,7 @@ impl App {
     }
 
     fn prompt(&mut self, kind: PromptKind, initial: String) {
-        let max = if kind == PromptKind::Goto {
+        let max = if kind == PromptKind::Cd {
             512
         } else {
             NAME_MAX_CHARS
@@ -616,7 +616,7 @@ impl App {
                 }
             }
             Cmd::GoRoot => self.cd(PathBuf::from("/")),
-            Cmd::Goto => self.prompt(PromptKind::Goto, String::new()),
+            Cmd::Cd => self.prompt(PromptKind::Cd, String::new()),
             Cmd::Filter => self.prompt(PromptKind::Filter, self.opts.filter.clone()),
             Cmd::ClearFilter => {
                 if self.opts.filter.is_empty() {
@@ -941,11 +941,11 @@ impl App {
                     to: self.cwd.join(&text),
                 });
             }
-            PromptKind::Goto => {
+            PromptKind::Cd => {
                 if text.is_empty() {
                     return;
                 }
-                let path = expand_path(&text);
+                let path = expand_path(&text, &self.cwd);
                 self.cd(path);
             }
         }
@@ -980,11 +980,19 @@ impl App {
             PickerOutcome::Commit => {
                 let cmd = picker.current_item().map(|it| it.payload);
                 // `:open` consumes the rest of the line as a one-off
-                // command; every other command ignores its args.
+                // command and `:cd` as a path; every other command
+                // ignores its args. The path is taken verbatim rather
+                // than tokenised — directory names contain spaces.
                 let args = picker.args();
+                let arg_line = picker.arg_line().to_string();
                 self.set_mode(Mode::Normal);
                 match cmd {
                     Some(Cmd::Open) => self.open_with_args(&args),
+                    // `:cd PATH` goes straight there; bare `:cd` asks.
+                    Some(Cmd::Cd) if !arg_line.is_empty() => {
+                        let path = expand_path(&arg_line, &self.cwd);
+                        self.cd(path);
+                    }
                     Some(other) => self.run_cmd(other),
                     None => {}
                 }
@@ -1326,7 +1334,11 @@ fn file_name(p: &Path) -> String {
 }
 
 /// Expand `~` and make a relative path absolute against the process cwd.
-fn expand_path(text: &str) -> PathBuf {
+/// Resolve what the user typed into a directory to visit: `~` is home,
+/// an absolute path is taken as-is, and anything else is relative to
+/// `base` — the directory being browsed, not the process's working
+/// directory, which is wherever vfm happened to be launched from.
+fn expand_path(text: &str, base: &Path) -> PathBuf {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix('~') {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1339,11 +1351,7 @@ fn expand_path(text: &str) -> PathBuf {
         }
     }
     let p = PathBuf::from(text);
-    if p.is_absolute() {
-        p
-    } else {
-        std::env::current_dir().unwrap_or_default().join(p)
-    }
+    if p.is_absolute() { p } else { base.join(p) }
 }
 
 fn help_lines() -> Vec<String> {
@@ -1384,6 +1392,7 @@ fn help_lines() -> Vec<String> {
         "  :               command palette (type to filter, Enter runs)",
         "  :open CMD       open the file with a one-off command (detached)",
         "  :open -t CMD    …run it in this terminal (editor / TUI); % = the file",
+        "  :cd [PATH]      change directory; without PATH it asks for one",
         "  ?               this help",
         "  q               quit",
         "",
@@ -2001,6 +2010,68 @@ mod tests {
         app.on_event(Event::Enter);
         assert!(matches!(app.mode, Mode::Normal));
         assert!(app.opts.show_hidden);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Type `text` into the palette and commit it.
+    fn palette(app: &mut App, text: &str) {
+        app.on_event(Event::Key(':'));
+        for c in text.chars() {
+            app.on_event(Event::Key(c));
+        }
+        app.on_event(Event::Enter);
+    }
+
+    #[test]
+    fn cd_with_a_path_argument_goes_straight_there() {
+        let d = tmpdir("cd-arg");
+        // A directory whose name has a space: the path must survive as
+        // one argument rather than being tokenised.
+        let target = d.join("My Pictures");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut app = app_in(&d);
+
+        palette(&mut app, "cd My Pictures");
+        assert!(matches!(app.mode, Mode::Normal), "no prompt when a path is given");
+        assert_eq!(app.cwd, target);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn cd_resolves_a_relative_path_against_the_browsed_directory() {
+        // Not the process's working directory, which is wherever vfm was
+        // launched from and has nothing to do with what is on screen.
+        let d = tmpdir("cd-rel");
+        std::fs::create_dir_all(d.join("inner/deeper")).unwrap();
+        let mut app = app_in(&d);
+        palette(&mut app, "cd inner");
+        assert_eq!(app.cwd, d.join("inner"));
+        palette(&mut app, "cd deeper");
+        assert_eq!(app.cwd, d.join("inner/deeper"), "relative to where we now are");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bare_cd_asks_for_a_path() {
+        let d = tmpdir("cd-bare");
+        let mut app = app_in(&d);
+        palette(&mut app, "cd");
+        assert!(
+            matches!(app.mode, Mode::Prompt { kind: PromptKind::Cd, .. }),
+            "bare :cd opens the prompt"
+        );
+        assert_eq!(app.cwd, d, "and goes nowhere until it is answered");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn cd_to_a_non_directory_reports_instead_of_moving() {
+        let d = tmpdir("cd-bad");
+        std::fs::write(d.join("file.txt"), b"x").unwrap();
+        let mut app = app_in(&d);
+        palette(&mut app, "cd file.txt");
+        assert_eq!(app.cwd, d);
+        assert!(app.message.as_ref().unwrap().1, "reported as a failure");
         std::fs::remove_dir_all(&d).unwrap();
     }
 
