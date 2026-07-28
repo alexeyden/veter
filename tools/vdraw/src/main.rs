@@ -124,8 +124,8 @@ fn main() -> Result<()> {
     let (mut cols, mut rows) = term_size()?;
 
     // Optional reference image, fitted to the pane on open. Uploaded once
-    // here; it survives every later `ClearAll`, so `full_render` only
-    // re-creates the element (see `background.rs`).
+    // here, pinned so it survives every later `ClearAll`, so `full_render`
+    // only re-creates the element (see `background.rs`).
     let background = match &background {
         Some(p) => {
             let (bg, uploads) = Background::load(p, &cam, cols, rows, &probe)?;
@@ -783,7 +783,9 @@ fn full_render(
         (render::canvas_element(cam), REQ_ID_NO_RESPONSE),
     ];
     // Behind every shape, but a child of the canvas so it pans and zooms
-    // with the drawing. The image itself outlives the `ClearAll` above.
+    // with the drawing. The image itself outlives the `ClearAll` above
+    // because it is pinned — an `Auto` upload would be collected by that
+    // very `ClearAll` and this element would fail to resolve it.
     if let Some(bg) = background {
         out.push((bg.element(), REQ_ID_NO_RESPONSE));
     }

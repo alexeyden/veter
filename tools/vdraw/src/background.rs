@@ -9,9 +9,18 @@
 //!
 //! The element sits below every shape (`BACKGROUND_ORDER`), is not part
 //! of `document.elements`, and so is never hit-tested, selected, saved
-//! or undone. `ClearAll` (used by `full_render` on undo/redo) wipes the
-//! element but leaves the image table untouched (§6.7), so the picture
-//! only needs uploading once — later frames just re-create the element.
+//! or undone.
+//!
+//! The picture is uploaded once and re-created as an element by every
+//! later `full_render` (undo/redo, resize). That makes it a *cache* in
+//! §8.2's sense, so it is uploaded with **Manual** retention. `ClearAll`
+//! does not touch the image table (§6.7), but it does release every
+//! reference (§8.2), and an `Auto` image whose count falls to zero is
+//! collected there and then — the next `full_render`'s `CreateElement`
+//! would name a dead id, fail with `err_unknown_image`, and (validation
+//! being atomic, §7.5) drop the whole background element. Manual
+//! retention means vdraw releases the id itself: `load` drops it before
+//! uploading and `TermExit` drops it on the way out.
 
 use std::path::Path;
 
@@ -19,7 +28,7 @@ use anyhow::{Context, Result};
 use image::ImageReader;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Command, CreateElementBody, DrawCmd, OriginAnchor, UploadImageBody,
+    Command, CreateElementBody, DrawCmd, OriginAnchor, Retention, UploadImageBody,
 };
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_render::is_ssh_session;
@@ -189,6 +198,10 @@ fn upload_dims(w: u32, h: u32, probe: &ProbeData) -> (u32, u32) {
 /// SSH so a large image streams politely, a single chunk locally. Every
 /// chunk is quiet (`REQ_ID_NO_RESPONSE`) so no ack frames land back on
 /// vdraw's stdin, where the input parser would choke on them.
+///
+/// Retention is Manual on every chunk — the host only reads the flag on
+/// the first one, but a uniform body is one less thing to get wrong. See
+/// the module docs for why the background must not be auto-collected.
 fn chunk_uploads(
     id: &str,
     encoding: u8,
@@ -210,7 +223,7 @@ fn chunk_uploads(
             let end = (offset + chunk_size).min(total_bytes);
             (
                 Command::UploadImage(UploadImageBody {
-                    retention: vge_protocol::command::Retention::Auto,
+                    retention: Retention::Manual,
                     id: id.to_string(),
                     encoding,
                     width,
