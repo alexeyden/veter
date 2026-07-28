@@ -5,7 +5,7 @@
 //! reply lands in the pane's input queue, where the foreground program
 //! is blocked in `read()`, and whoever the kernel wakes gets the bytes.
 //! Everything such a client needs must therefore be reachable without a
-//! round-trip. See `doc/client-integration-groundwork.md` items 3 and 7.
+//! round-trip. See `doc/vector-graphics-extension.md` §11.1.
 //!
 //! The split is deliberate:
 //!

@@ -33,7 +33,8 @@ use vge_protocol::apc::Segment;
 /// tracker anchoring depends on it — but only when text is pending, so
 /// a run of commands costs one sync rather than one per command.
 ///
-/// See `doc/client-integration-groundwork.md` item 5.
+/// See `doc/vector-graphics-extension.md` §5.2, which makes this
+/// ordering normative.
 pub fn drive_terminal_stage<CB: vt100::Callbacks>(
     engine: &mut VgeEngine,
     parser: &mut vt100::Parser<CB>,

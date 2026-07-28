@@ -136,7 +136,7 @@ pub struct Output {
 /// needs. A `CreateElement` whose origin resolves against the cursor
 /// must see the text that preceded it in the same read, and only the
 /// sequence tells you where that boundary is. See
-/// `doc/client-integration-groundwork.md` item 5.
+/// `doc/vector-graphics-extension.md` §5.2 on ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
     /// Bytes destined for the vt100, verbatim.

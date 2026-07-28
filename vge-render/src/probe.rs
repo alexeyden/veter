@@ -41,7 +41,7 @@ const DEFAULT_MAX_NESTING_DEPTH: u8 = 16;
 
 /// Assemble capabilities with no round-trip at all, from `TIOCGWINSZ`
 /// (live cell dimensions) and the environment veter exports (static
-/// caps). See `doc/client-integration-groundwork.md` items 1, 3 and 7.
+/// caps). See `doc/vector-graphics-extension.md` §11.1.
 ///
 /// Returns `None` unless `$VETER` is set — that variable is the only
 /// evidence available without a reply that the terminal speaks VGE —
