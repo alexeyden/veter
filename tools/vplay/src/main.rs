@@ -9,6 +9,7 @@
 
 mod image_src;
 mod input;
+mod playlist;
 mod video;
 mod viewport;
 
@@ -33,6 +34,7 @@ use vge_render::upload::{Encoding, encode_payload};
 
 use image_src::{Frame, load_image};
 use input::{Dir, Event, InputParser};
+use playlist::Playlist;
 use video::{Decode, DecodeState, VideoMeta, grab_one_frame, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
 
@@ -81,6 +83,15 @@ struct Cli {
     /// Milliseconds to wait for the terminal's VGE probe response.
     #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
+}
+
+/// What the status bar calls a file: its name, or the whole path when it
+/// has no trailing name component.
+fn file_label(p: &std::path::Path) -> String {
+    p.file_name()
+        .unwrap_or(p.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn is_video_ext(p: &std::path::Path) -> bool {
@@ -179,6 +190,17 @@ fn pick_encoding(
     }
 }
 
+/// The single-shot upload of a still, under the one still texture id.
+///
+/// Retention is **Manual** (§8.2): the still is client-managed, and the
+/// host's `Auto` refcount is wrong for it twice over. Swapping to a
+/// sibling image re-uses the id — `DropImage`, `UploadImage`, retarget,
+/// one envelope — and the retarget's release of the *old* command would
+/// collect the texture that just landed under that id. And the resize
+/// path's `ClearAll` recomputes every `Auto` image to zero refs, which
+/// collects the texture the element is about to be recreated over.
+/// Pinning is what makes both work; `TermExit` and each swap release the
+/// id explicitly, so nothing leaks.
 fn upload_cmd(
     id: &str,
     w: u32,
@@ -198,7 +220,7 @@ fn upload_cmd(
         );
     }
     Ok(Command::UploadImage(UploadImageBody {
-        retention: vge_protocol::command::Retention::Auto,
+        retention: vge_protocol::command::Retention::Manual,
         id: id.into(),
         encoding,
         width: w,
@@ -493,6 +515,62 @@ fn render_image_mode<W: Write>(out: &mut W, vp: &Viewport, created: &mut bool) {
     send(out, &[np(cmd)]);
 }
 
+/// One keyboard pan step, in cells.
+const PAN_CELLS: f32 = 3.0;
+
+/// Pan the viewport one step in `dir` (arrow keys in the axes that don't
+/// mean something else, and `hjkl` always).
+fn pan(vp: &mut Viewport, dir: Dir) {
+    match dir {
+        Dir::Up => vp.pan_cells(0.0, PAN_CELLS),
+        Dir::Down => vp.pan_cells(0.0, -PAN_CELLS),
+        Dir::Left => vp.pan_cells(PAN_CELLS, 0.0),
+        Dir::Right => vp.pan_cells(-PAN_CELLS, 0.0),
+    }
+}
+
+/// Move the playlist cursor `delta` entries and prepare the first entry
+/// that both decodes and encodes, skipping the ones that don't — a
+/// directory listing is no promise that every file is a usable image.
+/// Returns the entry's path, its decoded pixels and the upload command
+/// that installs them, or `None` (cursor left where it started) when
+/// nothing else in the directory could be shown.
+///
+/// Decoding is synchronous, as it is at startup: a still is one upload,
+/// with no seek spinner to keep alive.
+fn step_image(
+    pl: &mut Playlist,
+    delta: isize,
+    supported: u8,
+    ssh: bool,
+    max_image_bytes: u32,
+) -> Option<(std::path::PathBuf, Frame, Command)> {
+    let start = pl.index();
+    // At most every *other* entry, so a directory of undecodable files
+    // terminates instead of spinning.
+    for _ in 0..pl.len().saturating_sub(1) {
+        let path = pl.step(delta);
+        let Ok(f) = load_image(&path) else { continue };
+        // The upload is built here, before anything is sent, so a frame
+        // that busts the host's limits is skipped like an undecodable
+        // one rather than tearing down the picture on screen.
+        let Ok(up) = upload_cmd(
+            IMG_ID,
+            f.w,
+            f.h,
+            f.rgba.clone(),
+            supported,
+            ssh,
+            max_image_bytes,
+        ) else {
+            continue;
+        };
+        return Some((path, f, up));
+    }
+    pl.set_index(start);
+    None
+}
+
 /// Queue the full decoded frame for upload under the next ping-pong id
 /// as a [`ChunkedUpload`]. The event loop pumps the chunks and builds
 /// the element retarget (with the viewport's then-current `source_rect`)
@@ -561,11 +639,7 @@ fn main() -> Result<()> {
     };
 
     let path_str = cli.file.to_string_lossy().into_owned();
-    let name = cli
-        .file
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path_str.clone());
+    let mut name = file_label(&cli.file);
 
     // Probe video metadata / load the image up front so we fail before
     // touching the terminal if the input is bad or ffmpeg is missing.
@@ -607,8 +681,9 @@ fn main() -> Result<()> {
     }
     let mut media_rows = rows - if is_video { 2 } else { 1 };
 
-    // Source dimensions for the viewport.
-    let (src_w, src_h) = match (&meta, &image_frame) {
+    // Source dimensions for the viewport. Mutable: in image mode the
+    // left/right arrows swap in a sibling still of any size.
+    let (mut src_w, mut src_h) = match (&meta, &image_frame) {
         (Some(m), _) => (m.width, m.height),
         (_, Some(f)) => (f.w, f.h),
         _ => unreachable!(),
@@ -655,6 +730,15 @@ fn main() -> Result<()> {
     let fps = meta.as_ref().map(|m| m.fps).unwrap_or(30.0);
     let mut cur_pts = 0.0f64;
     let mut cur_index = 0u64;
+
+    // Image state: the opened file's sibling stills, which the left/right
+    // arrows cycle through. Scanned once — the directory as it was when
+    // vplay opened.
+    let mut pl = if is_video {
+        None
+    } else {
+        Some(Playlist::scan(&cli.file))
+    };
 
     if is_video {
         let m = meta.as_ref().unwrap();
@@ -826,9 +910,14 @@ fn main() -> Result<()> {
                     dirty_media = true;
                     dirty_status = true;
                 }
+                Event::Pan(dir) => {
+                    pan(&mut vp, dir);
+                    dirty_media = true;
+                    dirty_status = true;
+                }
                 Event::Arrow(dir) => {
-                    const PAN: f32 = 3.0;
-                    if is_video && matches!(dir, Dir::Left | Dir::Right) {
+                    let horizontal = matches!(dir, Dir::Left | Dir::Right);
+                    if is_video && horizontal {
                         let dt = if dir == Dir::Right { 5.0 } else { -5.0 };
                         let target = frame_at_time(cur_pts + dt, &frame_times, fps);
                         request_seek(
@@ -843,13 +932,57 @@ fn main() -> Result<()> {
                         )?;
                         dirty_status = true;
                         dirty_seek = true;
-                    } else {
-                        match dir {
-                            Dir::Up => vp.pan_cells(0.0, PAN),
-                            Dir::Down => vp.pan_cells(0.0, -PAN),
-                            Dir::Left => vp.pan_cells(PAN, 0.0),
-                            Dir::Right => vp.pan_cells(-PAN, 0.0),
+                    } else if horizontal
+                        && let Some(pl) = pl.as_mut()
+                    {
+                        // Image mode: walk the directory's stills.
+                        // Horizontal panning moves to `h`/`l`.
+                        let delta = if dir == Dir::Right { 1 } else { -1 };
+                        if let Some((path, f, up)) =
+                            step_image(pl, delta, supported, ssh, max_image_bytes)
+                        {
+                            name = file_label(&path);
+                            src_w = f.w;
+                            src_h = f.h;
+                            source_frame = f;
+                            // A fresh still starts fitted, like the
+                            // opened one did.
+                            vp = Viewport::new(
+                                src_w,
+                                src_h,
+                                cell_pw,
+                                cell_ph,
+                                0.0,
+                                0.0,
+                                cols as f32,
+                                media_rows as f32,
+                            );
+                            // The still texture is a single slot, so the
+                            // swap is drop-then-upload (sound only
+                            // because the still is pinned — see
+                            // `upload_cmd`), kept in one envelope
+                            // together with the element's new geometry so
+                            // no frame is ever composed with the old
+                            // source_rect over the new texture.
+                            let l = vp.layout();
+                            let el = if created_img {
+                                update_image_el(l.target, IMG_ID, Some(l.source))
+                            } else {
+                                created_img = true;
+                                create_image_el(l.target, IMG_ID, Some(l.source))
+                            };
+                            send(
+                                &mut out,
+                                &[
+                                    np(Command::DropImage { id: IMG_ID.into() }),
+                                    np(up),
+                                    np(el),
+                                ],
+                            );
+                            dirty_status = true;
                         }
+                    } else {
+                        pan(&mut vp, dir);
                         dirty_media = true;
                         dirty_status = true;
                     }
@@ -1044,9 +1177,15 @@ fn main() -> Result<()> {
                     cursor_readout(&cur),
                 )
             } else {
+                // The playlist position only earns its space when there
+                // is somewhere to cycle to.
+                let pos = match pl.as_ref().filter(|p| p.len() > 1) {
+                    Some(p) => format!("  {}/{}", p.index() + 1, p.len()),
+                    None => String::new(),
+                };
                 (
                     format!("{name}  {src_w}x{src_h}"),
-                    format!("{}%", vp.zoom_percent()),
+                    format!("{}%{pos}", vp.zoom_percent()),
                     cursor_readout(&cur),
                 )
             };

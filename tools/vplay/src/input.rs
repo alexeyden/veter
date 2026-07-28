@@ -16,7 +16,12 @@ pub enum Event {
     ZoomOut,
     Fit,
     Actual,
+    /// A cursor key. Mode-dependent: the horizontal pair seeks in video
+    /// mode and cycles the directory's stills in image mode.
     Arrow(Dir),
+    /// `hjkl` — always a pan, in both modes, so the keyboard can still
+    /// pan horizontally where `Arrow` means something else.
+    Pan(Dir),
     StepNext,
     StepPrev,
     /// Left-button press at a 0-indexed cell.
@@ -145,6 +150,22 @@ impl InputParser {
                     out.push(Event::Actual);
                     i += 1;
                 }
+                b'h' => {
+                    out.push(Event::Pan(Dir::Left));
+                    i += 1;
+                }
+                b'j' => {
+                    out.push(Event::Pan(Dir::Down));
+                    i += 1;
+                }
+                b'k' => {
+                    out.push(Event::Pan(Dir::Up));
+                    i += 1;
+                }
+                b'l' => {
+                    out.push(Event::Pan(Dir::Right));
+                    i += 1;
+                }
                 b'.' => {
                     out.push(Event::StepNext);
                     i += 1;
@@ -269,6 +290,20 @@ mod tests {
                 Event::StepNext,
                 Event::StepPrev,
                 Event::Quit,
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_pan_keys() {
+        let mut p = InputParser::new();
+        assert_eq!(
+            p.feed(b"hjkl"),
+            vec![
+                Event::Pan(Dir::Left),
+                Event::Pan(Dir::Down),
+                Event::Pan(Dir::Up),
+                Event::Pan(Dir::Right),
             ]
         );
     }
