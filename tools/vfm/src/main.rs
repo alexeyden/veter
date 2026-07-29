@@ -18,6 +18,7 @@
 //! worker runs copies/moves/deletes ([`ops`]), so neither a directory of
 //! 4000 JPEGs nor a multi-gigabyte copy stops the grid repainting.
 
+mod clip;
 mod config;
 mod entry;
 mod icons;
@@ -126,6 +127,10 @@ enum Cmd {
     Copy,
     Cut,
     Paste,
+    /// Copy the targets' paths to the *system* clipboard, as text.
+    CopyPath,
+    /// Copy the targets themselves to the *system* clipboard, as files.
+    SysCopy,
     Delete,
     Rename,
     Mkdir,
@@ -158,6 +163,8 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("copy", "y", Cmd::Copy),
     ("cut", "d", Cmd::Cut),
     ("paste", "p", Cmd::Paste),
+    ("copy-path", "Y", Cmd::CopyPath),
+    ("copy-to-system", "Ctrl+Y", Cmd::SysCopy),
     ("delete", "D", Cmd::Delete),
     ("rename", "r", Cmd::Rename),
     ("mkdir", "m", Cmd::Mkdir),
@@ -250,8 +257,13 @@ struct App {
     cursor: usize,
     scroll_row: usize,
     marks: HashSet<PathBuf>,
+    /// vfm's own clipboard, for `y`/`d`/`p`. Entirely internal — the
+    /// system one is [`App::sys_clip`], and the two never mix.
     clipboard: Vec<PathBuf>,
     clip_mode: ClipMode,
+    /// The system clipboard ([`clip`]). Holds no connection of its own —
+    /// a copy hands the selection to a detached helper process.
+    sys_clip: clip::SysClip,
     /// Where the cursor was in each directory we have visited.
     memory: HashMap<PathBuf, PathBuf>,
     opts: ListOpts,
@@ -262,6 +274,11 @@ struct App {
     /// to suspend/restore raw mode + the VGE UI, which the App can't do
     /// itself).
     pending_open: Option<ResolvedOpen>,
+    /// Raw bytes for the event loop to write to the terminal after the
+    /// current event — OSC 52 rides the same stdout as the VGE stream,
+    /// and the App holds no writer of its own (same reason as
+    /// `pending_open`).
+    pending_out: Vec<u8>,
 
     cols: u32,
     rows: u32,
@@ -306,11 +323,13 @@ impl App {
             marks: HashSet::new(),
             clipboard: Vec::new(),
             clip_mode: ClipMode::Copy,
+            sys_clip: clip::SysClip::new(),
             memory: HashMap::new(),
             opts,
             zoom: DEFAULT_TILE_ZOOM,
             config,
             pending_open: None,
+            pending_out: Vec::new(),
             cols,
             rows,
             cell_pw,
@@ -597,6 +616,19 @@ impl App {
         self.dirty.status = true;
     }
 
+    /// Queue an OSC 52 write putting `paths` — one absolute path per
+    /// line — on the system clipboard as text. `false` if the text is
+    /// over [`clip::MAX_OSC52_TEXT`]; the caller reports that, since it
+    /// knows whether this was the requested action or a fallback.
+    fn queue_path_copy(&mut self, paths: &[PathBuf]) -> bool {
+        let text = clip::paths_as_text(paths);
+        if text.len() > clip::MAX_OSC52_TEXT {
+            return false;
+        }
+        self.pending_out.extend_from_slice(&clip::osc52_set(&text));
+        true
+    }
+
     // ── commands ─────────────────────────────────────────────────────
 
     fn run_cmd(&mut self, cmd: Cmd) {
@@ -694,6 +726,41 @@ impl App {
                     self.clipboard.clear();
                 }
                 self.submit(op);
+            }
+            Cmd::CopyPath => {
+                let targets = self.targets();
+                if targets.is_empty() {
+                    return;
+                }
+                let n = targets.len();
+                if self.queue_path_copy(&targets) {
+                    self.note(format!("copied {n} path{}", plural(n)));
+                } else {
+                    self.warn("too much text for one clipboard write".into());
+                }
+            }
+            Cmd::SysCopy => {
+                let targets = self.targets();
+                if targets.is_empty() {
+                    return;
+                }
+                let n = targets.len();
+                match self.sys_clip.set_files(&targets) {
+                    clip::FileCopy::Ok => {
+                        self.note(format!("copied {n} file{} to the system clipboard", plural(n)))
+                    }
+                    // No selection for us to own. The paths are still
+                    // worth having, and OSC 52 reaches the renderer's
+                    // clipboard even from the far side of an SSH hop.
+                    clip::FileCopy::Unavailable(why) => {
+                        if self.queue_path_copy(&targets) {
+                            self.warn(format!("{why} — copied path{} instead", plural(n)));
+                        } else {
+                            self.warn(why.to_string());
+                        }
+                    }
+                    clip::FileCopy::Failed(e) => self.warn(format!("clipboard: {e}")),
+                }
             }
             Cmd::Delete => {
                 let targets = self.targets();
@@ -809,6 +876,10 @@ impl App {
             Event::Key('y') => self.run_cmd(Cmd::Copy),
             Event::Key('d') => self.run_cmd(Cmd::Cut),
             Event::Key('p') => self.run_cmd(Cmd::Paste),
+            // Uppercase / Ctrl are the *system* clipboard; y and d stay
+            // vfm's own.
+            Event::Key('Y') => self.run_cmd(Cmd::CopyPath),
+            Event::Ctrl('y') => self.run_cmd(Cmd::SysCopy),
             Event::Key('D') => self.run_cmd(Cmd::Delete),
             Event::Key('r') => self.run_cmd(Cmd::Rename),
             Event::Key('m') => self.run_cmd(Cmd::Mkdir),
@@ -1333,6 +1404,11 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// Plural `s` for a count, for status-line messages.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 /// Expand `~` and make a relative path absolute against the process cwd.
 /// Resolve what the user typed into a directory to visit: `~` is home,
 /// an absolute path is taken as-is, and anything else is relative to
@@ -1374,9 +1450,11 @@ fn help_lines() -> Vec<String> {
         "  v / V / U       invert marks / mark all / clear marks",
         "",
         "Act on the marks (or on the entry under the cursor)",
-        "  y               copy",
-        "  d               cut",
+        "  y               copy          (vfm's own clipboard)",
+        "  d               cut           (vfm's own clipboard)",
         "  p               paste into this directory",
+        "  Y               copy the path(s) to the system clipboard",
+        "  Ctrl+Y          copy the file(s) to the system clipboard",
         "  D               delete (asks first)",
         "  r               rename",
         "  m               make a directory",
@@ -1583,6 +1661,14 @@ fn term_size() -> (u32, u32) {
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
+    // The clipboard helper is this same binary re-exec'd (see [`clip`]).
+    // It owns a selection on vfm's behalf and has neither a terminal nor
+    // any of vfm's arguments, so it has to be recognised before both
+    // `parse_args` and the tty check below.
+    if std::env::args_os().nth(1).is_some_and(|a| a == clip::SERVE_ARG) {
+        std::process::exit(clip::serve_from_stdin());
+    }
+
     let Some(args) = parse_args()? else {
         return Ok(());
     };
@@ -1680,6 +1766,14 @@ fn main() -> Result<()> {
             if app.quit {
                 break;
             }
+        }
+        // Anything the App wants written verbatim (OSC 52 clipboard
+        // writes). Goes out before the frame's VGE so a copy lands even
+        // if this turns out to be the last frame.
+        if !app.pending_out.is_empty() {
+            let bytes = std::mem::take(&mut app.pending_out);
+            out.write_all(&bytes)?;
+            out.flush()?;
         }
 
         if take_sigwinch(winch) {
@@ -1849,6 +1943,51 @@ mod tests {
         assert_eq!(app.targets().len(), 2);
         app.run_cmd(Cmd::MarkClear);
         assert_eq!(app.targets().len(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // Note: there is deliberately no test that runs `Cmd::SysCopy`. On a
+    // developer's machine it would spawn a real clipboard helper and
+    // take over their actual selection. Its text fallback is exercised
+    // below through the shared `queue_path_copy`.
+    #[test]
+    fn copy_path_queues_one_osc52_write_for_every_target() {
+        let d = tmpdir("copypath");
+        std::fs::write(d.join("a.txt"), b"a").unwrap();
+        std::fs::write(d.join("b.txt"), b"b").unwrap();
+        let mut app = app_in(&d);
+
+        // Cursor only.
+        app.on_event(Event::Key('Y'));
+        let expected = clip::osc52_set(&format!("{}\n", d.join("a.txt").display()));
+        assert_eq!(app.pending_out, expected);
+
+        // Both marks, in listing order, in one write.
+        app.pending_out.clear();
+        app.run_cmd(Cmd::MarkAll);
+        app.on_event(Event::Key('Y'));
+        let expected = clip::osc52_set(&format!(
+            "{}\n{}\n",
+            d.join("a.txt").display(),
+            d.join("b.txt").display()
+        ));
+        assert_eq!(app.pending_out, expected);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn copy_path_leaves_vfms_own_clipboard_alone() {
+        // The two clipboards are separate: `Y` must not disturb what `y`
+        // put aside, and `p` must still paste the latter.
+        let d = tmpdir("twoclips");
+        std::fs::write(d.join("a.txt"), b"a").unwrap();
+        let mut app = app_in(&d);
+
+        app.run_cmd(Cmd::Copy);
+        assert_eq!(app.clipboard, vec![d.join("a.txt")]);
+        app.run_cmd(Cmd::CopyPath);
+        assert_eq!(app.clipboard, vec![d.join("a.txt")], "y's clipboard moved");
+        assert_eq!(app.clip_mode, ClipMode::Copy);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
