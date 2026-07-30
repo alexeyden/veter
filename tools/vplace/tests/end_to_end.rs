@@ -269,6 +269,82 @@ fn cover_rect_spans_the_pane_and_sits_under_the_image() {
 }
 
 #[test]
+fn a_tall_image_is_scaled_to_fit_instead_of_overrunning() {
+    // The bug this guards: width was clamped to the pane but height was
+    // not, so a tall image ran past the rows the application reserved,
+    // painted over the text below, and could leave the screen entirely.
+    use vge_protocol::command::DrawCmd;
+
+    let dir = std::env::temp_dir().join("vplace-e2e-tall");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("tall.png");
+    // Far taller than the 24-row pane: 400x4000 px on 9x20 cells is
+    // ~200 rows unclamped.
+    tiny_png(&png, 400, 4000);
+
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:tall@@"]);
+    let app = b"@@IMG:tall@@\r\n\r\n\r\n".to_vec();
+    let (engine, _parser) = apply(&app, &envelope);
+
+    let el = &engine.state.elements()["vplace.IMG-tall"];
+    let h = match el.commands.iter().find_map(|c| match c {
+        DrawCmd::DrawImage { target_rect, .. } => Some(target_rect.h),
+        _ => None,
+    }) {
+        Some(h) => h,
+        None => panic!("no DrawImage emitted"),
+    };
+
+    let budget = (ROWS as f32 * 2.0 / 3.0).floor();
+    assert!(
+        h <= budget,
+        "image is {h} rows on a {ROWS}-row pane; must fit the {budget}-row budget"
+    );
+    assert!(h > 1.0, "scaled to nothing — the fit collapsed instead of shrinking");
+}
+
+#[test]
+fn max_rows_is_honoured_and_preserves_aspect() {
+    use vge_protocol::command::DrawCmd;
+
+    let dir = std::env::temp_dir().join("vplace-e2e-maxrows");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("sq.png");
+    tiny_png(&png, 400, 400); // square: rows and cols should track
+
+    let envelope = run_vplace(&[
+        png.to_str().unwrap(),
+        "--marker",
+        "@@IMG:mr@@",
+        "--max-rows",
+        "4",
+    ]);
+    let app = b"@@IMG:mr@@\r\n\r\n\r\n".to_vec();
+    let (engine, _parser) = apply(&app, &envelope);
+    let el = &engine.state.elements()["vplace.IMG-mr"];
+
+    let rect = el
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCmd::DrawImage { target_rect, .. } => Some(*target_rect),
+            _ => None,
+        })
+        .expect("no DrawImage");
+    assert!(rect.h <= 4.0, "--max-rows 4 but got {} rows", rect.h);
+
+    // A square image on 9x20 cells is about 2.2x wider in cells than
+    // tall; assert the ratio survived the shrink rather than the image
+    // being squashed.
+    let ratio = rect.w / rect.h;
+    let expected = CELL_H as f32 / CELL_W as f32;
+    assert!(
+        (ratio - expected).abs() / expected < 0.25,
+        "aspect drifted: {ratio:.2} cells w/h vs expected ~{expected:.2}"
+    );
+}
+
+#[test]
 fn clear_sweeps_only_this_tools_namespace() {
     let dir = std::env::temp_dir().join("vplace-e2e-clear");
     std::fs::create_dir_all(&dir).unwrap();

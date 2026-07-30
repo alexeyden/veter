@@ -96,9 +96,16 @@ struct Args {
     offset_x: f32,
 
     /// Width in cells. Defaults to the image's natural width, clamped
-    /// to the pane.
+    /// to the pane and to `--max-rows`.
     #[arg(long)]
     width_cells: Option<u32>,
+
+    /// Tallest the image may be, in rows. A tall image is scaled down
+    /// (aspect preserved) rather than overrunning the gap the
+    /// application reserved and painting over what follows. Defaults to
+    /// two thirds of the pane's height.
+    #[arg(long)]
+    max_rows: Option<u32>,
 
     /// Leave the marker's own row visible.
     ///
@@ -184,14 +191,10 @@ fn main() -> Result<()> {
         bail!("image has a zero dimension");
     }
 
-    let placement = compute_placement(
-        w_px,
-        h_px,
-        caps.cell_pw as f32,
-        caps.cell_ph as f32,
-        caps.cols as u32,
-        args.width_cells,
-    );
+    let max_rows = args.max_rows.unwrap_or_else(|| {
+        ((caps.rows as f32 * DEFAULT_HEIGHT_FRACTION) as u32).max(3)
+    });
+    let placement = fit_placement(w_px, h_px, &caps, args.width_cells, max_rows);
 
     if args.measure {
         // stdout only, one `key=value` line, so a caller can read it
@@ -383,6 +386,7 @@ struct Caps {
     cell_pw: u16,
     cell_ph: u16,
     cols: u16,
+    rows: u16,
     max_image_bytes: u32,
     encoding: Encoding,
 }
@@ -409,6 +413,7 @@ impl Caps {
             cell_pw: ws.ws_xpixel / ws.ws_col,
             cell_ph: ws.ws_ypixel / ws.ws_row,
             cols: ws.ws_col,
+            rows: ws.ws_row,
             max_image_bytes: limit(&limits, "mib").unwrap_or(32 * 1024 * 1024) as u32,
             // Prefer WebP whenever the host supports it. Unlike an
             // in-pane client, our bytes cross the vmux relay as
@@ -420,6 +425,59 @@ impl Caps {
                 Encoding::Raw
             },
         })
+    }
+}
+
+/// Fraction of the pane an image may occupy vertically when no
+/// `--max-rows` is given. A gap taller than this pushes everything the
+/// user was reading off screen to show one picture, which is a bad
+/// trade in a conversation; two thirds leaves the surrounding text
+/// legible while still being big enough to see.
+const DEFAULT_HEIGHT_FRACTION: f32 = 2.0 / 3.0;
+
+/// Placement that also respects a row budget.
+///
+/// [`compute_placement`] clamps width to the pane but leaves height
+/// unbounded, so a tall image overruns the rows the application
+/// reserved, paints over whatever follows, and can run off the bottom
+/// of the screen entirely. Width is the only lever — height follows
+/// from it and the aspect ratio — so shrink the width until the height
+/// fits.
+///
+/// Both `--measure` and the placement path go through here, so the rows
+/// an application is told to reserve are the rows that get drawn.
+fn fit_placement(
+    w_px: u32,
+    h_px: u32,
+    caps: &Caps,
+    forced_w_cells: Option<u32>,
+    max_rows: u32,
+) -> vge_render::Placement {
+    let compute = |w: Option<u32>| {
+        compute_placement(
+            w_px,
+            h_px,
+            caps.cell_pw as f32,
+            caps.cell_ph as f32,
+            caps.cols as u32,
+            w,
+        )
+    };
+    let p = compute(forced_w_cells);
+    if p.h_cells <= max_rows || max_rows == 0 {
+        return p;
+    }
+    // One proportional step gets very close; the loop then walks the
+    // last cell or two off, since ceil() means the relationship is not
+    // exactly linear. Bounded by the width, so it always terminates.
+    let scaled = (p.w_cells as f32 * max_rows as f32 / p.target_rect_h).floor() as u32;
+    let mut w = scaled.clamp(1, p.w_cells);
+    loop {
+        let q = compute(Some(w));
+        if q.h_cells <= max_rows || w <= 1 {
+            return q;
+        }
+        w -= 1;
     }
 }
 
