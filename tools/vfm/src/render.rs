@@ -23,7 +23,7 @@ use vge_ui::theme::{
 
 use crate::entry::{Entry, ListOpts};
 use crate::icons::{self, IconBox};
-use crate::layout::{Area, Layout};
+use crate::layout::{Area, Layout, View};
 use crate::thumbs::{Slot, Thumbs, stamp_of};
 
 /// Window backdrop — dark enough that the panes read as panels.
@@ -176,7 +176,8 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
     cmds
 }
 
-/// The icon grid: the current directory, one tile per entry.
+/// The current directory's pane: one tile per entry in the icon grid,
+/// one row per entry in the detail list ([`View`]).
 pub struct GridView<'a> {
     pub layout: &'a Layout,
     pub entries: &'a [Entry],
@@ -220,7 +221,10 @@ pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
     let first = v.scroll_row * l.grid_cols;
     let last = (first + l.page()).min(v.entries.len());
     for index in first..last {
-        cmds.extend(tile_commands(v, index));
+        cmds.extend(match l.view {
+            View::Grid => tile_commands(v, index),
+            View::List => row_commands(v, index),
+        });
     }
 
     // Scrollbar down the right edge when the listing overflows.
@@ -282,7 +286,6 @@ fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
     }];
     // The picture sits on its own plate so a selected tile still frames
     // the image rather than tinting it.
-    let img_area = (x, y, l.tile_w, l.tile_img_h);
     cmds.push(DrawCmd::FillPath {
         fill: Style::Flat(darken(COLOR_TILE, 0.25)),
         segments: rounded_rect_path(
@@ -294,32 +297,12 @@ fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
             ry,
         ),
     });
-
-    let stamp = stamp_of(e.size, e.mtime);
-    match v.thumbs.slot(&e.path, stamp) {
-        Some(Slot::Ready { image_id, w, h }) => {
-            cmds.push(DrawCmd::DrawImage {
-                target_rect: fit(
-                    (x + 0.25, y + 0.15, l.tile_w - 0.5, l.tile_img_h - 0.15),
-                    *w,
-                    *h,
-                    v.cell_pw,
-                    v.cell_ph,
-                ),
-                image_id: image_id.clone(),
-                source_rect: None,
-            });
-        }
-        _ => {
-            let b = IconBox::centered(img_area, 0.62, v.cell_pw, v.cell_ph);
-            cmds.extend(icons::draw(
-                e.media(),
-                b,
-                e.is_link,
-                e.kind == crate::entry::Kind::Broken,
-            ));
-        }
-    }
+    cmds.extend(picture(
+        v,
+        e,
+        (x + 0.25, y + 0.15, l.tile_w - 0.5, l.tile_img_h - 0.15),
+        0.66,
+    ));
 
     if marked {
         cmds.push(DrawCmd::FillPath {
@@ -342,6 +325,117 @@ fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
         elide(&e.name, label_w),
     ));
     cmds
+}
+
+/// Detail columns of a list row, in cells: the size and the modified
+/// time. Fixed width, so the numbers line up down the pane.
+const LIST_SIZE_COLS: f32 = 7.0;
+const LIST_DATE_COLS: f32 = 17.0;
+/// Row widths at which those columns are worth their cells. Below each,
+/// the column is dropped and the name keeps the room.
+const LIST_SIZE_MIN_W: f32 = 30.0;
+const LIST_DATE_MIN_W: f32 = 50.0;
+
+/// One list row: selection, mark, picture at the left, then name, size
+/// and modified time. Rows are contiguous, so alternate ones get a faint
+/// plate — that striping is what carries the eye across a wide row.
+fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
+    let l = v.layout;
+    let e = &v.entries[index];
+    let (x, y) = l.tile_origin(index, v.scroll_row);
+    let w = l.tile_w;
+    let (rx, ry) = chrome_corner_radii(w, l.tile_h, v.cell_pw, v.cell_ph);
+    let selected = index == v.cursor;
+    let mut cmds: Vec<DrawCmd> = Vec::new();
+
+    if selected {
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(Color {
+                a: 0.9,
+                ..accent_color()
+            }),
+            segments: rounded_rect_path(x, y, x + w, y + l.tile_h, rx, ry),
+        });
+    } else if index % 2 == 1 {
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(Color { a: 0.5, ..COLOR_TILE }),
+            segments: rounded_rect_path(x, y, x + w, y + l.tile_h, rx, ry),
+        });
+    }
+    if v.marks.contains(&e.path) {
+        cmds.push(DrawCmd::FillRectangles {
+            fill: Style::Flat(MARK_COLOR),
+            rects: vec![Rect {
+                x: x + 0.15,
+                y: y + 0.1,
+                w: 0.3,
+                h: (l.tile_h - 0.2).max(0.4),
+            }],
+        });
+    }
+
+    // A square picture box at the left, as tall as the row.
+    let icon_w = (l.tile_h * v.cell_ph / v.cell_pw.max(1.0)).max(1.0);
+    let icon_x = x + 0.7;
+    cmds.extend(picture(v, e, (icon_x, y + 0.05, icon_w, l.tile_h - 0.1), 0.82));
+
+    // One text baseline, centered when the row is more than a row tall.
+    let ty = y + (l.tile_h - 1.0) * 0.5;
+    let meta_ink = if selected {
+        COLOR_ACTIVE_TEXT
+    } else {
+        COLOR_DIM_TEXT
+    };
+    // Columns are laid out from the right; the name takes what is left.
+    let mut right = x + w - 0.5;
+    if w >= LIST_DATE_MIN_W {
+        cmds.push(text(right, ty, Align::Right, meta_ink, false, e.mtime_label()));
+        right -= LIST_DATE_COLS;
+    }
+    if w >= LIST_SIZE_MIN_W {
+        cmds.push(text(right, ty, Align::Right, meta_ink, false, e.size_label()));
+        right -= LIST_SIZE_COLS;
+    }
+
+    let name_x = icon_x + icon_w + 0.6;
+    let name_w = ((right - name_x - 1.0).max(4.0)) as usize;
+    let label = if e.is_dir() {
+        format!("{}/", elide(&e.name, name_w.saturating_sub(1)))
+    } else {
+        elide(&e.name, name_w)
+    };
+    let ink = if selected {
+        COLOR_ACTIVE_TEXT
+    } else if e.is_dir() {
+        accent_text()
+    } else {
+        COLOR_TITLE_TEXT
+    };
+    cmds.push(text(name_x, ty, Align::Left, ink, selected, label));
+    cmds
+}
+
+/// An entry's picture fitted into `area`: its thumbnail once a decoder
+/// has one, else the file-type icon at `icon_frac` of the box.
+fn picture(
+    v: &GridView,
+    e: &Entry,
+    area: (f32, f32, f32, f32),
+    icon_frac: f32,
+) -> Vec<DrawCmd> {
+    match v.thumbs.slot(&e.path, stamp_of(e.size, e.mtime)) {
+        Some(Slot::Ready { image_id, w, h }) => vec![DrawCmd::DrawImage {
+            target_rect: fit(area, *w, *h, v.cell_pw, v.cell_ph),
+            image_id: image_id.clone(),
+            source_rect: None,
+        }],
+        _ => icons::draw(
+            e.media(),
+            IconBox::centered(area, icon_frac, v.cell_pw, v.cell_ph),
+            e.is_link,
+            e.kind == crate::entry::Kind::Broken,
+        ),
+    }
 }
 
 /// Marked-entry badge — a warm tone that reads as "chosen by hand",
@@ -376,6 +470,7 @@ pub struct StatusView<'a> {
     pub index: usize,
     pub total: usize,
     pub marks: usize,
+    pub view: View,
     pub opts: &'a ListOpts,
     /// Pending clipboard, as `(count, "copy" | "move")`.
     pub clip: Option<(usize, &'static str)>,
@@ -407,7 +502,8 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         right.push_str("hidden   ");
     }
     right.push_str(&format!(
-        "{}{}   {}/{}",
+        "{}   {}{}   {}/{}",
+        v.view.label(),
         v.opts.sort.label(),
         if v.opts.reverse { "↓" } else { "↑" },
         if v.total == 0 { 0 } else { v.index + 1 },
@@ -515,7 +611,30 @@ mod tests {
     }
 
     fn layout() -> Layout {
-        Layout::compute(120, 40, 9.0, 20.0, 1, 2)
+        Layout::compute(120, 40, 9.0, 20.0, View::Grid, 1, 2)
+    }
+
+    fn view<'a>(l: &'a Layout, entries: &'a [Entry], marks: &'a HashSet<PathBuf>, thumbs: &'a Thumbs) -> GridView<'a> {
+        GridView {
+            layout: l,
+            entries,
+            cursor: 0,
+            scroll_row: 0,
+            marks,
+            thumbs,
+            cell_pw: 9.0,
+            cell_ph: 20.0,
+            error: None,
+        }
+    }
+
+    fn texts(cmds: &[DrawCmd]) -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                DrawCmd::DrawText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -572,22 +691,8 @@ mod tests {
         let entries: Vec<Entry> = (0..200).map(|i| entry(&format!("f{i}.txt"), false)).collect();
         let marks = HashSet::new();
         let thumbs = Thumbs::new(64, 1, 8);
-        let v = GridView {
-            layout: &l,
-            entries: &entries,
-            cursor: 0,
-            scroll_row: 0,
-            marks: &marks,
-            thumbs: &thumbs,
-            cell_pw: 9.0,
-            cell_ph: 20.0,
-            error: None,
-        };
-        let cmds = grid_commands(&v);
-        let labels = cmds
-            .iter()
-            .filter(|c| matches!(c, DrawCmd::DrawText { .. }))
-            .count();
+        let cmds = grid_commands(&view(&l, &entries, &marks, &thumbs));
+        let labels = texts(&cmds).len();
         assert_eq!(labels, l.page(), "one label per visible tile");
     }
 
@@ -597,22 +702,53 @@ mod tests {
         let entries: Vec<Entry> = (0..3).map(|i| entry(&format!("f{i}"), false)).collect();
         let marks = HashSet::new();
         let thumbs = Thumbs::new(64, 1, 8);
-        let v = GridView {
-            layout: &l,
-            entries: &entries,
-            cursor: 0,
-            scroll_row: 0,
-            marks: &marks,
-            thumbs: &thumbs,
-            cell_pw: 9.0,
-            cell_ph: 20.0,
-            error: None,
-        };
-        let labels = grid_commands(&v)
-            .iter()
-            .filter(|c| matches!(c, DrawCmd::DrawText { .. }))
-            .count();
+        let labels = texts(&grid_commands(&view(&l, &entries, &marks, &thumbs))).len();
         assert_eq!(labels, 3);
+    }
+
+    #[test]
+    fn a_list_row_carries_the_name_and_both_detail_columns() {
+        let l = Layout::compute(120, 40, 9.0, 20.0, View::List, 0, 2);
+        let entries = vec![entry("sub", true), entry("photo.png", false)];
+        let marks = HashSet::new();
+        let thumbs = Thumbs::new(64, 1, 8);
+        let cmds = grid_commands(&view(&l, &entries, &marks, &thumbs));
+        let t = texts(&cmds);
+        // Per row: date, size, name — the name last, over the plate.
+        assert_eq!(t.len(), 6, "{t:?}");
+        assert_eq!(t[2], "sub/", "a directory keeps its trailing slash");
+        assert_eq!(t[1], "dir");
+        assert_eq!(t[5], "photo.png");
+        assert_eq!(t[4], "0B");
+        assert!(t[0].starts_with("19") || t[0].starts_with("20"), "{}", t[0]);
+    }
+
+    #[test]
+    fn a_narrow_list_drops_the_detail_columns_for_the_name() {
+        let marks = HashSet::new();
+        let thumbs = Thumbs::new(64, 1, 8);
+        let entries = vec![entry("a-fairly-long-name.txt", false)];
+        // 24 columns: too narrow for either column, so only the name.
+        let narrow = Layout::compute(24, 20, 9.0, 20.0, View::List, 0, 0);
+        assert_eq!(texts(&grid_commands(&view(&narrow, &entries, &marks, &thumbs))).len(), 1);
+        // Wide enough for the size but not the date.
+        let mid = Layout::compute(40, 20, 9.0, 20.0, View::List, 0, 0);
+        assert_eq!(texts(&grid_commands(&view(&mid, &entries, &marks, &thumbs))).len(), 2);
+    }
+
+    #[test]
+    fn every_visible_list_row_draws_its_name() {
+        let l = Layout::compute(120, 40, 9.0, 20.0, View::List, 0, 2);
+        let entries: Vec<Entry> = (0..200).map(|i| entry(&format!("f{i}.txt"), false)).collect();
+        let marks = HashSet::new();
+        let thumbs = Thumbs::new(64, 1, 8);
+        let mut v = view(&l, &entries, &marks, &thumbs);
+        v.scroll_row = 5;
+        let t = texts(&grid_commands(&v));
+        for row in 0..l.grid_rows {
+            let name = format!("f{}.txt", 5 + row);
+            assert!(t.contains(&name), "{name} missing from {t:?}");
+        }
     }
 
     #[test]
@@ -620,18 +756,7 @@ mod tests {
         let l = layout();
         let marks = HashSet::new();
         let thumbs = Thumbs::new(64, 1, 8);
-        let v = GridView {
-            layout: &l,
-            entries: &[],
-            cursor: 0,
-            scroll_row: 0,
-            marks: &marks,
-            thumbs: &thumbs,
-            cell_pw: 9.0,
-            cell_ph: 20.0,
-            error: None,
-        };
-        let cmds = grid_commands(&v);
+        let cmds = grid_commands(&view(&l, &[], &marks, &thumbs));
         assert!(matches!(cmds.as_slice(), [DrawCmd::DrawText { .. }]));
     }
 
@@ -652,6 +777,7 @@ mod tests {
             index: 4,
             total: 57,
             marks: 3,
+            view: View::Grid,
             opts: &opts,
             clip: Some((2, "copy")),
             message: None,
@@ -686,6 +812,7 @@ mod tests {
             index: 0,
             total: 1,
             marks: 0,
+            view: View::List,
             opts: &opts,
             clip: None,
             message: Some(("deleting: nope", true)),

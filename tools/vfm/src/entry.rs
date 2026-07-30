@@ -105,6 +105,39 @@ impl Entry {
         }
         human_size(self.size)
     }
+
+    /// Modification time as the detail list shows it: `2026-07-30 14:02`,
+    /// in the viewer's local time.
+    pub fn mtime_label(&self) -> String {
+        local_stamp(self.mtime)
+    }
+}
+
+/// Format a `SystemTime` as `YYYY-MM-DD HH:MM` in local time. Times the
+/// clock cannot place (a filesystem reporting something before the epoch,
+/// or a broken link's placeholder) come back as dashes rather than a
+/// misleading date.
+pub fn local_stamp(t: SystemTime) -> String {
+    let Ok(since) = t.duration_since(SystemTime::UNIX_EPOCH) else {
+        return "—".into();
+    };
+    let secs = since.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` fills the caller's `tm` — no shared state and
+    // no allocation, unlike `localtime`. A null return means the time is
+    // out of range for the calendar, which the check below handles.
+    let ok = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
+    if !ok {
+        return "—".into();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }
 
 /// Size in the compact form the status line and tiles use.
@@ -345,6 +378,20 @@ mod tests {
         sort_entries(&mut v, &ListOpts::default());
         let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["img1.png", "IMG2.png", "img10.png"]);
+    }
+
+    #[test]
+    fn the_mtime_column_is_a_fixed_width_stamp() {
+        let e = entry("a.txt", false, 0);
+        let s = e.mtime_label();
+        assert_eq!(s.chars().count(), 16, "{s}");
+        // The epoch lands on 1970 in every timezone we could be in.
+        assert!(s.starts_with("1969-") || s.starts_with("1970-"), "{s}");
+        let later = Entry {
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000),
+            ..entry("b.txt", false, 0)
+        };
+        assert!(later.mtime_label().starts_with("2026-"), "{}", later.mtime_label());
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! directory remembers where the cursor was. The current directory
 //! itself is drawn the way a desktop file manager draws one — a grid of
 //! tiles, each with a thumbnail for pictures and video and a file-type
-//! icon for everything else.
+//! icon for everything else — or, on `Tab`, as a dense detail list with
+//! the same pictures shrunk to the left of each row ([`layout::View`]).
 //!
 //! Everything on screen is VGE: panes, labels, icons and thumbnails
 //! alike. The terminal's text layer always renders *below* VGE elements
@@ -56,7 +57,7 @@ use vge_ui::theme;
 
 use config::{Config, ResolvedOpen};
 use entry::{Entry, ListOpts, Sort, read_dir};
-use layout::{DEFAULT_TILE_ZOOM, Layout, TILE_WIDTHS};
+use layout::{Layout, VIEWS, View};
 use ops::{Op, Runner};
 use thumbs::{Thumbs, stamp_of};
 
@@ -145,6 +146,10 @@ enum Cmd {
     Reload,
     ZoomIn,
     ZoomOut,
+    /// Swap the icon grid for the detail list, or back.
+    ToggleView,
+    ViewGrid,
+    ViewList,
     Open,
     Preview,
     MarkAll,
@@ -179,6 +184,9 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("reload", "Ctrl+R", Cmd::Reload),
     ("zoom-in", "+", Cmd::ZoomIn),
     ("zoom-out", "-", Cmd::ZoomOut),
+    ("toggle-view", "Tab", Cmd::ToggleView),
+    ("view-grid", "", Cmd::ViewGrid),
+    ("view-list", "", Cmd::ViewList),
     ("open", "Enter", Cmd::Open),
     ("preview", "i", Cmd::Preview),
     ("mark-all", "V", Cmd::MarkAll),
@@ -267,7 +275,12 @@ struct App {
     /// Where the cursor was in each directory we have visited.
     memory: HashMap<PathBuf, PathBuf>,
     opts: ListOpts,
-    zoom: usize,
+    /// How the current directory is drawn — icon grid or detail list.
+    view: View,
+    /// Size step per view, indexed by [`View::index`]: the two layouts
+    /// scale differently (tile width vs row height), so each remembers
+    /// where `+` / `-` left it.
+    zoom: [usize; VIEWS],
     config: Config,
     /// An open the event loop should perform: `main` owns the terminal,
     /// so it drains this after handling input (an in-terminal open needs
@@ -301,9 +314,13 @@ struct App {
 }
 
 impl App {
+    // Startup state, straight from the CLI and the probe. Bundling it in
+    // a struct would only move the same list one line up.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cwd: PathBuf,
         opts: ListOpts,
+        view: View,
         config: Config,
         cols: u32,
         rows: u32,
@@ -313,6 +330,7 @@ impl App {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).clamp(1, 4))
             .unwrap_or(2);
+        let zoom = [View::Grid.default_zoom(), View::List.default_zoom()];
         let mut app = App {
             cwd,
             entries: Vec::new(),
@@ -326,7 +344,8 @@ impl App {
             sys_clip: clip::SysClip::new(),
             memory: HashMap::new(),
             opts,
-            zoom: DEFAULT_TILE_ZOOM,
+            view,
+            zoom,
             config,
             pending_open: None,
             pending_out: Vec::new(),
@@ -334,7 +353,7 @@ impl App {
             rows,
             cell_pw,
             cell_ph,
-            layout: Layout::compute(cols, rows, cell_pw, cell_ph, DEFAULT_TILE_ZOOM, 0),
+            layout: Layout::compute(cols, rows, cell_pw, cell_ph, view, zoom[view.index()], 0),
             mode: Mode::Normal,
             message: None,
             thumbs: Thumbs::new(THUMB_PX, workers, MAX_LIVE_THUMBS),
@@ -419,13 +438,19 @@ impl App {
         }
     }
 
+    /// The active view's size step.
+    fn zoom(&self) -> usize {
+        self.zoom[self.view.index()]
+    }
+
     fn relayout(&mut self) {
         self.layout = Layout::compute(
             self.cols,
             self.rows,
             self.cell_pw,
             self.cell_ph,
-            self.zoom,
+            self.view,
+            self.zoom(),
             self.columns.len(),
         );
         // The layout drops ancestor columns that would squeeze the grid;
@@ -671,8 +696,11 @@ impl App {
                 self.opts.reverse = !self.opts.reverse;
                 self.reload();
             }
-            Cmd::ZoomIn => self.set_zoom(self.zoom + 1),
-            Cmd::ZoomOut => self.set_zoom(self.zoom.saturating_sub(1)),
+            Cmd::ZoomIn => self.set_zoom(self.zoom() + 1),
+            Cmd::ZoomOut => self.set_zoom(self.zoom().saturating_sub(1)),
+            Cmd::ToggleView => self.set_view(self.view.toggle()),
+            Cmd::ViewGrid => self.set_view(View::Grid),
+            Cmd::ViewList => self.set_view(View::List),
             Cmd::MarkAll => {
                 for e in &self.entries {
                     self.marks.insert(e.path.clone());
@@ -793,11 +821,24 @@ impl App {
     }
 
     fn set_zoom(&mut self, zoom: usize) {
-        let zoom = zoom.min(TILE_WIDTHS.len() - 1);
-        if zoom == self.zoom {
+        let zoom = zoom.min(self.view.zoom_steps().len() - 1);
+        if zoom == self.zoom() {
             return;
         }
-        self.zoom = zoom;
+        self.zoom[self.view.index()] = zoom;
+        self.relayout();
+        self.clamp_cursor();
+        self.dirty = Dirty::all();
+    }
+
+    /// Swap the layout the current directory is drawn in. The cursor
+    /// stays on the same entry — only the geometry around it changes, and
+    /// `clamp_cursor` scrolls the new one to it.
+    fn set_view(&mut self, view: View) {
+        if view == self.view {
+            return;
+        }
+        self.view = view;
         self.relayout();
         self.clamp_cursor();
         self.dirty = Dirty::all();
@@ -843,7 +884,8 @@ impl App {
 
             // Motion. Arrows step one entry (the grid reads left to
             // right); j/k and Up/Down move a whole row, as in any icon
-            // view. h/l keep ranger's meaning.
+            // view — which in the list, one entry per row, is the same
+            // thing. h/l keep ranger's meaning.
             Event::Arrow(Dir::Right) => self.move_cursor(1),
             Event::Arrow(Dir::Left) => self.move_cursor(-1),
             Event::Key('j') | Event::Arrow(Dir::Down) => self.move_cursor(cols),
@@ -889,6 +931,7 @@ impl App {
             Event::Ctrl('r') => self.run_cmd(Cmd::Reload),
             Event::Key('+') | Event::Key('=') => self.run_cmd(Cmd::ZoomIn),
             Event::Key('-') => self.run_cmd(Cmd::ZoomOut),
+            Event::Tab => self.run_cmd(Cmd::ToggleView),
             Event::Escape => self.run_cmd(Cmd::ClearFilter),
 
             Event::MouseDown { button, col, row } => self.on_click(button, col, row),
@@ -1238,6 +1281,7 @@ impl App {
                 index: self.cursor,
                 total: self.entries.len(),
                 marks: self.marks.len(),
+                view: self.view,
                 opts: &self.opts,
                 clip: (!self.clipboard.is_empty()).then(|| {
                     (
@@ -1460,10 +1504,11 @@ fn help_lines() -> Vec<String> {
         "  m               make a directory",
         "",
         "View",
+        "  Tab             switch between the icon grid and the detail list",
         "  .               show / hide dotfiles",
         "  s               reverse the sort order",
         "  / and Esc       filter by name / clear the filter",
-        "  + / -           bigger / smaller tiles",
+        "  + / -           bigger / smaller tiles (taller / shorter list rows)",
         "  Ctrl+R          re-read the directory",
         "",
         "Other",
@@ -1492,6 +1537,8 @@ usage: vfm [PATH] [options]
 
 options:
   -a, --hidden          show dotfiles from the start
+  -l, --list            start in the detail list instead of the icon grid
+                        (Tab switches either way)
   -A, --accent COLOR    chrome accent (name or #rrggbb); overrides the
                         terminal's themed accent
   -c, --config PATH     config file (default: ~/.config/vfm/config.toml)
@@ -1501,6 +1548,7 @@ options:
 struct Args {
     path: PathBuf,
     hidden: bool,
+    view: View,
     accent: Option<u32>,
     config: Option<PathBuf>,
 }
@@ -1508,6 +1556,7 @@ struct Args {
 fn parse_args() -> Result<Option<Args>> {
     let mut path: Option<PathBuf> = None;
     let mut hidden = false;
+    let mut view = View::Grid;
     let mut accent = None;
     let mut config = None;
     let mut it = std::env::args().skip(1);
@@ -1518,6 +1567,7 @@ fn parse_args() -> Result<Option<Args>> {
                 return Ok(None);
             }
             "-a" | "--hidden" => hidden = true,
+            "-l" | "--list" => view = View::List,
             "-A" | "--accent" => {
                 let v = it.next().ok_or_else(|| anyhow!("--accent needs a value"))?;
                 accent = Some(theme::parse_accent_color(&v).map_err(|e| anyhow!(e))?);
@@ -1546,6 +1596,7 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(Args {
         path,
         hidden,
+        view,
         accent,
         config,
     }))
@@ -1739,6 +1790,7 @@ fn main() -> Result<()> {
     let mut app = App::new(
         args.path,
         opts,
+        args.view,
         config,
         cols,
         rows,
@@ -1868,6 +1920,7 @@ mod tests {
         App::new(
             dir.to_path_buf(),
             ListOpts::default(),
+            View::Grid,
             Config::default(),
             120,
             40,
@@ -2284,11 +2337,56 @@ mod tests {
         for _ in 0..10 {
             app.run_cmd(Cmd::ZoomIn);
         }
-        assert_eq!(app.zoom, TILE_WIDTHS.len() - 1);
+        assert_eq!(app.zoom(), View::Grid.zoom_steps().len() - 1);
         for _ in 0..10 {
             app.run_cmd(Cmd::ZoomOut);
         }
-        assert_eq!(app.zoom, 0);
+        assert_eq!(app.zoom(), 0);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn tab_swaps_the_layout_and_each_view_keeps_its_own_zoom() {
+        let d = tmpdir("view");
+        for i in 0..40 {
+            std::fs::write(d.join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+        let mut app = app_in(&d);
+        assert_eq!(app.layout.view, View::Grid);
+        assert!(app.layout.grid_cols > 1);
+
+        app.run_cmd(Cmd::ZoomIn); // grid: step 1 → 2
+        app.on_event(Event::Tab);
+        assert_eq!(app.layout.view, View::List);
+        assert_eq!(app.layout.grid_cols, 1, "the list is one entry per row");
+        assert_eq!(app.zoom(), View::List.default_zoom(), "the list has its own step");
+
+        app.run_cmd(Cmd::ZoomIn); // list: step 0 → 1
+        app.on_event(Event::Tab);
+        assert_eq!(app.layout.view, View::Grid);
+        assert_eq!(app.zoom(), 2, "the grid is back where it was");
+        app.on_event(Event::Tab);
+        assert_eq!(app.zoom(), 1, "and so is the list");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn switching_view_keeps_the_cursor_and_scrolls_it_into_sight() {
+        let d = tmpdir("view-cursor");
+        for i in 0..200 {
+            std::fs::write(d.join(format!("f{i:03}.txt")), b"x").unwrap();
+        }
+        let mut app = app_in(&d);
+        app.cursor_to(150);
+        let name = app.current().unwrap().name.clone();
+        app.on_event(Event::Tab);
+        assert_eq!(app.current().unwrap().name, name, "same entry under the cursor");
+        assert!(app.visible_range().contains(&150), "and it is on screen");
+        // A click on the row it now occupies is a no-op on the cursor.
+        let row = 150 - app.scroll_row;
+        let (x, y) = app.layout.tile_origin(150, app.scroll_row);
+        assert_eq!(app.layout.tile_at(x + 1.0, y, app.scroll_row, 200), Some(150));
+        assert!(row < app.layout.grid_rows);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
