@@ -77,6 +77,35 @@ def log(msg):
 # never be found.
 MARKER_RE = re.compile(r"@@IMG:([A-Za-z0-9_.-]{1,32})@@[ \t]+(\S+)")
 
+# The fenced block immediately following a marker: its blank body is the
+# space that was actually reserved.
+# `match(text, pos)` already anchors at pos, so no \A here -- \A would
+# mean "start of string" and never match after the marker.
+FENCE_RE = re.compile(r"[ \t]*\n[ \t]*(?:\n[ \t]*)?```[^\n]*\n(.*?)\n?```", re.S)
+
+
+def reserved_rows(text, marker_end):
+    """Rows the message actually reserved after a marker, or None.
+
+    The instruction tells Claude to size the gap from `vplace --measure`,
+    but that is a counting step done by hand, and getting it wrong draws
+    the image over the text below. Reading the gap back out of the
+    message makes the placement self-correcting: whatever was reserved
+    is the ceiling, so a miscount costs a smaller image instead of
+    covering someone's paragraph.
+
+    A fence with N blank lines occupies N+1 rows on screen -- the extra
+    one is the blank the renderer puts between a paragraph and the fence
+    beneath it, which is also the row the image starts on.
+    """
+    m = FENCE_RE.match(text, marker_end)
+    if not m:
+        return None
+    body = m.group(1)
+    if body.strip():
+        return None  # a real code block, not a reserved gap
+    return body.count("\n") + 2
+
 # Images are decorative; a hook that fails must never break the
 # session. Every failure path below exits 0.
 OK = 0
@@ -185,6 +214,32 @@ def last_assistant_text(transcript_path):
     return ""
 
 
+# (label, message text, expected reserved rows). Run with --self-test.
+# The gap parser is the only real logic in this file and it silently
+# degrades when wrong -- an undersized clamp shrinks an image, a missed
+# one lets it cover text -- so it is worth pinning.
+_SELF_TESTS = [
+    ("correct 5-line gap", "@@IMG:a@@ /x.png\n```\n\n\n\n\n\n```\nafter", 6),
+    ("undersized gap", "@@IMG:a@@ /x.png\n```\n\n\n```\nafter", 3),
+    ("blank line before fence", "@@IMG:a@@ /x.png\n\n```\n\n\n\n```\nafter", 4),
+    ("language-tagged fence", "@@IMG:a@@ /x.png\n```text\n\n\n\n```\n", 4),
+    ("no fence", "@@IMG:a@@ /x.png\nplain text", None),
+    ("real code block", "@@IMG:a@@ /x.png\n```\nfn main() {}\n```\n", None),
+]
+
+
+def self_test():
+    bad = 0
+    for label, text, expect in _SELF_TESTS:
+        m = MARKER_RE.search(text)
+        got = reserved_rows(text, m.end()) if m else "no-marker"
+        if got != expect:
+            bad += 1
+            print(f"FAIL {label}: got {got!r}, expected {expect!r}")
+    print(f"{len(_SELF_TESTS) - bad}/{len(_SELF_TESTS)} passed")
+    return 1 if bad else 0
+
+
 def find_vplace():
     """Prefer a vplace sitting next to this script, then $PATH."""
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vplace")
@@ -197,7 +252,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--transcript", help="bypass stdin; for manual testing")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the gap parser and exit")
     a = ap.parse_args()
+
+    if a.self_test:
+        return self_test()
 
     cwd = os.getcwd()
     session = ""
@@ -230,17 +290,19 @@ def main():
     already = load_placed(session)
     seen = set()
     found = []
-    for ident, path in MARKER_RE.findall(text):
+    for m in MARKER_RE.finditer(text):
+        ident, path = m.group(1), m.group(2)
         if ident in seen or ident in already:
             continue
         seen.add(ident)
+        rows = reserved_rows(text, m.end())
         # Markers inside the message are relative to where the session
         # is running, matching how Claude writes paths.
         resolved = path if os.path.isabs(path) else os.path.join(cwd, path)
         if os.path.isfile(resolved):
-            found.append((ident, resolved))
+            found.append((ident, resolved, rows))
 
-    log(f"  markers={[i for i, _ in found]}")
+    log(f"  markers={[(i, r) for i, _, r in found]}")
     if not found:
         return OK
 
@@ -249,11 +311,15 @@ def main():
         log("  ERROR: vplace not found")
         print("vplace-hook: vplace not found on PATH", file=sys.stderr)
         return OK
-    for ident, path in found:
+    for ident, path, rows in found:
         # Offset is vplace's default, calibrated to this renderer.
         # --offset-x 2 matches the indent Claude Code renders
         # message bodies at, so the image lines up with the text.
         cmd = [vplace, path, "--marker", f"@@IMG:{ident}@@", "--offset-x", "2"]
+        # Clamp to the gap the message actually reserved. A miscounted
+        # fence then costs a smaller image, not a paragraph drawn over.
+        if rows:
+            cmd += ["--max-rows", str(rows)]
         if a.dry_run:
             print(" ".join(cmd))
             continue
