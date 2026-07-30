@@ -979,8 +979,7 @@ fn main() -> Result<()> {
                             src_w = f.w;
                             src_h = f.h;
                             source_frame = f;
-                            // A fresh still starts fitted, like the
-                            // opened one did.
+                            let zoom  = vp.zoom;
                             vp = Viewport::new(
                                 src_w,
                                 src_h,
@@ -991,6 +990,7 @@ fn main() -> Result<()> {
                                 cols as f32,
                                 media_rows as f32,
                             );
+                            vp.zoom = zoom;
                             // The still texture is a single slot, so the
                             // swap is drop-then-upload (sound only
                             // because the still is pinned — see
