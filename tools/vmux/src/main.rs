@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::unistd::{execvp, Pid};
+use nix::unistd::{chdir, execvp, tcgetpgrp, Pid};
 
 use prt_protocol::apc::ApcStream as PrtApcStream;
 use prt_protocol::codec::Reader as PrtReader;
@@ -678,6 +679,37 @@ fn separator_hit(
 // PTY-per-pane plumbing
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Directory a new sibling pane should start in, resolved from an
+/// existing pane's PTY. `None` means "inherit vmux's own cwd", which is
+/// where every pane started before this.
+///
+/// Prefers the terminal's *foreground process group* over the pane's
+/// shell: a pane sitting in `vim` after `:cd`, or inside a subshell,
+/// then reports where the user actually is rather than the shell's
+/// stale idea of it. Falls back to the shell when there is no
+/// foreground group — `master` isn't a controlling terminal, or the
+/// group leader exited between the ioctl and the readlink.
+///
+/// `/proc` is the source rather than OSC 7 (which PRT already surfaces
+/// as `WorkingDirChange`, §8.3) because it needs no shell cooperation
+/// and cannot hand back a path that only exists on a remote host: for
+/// an `ssh` pane this answers with the directory ssh was launched from,
+/// which is the only one a local shell can enter. Linux-only by
+/// construction, as are all of vmux's dist targets.
+fn pane_cwd(master: RawFd, child: Pid) -> Option<PathBuf> {
+    let fg = tcgetpgrp(unsafe { BorrowedFd::borrow_raw(master) }).ok();
+    fg.into_iter()
+        .chain(std::iter::once(child))
+        .find_map(|pid| {
+            let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+            // A removed directory readlinks as `/old/path (deleted)`,
+            // and a pid can exit between the readlink and the fork.
+            // Both fail the directory check, so we fall through rather
+            // than handing `chdir` a path it will reject.
+            path.is_dir().then_some(path)
+        })
+}
+
 struct PanePty {
     master: OwnedFd,
     child: Pid,
@@ -703,7 +735,13 @@ fn pane_pixel_size(rows: u16, cols: u16, cell_px: (u16, u16)) -> (u16, u16) {
 }
 
 impl PanePty {
-    fn spawn(pane_id: &str, rows: u16, cols: u16, cell_px: (u16, u16)) -> Result<Self> {
+    fn spawn(
+        pane_id: &str,
+        rows: u16,
+        cols: u16,
+        cell_px: (u16, u16),
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
         let (xpixel, ypixel) = pane_pixel_size(rows.max(1), cols.max(1), cell_px);
         let winsize = Winsize {
             ws_row: rows.max(1),
@@ -715,6 +753,13 @@ impl PanePty {
             unsafe { forkpty(Some(&winsize), None) }.context("forkpty")?;
         match result {
             ForkptyResult::Child => {
+                // Start where the pane we were split off from was (see
+                // `pane_cwd`). Best effort: if the directory went away
+                // between the readlink and now, the child stays in
+                // vmux's cwd rather than failing to open at all.
+                if let Some(dir) = cwd {
+                    let _ = chdir(dir);
+                }
                 let shell = user_shell();
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
                 // Which pane a process occupies, without it having to
@@ -2161,7 +2206,8 @@ impl State {
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let cell_px = s.cell_px();
-        let pty = PanePty::spawn(&id, rows as u16, cols as u16, cell_px)?;
+        // First pane: nothing to inherit from, so it takes vmux's own cwd.
+        let pty = PanePty::spawn(&id, rows as u16, cols as u16, cell_px, None)?;
         s.panes.insert(
             id.clone(),
             Pane {
@@ -2260,7 +2306,14 @@ impl State {
             .expect("new pane must appear in post-split layout");
         let (rows, cols) = inner_grid_for(rect);
         let cell_px = self.cell_px();
-        let pty = PanePty::spawn(&new_id, rows as u16, cols as u16, cell_px)?;
+        // Read from the pane that was focused when the split was asked
+        // for — `set_focus` below hands focus to the new pane, so the
+        // directory has to be resolved before that.
+        let cwd = self
+            .panes
+            .get(&target)
+            .and_then(|p| pane_cwd(p.pty.raw_fd(), p.pty.child));
+        let pty = PanePty::spawn(&new_id, rows as u16, cols as u16, cell_px, cwd.as_deref())?;
         self.panes.insert(
             new_id.clone(),
             Pane {
@@ -2567,6 +2620,13 @@ impl State {
 
     /// Spawn a brand new tab containing one fresh pane and switch to it.
     fn new_tab(&mut self) -> Result<Vec<u8>> {
+        // Resolved before the tab is pushed and activated below: after
+        // that, `focus()` names the pane we are about to spawn rather
+        // than the one whose directory we want to inherit.
+        let cwd = self
+            .panes
+            .get(self.focus())
+            .and_then(|p| pane_cwd(p.pty.raw_fd(), p.pty.child));
         let pane_id = self.allocate_pane_id();
         let tab_title = self.allocate_tab_id();
         let new_tab = Tab {
@@ -2584,7 +2644,7 @@ impl State {
         let bounds = self.full_bounds();
         let (rows, cols) = inner_grid_for(bounds);
         let cell_px = self.cell_px();
-        let pty = PanePty::spawn(&pane_id, rows as u16, cols as u16, cell_px)?;
+        let pty = PanePty::spawn(&pane_id, rows as u16, cols as u16, cell_px, cwd.as_deref())?;
         self.panes.insert(
             pane_id.clone(),
             Pane {
@@ -5871,6 +5931,56 @@ mod tests {
         // a small value, which would look like a legitimate size.
         assert_eq!(pane_pixel_size(u16::MAX, u16::MAX, (12, 28)), (u16::MAX, u16::MAX));
         assert_eq!(pane_pixel_size(10, 10, (0, 0)), (0, 0));
+    }
+
+    #[test]
+    fn pane_cwd_falls_back_to_the_pane_shell() {
+        // `/dev/null` is not a controlling terminal, so `tcgetpgrp`
+        // fails and the shell-pid arm answers. Pointing that arm at our
+        // own pid is what makes the expected value knowable.
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        let me = Pid::from_raw(std::process::id() as i32);
+        assert_eq!(
+            pane_cwd(fd.as_raw_fd(), me).unwrap(),
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn spawn_starts_the_pane_in_the_requested_directory() {
+        // The chdir happens in the forked child before `execvp`, so the
+        // parent can only observe it through `/proc`. Poll rather than
+        // sleep a fixed amount: we pass on the first matching read,
+        // which is also what keeps a shell rc that later `cd`s of its
+        // own accord from turning into a spurious failure.
+        let dir = std::env::temp_dir().join(format!("vmux-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let want = std::fs::canonicalize(&dir).unwrap();
+
+        let pty = PanePty::spawn("p-test", 24, 80, (12, 28), Some(&want)).unwrap();
+        let link = format!("/proc/{}/cwd", pty.child);
+        let mut got = None;
+        for _ in 0..200 {
+            if std::fs::read_link(&link).ok().as_ref() == Some(&want) {
+                got = Some(want.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Drop SIGHUPs the pane's shell; do it before asserting so a
+        // failure doesn't leak the child.
+        drop(pty);
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(got.as_ref(), Some(&want));
+    }
+
+    #[test]
+    fn pane_cwd_is_none_when_neither_pid_resolves() {
+        // pid 0 never has a `/proc` entry, so both arms miss and the
+        // caller inherits vmux's own cwd instead of being handed a path
+        // `chdir` would reject.
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        assert!(pane_cwd(fd.as_raw_fd(), Pid::from_raw(0)).is_none());
     }
 
     #[test]
