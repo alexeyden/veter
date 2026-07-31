@@ -97,7 +97,8 @@ fn run_vplace(args: &[&str]) -> Vec<u8> {
 fn apply(app_output: &[u8], envelope: &[u8]) -> (VgeEngine, vt100::Parser) {
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
-    // Baseline the line tracker, as a real host does on its first pass.
+    // Pick up the parser's line origin, as a real host does on its
+    // first pass.
     engine.after_vt100_process(&mut parser);
 
     // The application's own output first — this is what puts the marker

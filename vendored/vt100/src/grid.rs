@@ -18,15 +18,19 @@ pub struct Grid {
     /// runtime-only signal for the PRT activity heuristic — never
     /// serialized; reset to 0 on construction and snapshot restore.
     scroll_committed: u64,
-    /// Net number of lines the live grid's first row has moved *down*
-    /// in absolute scrollback coordinates: +1 per line scrolled off
-    /// the top (same sites as `scroll_committed`), +k when a vertical
-    /// shrink pushes k top rows into scrollback, -k when a vertical
-    /// grow pulls k rows back out. The VGE/PRT scrollback-line
-    /// trackers advance `top_of_live_screen` by deltas of this value.
-    /// Runtime-only — never serialized; reset to 0 on construction
-    /// and snapshot restore (delta-based consumers re-baseline).
-    origin_shift: i64,
+    /// Absolute scrollback line index of the live grid's first row,
+    /// where line 0 is the first row this grid ever displayed. Moves
+    /// +1 per line scrolled off the top (same sites as
+    /// `scroll_committed`), +k when a vertical shrink pushes k top
+    /// rows into scrollback, -k when a vertical grow pulls k rows back
+    /// out. Scroll-region scrolls are excluded — they don't move the
+    /// screen relative to scrollback.
+    ///
+    /// This is the coordinate space VGE elements and Scrollback-anchored
+    /// PRT portals pin themselves to, so unlike `scroll_committed` it
+    /// *is* serialized: a restored snapshot has to keep anchoring
+    /// those objects to the same text lines.
+    top_of_live_screen: i64,
 }
 
 impl Grid {
@@ -44,7 +48,7 @@ impl Grid {
             scrollback_len,
             scrollback_offset: 0,
             scroll_committed: 0,
-            origin_shift: 0,
+            top_of_live_screen: 0,
         }
     }
 
@@ -54,11 +58,11 @@ impl Grid {
         self.scroll_committed
     }
 
-    /// Net downward movement of the live grid's first row in absolute
-    /// scrollback coordinates. See the field doc; used by the VGE/PRT
-    /// scrollback-line trackers.
-    pub fn origin_shift(&self) -> i64 {
-        self.origin_shift
+    /// Absolute scrollback line index of the live grid's first row.
+    /// See the field doc; this is what VGE elements and Scrollback
+    /// portals anchor against.
+    pub fn top_of_live_screen(&self) -> i64 {
+        self.top_of_live_screen
     }
 
     /// Number of rows currently held in the scrollback ring. Distinct
@@ -126,6 +130,7 @@ impl Grid {
             row.serialize_binary(w);
         }
         w.varu(self.scrollback_offset as u64);
+        w.i64(self.top_of_live_screen);
     }
 
     pub(crate) fn deserialize_binary(
@@ -166,6 +171,7 @@ impl Grid {
             scrollback.push_back(crate::row::Row::deserialize_binary(r)?);
         }
         let scrollback_offset = r.varu()? as usize;
+        let top_of_live_screen = r.i64()?;
 
         Ok(Self {
             size,
@@ -180,7 +186,7 @@ impl Grid {
             scrollback_len,
             scrollback_offset,
             scroll_committed: 0,
-            origin_shift: 0,
+            top_of_live_screen,
         })
     }
 
@@ -193,7 +199,8 @@ impl Grid {
         // shrinking pushes top rows into scrollback so the cursor row
         // survives instead of truncating the bottom of the grid, and
         // growing pulls rows back out. Each moved row adjusts
-        // `origin_shift` so scrollback-anchored consumers stay aligned.
+        // `top_of_live_screen` so scrollback-anchored consumers stay
+        // aligned.
         // With an active scroll region (or before the rows are lazily
         // allocated) the legacy truncate/extend behavior applies.
         if !self.rows.is_empty() && !self.scroll_region_active() {
@@ -202,7 +209,7 @@ impl Grid {
                 let push = usize::from(self.pos.row + 1).saturating_sub(keep);
                 for _ in 0..push {
                     let row = self.rows.remove(0);
-                    self.origin_shift += 1;
+                    self.top_of_live_screen += 1;
                     if self.scrollback_len > 0 {
                         self.scrollback.push_back(row);
                         while self.scrollback.len() > self.scrollback_len {
@@ -224,7 +231,7 @@ impl Grid {
                 for _ in 0..pull {
                     let row = self.scrollback.pop_back().unwrap();
                     self.rows.insert(0, row);
-                    self.origin_shift -= 1;
+                    self.top_of_live_screen -= 1;
                     if self.scrollback_offset > 0 {
                         self.scrollback_offset -= 1;
                     }
@@ -749,7 +756,7 @@ impl Grid {
                 // A line scrolled off the top of the live grid: the
                 // signal the PRT activity heuristic watches.
                 self.scroll_committed = self.scroll_committed.wrapping_add(1);
-                self.origin_shift += 1;
+                self.top_of_live_screen += 1;
                 if self.scrollback_len > 0 {
                     self.scrollback.push_back(removed);
                     while self.scrollback.len() > self.scrollback_len {

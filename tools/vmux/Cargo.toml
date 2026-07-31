@@ -5,10 +5,10 @@ edition = "2024"
 description = "Terminal multiplexer over the PRT/VGE extensions."
 
 [dependencies]
-prt-protocol = { path = "../../prt-protocol" }
-vge-protocol = { path = "../../vge-protocol" }
-ses-protocol = { path = "../../ses-protocol" }
-vge-ui = { path = "../../vge-ui" }
+prt-protocol = { path = "../../protocol/prt" }
+vge-protocol = { path = "../../protocol/vge" }
+ses-protocol = { path = "../../protocol/ses" }
+vge-ui = { path = "../../libs/vge-ui" }
 anyhow = "1"
 nix = { version = "0.29", features = ["term", "poll", "process", "signal", "fs"] }
 libc = "0.2"

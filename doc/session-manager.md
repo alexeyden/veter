@@ -310,7 +310,13 @@ origin mode, current and **saved SGR attributes**, current and
 **saved G0/G1 charset**, all input modes (application keypad / cursor,
 hide cursor, bracketed paste, alt-screen flag, mouse protocol mode
 + encoding), title, icon name, the scrollback ring with current
-scrollback offset. Lives in the vt100 fork as
+scrollback offset, and each grid's `top_of_live_screen` — the
+absolute scrollback line index of its first live row. That last one
+is the coordinate space VGE `anchor_line`s and Scrollback portal
+anchors are expressed in, so it belongs to whoever owns the screen;
+the VGE and PRT fragments deliberately do *not* carry their own copy,
+and a receiver must apply this fragment before them. Lives in the
+vt100 fork as
 `Screen::binary_snapshot()` / `restore_from_binary_snapshot()`.
 Bolded items are gaps the v1 replay serializer drops.
 
@@ -366,10 +372,10 @@ forward verbatim per §1.1 of each spec.
 The renderer's byte pipeline
 (`veter/src/main.rs::App::process_pty_output`,
 `PRT → VGE → VFT → vt100`) and the equivalent per-portal pipeline in
-`veter-host/src/prt/state.rs::WritePortal` gain a fourth stage:
+`libs/veter-host/src/prt/state.rs::WritePortal` gain a fourth stage:
 `VssEngine`, sitting between VFT and vt100.
 
-`VssEngine` (new module, `veter-host/src/vss/state.rs`) is an APC
+`VssEngine` (new module, `libs/veter-host/src/vss/state.rs`) is an APC
 parser and fragment reassembler with the same shape as `VftEngine`.
 On a complete snapshot (`SnapshotBegin` … `SnapshotEnd` matched and
 validated):
@@ -522,7 +528,7 @@ the cutover moment; step 8 garbage-collects the replay path.
    malformed frames, version mismatch.
 6. **Renderer pipeline wire-up.** Add the VSS stage to
    `veter/src/main.rs::App::process_pty_output` and to the
-   per-portal pipeline in `veter-host/src/prt/state.rs::WritePortal`.
+   per-portal pipeline in `libs/veter-host/src/prt/state.rs::WritePortal`.
    Manual end-to-end test by hand-rolling a VSS envelope inside a
    vmux pane.
 7. **`vsd` switches to VSS.** `attach.rs` composition rewritten;

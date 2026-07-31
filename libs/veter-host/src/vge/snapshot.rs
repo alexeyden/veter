@@ -25,11 +25,14 @@ use super::state::{Element, ElementSet, SharedTables, UploadedImage, VgeState};
 /// match — see [`super::state::VgeEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v4: drop `top_of_live_screen` — the line origin `anchor_line`
+///   values reference now lives in (and is restored by) the vt100
+///   snapshot that always accompanies this fragment.
 /// - v3: per-element affine transform (§9.11).
 /// - v2: include `top_of_live_screen` so element `anchor_line` values
-///   stay aligned with the receiving engine's `LineTracker`.
+///   stay aligned with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
 
 /// Error returned when a VGE binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -70,7 +73,6 @@ pub(crate) fn encode_state(
     state: &VgeState,
     cell_px: (u16, u16),
     scale_factor: f32,
-    top_of_live_screen: i64,
     out: &mut Vec<u8>,
 ) {
     let mut w = Writer::new();
@@ -79,13 +81,11 @@ pub(crate) fn encode_state(
     w.u16(cell_px.0);
     w.u16(cell_px.1);
     w.f32(scale_factor);
-    // The element `anchor_line` values reference absolute scrollback
-    // line indices in the *source* engine's `LineTracker`. Ship the
-    // value here so the receiving engine can pin its own tracker to
-    // the same origin — without this, anchors render at row
-    // `anchor_line - 0` instead of `anchor_line - top_of_live_screen`,
-    // i.e. far off-screen or in the wrong row.
-    w.i64(top_of_live_screen);
+    // Element `anchor_line` values are absolute scrollback line
+    // indices, so they only mean anything against a matching
+    // `top_of_live_screen`. That origin is vt100's (§4.3): a VGE
+    // fragment is always applied alongside the vt100 fragment of the
+    // same screen, whose restore carries it.
 
     encode_shared(&state.shared, &mut w);
     encode_element_set(&state.main, &mut w);
@@ -104,7 +104,6 @@ pub(crate) struct DecodedState {
     pub state: VgeState,
     pub cell_px: (u16, u16),
     pub scale_factor: f32,
-    pub top_of_live_screen: i64,
 }
 
 pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> {
@@ -119,7 +118,6 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> 
 
     let cell_px = (r.u16()?, r.u16()?);
     let scale_factor = r.f32()?;
-    let top_of_live_screen = r.i64()?;
 
     let shared = decode_shared(&mut r)?;
     let main = decode_element_set(&mut r)?;
@@ -141,7 +139,6 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> 
         state: VgeState::from_raw_parts(shared, main, alt, on_alt),
         cell_px,
         scale_factor,
-        top_of_live_screen,
     })
 }
 

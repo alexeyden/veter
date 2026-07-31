@@ -5,8 +5,8 @@ edition = "2024"
 description = "Place an image into another program's pane, anchored to a marker string it printed."
 
 [dependencies]
-vge-protocol = { path = "../../vge-protocol" }
-vge-render = { path = "../../vge-render" }
+vge-protocol = { path = "../../protocol/vge" }
+vge-render = { path = "../../libs/vge-render" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 libc = "0.2"
@@ -15,5 +15,5 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [dev-dependencies]
 # The end-to-end test drives the real host engine, so it asserts
 # against the same code a live veter runs rather than a stand-in.
-veter-host = { path = "../../veter-host" }
-vt100 = { path = "../../vt100" }
+veter-host = { path = "../../libs/veter-host" }
+vt100 = { path = "../../vendored/vt100" }

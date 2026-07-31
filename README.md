@@ -29,7 +29,7 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
 | `vge-render` | Shared client-side image-rendering + raw-TTY / probe helpers (used by `vcat`, `vplay`, `vdraw`, `vfm`). |
 | `vge-ui` | Shared client-side widget toolkit: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing (used by `vmux`, `vfm`). |
-| `vt100` | Vendored fork of the `vt100` parser (adds `clear_scrollback`, resize helpers, and binary snapshot/restore). |
+| `vt100` | Vendored fork of the `vt100` parser (adds `clear_scrollback`, resize helpers, scrollback-line tracking, and binary snapshot/restore). |
 | `breakout`, `spinner` | VGE demos. |
 
 ## Build

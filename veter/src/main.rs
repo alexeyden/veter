@@ -2636,6 +2636,11 @@ impl App {
                         if let Err(e) = prt.restore_from_binary_snapshot(&cs.prt_bytes) {
                             eprintln!("veter: host VSS PRT restore failed: {e}");
                         }
+                        // The line origin the VGE elements and
+                        // Scrollback portals anchor against came in
+                        // with the vt100 fragment restored just above.
+                        engine.sync_top_of_live_screen(parser);
+                        prt.sync_top_of_live_screen(parser);
                     }
                     // DetachNotify: roll back to whatever we stashed
                     // on the first snapshot of this attach.
@@ -2652,11 +2657,13 @@ impl App {
                             if let Err(e) = prt.restore_from_binary_snapshot(&backup.prt) {
                                 eprintln!("veter: host VSS detach-restore PRT failed: {e}");
                             }
+                            engine.sync_top_of_live_screen(parser);
+                            prt.sync_top_of_live_screen(parser);
                         }
                     }
                     // PRT host-screen reactions: scope_reset / cull on
                     // observed RIS/DECSTR/2J/3J, then alt-screen swap +
-                    // line tracker + scrollback eviction.
+                    // line origin refresh + scrollback eviction.
                     prt.handle_terminal_events(&prt_chunk.terminal_events);
                     // §5.6 — VFT has no apc-side observation of resets,
                     // so it relies on PRT's terminal event stream.
@@ -2814,10 +2821,16 @@ impl ApplicationHandler for App {
         let vft_wakeup: vft::Wakeup = std::sync::Arc::new(move || {
             let _ = wakeup_proxy.send_event(());
         });
-        let vft_engine = vft::VftEngine::with_wakeup(vft_wakeup.clone());
+        // The desktop half of VFT: `veter-host` links no toolkit, so
+        // the renderer hands it a file picker and a default-app
+        // launcher. Shared by the host engine and every per-portal one.
+        let vft_hooks: vft::Hooks = std::sync::Arc::new(vft::RendererHooks);
+        let mut vft_engine = vft::VftEngine::with_wakeup(vft_wakeup.clone());
+        vft_engine.set_hooks(vft_hooks.clone());
 
         let mut prt_engine =
             prt::PrtEngine::with_metrics_and_wakeup(cell_px, scale, vft_wakeup);
+        prt_engine.set_vft_hooks(vft_hooks);
         // Same palette as the top-level VGE engine, inherited by every
         // per-portal VGE engine PRT spawns; each portal keys its
         // contextual `host.accent` on its own nesting depth.
@@ -2897,7 +2910,7 @@ impl ApplicationHandler for App {
                         parser.screen_mut().set_size(rows, cols);
                         // A vertical resize moves the live screen
                         // relative to scrollback (xterm-style push/
-                        // pull); sync the engines' line trackers now
+                        // pull); re-read the engines' line origins now
                         // rather than waiting for the next PTY chunk,
                         // or anchored elements/portals render shifted
                         // until the shell redraws.

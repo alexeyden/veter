@@ -5,4 +5,4 @@ edition = "2024"
 description = "Shared client-side widget toolkit for VGE-aware terminal apps: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing."
 
 [dependencies]
-vge-protocol = { path = "../vge-protocol" }
+vge-protocol = { path = "../../protocol/vge" }

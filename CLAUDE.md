@@ -21,9 +21,24 @@ Most tests are inline `#[cfg(test)]` modules — there is no separate test harne
 - One crate: `cargo test -p prt-protocol`
 - One test by name substring: `cargo test -p prt-protocol envelope_roundtrip`
 
-The only integration test directory is `vge-cli/tests/cli_roundtrip.rs`.
+The only integration test directory is `tools/vge-cli/tests/cli_roundtrip.rs`.
 
 ## Repository layout
+
+Crates are grouped by what they are, not by name. A crate's directory
+name drops the redundant suffix its parent already supplies
+(`protocol/vge` is the `vge-protocol` crate); **crate names are
+unchanged**, so `cargo -p <name>` and every `use` path work exactly as
+before.
+
+```
+protocol/   vge prt vft vss ses   — pure wire format, no state, no I/O
+libs/       veter-host vge-render vge-ui   — shared implementation crates
+tools/      the CLI/TUI clients, plus vge-cli and prt-cli
+vendored/   vt100 femtovg   — third-party forks
+veter/      the GUI terminal
+doc/        the normative protocol specs
+```
 
 The protocols live under `doc/` and drive the entire codebase. Read the relevant one before making non-trivial changes:
 
@@ -33,17 +48,17 @@ The protocols live under `doc/` and drive the entire codebase. Read the relevant
 - `doc/session-manager.md` — `vsd`, the persistent session daemon, and **VSS** (`ESC _ VSS … ESC \`, in `doc/session-manager.md` §4), the binary engine-snapshot protocol it uses to ship state to an attaching renderer.
 - `doc/session-extension.md` — SES (`ESC _ SES … ESC \`), the small `vmux` ↔ `vsd` control channel (session-name probe, detach command).
 
-Host-side engine state (the vt100 grids and all five engines) lives in **`veter-host`**, GUI-free, so the same code backs both the `veter` GUI binary and the headless `vsd` daemon. The `veter` crate keeps only the GUI and the render/glue side of each engine (`src/prt/render.rs`, `src/vge/render.rs`, `src/vft/`, `src/ses.rs`, `src/vss.rs`).
+Host-side engine state (the vt100 grids and all five engines) lives in **`libs/veter-host`**, GUI-free, so the same code backs both the `veter` GUI binary and the headless `vsd` daemon. The `veter` crate keeps only the GUI and the render/glue side of each engine (`src/prt/render.rs`, `src/vge/render.rs`, `src/vft/`, `src/ses.rs`, `src/vss.rs`).
 
 | Crate | Role |
 |---|---|
-| `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. |
-| `vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, and the `origin_shift` / `scroll_committed` counters the engines' line trackers consume). The screen model the host and every portal use. |
-| `veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines and the shared line tracker. `gui` feature pulls desktop-only deps VFT needs on a real renderer. Consumed by both `veter` and `vsd`. |
+| `protocol/*` — `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. |
+| `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, and `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot). The screen model the host and every portal use. |
+| `libs/veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines. Links no GUI toolkit at all — the two desktop affordances VFT needs (native file picker, open-after-finalize) are the `vft::DesktopHooks` trait, which `veter` implements and `vsd` leaves at its `HeadlessHooks` default. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
-| `vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal, plus the shared raw-TTY / poll / probe helpers every VGE client uses (`vcat`, `vplay`, `vdraw`, `vfm`, `spinner`, `breakout`). |
-| `vge-ui` | Shared client-side widget toolkit, extracted from `vmux`: accent theme (`theme`), rounded chrome paths (`shape`), the readline-style `LineEditor` (`edit`), the filterable `Picker` (`picker`), the prompt/picker/scrolling modal builders (`modal`), and the key + SGR-mouse `InputParser` (`input`). Pure `vge-protocol` consumer — builds draw commands and parses input, owns no state and does no I/O. Used by `vmux` and `vfm`. |
-| `vge-cli`, `prt-cli` | Emit raw envelopes for manual protocol testing. |
+| `libs/vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal, plus the shared raw-TTY / poll / probe helpers every VGE client uses (`vcat`, `vplay`, `vdraw`, `vfm`, `spinner`, `breakout`). |
+| `libs/vge-ui` | Shared client-side widget toolkit, extracted from `vmux`: accent theme (`theme`), rounded chrome paths (`shape`), the readline-style `LineEditor` (`edit`), the filterable `Picker` (`picker`), the prompt/picker/scrolling modal builders (`modal`), and the key + SGR-mouse `InputParser` (`input`). Pure `vge-protocol` consumer — builds draw commands and parses input, owns no state and does no I/O. Used by `vmux` and `vfm`. |
+| `tools/vge-cli`, `tools/prt-cli` | Emit raw envelopes for manual protocol testing. |
 | `tools/vmux` | Terminal multiplexer that runs *inside* veter, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
 | `tools/vcat` | Display images inside a VGE-aware terminal. |
 | `tools/vplay` | Interactive image and video viewer for VGE-aware terminals. Left/right arrows seek in video mode and, in image mode, cycle the opened file's sibling stills (`src/playlist.rs`, lexicographical, directory scanned once at startup); `hjkl` always pans, since the arrows are taken. Every texture (the still and the two ping-ponged video frame slots) is uploaded with `Retention::Manual` — see `RETENTION` in `src/main.rs`: an `Auto` image is refcount-collected by the resize path's element wipe, and in the still's case by its own same-id swap's element retarget. vplay therefore releases each id by hand (each swap drops the id it supersedes; `TermExit` sweeps the `vplay-` prefix). |

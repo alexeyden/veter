@@ -5,6 +5,6 @@ edition = "2024"
 description = "VGE transform demo: a complex shape created once, rotated with one UpdateTransform per frame."
 
 [dependencies]
-vge-protocol = { path = "../../vge-protocol" }
-vge-render = { path = "../../vge-render" }
+vge-protocol = { path = "../../protocol/vge" }
+vge-render = { path = "../../libs/vge-render" }
 anyhow = "1"

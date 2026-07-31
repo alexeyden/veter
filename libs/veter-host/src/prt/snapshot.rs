@@ -21,11 +21,15 @@ use prt_protocol::command::CursorStyle;
 /// match — see [`PrtEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v3: drop `top_of_live_screen` — the line origin
+///   `PortalAnchor::Scrollback { anchor_line }` values reference now
+///   lives in (and is restored by) the vt100 snapshot that always
+///   accompanies this fragment.
 /// - v2: include `top_of_live_screen` so portal
 ///   `PortalAnchor::Scrollback { anchor_line }` values stay aligned
-///   with the receiving engine's `LineTracker`.
+///   with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 2;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
 
 /// Error returned when a PRT binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -87,10 +91,9 @@ impl From<crate::vge::SnapshotError> for SnapshotError {
 pub(crate) fn encode_engine(engine: &PrtEngine, out: &mut Vec<u8>) {
     let mut w = Writer::new();
     w.u16(SNAPSHOT_KIND_VERSION);
-    // See VGE snapshot for the rationale: portals anchored to a
-    // scrollback line need the source engine's `top_of_live_screen`
-    // so the receiver renders them at the right row.
-    w.i64(engine.line_tracker_top_of_live_screen());
+    // See the VGE snapshot for the rationale: the line origin a
+    // `Scrollback` portal's `anchor_line` references is vt100's, and
+    // rides along in the vt100 fragment of the same screen.
 
     encode_focus(&engine.state.focus, &mut w);
     encode_cursor_style(engine.state.cursor_style, &mut w);
@@ -118,8 +121,6 @@ pub(crate) fn decode_engine_into(
             want: SNAPSHOT_KIND_VERSION,
         });
     }
-    let top_of_live_screen = r.i64()?;
-
     let focus = decode_focus(&mut r)?;
     let cursor_style = decode_cursor_style(&mut r)?;
     let on_alt = r.bool()?;
@@ -137,10 +138,13 @@ pub(crate) fn decode_engine_into(
         return Err(SnapshotError::TrailingBytes);
     }
 
-    engine.install_state_from_snapshot(
-        PrtState::from_raw_parts(main, alt, on_alt, focus, cursor_style),
-        top_of_live_screen,
-    );
+    engine.install_state_from_snapshot(PrtState::from_raw_parts(
+        main,
+        alt,
+        on_alt,
+        focus,
+        cursor_style,
+    ));
     Ok(())
 }
 
@@ -331,6 +335,12 @@ fn decode_portal(
 
     let mut children = parent_engine.child_engine_scaffold();
     decode_engine_into(&mut children, children_bytes)?;
+
+    // Both sub-engines anchor to this portal's vt100, restored just
+    // above with the line origin their `anchor_line` values were
+    // recorded against.
+    vge.sync_top_of_live_screen(&vt);
+    children.sync_top_of_live_screen(&vt);
 
     let vft = parent_engine.spawn_portal_vft();
     // A restored portal starts with a fresh VssEngine: any in-flight

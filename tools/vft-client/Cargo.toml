@@ -5,8 +5,8 @@ edition = "2024"
 description = "Shared client code for vsend / vrecv: raw-TTY guard, host-side frame stream, probe + cursor-position helpers, progress UI."
 
 [dependencies]
-vft-protocol = { path = "../../vft-protocol" }
-vge-protocol = { path = "../../vge-protocol" }
+vft-protocol = { path = "../../protocol/vft" }
+vge-protocol = { path = "../../protocol/vge" }
 anyhow = "1"
 nix = { version = "0.29", features = ["term", "poll"] }
 libc = "0.2"
@@ -17,4 +17,4 @@ libc = "0.2"
 # that they provoke no response frames (an unread ack backlog is what
 # garbles the shell when a transfer is cancelled). No `gui` feature: the
 # VGE engine is GUI-free.
-veter-host = { path = "../../veter-host" }
+veter-host = { path = "../../libs/veter-host" }

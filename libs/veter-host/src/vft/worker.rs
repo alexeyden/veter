@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vft_protocol::frame::*;
 
+use super::hooks::Hooks;
+
 /// Result of a native file-picker dialog spawned for a deferred-form
 /// BeginDownload (§7.1).
 pub enum PickerResult {
@@ -19,39 +21,27 @@ pub enum PickerResult {
     Cancelled,
 }
 
-/// Open a native file dialog (sync, blocking), post the result onto
+/// Run the host's file picker (sync, blocking), post the result onto
 /// `tx`, and tick the engine via `wakeup` so `drive()` consumes the
-/// outcome on the next main-loop pass. Errors from the dialog
-/// backend (e.g. no display, GTK init failure) surface as
-/// `Cancelled` — the engine then returns `err_cancelled` to the
-/// client, which is the same code the user-cancel path uses.
+/// outcome on the next main-loop pass. Anything other than a chosen
+/// path — user cancelled, no display, dialog backend failure, a panic
+/// out of the toolkit — surfaces as `Cancelled`, and the engine
+/// answers the client `err_cancelled` in every one of those cases.
 ///
-/// Under `cfg(test)` the GTK dialog is suppressed and an immediate
-/// `Cancelled` is sent, so unit tests can exercise the spawn /
-/// drain / response-slot plumbing without blocking on a real UI.
-pub fn run_picker(title: String, tx: Sender<PickerResult>, wakeup: Wakeup) {
-    // Suppressed under cfg(test) so unit tests don't spawn real UI;
-    // suppressed when the `gui` feature is off (headless vsd) so
-    // the picker becomes a deterministic Cancelled and the renderer's
-    // own picker handles the real interaction.
-    #[cfg(any(test, not(feature = "gui")))]
-    {
-        let _ = title;
-        let _ = tx.send(PickerResult::Cancelled);
-        wakeup();
-    }
-    #[cfg(all(not(test), feature = "gui"))]
-    {
-        let result = std::panic::catch_unwind(move || {
-            rfd::FileDialog::new().set_title(title).pick_file()
-        });
-        let outcome = match result {
-            Ok(Some(p)) => PickerResult::Selected(p),
-            _ => PickerResult::Cancelled,
-        };
-        let _ = tx.send(outcome);
-        wakeup();
-    }
+/// With the default [`HeadlessHooks`](crate::vft::HeadlessHooks) this
+/// is an immediate `Cancelled`, which is what lets unit tests
+/// exercise the spawn / drain / response-slot plumbing without
+/// blocking on a real UI.
+pub fn run_picker(title: String, hooks: Hooks, tx: Sender<PickerResult>, wakeup: Wakeup) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        hooks.pick_file(&title)
+    }));
+    let outcome = match result {
+        Ok(Some(p)) => PickerResult::Selected(p),
+        _ => PickerResult::Cancelled,
+    };
+    let _ = tx.send(outcome);
+    wakeup();
 }
 
 /// Closure called by a worker after pushing an event. The host wires
@@ -79,9 +69,9 @@ pub enum WorkerCmd {
     /// optionally launch the user's default app for the result, and
     /// reply with `Finalised`. `request_id` is echoed in the reply
     /// so the engine can match it to the originating EndUpload.
-    /// `open_after` triggers `opener::open(final_path)` after the
-    /// file is durable; used by deferred-form uploads (§6.1) to
-    /// hand the result to the user's default viewer.
+    /// `open_after` triggers `DesktopHooks::open_path(final_path)`
+    /// after the file is durable; used by deferred-form uploads
+    /// (§6.1) to hand the result to the user's default viewer.
     Finalize {
         request_id: u32,
         mode: u32,
@@ -124,6 +114,7 @@ pub fn run_upload(
     cmd_rx: Receiver<WorkerCmd>,
     evt_tx: Sender<WorkerEvt>,
     wakeup: Wakeup,
+    hooks: Hooks,
 ) {
     let send = |evt: WorkerEvt| {
         let _ = evt_tx.send(evt);
@@ -172,7 +163,10 @@ pub fn run_upload(
                     apply_mtime(&final_path, mtime);
                 }
                 if open_after {
-                    maybe_open_default(&final_path);
+                    // Best-effort by contract: the file is durable at
+                    // this point, so a launcher that does nothing (or
+                    // fails) must not fail the transfer.
+                    hooks.open_path(&final_path);
                 }
                 let bytes_written = bytes_processed.load(Ordering::Relaxed);
                 send(WorkerEvt::Finalised {
@@ -333,26 +327,6 @@ fn classify_io_error(e: &std::io::Error) -> u8 {
             ABORT_IO_ERROR
         }
     }
-}
-
-/// Hand the finalised file to the user's default application. Used
-/// by deferred-form uploads (§6.1) so a `vsend ./screenshot.png` lands
-/// in `$TMPDIR` and then immediately pops up in the user's image
-/// viewer. Errors are swallowed — failing to launch the app does not
-/// abort the transfer; the file is already durable.
-///
-/// Disabled under `cfg(test)` (don't spawn real apps from unit tests)
-/// and when the `gui` feature is off (headless vsd: the renderer
-/// has the real default-app launcher; opening from the daemon would
-/// happen on the wrong machine anyway).
-#[cfg(all(not(test), feature = "gui"))]
-fn maybe_open_default(path: &PathBuf) {
-    let _ = opener::open(path);
-}
-
-#[cfg(any(test, not(feature = "gui")))]
-fn maybe_open_default(_path: &PathBuf) {
-    // intentional no-op
 }
 
 #[cfg(unix)]

@@ -144,18 +144,23 @@ impl Screen {
         self.grid.scroll_committed()
     }
 
-    /// Net downward movement of the *main* grid's first row in
-    /// absolute scrollback coordinates: lines scrolled off the top
-    /// count +1 (scroll-region scrolls excluded — they don't move the
-    /// screen relative to scrollback), rows pushed into scrollback by
-    /// a vertical shrink count +1 each, rows pulled back out by a
-    /// vertical grow count -1 each. The VGE/PRT line trackers advance
-    /// `top_of_live_screen` by deltas of this value. Runtime-only —
-    /// not preserved across a binary snapshot restore; delta-based
-    /// consumers must re-baseline after a restore.
+    /// Absolute scrollback line index of the *main* grid's first live
+    /// row, where line 0 is the first row the parser ever displayed.
+    /// Lines scrolled off the top count +1 (scroll-region scrolls
+    /// excluded — they don't move the screen relative to scrollback),
+    /// rows pushed into scrollback by a vertical shrink count +1 each,
+    /// rows pulled back out by a vertical grow count -1 each.
+    ///
+    /// VGE elements and Scrollback-anchored PRT portals live in this
+    /// coordinate space. Deliberately the *main* grid's value even
+    /// while the alternate screen is up: the alternate screen has no
+    /// scrollback, so anchors stay frozen against the main screen they
+    /// were placed on, and a resize during the alt screen — which
+    /// pushes/pulls main-grid rows — is reflected the moment the alt
+    /// screen goes away. Preserved across a binary snapshot restore.
     #[must_use]
-    pub fn origin_shift(&self) -> i64 {
-        self.grid.origin_shift()
+    pub fn top_of_live_screen(&self) -> i64 {
+        self.grid.top_of_live_screen()
     }
 
     /// Number of rows currently held in the *main* grid's scrollback
@@ -1651,7 +1656,7 @@ mod resize_tests {
     fn vertical_shrink_pushes_top_rows_keeping_cursor_line() {
         let mut p = parser_with_lines();
         assert_eq!(p.screen().cursor_position(), (9, 0));
-        assert_eq!(p.screen().origin_shift(), 6);
+        assert_eq!(p.screen().top_of_live_screen(), 6);
 
         p.screen_mut().set_size(6, 20);
         // The four rows above the kept window went into scrollback
@@ -1659,7 +1664,7 @@ mod resize_tests {
         // as the new bottom row.
         assert_eq!(p.screen().cursor_position(), (5, 0));
         assert_eq!(p.screen().scrollback_fill(), 10);
-        assert_eq!(p.screen().origin_shift(), 10);
+        assert_eq!(p.screen().top_of_live_screen(), 10);
         assert!(p.screen().contents().starts_with("line10"));
     }
 
@@ -1671,7 +1676,7 @@ mod resize_tests {
         p.screen_mut().set_size(10, 20);
         assert_eq!(p.screen().cursor_position(), (9, 0));
         assert_eq!(p.screen().scrollback_fill(), 6);
-        assert_eq!(p.screen().origin_shift(), 6);
+        assert_eq!(p.screen().top_of_live_screen(), 6);
         assert_eq!(p.screen().contents(), before);
     }
 
@@ -1683,7 +1688,7 @@ mod resize_tests {
         // the bottom and leaves the cursor line alone.
         p.screen_mut().set_size(8, 20);
         assert_eq!(p.screen().cursor_position(), (1, 1));
-        assert_eq!(p.screen().origin_shift(), 0);
+        assert_eq!(p.screen().top_of_live_screen(), 0);
     }
 
     #[test]
@@ -1691,8 +1696,126 @@ mod resize_tests {
         let mut p = Parser::new(10, 20, 100);
         p.process(b"\x1b[2;5r");
         p.screen_mut().set_size(6, 20);
-        assert_eq!(p.screen().origin_shift(), 0);
+        assert_eq!(p.screen().top_of_live_screen(), 0);
         assert_eq!(p.screen().scrollback_fill(), 0);
+    }
+}
+
+/// `top_of_live_screen` is the absolute line coordinate VGE elements
+/// and Scrollback portals anchor to, so it has to stay exact through
+/// the cases that used to fool the host's probe-and-hash heuristic:
+/// width changes, saturated scrollback, and vertical push/pull.
+#[cfg(test)]
+mod top_of_live_screen_tests {
+    use crate::Parser;
+
+    #[test]
+    fn advances_by_exact_scroll_count() {
+        let mut p = Parser::new(5, 20, 100);
+        // 12 CRLF-terminated lines on a 5-row screen: the cursor
+        // reaches the bottom row after 4 line feeds, so the remaining
+        // 8 each scroll one line into history.
+        p.process(&b"x\r\n".repeat(12));
+        assert_eq!(p.screen().top_of_live_screen(), 8);
+    }
+
+    #[test]
+    fn counts_scrolls_past_scrollback_saturation() {
+        // Tiny scrollback: the 4-line cap saturates immediately.
+        let mut p = Parser::new(2, 10, 4);
+        p.process(&b"\n".repeat(20));
+        // 20 LFs on a 2-row screen: the first moves the cursor to the
+        // bottom row, every later one scrolls — 19 exactly, even
+        // though only 4 scrollback rows survive.
+        assert_eq!(p.screen().top_of_live_screen(), 19);
+        assert_eq!(p.screen().scrollback_fill(), 4);
+    }
+
+    #[test]
+    fn width_resize_does_not_move_it() {
+        let mut p = Parser::new(10, 80, 100);
+        p.process(&b"line\r\n".repeat(15));
+        let before = p.screen().top_of_live_screen();
+        for cols in [70, 50, 90] {
+            p.screen_mut().set_size(10, cols);
+            p.process(b"$ ");
+        }
+        assert_eq!(p.screen().top_of_live_screen(), before);
+    }
+
+    #[test]
+    fn vertical_resize_keeps_cursor_line_anchored() {
+        let mut p = Parser::new(10, 80, 100);
+        p.process(&b"line\r\n".repeat(15));
+        // The cursor's absolute line is the invariant a vcat image is
+        // placed against; shrink + grow must preserve it throughout.
+        let cursor_abs = |p: &Parser| {
+            p.screen().top_of_live_screen()
+                + i64::from(p.screen().cursor_position().0)
+        };
+        let anchor = cursor_abs(&p);
+
+        p.screen_mut().set_size(6, 80); // shrink: pushes rows
+        assert_eq!(cursor_abs(&p), anchor);
+
+        p.screen_mut().set_size(12, 80); // grow: pulls them back
+        assert_eq!(cursor_abs(&p), anchor);
+    }
+
+    #[test]
+    fn scroll_region_scrolls_do_not_count() {
+        let mut p = Parser::new(10, 20, 100);
+        // Restrict scrolling to rows 2..=5, park the cursor at the
+        // region bottom, and force region scrolls.
+        p.process(b"\x1b[2;5r\x1b[5;1H");
+        p.process(&b"\n".repeat(6));
+        assert_eq!(p.screen().top_of_live_screen(), 0);
+    }
+
+    #[test]
+    fn alt_screen_freezes_it_until_the_main_screen_returns() {
+        let mut p = Parser::new(5, 20, 100);
+        p.process(&b"x\r\n".repeat(12));
+        let before = p.screen().top_of_live_screen();
+
+        // Scrolling the alternate screen must not move the main
+        // screen's line origin — the alt grid has no scrollback and
+        // main-screen anchors have to survive the round trip.
+        p.process(b"\x1b[?1049h");
+        p.process(&b"y\r\n".repeat(20));
+        assert_eq!(p.screen().top_of_live_screen(), before);
+
+        p.process(b"\x1b[?1049l");
+        assert_eq!(p.screen().top_of_live_screen(), before);
+    }
+
+    #[test]
+    fn resize_during_alt_screen_moves_the_main_origin() {
+        let mut p = Parser::new(10, 80, 100);
+        p.process(&b"line\r\n".repeat(15));
+        let before = p.screen().top_of_live_screen();
+
+        // A shrink while the alt screen is up still pushes main-grid
+        // rows into scrollback, so the main screen's text genuinely
+        // moved and anchors have to follow it.
+        p.process(b"\x1b[?1049h");
+        p.screen_mut().set_size(6, 80);
+        p.process(b"\x1b[?1049l");
+        assert_eq!(p.screen().top_of_live_screen(), before + 4);
+    }
+
+    #[test]
+    fn survives_a_snapshot_roundtrip() {
+        let mut p = Parser::new(5, 20, 100);
+        p.process(&b"x\r\n".repeat(12));
+        let bytes = p.screen().binary_snapshot();
+
+        let mut q = Parser::new(5, 20, 100);
+        q.screen_mut().restore_from_binary_snapshot(&bytes).unwrap();
+        assert_eq!(q.screen().top_of_live_screen(), 8);
+        // And keeps counting from the restored origin.
+        q.process(&b"x\r\n".repeat(3));
+        assert_eq!(q.screen().top_of_live_screen(), 11);
     }
 }
 

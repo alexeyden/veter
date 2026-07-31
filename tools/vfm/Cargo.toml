@@ -14,10 +14,10 @@ default = ["system-clipboard"]
 system-clipboard = ["dep:arboard"]
 
 [dependencies]
-vge-protocol = { path = "../../vge-protocol" }
-vge-render = { path = "../../vge-render" }
-vge-ui = { path = "../../vge-ui" }
-prt-protocol = { path = "../../prt-protocol" }
+vge-protocol = { path = "../../protocol/vge" }
+vge-render = { path = "../../libs/vge-render" }
+vge-ui = { path = "../../libs/vge-ui" }
+prt-protocol = { path = "../../protocol/prt" }
 anyhow = "1"
 # Same trim as veter's: `image-data` would pull an image stack we have
 # no use for — vfm only ever sets a file list.

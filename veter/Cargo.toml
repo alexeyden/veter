@@ -17,12 +17,12 @@ name = "veter"
 path = "src/main.rs"
 
 [dependencies]
-veter-host = { path = "../veter-host", features = ["gui"] }
-vge-protocol = { path = "../vge-protocol" }
-prt-protocol = { path = "../prt-protocol" }
-vft-protocol = { path = "../vft-protocol" }
-vt100 = { path = "../vt100" }
-femtovg = { path = "../femtovg", features = ["swash"] }
+veter-host = { path = "../libs/veter-host" }
+vge-protocol = { path = "../protocol/vge" }
+prt-protocol = { path = "../protocol/prt" }
+vft-protocol = { path = "../protocol/vft" }
+vt100 = { path = "../vendored/vt100" }
+femtovg = { path = "../vendored/femtovg", features = ["swash"] }
 parley = "0.7"
 swash = "0.2"
 winit = "0.30"
@@ -35,6 +35,11 @@ rgb = "0.8"
 imgref = "1"
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Backing for `vft::RendererHooks` — the native file dialog VFT
+# opens for a deferred-form transfer (§7.1) and the launcher that
+# hands a finished download to the user's default app (§6.1).
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+opener = "0.8"
 memchr = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

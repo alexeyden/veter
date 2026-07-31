@@ -30,7 +30,6 @@ use super::portal::{
     Portal, PortalAnchor, PortalCallbacks, PortalSet, PolledStateCache, RawCallbackEvent,
     RowDamage,
 };
-use crate::line_tracker::LineTracker;
 
 /// Host-side caps published in the probe response (§2.1, §12).
 #[derive(Debug, Clone, Copy)]
@@ -226,11 +225,12 @@ pub struct PrtEngine {
     /// §1.2; `flush_pending_events` wraps any leftovers into a
     /// standalone event envelope.
     pending_events: Vec<(u8, Vec<u8>)>,
-    /// Tracks `top_of_live_screen` (absolute scrollback line index of
-    /// the parent vt100's first live-screen row). Updated by
-    /// `after_vt100_process`, used by anchor-line resolution and
-    /// scrollback eviction.
-    line_tracker: LineTracker,
+    /// Mirror of `vt100::Screen::top_of_live_screen` for the parent
+    /// vt100 (absolute scrollback line index of its first live-screen
+    /// row). Refreshed by `after_vt100_process`; used by anchor-line
+    /// resolution and scrollback eviction, both of which run from
+    /// paths that hold no parser reference.
+    top_of_live_screen: i64,
     /// Cell metrics inherited by every per-portal VGE engine spun up
     /// when a portal is created in this scope. Children of a portal
     /// inherit the same metrics — the host grid measures cells
@@ -256,6 +256,10 @@ pub struct PrtEngine {
     /// to tick the host's main loop so `drive_and_flush_vft` runs and
     /// the event surfaces as a RawReply.
     vft_wakeup: crate::vft::Wakeup,
+    /// The host's desktop hooks, cloned into every per-portal VFT
+    /// engine spawned in this scope so a `vsend` inside a nested
+    /// portal reaches the same renderer as one on the host screen.
+    vft_hooks: crate::vft::Hooks,
 }
 
 impl PrtEngine {
@@ -270,12 +274,15 @@ impl PrtEngine {
             (8, 16),
             1.0,
             std::sync::Arc::new(|| {}),
+            crate::vft::hooks::headless(),
             crate::vge::HostThemePalette::default(),
         )
     }
 
-    /// Production constructor for the host's top-level engine. The
-    /// supplied wakeup is shared with every per-portal VFT engine
+    /// Production constructor for the host's top-level engine. Desktop
+    /// hooks default to headless — install them with
+    /// [`Self::set_vft_hooks`]. The supplied wakeup is shared with
+    /// every per-portal VFT engine
     /// spawned in this scope (and inherited by sub-engines), so a
     /// download chunk emitted by a worker inside a deeply nested
     /// portal still ticks the same main loop that drives the host.
@@ -290,6 +297,7 @@ impl PrtEngine {
             cell_px,
             scale_factor,
             vft_wakeup,
+            crate::vft::hooks::headless(),
             crate::vge::HostThemePalette::default(),
         )
     }
@@ -304,6 +312,7 @@ impl PrtEngine {
             (8, 16),
             1.0,
             std::sync::Arc::new(|| {}),
+            crate::vft::hooks::headless(),
             crate::vge::HostThemePalette::default(),
         )
     }
@@ -314,6 +323,7 @@ impl PrtEngine {
         cell_px: (u16, u16),
         scale_factor: f32,
         vft_wakeup: crate::vft::Wakeup,
+        vft_hooks: crate::vft::Hooks,
         host_palette: crate::vge::HostThemePalette,
     ) -> Self {
         Self {
@@ -330,13 +340,22 @@ impl PrtEngine {
             host_palette,
             pending_response_bytes: Vec::new(),
             pending_events: Vec::new(),
-            line_tracker: LineTracker::new(),
+            top_of_live_screen: 0,
             cell_px,
             scale_factor,
             pending_image_deletes: Vec::new(),
             pending_clipboard_writes: Vec::new(),
             vft_wakeup,
+            vft_hooks,
         }
+    }
+
+    /// Install the host's desktop hooks for VFT (§7.1 file picker,
+    /// §6.1 open-after-finalize). Called once on the top-level engine
+    /// after construction, like [`Self::set_host_palette`]; inherited
+    /// by every child engine and per-portal VFT engine thereafter.
+    pub fn set_vft_hooks(&mut self, hooks: crate::vft::Hooks) {
+        self.vft_hooks = hooks;
     }
 
     /// Set the host accent palette seeded into per-portal VGE engines
@@ -366,7 +385,7 @@ impl PrtEngine {
 
     /// Build a fresh child PrtEngine sized like one of this engine's
     /// portals (one nesting level deeper), inheriting `Limits`,
-    /// `cell_px`, `scale_factor`, and the VFT wakeup. Used by the
+    /// `cell_px`, `scale_factor`, and the VFT wakeup and hooks. Used by the
     /// snapshot decoder before recursively populating the child's
     /// state.
     pub(in crate::prt) fn child_engine_scaffold(&self) -> Self {
@@ -376,42 +395,37 @@ impl PrtEngine {
             self.cell_px,
             self.scale_factor,
             self.vft_wakeup.clone(),
+            self.vft_hooks.clone(),
             self.host_palette.clone(),
         )
     }
 
     /// Build a fresh per-portal VFT engine carrying this engine's
-    /// wakeup. VFT in-flight transfer state is not snapshotted; on
+    /// wakeup and desktop hooks. VFT in-flight transfer state is not
+    /// snapshotted; on
     /// reattach every portal starts with an empty transfer table.
     pub(in crate::prt) fn spawn_portal_vft(&self) -> crate::vft::VftEngine {
-        crate::vft::VftEngine::with_wakeup(self.vft_wakeup.clone())
-    }
-
-    /// Engine-level `top_of_live_screen`, exposed for the snapshot
-    /// encoder. Mirrors `VgeEngine::top_of_live_screen`.
-    pub(in crate::prt) fn line_tracker_top_of_live_screen(&self) -> i64 {
-        self.line_tracker.top_of_live_screen
+        crate::vft::VftEngine::with_wakeup_and_hooks(
+            self.vft_wakeup.clone(),
+            self.vft_hooks.clone(),
+        )
     }
 
     /// Replace `state` with one decoded from a binary snapshot. Used
     /// only by [`crate::prt::snapshot::decode_engine_into`]; the new
     /// state is constructed with the recursion already done.
-    pub(in crate::prt) fn install_state_from_snapshot(
-        &mut self,
-        state: PrtState,
-        top_of_live_screen: i64,
-    ) {
+    pub(in crate::prt) fn install_state_from_snapshot(&mut self, state: PrtState) {
         self.state = state;
         // Transient queues are stale w.r.t. the restored state.
         self.pending_response_bytes.clear();
         self.pending_events.clear();
         self.pending_image_deletes.clear();
         self.pending_clipboard_writes.clear();
-        // Pin top_of_live_screen so `Scrollback`-anchored portals
-        // render at the right row; the rest of `LineTracker` re-syncs
-        // against this engine's own parser on next update.
-        self.line_tracker = LineTracker::new();
-        self.line_tracker.top_of_live_screen = top_of_live_screen;
+        // `top_of_live_screen` is left alone: the origin
+        // `Scrollback`-anchored portals reference belongs to the
+        // parent vt100 and arrives with its own fragment. The caller
+        // restores that first, then calls
+        // [`Self::sync_top_of_live_screen`].
     }
 
     /// Serialize this engine's state as a binary blob for the VSS
@@ -487,7 +501,19 @@ impl PrtEngine {
     /// `0` until the engine's first `after_vt100_process` call.
     #[allow(dead_code)] // Phase 6 (renderer reads this)
     pub fn top_of_live_screen(&self) -> i64 {
-        self.line_tracker.top_of_live_screen
+        self.top_of_live_screen
+    }
+
+    /// Re-read the line origin from `parser` without any of
+    /// [`Self::after_vt100_process`]'s side effects. Call after
+    /// restoring a VSS snapshot (which installs a fresh vt100 state,
+    /// line origin included) so the first paint puts
+    /// `Scrollback`-anchored portals on the row they were pinned to.
+    pub fn sync_top_of_live_screen<CB: vt100::Callbacks>(
+        &mut self,
+        parser: &vt100::Parser<CB>,
+    ) {
+        self.top_of_live_screen = parser.screen().top_of_live_screen();
     }
 
     #[allow(dead_code)] // Phase 6 / introspection
@@ -692,7 +718,17 @@ impl PrtEngine {
     pub fn handle_terminal_events(&mut self, events: &[TerminalEvent]) {
         for ev in events {
             match ev {
-                TerminalEvent::HardReset | TerminalEvent::SoftReset => self.scope_reset(),
+                TerminalEvent::HardReset => {
+                    self.scope_reset();
+                    // RIS rebuilds vt100's screen from scratch, line
+                    // origin included, so follow it back to 0 now
+                    // rather than waiting for the post-chunk refresh —
+                    // a later command in this same chunk must anchor
+                    // against the reset screen. (DECSTR doesn't move
+                    // the screen and so doesn't move the origin.)
+                    self.top_of_live_screen = 0;
+                }
+                TerminalEvent::SoftReset => self.scope_reset(),
                 TerminalEvent::EraseDisplay => self.cull_for_erase_display(),
                 TerminalEvent::EraseScrollback => self.cull_for_erase_scrollback(),
                 TerminalEvent::CursorPositionQuery => {}
@@ -727,22 +763,18 @@ impl PrtEngine {
                     );
                 }
             }
-            // Don't clear the line tracker here: `set_size` resizes the
+            // Don't reset the line origin here: `set_size` resizes the
             // *main* grid too, so a resize while the alt screen was up
-            // pushes/pulls main-grid rows and moves `origin_shift`. The
-            // main screen's text genuinely shifted by that much, so the
-            // `update` below must apply the accumulated delta (matching
-            // VGE) instead of re-baselining it away — otherwise
-            // Scrollback-anchored portals land N rows off after a
-            // resize-during-alt round trip. Updates are skipped while on
-            // alt (below), so `prev_shift` stayed frozen at the pre-alt
-            // value and the delta is exactly the resize shift.
+            // pushes/pulls main-grid rows and genuinely moves the main
+            // screen's text. The refresh below picks that up in one
+            // step; discarding it would land Scrollback-anchored
+            // portals N rows off after a resize-during-alt round trip.
         }
 
         // Anchor math is meaningful only on the main screen — the alt
         // screen has no scrollback (§5.3 per VGE precedent).
         if !self.state.on_alt() {
-            self.line_tracker.update(parser);
+            self.top_of_live_screen = parser.screen().top_of_live_screen();
             self.evict_off_scrollback(parser.screen().scrollback_fill());
         }
     }
@@ -771,15 +803,13 @@ impl PrtEngine {
         if matches!(self.state.focus, FocusKind::Portal(_)) {
             self.state.focus = FocusKind::Host;
         }
-        // Line tracking is re-derived on the next `after_vt100_process`.
-        self.line_tracker.clear();
     }
 
     /// §5.8 ESC[2J: drop every portal whose effective anchor lies in
     /// the live region. For Live portals that's always; for Scrollback
     /// portals it means anchor_line >= top_of_live_screen.
     fn cull_for_erase_display(&mut self) {
-        let top = self.line_tracker.top_of_live_screen;
+        let top = self.top_of_live_screen;
         let to_drop: Vec<String> = self
             .state
             .current()
@@ -809,7 +839,7 @@ impl PrtEngine {
     /// in the scrollback region (anchor_line < top_of_live_screen).
     /// Live portals are unaffected.
     fn cull_for_erase_scrollback(&mut self) {
-        let top = self.line_tracker.top_of_live_screen;
+        let top = self.top_of_live_screen;
         let to_drop: Vec<String> = self
             .state
             .current()
@@ -838,12 +868,12 @@ impl PrtEngine {
     /// the bottom of the parser's scrollback ring. Emit PortalEvicted
     /// reason=0 for each.
     fn evict_off_scrollback(&mut self, scrollback_fill: usize) {
-        if scrollback_fill == 0 && self.line_tracker.top_of_live_screen == 0 {
+        if scrollback_fill == 0 && self.top_of_live_screen == 0 {
             // Nothing has ever scrolled; keep pre-scroll anchors alive.
             return;
         }
         let oldest_visible =
-            self.line_tracker.top_of_live_screen - scrollback_fill as i64;
+            self.top_of_live_screen - scrollback_fill as i64;
         let to_evict: Vec<String> = self
             .state
             .current()
@@ -1069,7 +1099,7 @@ impl PrtEngine {
                 origin_y: b.origin_y,
             },
             AnchorMode::Scrollback => PortalAnchor::Scrollback {
-                anchor_line: self.line_tracker.top_of_live_screen + i64::from(b.origin_y),
+                anchor_line: self.top_of_live_screen + i64::from(b.origin_y),
             },
         };
         let child_engine = PrtEngine::with_all(
@@ -1078,6 +1108,7 @@ impl PrtEngine {
             self.cell_px,
             self.scale_factor,
             self.vft_wakeup.clone(),
+            self.vft_hooks.clone(),
             self.host_palette.clone(),
         );
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
@@ -1092,7 +1123,10 @@ impl PrtEngine {
         // §10 (vft-in-portal) — every portal owns its own VFT engine.
         // Workers share the host's wakeup so async events from any
         // depth tick the host's main loop.
-        let portal_vft = crate::vft::VftEngine::with_wakeup(self.vft_wakeup.clone());
+        let portal_vft = crate::vft::VftEngine::with_wakeup_and_hooks(
+            self.vft_wakeup.clone(),
+            self.vft_hooks.clone(),
+        );
 
         let set = self.state.current_mut();
         let creation_seq = set.next_seq();
@@ -1153,12 +1187,11 @@ impl PrtEngine {
         let changed = portal.size_w != new_w || portal.size_h != new_h;
         // A vertical resize moves the portal's live screen relative to
         // its scrollback (xterm-style push/pull), so the per-portal
-        // engines' line trackers must observe it now rather than on
-        // the next WritePortal — or inner anchored elements render
-        // shifted until the inner program redraws. The pre-resize sync
-        // baselines trackers that haven't seen this vt yet (snapshot
-        // restore followed immediately by UpdateSize), so the
-        // post-resize sync counts exactly the resize shift.
+        // engines must re-read the line origin now rather than on the
+        // next WritePortal — or inner anchored elements render shifted
+        // until the inner program redraws. The pre-resize pass settles
+        // any alt-screen swap or scrollback eviction still pending from
+        // before the geometry change.
         portal.children.after_vt100_process(&mut portal.vt);
         portal.vge.after_vt100_process(&mut portal.vt);
         portal.vt.screen_mut().set_size(new_h as u16, new_w as u16);
@@ -1178,7 +1211,7 @@ impl PrtEngine {
         &mut self,
         b: UpdateOriginBody,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
-        let top = self.line_tracker.top_of_live_screen;
+        let top = self.top_of_live_screen;
         let portal = self
             .state
             .current_mut()
@@ -1383,6 +1416,10 @@ impl PrtEngine {
                 }
                 let _ = portal.vge.restore_from_binary_snapshot(&cs.vge_bytes);
                 let _ = portal.children.restore_from_binary_snapshot(&cs.prt_bytes);
+                // The line origin both sub-engines anchor against came
+                // in with the vt100 fragment restored just above.
+                portal.vge.sync_top_of_live_screen(&portal.vt);
+                portal.children.sync_top_of_live_screen(&portal.vt);
             }
             // 2d. VSS detach — restore the pre-attach state if a
             //     DetachNotify came through. Multiple coalesced
@@ -1393,6 +1430,8 @@ impl PrtEngine {
                     let _ = portal.vt.screen_mut().restore_from_binary_snapshot(&backup.vt);
                     let _ = portal.vge.restore_from_binary_snapshot(&backup.vge);
                     let _ = portal.children.restore_from_binary_snapshot(&backup.prt);
+                    portal.vge.sync_top_of_live_screen(&portal.vt);
+                    portal.children.sync_top_of_live_screen(&portal.vt);
                 }
             }
 
@@ -1434,7 +1473,7 @@ impl PrtEngine {
             let activity = Self::portal_activity(portal, committed_line);
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
-            // 4. Update the children engine's line tracker against the
+            // 4. Re-read the children engine's line origin from the
             //    parent portal's vt100 (sub-portal anchoring is
             //    relative to that vt100), and run any pending alt-
             //    screen / scrollback eviction logic. The per-portal VGE
@@ -2044,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn update_size_syncs_inner_line_trackers() {
+    fn update_size_syncs_inner_line_origins() {
         // A vertical shrink pushes inner top rows into the portal's
         // scrollback (xterm-style); the per-portal VGE/PRT trackers
         // must observe the shift during UpdateSize itself, not on the
@@ -2088,15 +2127,15 @@ mod tests {
     }
 
     #[test]
-    fn resize_during_alt_screen_keeps_main_line_tracker_aligned() {
-        // Regression: leaving the alt screen used to `clear()` the line
-        // tracker, discarding the `origin_shift` delta a resize applied
-        // to the *main* grid while the alt screen was up. `set_size`
-        // resizes both grids, so a vim-then-resize-then-quit round trip
-        // pushed N rows into the main scrollback yet left
-        // `top_of_live_screen` unmoved, landing Scrollback-anchored
-        // portals N rows off. The tracker must follow the shift — the
-        // same way the VGE engine already does.
+    fn resize_during_alt_screen_keeps_the_main_origin_aligned() {
+        // Regression: leaving the alt screen used to reset the line
+        // origin, discarding the shift a resize applied to the *main*
+        // grid while the alt screen was up. `set_size` resizes both
+        // grids, so a vim-then-resize-then-quit round trip pushed N
+        // rows into the main scrollback yet left `top_of_live_screen`
+        // unmoved, landing Scrollback-anchored portals N rows off. The
+        // engine must follow the shift — the same way the VGE engine
+        // already does.
         let mut engine = PrtEngine::new();
         let mut parser = vt100::Parser::new(10, 80, 100);
 
@@ -3081,8 +3120,7 @@ mod tests {
     fn host_3j_drops_scrollback_region_portals_only() {
         let mut engine = PrtEngine::new();
         // Move top_of_live_screen forward so we have a "scrollback
-        // region" to anchor a portal in. The line tracker's first
-        // call only primes — we need a baseline-then-delta sequence.
+        // region" to anchor a portal in.
         let mut parser = vt100::Parser::new(24, 80, 1000);
         engine.after_vt100_process(&mut parser);
         parser.process(&b"\n".repeat(30));
@@ -3169,7 +3207,7 @@ mod tests {
         let mut engine = PrtEngine::new();
         let mut parser = vt100::Parser::new(2, 10, 5);
 
-        // Prime the line tracker.
+        // Pick up the parser's line origin, as the host does.
         engine.after_vt100_process(&mut parser);
         // Create a Scrollback portal at line 0 (current top == 0).
         let _ = dispatch_one(
@@ -3179,11 +3217,10 @@ mod tests {
             &make_create_body_full("pin", 5, 5, AnchorMode::Scrollback, 0),
         );
 
-        // Step the line tracker once per scroll so the at-cap eviction
-        // counter advances correctly (the tracker only registers ≥1
-        // eviction per update call, by design — see comment on
-        // `LineTracker::update`). Each row needs unique content so the
-        // saturation detector's row-hash sees a change.
+        // Re-read the origin once per scroll so eviction runs against
+        // each intermediate scrollback fill rather than one jump at the
+        // end. Each row needs unique content so the saturation
+        // detector's row-hash sees a change.
         for i in 0..20u8 {
             parser.process(format!("r{i}\r\n").as_bytes());
             engine.after_vt100_process(&mut parser);
@@ -3260,14 +3297,14 @@ mod tests {
     }
 
     #[test]
-    fn line_tracker_advances_with_history() {
+    fn line_origin_advances_with_history() {
         let mut engine = PrtEngine::new();
         let mut parser = vt100::Parser::new(2, 10, 100);
         engine.after_vt100_process(&mut parser);
         assert_eq!(engine.top_of_live_screen(), 0);
         // 5 newlines on a 2-row screen push 4 lines into history (the
         // last LF advances the cursor without yet scrolling the next).
-        // The line tracker advances by exactly that many.
+        // The line origin advances by exactly that many.
         parser.process(&b"\n".repeat(5));
         engine.after_vt100_process(&mut parser);
         let top = engine.top_of_live_screen();
@@ -3275,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn line_tracker_ignores_width_resize() {
+    fn line_origin_ignores_width_resize() {
         // Regression: a width shrink used to read as a phantom
         // scrollback eviction (probe-and-hash heuristic), shifting
         // every Scrollback portal anchor up one row per resize step.
@@ -3292,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    fn line_tracker_follows_vertical_resize_roundtrip() {
+    fn line_origin_follows_vertical_resize_roundtrip() {
         // xterm-style push/pull resize: a vertical shrink advances
         // top_of_live_screen by the pushed rows; growing back pulls
         // them out again, so a Scrollback portal stays glued to its
@@ -3927,6 +3964,52 @@ mod tests {
         let inner = &outer.children.state.current().portals["inner"];
         assert_eq!(inner.size_w, 10);
         assert_eq!(inner.size_h, 4);
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_scrollback_portals_on_their_rows() {
+        // The line origin `PortalAnchor::Scrollback { anchor_line }`
+        // is measured against rides in the vt100 fragment, not the PRT
+        // one. Restoring the pair must put the portal back on the same
+        // screen row it occupied in the source engine.
+        let mut a = PrtEngine::new();
+        let mut pa = vt100::Parser::new(24, 80, 1000);
+        pa.process(&b"line\r\n".repeat(30));
+        a.after_vt100_process(&mut pa);
+        let top = a.top_of_live_screen();
+        assert!(top > 0, "history should have scrolled");
+
+        // Portal pinned 3 rows below the top of the live screen.
+        let _ = dispatch_one(
+            &mut a,
+            CMD_CREATE_PORTAL,
+            0,
+            &make_create_body_full("sb", 10, 4, AnchorMode::Scrollback, 3),
+        );
+        let anchor = match a.state.current().portals["sb"].anchor {
+            PortalAnchor::Scrollback { anchor_line } => anchor_line,
+            _ => panic!("expected a Scrollback anchor"),
+        };
+        assert_eq!(anchor, top + 3);
+
+        let vt_bytes = pa.screen().binary_snapshot();
+        let prt_bytes = a.binary_snapshot();
+
+        // Fresh, never-scrolled pair on the "renderer" side.
+        let mut pb = vt100::Parser::new(24, 80, 1000);
+        let mut b = PrtEngine::new();
+        pb.screen_mut().restore_from_binary_snapshot(&vt_bytes).unwrap();
+        b.restore_from_binary_snapshot(&prt_bytes).expect("restore");
+        b.sync_top_of_live_screen(&pb);
+
+        assert_eq!(b.top_of_live_screen(), top);
+        let restored = match b.state.current().portals["sb"].anchor {
+            PortalAnchor::Scrollback { anchor_line } => anchor_line,
+            _ => panic!("expected a Scrollback anchor"),
+        };
+        // Same absolute line, and therefore the same rendered row.
+        assert_eq!(restored, anchor);
+        assert_eq!(restored - b.top_of_live_screen(), 3);
     }
 
     #[test]

@@ -392,7 +392,7 @@ of now-blank text.
 two events together wipe every top-level element on the current
 screen. The terminal's underlying text grid + scrollback go with them
 (the host terminal must implement `3J` for the text side; see the
-notes for veter's vendored vt100 fork in `vt100/src/screen.rs`).
+notes for veter's vendored vt100 fork in `vendored/vt100/src/screen.rs`).
 
 The style table is not affected; only the element table. Images are not
 erased *directly* either, but an erase releases the references the

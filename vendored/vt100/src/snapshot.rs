@@ -15,7 +15,13 @@
 
 /// Bumped on any breaking change to the binary layout below. Strict
 /// match — see [`Screen::restore_from_binary_snapshot`].
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 1;
+///
+/// History:
+/// - v2: per-grid `top_of_live_screen`, so scrollback-anchored VGE /
+///   PRT objects survive a restore without the engines carrying their
+///   own copy of the line origin.
+/// - v1: initial layout.
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 2;
 
 /// Error returned when a `Screen` binary snapshot cannot be decoded:
 /// wrong kind version, truncated payload, or otherwise malformed.
@@ -62,6 +68,9 @@ impl<'a> Writer<'a> {
     }
     #[allow(dead_code)]
     pub(crate) fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    pub(crate) fn i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
     pub(crate) fn varu(&mut self, mut v: u64) {
@@ -123,6 +132,12 @@ impl<'a> Reader<'a> {
     pub(crate) fn u64(&mut self) -> Result<u64, SnapshotError> {
         let b = self.take(8)?;
         Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    pub(crate) fn i64(&mut self) -> Result<i64, SnapshotError> {
+        let b = self.take(8)?;
+        Ok(i64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
     }

@@ -18,7 +18,6 @@ use vge_protocol::envelope::{
 };
 use vge_protocol::frame::*;
 
-use crate::line_tracker::LineTracker;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -513,7 +512,14 @@ pub struct VgeEngine {
     host_seed: Option<(HostThemePalette, u32)>,
     cell_px: (u16, u16),
     scale_factor: f32,
-    line_tracker: LineTracker,
+    /// Mirror of `vt100::Screen::top_of_live_screen` for the screen
+    /// this engine is anchored to, refreshed by
+    /// [`Self::after_vt100_process`]. Cached rather than read live
+    /// because most of the anchor math (element placement, erase
+    /// culling) runs from paths that hold no parser reference.
+    /// Deliberately frozen while the alternate screen is up — see
+    /// `after_vt100_process`.
+    top_of_live_screen: i64,
     pending_response_bytes: Vec<u8>,
     /// Chunked image uploads still in flight, keyed by image id.
     pending_uploads: HashMap<String, PendingUpload>,
@@ -570,7 +576,7 @@ impl VgeEngine {
             host_seed: None,
             cell_px,
             scale_factor,
-            line_tracker: LineTracker::new(),
+            top_of_live_screen: 0,
             pending_response_bytes: Vec::new(),
             pending_uploads: HashMap::new(),
             pending_image_deletes: Vec::new(),
@@ -630,7 +636,19 @@ impl VgeEngine {
     }
 
     pub fn top_of_live_screen(&self) -> i64 {
-        self.line_tracker.top_of_live_screen
+        self.top_of_live_screen
+    }
+
+    /// Re-read the line origin from `parser` without any of
+    /// [`Self::after_vt100_process`]'s side effects. Call after
+    /// restoring a VSS snapshot (which installs a fresh vt100 state,
+    /// line origin included) so the first paint anchors elements
+    /// against the screen they were drawn on.
+    pub fn sync_top_of_live_screen<CB: vt100::Callbacks>(
+        &mut self,
+        parser: &vt100::Parser<CB>,
+    ) {
+        self.top_of_live_screen = parser.screen().top_of_live_screen();
     }
 
     /// Serialize the engine's full state as a binary blob for the VSS
@@ -641,7 +659,7 @@ impl VgeEngine {
     /// [`Self::restore_from_binary_snapshot`].
     ///
     /// Side-effect-free; does not consume any pending responses or
-    /// touch line-tracker / DSR state.
+    /// touch line-origin / DSR state.
     #[must_use]
     pub fn binary_snapshot(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -649,7 +667,6 @@ impl VgeEngine {
             &self.state,
             self.cell_px,
             self.scale_factor,
-            self.line_tracker.top_of_live_screen,
             &mut out,
         );
         out
@@ -661,8 +678,8 @@ impl VgeEngine {
     /// engine state is left untouched.
     ///
     /// Side-effect-free: no responses are queued, no callbacks fire,
-    /// and the line tracker / DSR pending counts are reset to the
-    /// values implied by the snapshot — image GPU handles are left
+    /// and the DSR pending counts are reset to the values implied by
+    /// the snapshot — image GPU handles are left
     /// `None` so the renderer lazily registers them on first paint.
     /// `pending_response_bytes`, `pending_image_deletes`,
     /// `pending_cursor_queries`, and the `auto_reply_*` flags retain
@@ -683,13 +700,12 @@ impl VgeEngine {
         self.pending_image_deletes.clear();
         self.pending_uploads.clear();
         self.pending_cursor_queries = 0;
-        // Pin top_of_live_screen to the snapshotted value so element
-        // `anchor_line`s line up with where they were drawn in the
-        // source engine. The rest of LineTracker stays uninitialised
-        // so the next `update()` call (re-)synchronises against this
-        // engine's own parser scrollback.
-        self.line_tracker = LineTracker::new();
-        self.line_tracker.top_of_live_screen = decoded.top_of_live_screen;
+        // `top_of_live_screen` is intentionally not touched here: the
+        // origin element `anchor_line`s reference belongs to vt100 and
+        // arrives with the accompanying vt100 fragment. The caller
+        // restores that first, then calls
+        // [`Self::sync_top_of_live_screen`].
+        //
         // Image reference counts are derived, not serialized — the
         // snapshot carries the element tables, and those are the only
         // truth about what references what. Recomputing here keeps the
@@ -746,9 +762,15 @@ impl VgeEngine {
                 let deletes = self.state.reset();
                 self.pending_image_deletes.extend(deletes);
                 self.pending_uploads.clear();
-                // Reset the line tracker too: scrollback state will be
-                // re-derived after vt100 finishes its own reset.
-                self.line_tracker = LineTracker::new();
+                // RIS rebuilds vt100's screen from scratch, line
+                // origin included, so follow it back to 0 now rather
+                // than waiting for the post-chunk refresh — a later
+                // command in this same chunk must anchor against the
+                // reset screen. (DECSTR doesn't move the screen and so
+                // doesn't move the origin.)
+                if matches!(ev, HardReset) {
+                    self.top_of_live_screen = 0;
+                }
                 // §7.3 — RIS/DECSTR wipes the style table; the host re-seeds
                 // its reserved `host.*` entries so clients' StyleRefs survive.
                 self.apply_host_styles();
@@ -779,7 +801,7 @@ impl VgeEngine {
     /// Delete every top-level element on the current screen for which
     /// `pred(el, top_of_live_screen)` returns true. Children cascade.
     fn drop_top_level_where(&mut self, pred: impl Fn(&Element, i64) -> bool) {
-        let top = self.line_tracker.top_of_live_screen;
+        let top = self.top_of_live_screen;
         let to_delete: Vec<String> = self
             .state
             .elements()
@@ -850,20 +872,24 @@ impl VgeEngine {
         self.answer_pending_cursor_queries(parser);
 
         // Scrollback anchoring is only meaningful on the main screen.
+        // vt100 already reports the *main* grid's line origin even
+        // while the alt screen is up, but holding the mirror still
+        // keeps anchors placed on the main screen from drifting under
+        // a resize that happens mid-alt-screen; the delta lands in one
+        // step when the main screen comes back.
         if !self.state.on_alt() {
-            self.line_tracker.update(parser);
+            self.top_of_live_screen = parser.screen().top_of_live_screen();
             self.evict(parser.screen().scrollback_fill());
         }
     }
 
     fn evict(&mut self, scrollback_fill: usize) {
-        if scrollback_fill == 0 && self.line_tracker.top_of_live_screen == 0 {
+        if scrollback_fill == 0 && self.top_of_live_screen == 0 {
             // Nothing has ever scrolled; keep pre-scroll anchors (e.g.
             // a tall image whose origin reached above row 0) alive.
             return;
         }
-        let oldest_visible =
-            self.line_tracker.top_of_live_screen - scrollback_fill as i64;
+        let oldest_visible = self.top_of_live_screen - scrollback_fill as i64;
         // Eviction applies only to top-level elements. Their subtrees
         // cascade.
         let to_evict: Vec<String> = self
@@ -1492,7 +1518,7 @@ impl VgeEngine {
         };
         let floor = origin.y.floor();
         (
-            self.line_tracker.top_of_live_screen + base_row + floor as i64,
+            self.top_of_live_screen + base_row + floor as i64,
             origin.y - floor,
         )
     }
@@ -3642,6 +3668,38 @@ mod tests {
         // engines must serialize identically.
         let bytes2 = e2.binary_snapshot();
         assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn snapshot_restore_keeps_anchors_on_their_text_lines() {
+        // The line origin `anchor_line` values live in rides in the
+        // vt100 fragment, not the VGE one. A restore that pairs the
+        // two must land an element on the same screen row it occupied
+        // in the source engine — the whole point of the origin being
+        // shipped at all.
+        let mut e1 = VgeEngine::new((9, 20), 1.0);
+        let mut p1 = vt100::Parser::new(10, 80, 100);
+        p1.process(&b"line\r\n".repeat(25));
+        e1.after_vt100_process(&mut p1);
+        let top = e1.top_of_live_screen();
+        assert!(top > 0, "history should have scrolled");
+
+        let vt_bytes = p1.screen().binary_snapshot();
+        let vge_bytes = e1.binary_snapshot();
+
+        // Fresh, never-scrolled pair on the "renderer" side.
+        let mut p2 = vt100::Parser::new(10, 80, 100);
+        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        assert_eq!(e2.top_of_live_screen(), 0);
+        p2.screen_mut().restore_from_binary_snapshot(&vt_bytes).unwrap();
+        e2.restore_from_binary_snapshot(&vge_bytes).unwrap();
+        e2.sync_top_of_live_screen(&p2);
+        assert_eq!(e2.top_of_live_screen(), top);
+
+        // And the restored pair keeps counting from there.
+        p2.process(&b"more\r\n".repeat(3));
+        e2.after_vt100_process(&mut p2);
+        assert_eq!(e2.top_of_live_screen(), top + 3);
     }
 
     #[test]

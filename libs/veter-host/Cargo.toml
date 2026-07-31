@@ -1,0 +1,27 @@
+[package]
+name = "veter-host"
+version = "0.1.0"
+edition = "2024"
+description = "GUI-free host engines (vt100 + VGE + PRT + VFT) shared by the local veter GUI binary and the headless vsd session daemon."
+
+# No features: the two things VFT needs a desktop for (a native file
+# picker, and handing a finalized download to the user's default app)
+# are the `vft::DesktopHooks` trait, which the renderer implements.
+# The crate therefore links no toolkit at all, and a headless consumer
+# (vsd) gets `HeadlessHooks` no-ops — the right semantics for a
+# daemon, since VFT envelopes pass through to the actual renderer
+# where the real picker lives.
+
+[dependencies]
+vge-protocol = { path = "../../protocol/vge" }
+prt-protocol = { path = "../../protocol/prt" }
+vft-protocol = { path = "../../protocol/vft" }
+vss-protocol = { path = "../../protocol/vss" }
+ses-protocol = { path = "../../protocol/ses" }
+vt100 = { path = "../../vendored/vt100" }
+rgb = "0.8"
+libc = "0.2"
+# VGE decodes uploaded WebP/PNG images into RGBA8 for storage; the
+# engine needs to do this without any GUI involvement so headless
+# vsd can keep state authoritative across attaches.
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }

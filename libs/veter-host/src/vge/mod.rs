@@ -130,10 +130,8 @@ mod tests {
         // what moves `top_of_live_screen` and therefore the anchor.
         let mut engine = VgeEngine::new((9, 20), 1.0);
         let mut parser = vt100::Parser::new(4, 20, 100);
-        // The line tracker baselines itself on its first update, so the
-        // host's very first `after_vt100_process` establishes the
-        // origin rather than measuring a delta. Do the same here, or
-        // every scroll in the first chunk reads as zero.
+        // Mirror the host: its first `after_vt100_process` picks up
+        // the parser's line origin before any command is applied.
         engine.after_vt100_process(&mut parser);
         (engine, parser)
     }

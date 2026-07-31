@@ -37,6 +37,7 @@ use vft_protocol::envelope::{
 };
 use vft_protocol::frame::*;
 
+use super::hooks::Hooks;
 use super::path;
 use super::worker::{self, PickerResult, WorkerCmd, WorkerEvt};
 pub use super::worker::Wakeup;
@@ -132,7 +133,7 @@ struct TransferHandle {
     upload_mode: u32,
     upload_mtime: i64,
     /// Set on deferred-form uploads (§6.1): after finalisation the
-    /// worker calls `opener::open(final_path)` so the user's default
+    /// worker calls `DesktopHooks::open_path` so the user's default
     /// app pops up for the just-uploaded file.
     open_after_finalize: bool,
 }
@@ -169,6 +170,11 @@ pub struct VftEngine {
     /// exercise the stall-then-grant path without an 8 MiB fixture.
     download_window: u64,
     wakeup: Wakeup,
+    /// The host's desktop affordances (§7.1 file picker, §6.1
+    /// open-after-finalize). Defaults to
+    /// [`HeadlessHooks`](crate::vft::HeadlessHooks); `veter` installs
+    /// a real one, `vsd` deliberately does not.
+    hooks: Hooks,
 }
 
 struct PendingPicker {
@@ -195,6 +201,14 @@ impl VftEngine {
     /// construction and re-used for every portal so a worker in any
     /// scope ultimately ticks the same main loop.
     pub fn with_wakeup(wakeup: Wakeup) -> Self {
+        Self::with_wakeup_and_hooks(wakeup, crate::vft::hooks::headless())
+    }
+
+    /// Construct with both an existing wakeup `Arc` and the host's
+    /// desktop hooks. The PRT engine uses this for per-portal
+    /// engines, so a `vsend` inside a nested portal reaches the same
+    /// renderer as one on the host screen.
+    pub fn with_wakeup_and_hooks(wakeup: Wakeup, hooks: Hooks) -> Self {
         Self {
             apc: ApcStream::new(),
             response_queue: VecDeque::new(),
@@ -204,7 +218,15 @@ impl VftEngine {
             limits: Limits::default(),
             download_window: DOWNLOAD_WINDOW_BYTES,
             wakeup,
+            hooks,
         }
+    }
+
+    /// Install the host's desktop hooks after construction. Used by
+    /// the top-level engine, which is built before the renderer that
+    /// backs the hooks exists.
+    pub fn set_hooks(&mut self, hooks: Hooks) {
+        self.hooks = hooks;
     }
 
     /// Shrink the per-download flow-control window. Test-only; production
@@ -460,8 +482,9 @@ impl VftEngine {
         let bp = bytes_processed.clone();
         let final_path = resolved_path.clone();
         let wakeup = self.wakeup.clone();
+        let hooks = self.hooks.clone();
         std::thread::spawn(move || {
-            worker::run_upload(file, final_path, bp, cmd_rx, evt_tx, wakeup);
+            worker::run_upload(file, final_path, bp, cmd_rx, evt_tx, wakeup, hooks);
         });
 
         let resolved_str = resolved_path.to_string_lossy().into_owned();
@@ -564,9 +587,10 @@ impl VftEngine {
             // resolves (drain_pickers, called from drive()).
             let (tx, rx) = mpsc::channel();
             let wakeup = self.wakeup.clone();
+            let hooks = self.hooks.clone();
             let title = "Choose a file to send".to_string();
             std::thread::spawn(move || {
-                worker::run_picker(title, tx, wakeup);
+                worker::run_picker(title, hooks, tx, wakeup);
             });
             self.pending_pickers.push(PendingPicker {
                 transfer_id: b.transfer_id.clone(),
@@ -1554,8 +1578,8 @@ mod tests {
 
     #[test]
     fn begin_download_deferred_form_defers_response_then_cancels() {
-        // Empty host_path triggers the picker path. Under cfg(test)
-        // the picker is a no-op that immediately yields Cancelled, so
+        // Empty host_path triggers the picker path. With the default
+        // headless hooks the picker yields Cancelled at once, so
         // after drive() picks it up the slot fills with
         // err_cancelled. Before drive(), no frame has been emitted
         // (the response slot is still Pending).
@@ -1938,9 +1962,9 @@ mod tests {
 
     #[test]
     fn deferred_form_upload_sets_open_after_finalize_flag() {
-        // The actual `opener::open` call is suppressed under cfg(test),
-        // so this test just inspects the engine's bookkeeping to
-        // confirm the deferred form opts in.
+        // The default headless hooks launch nothing, so this test
+        // just inspects the engine's bookkeeping to confirm the
+        // deferred form opts in.
         let path = std::env::temp_dir().join(format!("vft-open-flag-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
