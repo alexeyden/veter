@@ -984,6 +984,11 @@ const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
 const TABBAR_CHEVRON_W: f32 = 2.0;
+/// Marker prefixed to a zoomed pane's title. Two columns wide, so with
+/// its trailing space it costs the same three the old `Z` spelling did
+/// — the thumb behind the title is measured, not counted, so a wide
+/// glyph here is sized correctly either way.
+const ZOOM_MARK: &str = "🔍";
 /// Single VGE element holding all between-pane separator strokes for the
 /// active tab. Recreated on every relayout — the layout tree determines
 /// which split boundaries to draw.
@@ -3407,13 +3412,13 @@ impl State {
 
     /// Title to display in `pane_id`'s chrome — usually the pane's own
     /// label, but a `[scroll: N]` indicator while that pane is being
-    /// scrolled.
+    /// scrolled, or [`ZOOM_MARK`] while it is zoomed.
     fn display_title_for(&self, pane_id: &str, raw_title: &str) -> String {
         if let Some(s) = self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
             return format!("[scroll: {}]", s.offset);
         }
         if self.tabs[self.active_tab].zoomed.as_deref() == Some(pane_id) {
-            return format!("Z  {}", raw_title);
+            return format!("{ZOOM_MARK} {}", raw_title);
         }
         // While resizing, mark the focused pane so the mode is visible
         // even though no center modal is shown.
@@ -6026,6 +6031,16 @@ mod tests {
         let out = elide_tab_label("a-very-long-tab-name", 6);
         assert_eq!(out.chars().count(), 6);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn the_zoom_mark_is_one_wide_glyph() {
+        // A single scalar, so a title carrying it still elides on a
+        // glyph boundary, and two columns wide — with its trailing
+        // space that is the three the `Z` spelling used, so the title
+        // does not shift when zoom toggles.
+        assert_eq!(ZOOM_MARK.chars().count(), 1);
+        assert_eq!(vge_ui::measure::text_cells(ZOOM_MARK), 2.0);
     }
 
     #[test]
