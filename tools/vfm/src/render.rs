@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
+use vge_ui::measure::text_cells;
 use vge_ui::shape::{chrome_corner_radii, rounded_rect_path};
 use vge_ui::theme::{
     COLOR_ACTIVE_TEXT, COLOR_DIM_TEXT, COLOR_TITLE_TEXT, accent_color, accent_style, darken,
@@ -519,7 +520,7 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
     ));
 
     // Left: a message while there is one, else the current path.
-    let room = (a.w as usize).saturating_sub(right.chars().count() + 3);
+    let room = (a.w as usize).saturating_sub(text_cells(&right) as usize + 3);
     let (left, color, bold) = match (v.busy, v.message) {
         (Some(busy), _) => (format!("{busy}…"), accent_text(), true),
         (None, Some((msg, failed))) => (
@@ -563,35 +564,10 @@ fn text(x: f32, y: f32, align: Align, fill: Color, bold: bool, s: String) -> Dra
     }
 }
 
-/// Clip `s` to `max` characters, marking the cut with `…`.
-pub fn elide(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    let mut out: String = s.chars().take(max - 1).collect();
-    out.push('…');
-    out
-}
-
-/// Clip from the *front*, which is what a long path wants — the tail
-/// (where you are) matters more than the root.
-pub fn elide_front(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    let skip = n - (max - 1);
-    let mut out = String::from("…");
-    out.extend(s.chars().skip(skip));
-    out
-}
+/// Clip `s` to `max` grid columns, marking the cut with `…`. Columns,
+/// not characters: a CJK name is twice as wide as its length suggests
+/// and would otherwise run past the tile it labels.
+pub use vge_ui::measure::{elide, elide_front};
 
 #[cfg(test)]
 mod tests {

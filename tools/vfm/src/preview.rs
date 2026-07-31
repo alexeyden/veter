@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use vge_ui::measure::elide;
+
 use crate::entry::{Entry, ListOpts, Media, human_size, read_dir};
 
 /// Most bytes a text preview reads.
@@ -82,11 +84,7 @@ fn text_lines(path: &Path, width: usize) -> Vec<String> {
         .take(MAX_PREVIEW_LINES)
         .map(|l| {
             let expanded = l.replace('\t', "    ");
-            let mut s: String = expanded.chars().take(clip).collect();
-            if expanded.chars().count() > clip {
-                s.push('…');
-            }
-            format!("  {s}")
+            format!("  {}", elide(&expanded, clip))
         })
         .collect();
     if bytes.len() == MAX_PREVIEW_BYTES {
