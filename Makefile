@@ -13,6 +13,11 @@ ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
 PACKAGES := veter vcat vplay vdraw vfm vmux vplace vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
+
+# Claude Code Stop hook. Point the `Stop` hook in
+# ~/.claude/settings.json at $(HOOK_DST).
+HOOK_SRC := $(CURDIR)/tools/vplace/claude-code-hook.py
+HOOK_DST := $(BINDIR)/vplace-claude-hook
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
 
@@ -54,7 +59,7 @@ endif
 RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
-.PHONY: all build install uninstall clean help install-desktop install-icon \
+.PHONY: all build install uninstall clean help install-desktop install-icon install-hook \
         install-config dist-clean install-dist-maybe \
         dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb \
         dist-aarch64-manifest install-remote-aarch64 \
@@ -68,6 +73,7 @@ help:
 	@echo "  build               cargo build --release for $(PACKAGES)"
 	@echo "  install             build and copy binaries into \$$BINDIR + desktop entry"
 	@echo "                      + skeleton config into \$$CONFIGDIR (if absent)"
+	@echo "                      + the Claude Code hook as \$$BINDIR/vplace-claude-hook"
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
@@ -101,7 +107,7 @@ build:
 # is missing after the build.
 $(BINS): build
 
-install: $(BINS) install-desktop install-icon install-config install-dist-maybe
+install: $(BINS) install-desktop install-icon install-config install-dist-maybe install-hook
 	@$(INSTALL) -d $(BINDIR)
 	@for pkg in $(PACKAGES); do \
 	    src="$(RELEASE_DIR)/$$pkg"; \
@@ -116,6 +122,17 @@ install: $(BINS) install-desktop install-icon install-config install-dist-maybe
 	    *":$(BINDIR):"*) ;; \
 	    *) echo "note: $(BINDIR) is not on \$$PATH; add it to your shell rc to use the binaries" ;; \
 	esac
+
+# The vplace Stop hook for Claude Code. Installed under a name that
+# says what it is rather than where it came from, since it lands beside
+# the binaries on $PATH. Installed by `make install` because it drifting
+# from the repo copy is silent: the marker syntax is a contract between
+# this script, vplace's --marker, and the instruction text in the user's
+# CLAUDE.md, and a stale copy just quietly stops matching.
+install-hook:
+	@$(INSTALL) -d $(BINDIR)
+	@$(INSTALL) -m 0755 $(HOOK_SRC) $(HOOK_DST)
+	@echo "    claude-code-hook.py -> $(HOOK_DST)"
 
 # Always (re)generate the desktop entry: its Exec/TryExec embed
 # $(BINDIR), so a $(PREFIX) override needs to refresh it even if the
@@ -207,6 +224,7 @@ uninstall:
 	@if [ -f "$(VFM_USER_CONFIG_DST)" ]; then \
 	    echo "    kept user config $(VFM_USER_CONFIG_DST) (remove by hand if unwanted)"; \
 	fi
+	@rm -f "$(HOOK_DST)" && echo "    removed $(HOOK_DST)"
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
 	@for sz in $(ICON_PNG_SIZES); do \
