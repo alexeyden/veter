@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Place an image into a pane whose foreground program is something else
+entirely -- a TUI we do not control and cannot modify.
+
+This is the out-of-band case, and everything about it is shaped by one
+constraint: we can write to the pane, but we can never read from it. A
+reply would land in the pane's *input* queue, where the foreground
+program is blocked in read(), and whoever the kernel wakes gets the
+bytes. So every command goes out with no request id (`vproto send
+--no-response`) and every capability we need comes from `vproto caps`,
+which reads TIOCGWINSZ and $VETER_LIMITS rather than asking the
+terminal.
+
+The other constraint is vertical space. We must not create it: a
+foreground TUI dead-reckons its frame position, so newlines injected
+underneath it strand the previous frame and desynchronise the next.
+Space can only be reserved *in-band*, by the application itself. So the
+division of labour is:
+
+  * the application prints a marker line and reserves the rows below it
+    (for a markdown renderer, a fenced code block whose body is blank
+    lines -- plain blank lines get collapsed);
+  * we anchor to that marker and draw into the rows it reserved.
+
+The terminal owns the grid, so it resolves the marker to a row. We never
+need to know where the cursor is.
+
+The marker's own row is left untouched -- the image starts one row below
+it -- so a marker written to be read (`[IMAGE: chart1] /path/chart.png`)
+doubles as the image's caption.
+
+This is a script rather than a binary because none of it is protocol.
+The arithmetic that is (fitting an image to a cell grid) lives in
+`vproto measure`; what is left here is one renderer's conventions.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+# Reserved id namespace (VGE §6.8). Everything this tool creates is
+# prefixed, so --clear is one command per table and can never destroy an
+# element another client owns.
+NS = "vplace."
+
+# Fraction of the pane an image may fill when the caller names no
+# ceiling. A marker with no reserved gap behind it is a mistake, but a
+# huge image is a worse symptom of it than a small one.
+DEFAULT_HEIGHT_FRACTION = 2 / 3
+
+
+def vproto():
+    """Prefer a vproto sitting next to this script, then $PATH."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vproto")
+    if os.path.isfile(here) and os.access(here, os.X_OK):
+        return here
+    found = shutil.which("vproto")
+    if not found:
+        sys.exit("vplace: vproto not found next to this script or on $PATH")
+    return found
+
+
+def run(args, stdin=None):
+    r = subprocess.run(
+        [vproto(), *args],
+        input=stdin.encode() if stdin else None,
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        sys.exit(f"vplace: vproto {args[0]}: {r.stderr.decode().strip()}")
+    return r.stdout
+
+
+def slugify(marker):
+    """An element id derived from the marker, id-safe and bounded.
+
+    Runs of punctuation collapse, so a readable marker like
+    `[IMAGE: chart1]` yields `IMAGE-chart1` rather than `IMAGE--chart1`.
+    Element ids are capped at 64 bytes (§6.8) and the namespace prefix
+    eats into that.
+    """
+    out = []
+    for ch in marker:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")[: 64 - len(NS)]
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Place an image into a pane, anchored to a marker the app printed",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("image", nargs="?", help="image file to display")
+    p.add_argument(
+        "-m", "--marker",
+        help="substring the application printed on the caption row. Keep it "
+             "short and at the start of a line: it is matched against a single "
+             "grid row, so a marker long enough to wrap cannot be found. It "
+             "must not appear on screen below the row you mean -- the terminal "
+             "anchors to the lowest match, and a shell echoing this very "
+             "command line counts. Use --marker-file when invoking by hand.",
+    )
+    p.add_argument(
+        "--marker-file",
+        help="read the marker from a file, so the literal never reaches the "
+             "screen as part of this invocation",
+    )
+    p.add_argument(
+        "--offset-y", type=float, default=1.0,
+        help="rows below the marker to place at. The default of 1 leaves the "
+             "marker line readable as a caption above the image, and is also "
+             "the first row the application reserved, so an n-row image fills "
+             "exactly the n rows a fence of n blank lines gives it. 0 places "
+             "over the marker row instead. (default: %(default)s)",
+    )
+    p.add_argument(
+        "--offset-x", type=float, default=0.0,
+        help="columns to indent by, to line up with text the host renders "
+             "inside its own margin (default: %(default)s)",
+    )
+    p.add_argument("--max-rows", type=int, help="tallest the image may be, in rows")
+    p.add_argument("--width-cells", type=int, help="force a width in cells")
+    p.add_argument("--tty", help="target tty (default: $VMUX_PANE_TTY, then /dev/tty)")
+    p.add_argument("--id", help="element id suffix (default: a slug of the marker)")
+    p.add_argument(
+        "--measure", action="store_true",
+        help="report the footprint this image would occupy and exit, drawing "
+             "nothing. An application has to reserve the rows before the image "
+             "can be placed into them, so it needs the number first.",
+    )
+    p.add_argument(
+        "--clear", action="store_true",
+        help="remove everything this tool has placed in the pane and exit",
+    )
+    a = p.parse_args()
+
+    tty_args = ["--tty", a.tty] if a.tty else []
+
+    if a.clear:
+        # Prefix form (§6.2 / §8.2): one command per table. Elements
+        # first -- dropping an image still referenced would leave the
+        # element rendering a magenta debug fill until it goes.
+        run(
+            ["send", "--proto", "vge", "--no-response", *tty_args],
+            json.dumps([
+                {"DeleteElement": {"id": NS, "by_prefix": True}},
+                {"DropImage": {"id": NS, "by_prefix": True}},
+            ]),
+        )
+        return
+
+    if not a.image:
+        p.error("an image is required unless --clear is given")
+
+    caps = json.loads(run(["caps", *tty_args]))
+    max_rows = a.max_rows or max(3, int(caps["rows"] * DEFAULT_HEIGHT_FRACTION))
+
+    measure_args = ["measure", "--image", a.image, "--max-rows", str(max_rows), *tty_args]
+    if a.width_cells:
+        measure_args += ["--width-cells", str(a.width_cells)]
+    fit = json.loads(run(measure_args))
+
+    if a.measure:
+        # One key=value line on stdout so a caller can read it without
+        # parsing prose. A fence of N blank lines renders as N rows, the
+        # first directly under the marker -- which is where the default
+        # --offset-y starts drawing. So the blank-line count is the
+        # image's row budget, one for one.
+        print(f"rows={fit['rows']} cols={fit['cols']} fence_blank_lines={fit['rows']}")
+        return
+
+    marker = resolve_marker(a.marker, a.marker_file)
+    eid = NS + (a.id or slugify(marker))
+
+    # Upload and place in one envelope: the element referring to an
+    # image the same envelope uploaded is well-defined, and it halves
+    # the writes.
+    commands = [
+        {"UploadImageFile": {
+            "id": eid,
+            "path": os.path.abspath(a.image),
+            "target_px": fit["target_px"],
+            # Auto retention: the image is owned by the element that
+            # references it and should die with it. When the marker's
+            # line falls out of scrollback the element goes, the
+            # refcount hits zero, and the image is collected (§8.0).
+            "retention": "Auto",
+        }},
+        {"CreateElement": {
+            "id": eid,
+            "commands": [{"DrawImage": {
+                "target_rect": {"x": 0.0, "y": 0.0,
+                                "w": float(fit["cols"]), "h": fit["rect_h"]},
+                "image_id": eid,
+                "source_rect": None,
+            }}],
+            "origin": {"x": a.offset_x, "y": a.offset_y},
+            "is_visible": True,
+            "draw_order": 0,
+            "parent": None,
+            "size": None,
+            "transform": None,
+            "anchor": {"Marker": marker},
+        }},
+    ]
+    run(["send", "--proto", "vge", "--no-response", *tty_args], json.dumps(commands))
+    print(
+        f"vplace: {fit['cols']} cols x {fit['rows']} rows -> {eid}",
+        file=sys.stderr,
+    )
+
+
+def resolve_marker(inline, path):
+    """The marker, from whichever source was given.
+
+    Only the first line of a file is used and it is trimmed, so a marker
+    written with printf/echo -- i.e. every ordinary way of writing one --
+    does not carry a trailing newline into the substring the terminal
+    searches for, where it would match nothing.
+    """
+    if inline and path:
+        sys.exit("vplace: --marker and --marker-file are mutually exclusive")
+    if path:
+        with open(path, encoding="utf8") as f:
+            inline = f.readline()
+    if not inline or not inline.strip():
+        sys.exit("vplace: an empty marker matches no row and must be refused")
+    return inline.strip()
+
+
+if __name__ == "__main__":
+    main()

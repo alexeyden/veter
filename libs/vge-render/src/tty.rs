@@ -1,5 +1,5 @@
 //! Raw-tty guard plus nonblocking poll/read helpers and terminal-size
-//! queries. Lifted from vcat (which in turn matched vge-cli's copy) so
+//! queries. Lifted from vcat so
 //! every client shares one implementation.
 
 use std::os::fd::AsRawFd;

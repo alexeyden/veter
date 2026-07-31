@@ -2,16 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around a family of APC-framed protocols that ride a single PTY: PRT (portals / multiplexing), VGE (vector graphics in the grid), VFT (file transfer), plus a session layer (SES + VSS) that keeps sessions alive across renderer disconnects. The terminal binary itself is `veter`; the supporting tools and library crates keep their names (`vmux`, `vcat`, `vplay`, `vdraw`, `vfm`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, and the `*-protocol` wire crates).
+The project is **Veter** (Russian: ветер, "wind") — a GUI terminal emulator built around a family of APC-framed protocols that ride a single PTY: PRT (portals / multiplexing), VGE (vector graphics in the grid), VFT (file transfer), plus a session layer (SES + VSS) that keeps sessions alive across renderer disconnects. The terminal binary itself is `veter`; the supporting tools and library crates keep their names (`vmux`, `vcat`, `vplay`, `vdraw`, `vfm`, `vsend`, `vrecv`, `vsd`, `vssh`, `vproto`, and the `*-protocol` wire crates).
 
 ## Build & run
 
 Cargo workspace; edition 2024 (the vendored `vt100` fork stays on 2021).
 
 - Build everything: `cargo build` (release: `cargo build --release`)
-- Build one crate: `cargo build -p veter` (or `veter-host`, `vmux`, `vcat`, `vplay`, `vdraw`, `vfm`, `vsend`, `vrecv`, `vsd`, `vssh`, `vge-cli`, `prt-cli`, `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol`, `vge-ui`, `breakout`)
+- Build one crate: `cargo build -p veter` (or `veter-host`, `vmux`, `vcat`, `vplay`, `vdraw`, `vfm`, `vsend`, `vrecv`, `vsd`, `vssh`, `vproto`, `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol`, `vge-ui`, `breakout`)
 - Run the GUI terminal: `cargo run -p veter`
-- Install `veter` plus the tool set (`vcat`, `vplay`, `vdraw`, `vfm`, `vmux`, `vsend`, `vrecv`, `vsd`, `vssh`) to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them). `make install-remote-<arch>` cross-compiles a musl build and scp-installs it to `$REMOTE`.
+- Install `veter` plus the tool set (`vcat`, `vplay`, `vdraw`, `vfm`, `vmux`, `vproto`, `vsend`, `vrecv`, `vsd`, `vssh`), the `vplace` script and the Claude Code hook to `$PREFIX/bin` (default `~/.local`) plus a desktop entry: `make install` (override `PREFIX=...` to retarget; `make uninstall` removes them). `make install-remote-<arch>` cross-compiles a musl build and scp-installs it to `$REMOTE`.
 
 ## Tests
 
@@ -21,7 +21,7 @@ Most tests are inline `#[cfg(test)]` modules — there is no separate test harne
 - One crate: `cargo test -p prt-protocol`
 - One test by name substring: `cargo test -p prt-protocol envelope_roundtrip`
 
-The only integration test directory is `tools/vge-cli/tests/cli_roundtrip.rs`.
+The only integration test directory is `tools/vproto/tests/` — `roundtrip.rs` (JSON → envelope → the host's own parser → JSON) and `placement.rs` (the `vplace` script against a real pty, replayed through the host engine).
 
 ## Repository layout
 
@@ -34,7 +34,7 @@ before.
 ```
 protocol/   vge prt vft vss ses   — pure wire format, no state, no I/O
 libs/       veter-host vge-render vge-ui   — shared implementation crates
-tools/      the CLI/TUI clients, plus vge-cli and prt-cli
+tools/      the CLI/TUI clients, plus vproto and the vplace script
 vendored/   vt100 femtovg   — third-party forks
 veter/      the GUI terminal
 doc/        the normative protocol specs
@@ -52,13 +52,14 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`libs/v
 
 | Crate | Role |
 |---|---|
-| `protocol/*` — `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. |
+| `protocol/*` — `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. VGE/PRT/SES carry optional default-off `serde` and `schemars` features so `vproto` can read the same types as JSON and generate their schema; nothing else enables them. |
 | `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, and `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot). The screen model the host and every portal use. |
 | `libs/veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines. Links no GUI toolkit at all — the two desktop affordances VFT needs (native file picker, open-after-finalize) are the `vft::DesktopHooks` trait, which `veter` implements and `vsd` leaves at its `HeadlessHooks` default. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
 | `libs/vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal, plus the shared raw-TTY / poll / probe helpers every VGE client uses (`vcat`, `vplay`, `vdraw`, `vfm`, `spinner`, `breakout`). |
 | `libs/vge-ui` | Shared client-side widget toolkit, extracted from `vmux`: accent theme (`theme`), rounded chrome paths (`shape`), the readline-style `LineEditor` (`edit`), the filterable `Picker` (`picker`), the prompt/picker/scrolling modal builders (`modal`), and the key + SGR-mouse `InputParser` (`input`). Pure `vge-protocol` consumer — builds draw commands and parses input, owns no state and does no I/O. Used by `vmux` and `vfm`. |
-| `tools/vge-cli`, `tools/prt-cli` | Emit raw envelopes for manual protocol testing. |
+| `tools/vproto` | Speak VGE/PRT/SES from a script: a JSON array of commands on stdin becomes one envelope, and the terminal's reply comes back as JSON. Deserializes straight into the protocol crates' own types, so its surface *is* the wire format — the hand-written `vge-cli`/`prt-cli` it replaced reached 11 of VGE's 15 commands and could not name a cursor or marker anchor at all. `send` / `emit` / `measure` / `caps` / `schema`; `emit` writes envelope bytes instead of sending, which is how a VGE envelope becomes the `data_file` of a PRT `WritePortal`. |
+| `tools/vplace` | Not a crate — a python script (plus the Claude Code `Stop` hook beside it) that places an image into a pane whose foreground program is something else. It can write to the pane but never read from it, so every command goes out with no request id and the cell metrics come from `vproto caps`. Space is reserved *in-band* by the application (a marker line plus a fenced gap); the script anchors to the marker and the image lands one row below it, leaving that line readable as a caption. All the arithmetic is `vproto measure`; what is left here is one renderer's conventions. |
 | `tools/vmux` | Terminal multiplexer that runs *inside* veter, using PRT for panes and VGE for chrome (outlines, titles). Default prefix `Ctrl+Space`. |
 | `tools/vcat` | Display images inside a VGE-aware terminal. |
 | `tools/vplay` | Interactive image and video viewer for VGE-aware terminals. Left/right arrows seek in video mode and, in image mode, cycle the opened file's sibling stills (`src/playlist.rs`, lexicographical, directory scanned once at startup); `hjkl` always pans, since the arrows are taken. Every texture (the still and the two ping-ponged video frame slots) is uploaded with `Retention::Manual` — see `RETENTION` in `src/main.rs`: an `Auto` image is refcount-collected by the resize path's element wipe, and in the still's case by its own same-id swap's element retarget. vplay therefore releases each id by hand (each swap drops the id it supersedes; `TermExit` sweeps the `vplay-` prefix). |

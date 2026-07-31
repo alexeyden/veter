@@ -11,12 +11,17 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vplay vdraw vfm vmux vplace vsend vrecv vsd vssh
+PACKAGES := veter vcat vplay vdraw vfm vmux vproto vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 
-# Claude Code Stop hook. Point the `Stop` hook in
-# ~/.claude/settings.json at $(HOOK_DST).
-HOOK_SRC := $(CURDIR)/tools/vplace/claude-code-hook.py
+# Scripts, which have no cargo build of their own but ship beside the
+# binaries: `vplace` drives vproto to put an image in a pane, and the
+# hook drives vplace from Claude Code. Both are $(SCRIPTS) so `install`
+# and the dist tarball stay in step with the repo — the marker syntax is
+# a contract between them and a stale copy just quietly stops matching.
+SCRIPT_SRCDIR := $(CURDIR)/tools/vplace
+SCRIPTS := vplace
+HOOK_SRC := $(SCRIPT_SRCDIR)/claude-code-hook.py
 HOOK_DST := $(BINDIR)/vplace-claude-hook
 ICON_SVG_SRC := $(CURDIR)/assets/veter.svg
 ICON_SVG_DST := $(ICONROOT)/scalable/apps/veter.svg
@@ -73,7 +78,7 @@ help:
 	@echo "  build               cargo build --release for $(PACKAGES)"
 	@echo "  install             build and copy binaries into \$$BINDIR + desktop entry"
 	@echo "                      + skeleton config into \$$CONFIGDIR (if absent)"
-	@echo "                      + the Claude Code hook as \$$BINDIR/vplace-claude-hook"
+	@echo "                      + the vplace script and the Claude Code hook"
 	@echo "  uninstall           remove installed binaries and desktop entry"
 	@echo "  clean               cargo clean"
 	@echo
@@ -131,6 +136,10 @@ install: $(BINS) install-desktop install-icon install-config install-dist-maybe 
 # CLAUDE.md, and a stale copy just quietly stops matching.
 install-hook:
 	@$(INSTALL) -d $(BINDIR)
+	@for s in $(SCRIPTS); do \
+	    $(INSTALL) -m 0755 "$(SCRIPT_SRCDIR)/$$s" "$(BINDIR)/$$s"; \
+	    echo "    $$s -> $(BINDIR)/$$s"; \
+	done
 	@$(INSTALL) -m 0755 $(HOOK_SRC) $(HOOK_DST)
 	@echo "    claude-code-hook.py -> $(HOOK_DST)"
 
@@ -224,6 +233,9 @@ uninstall:
 	@if [ -f "$(VFM_USER_CONFIG_DST)" ]; then \
 	    echo "    kept user config $(VFM_USER_CONFIG_DST) (remove by hand if unwanted)"; \
 	fi
+	@for s in $(SCRIPTS); do \
+	    rm -f "$(BINDIR)/$$s" && echo "    removed $(BINDIR)/$$s"; \
+	done
 	@rm -f "$(HOOK_DST)" && echo "    removed $(HOOK_DST)"
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
@@ -251,7 +263,7 @@ clean:
 # into either a .tar.xz or a .deb. Per-arch targets are emitted by the
 # DIST_ARCH_RULES macro below.
 
-DIST_TOOLS := vmux vcat vplay vdraw vfm vsend vrecv vsd
+DIST_TOOLS := vmux vcat vplay vdraw vfm vproto vsend vrecv vsd
 DIST_VERSION ?= 0.1.7
 
 # vfm builds separately, with `--no-default-features`. Its
@@ -323,6 +335,13 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    $$(INSTALL) -m 0755 $$(DIST_BINDIR_$(1))/$$$$t \
 	        $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/$$$$t; \
 	done
+	@# Scripts are architecture-independent but useless without the
+	@# binary they drive, so they ride along rather than being a
+	@# separate install step on the remote.
+	@for s in $$(SCRIPTS); do \
+	    $$(INSTALL) -m 0755 $$(SCRIPT_SRCDIR)/$$$$s \
+	        $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/$$$$s; \
+	done
 	@printf '%s\n' \
 	    'veter-tools $$(DIST_VERSION) — $(1)' \
 	    '' \
@@ -337,6 +356,8 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    '  vplay   interactive image/video viewer (VGE; needs ffmpeg)' \
 	    '  vdraw   block-diagram editor (VGE; .excalidraw)' \
 	    '  vfm     file browser with picture previews (VGE; ffmpeg for video thumbs)' \
+	    '  vproto  speak VGE/PRT/SES from a script (JSON in, JSON out)' \
+	    '  vplace  place an image in a pane from outside it (script; needs python3)' \
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
 	    '  vsd  persistent session daemon (doc/session-manager.md)' \
