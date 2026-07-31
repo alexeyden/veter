@@ -3081,6 +3081,7 @@ dependencies = [
  "prt-protocol",
  "serde",
  "serde_json",
+ "unicode-width",
  "vge-protocol",
  "vge-render",
 ]

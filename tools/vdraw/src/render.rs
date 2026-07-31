@@ -6,6 +6,7 @@
 //! position, so that later phases can move a shape with a single
 //! `UpdateOrigin` and rotate it with a pure rotation matrix (§9.13).
 
+use unicode_width::UnicodeWidthStr as _;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
@@ -157,12 +158,23 @@ pub fn element_origin(e: &Element, cam: &Camera) -> Point {
     }
 }
 
-/// A text caret, one cell tall, sitting after the last character.
+/// How many grid cells a string occupies when drawn.
 ///
-/// The primary font is the terminal's own, so an ASCII character
-/// advances exactly one cell — character count is the cursor column.
+/// The primary font is the terminal's own, so a narrow character
+/// advances exactly one cell. Wide ones (CJK, most emoji) advance two
+/// and combining marks none, which is the same `unicode-width` rule the
+/// vt100 grid applies to its own cells — so a diagram label lines up
+/// with terminal text beside it. The host shapes VGE text with the
+/// font's real advances rather than snapping to cells, so this is an
+/// approximation for anything a fallback font supplies; it is the same
+/// approximation the grid makes, and far closer than a character count.
+pub fn text_cells(text: &str) -> f32 {
+    text.width() as f32
+}
+
+/// A text caret, one cell tall, sitting after the last character.
 pub fn caret_command(e: &Element, accent: Style) -> DrawCmd {
-    let n = e.text.chars().count() as f32;
+    let n = text_cells(&e.text);
     let x = match e.shape() {
         // Container labels are centre-aligned about the origin.
         Some(Shape::Text) => n,
@@ -778,13 +790,21 @@ mod tests {
     }
 
     #[test]
-    fn caret_follows_the_character_count() {
+    fn caret_follows_the_display_width() {
         let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
         e.text = "hello".into();
         let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, ACCENT) else {
             panic!("expected caret rect");
         };
-        assert_eq!(rects[0].x, 5.0, "one cell per ASCII character");
+        assert_eq!(rects[0].x, 5.0, "one cell per narrow character");
+
+        // Wide glyphs take two cells each, so a character count would
+        // park the caret in the middle of the last one.
+        e.text = "日本".into();
+        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, ACCENT) else {
+            panic!("expected caret rect");
+        };
+        assert_eq!(rects[0].x, 4.0);
 
         // Container labels are centred, so the caret sits at half-width.
         let mut b = Element::new("b", Shape::Rectangle, 0.0, 0.0, 100.0, 40.0);
@@ -793,6 +813,17 @@ mod tests {
             panic!("expected caret rect");
         };
         assert_eq!(rects[0].x, 2.5);
+    }
+
+    #[test]
+    fn text_cells_counts_grid_columns_not_characters() {
+        assert_eq!(text_cells("abc"), 3.0);
+        // Cyrillic is narrow; CJK and emoji are wide.
+        assert_eq!(text_cells("привет"), 6.0);
+        assert_eq!(text_cells("日本語"), 6.0);
+        assert_eq!(text_cells("🙂"), 2.0);
+        // A combining mark rides on its base and claims no column.
+        assert_eq!(text_cells("e\u{0301}"), 1.0);
     }
 
     fn dashed_box(kind: &str, rounded: bool) -> Element {

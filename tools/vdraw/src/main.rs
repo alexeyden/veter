@@ -811,8 +811,7 @@ fn full_render(
 }
 
 /// Keep a text element's box in step with its string, so hit testing
-/// and the selection outline match what is drawn. The terminal font is
-/// the primary font, so one ASCII character is one cell wide.
+/// and the selection outline match what is drawn.
 fn resize_text_box(e: &mut doc::Element, cam: &Camera) {
     // Record the font size a *web* renderer should use, for every
     // element that carries text — containers included, since their
@@ -825,7 +824,7 @@ fn resize_text_box(e: &mut doc::Element, cam: &Camera) {
     if e.shape() != Some(doc::Shape::Text) {
         return;
     }
-    e.width = e.text.chars().count() as f32 * cam.cell_w;
+    e.width = render::text_cells(&e.text) * cam.cell_w;
     e.height = cam.cell_h;
 }
 

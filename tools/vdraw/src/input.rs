@@ -183,6 +183,25 @@ impl InputParser {
                     out.push(Event::Key(c as char));
                     i += 1;
                 }
+                c if c >= 0x80 => {
+                    // Multi-byte UTF-8 — Cyrillic, accented Latin, CJK,
+                    // emoji. Text fields hold a `String`, so the scalar
+                    // has to be decoded here rather than byte-fed.
+                    let len = utf8_len(c);
+                    if i + len > b.len() {
+                        if !eof {
+                            break; // split read: keep the tail buffered
+                        }
+                        i = b.len(); // truncated; nothing more is coming
+                        continue;
+                    }
+                    if let Ok(s) = std::str::from_utf8(&b[i..i + len])
+                        && let Some(ch) = s.chars().next()
+                    {
+                        out.push(Event::Key(ch));
+                    }
+                    i += len;
+                }
                 _ => {
                     i += 1; // ignore other control bytes
                 }
@@ -192,6 +211,16 @@ impl InputParser {
             self.buf.extend_from_slice(&b[i..]);
         }
         out
+    }
+}
+
+/// Byte length of a UTF-8 scalar from its lead byte.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
     }
 }
 
@@ -330,6 +359,38 @@ mod tests {
             Event::Key(' '),
             Event::Key('b')
         ]);
+    }
+
+    #[test]
+    fn non_ascii_text_reaches_the_buffer() {
+        let mut p = InputParser::new();
+        assert_eq!(
+            p.feed("привет".as_bytes()),
+            "привет".chars().map(Event::Key).collect::<Vec<_>>()
+        );
+        assert_eq!(p.feed("é漢🙂".as_bytes()), vec![
+            Event::Key('é'),
+            Event::Key('漢'),
+            Event::Key('🙂')
+        ]);
+    }
+
+    #[test]
+    fn a_scalar_split_across_reads_is_reassembled() {
+        let mut p = InputParser::new();
+        let ch = "ж".as_bytes();
+        assert!(p.feed(&ch[..1]).is_empty());
+        assert_eq!(p.feed(&ch[1..]), vec![Event::Key('ж')]);
+    }
+
+    #[test]
+    fn a_truncated_scalar_does_not_wedge_the_parser() {
+        // Without the eof drop, the partial lead byte stays buffered and
+        // every later keystroke is stuck behind it.
+        let mut p = InputParser::new();
+        assert!(p.feed(&"ж".as_bytes()[..1]).is_empty());
+        assert!(p.flush().is_empty());
+        assert_eq!(p.feed(b"a"), vec![Event::Key('a')]);
     }
 
     #[test]
