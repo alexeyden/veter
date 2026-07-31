@@ -6,3 +6,4 @@ description = "Shared client-side widget toolkit for VGE-aware terminal apps: ac
 
 [dependencies]
 vge-protocol = { path = "../../protocol/vge" }
+unicode-width = "0.2.1"

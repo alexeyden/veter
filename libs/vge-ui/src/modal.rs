@@ -20,6 +20,7 @@ use vge_protocol::command::{
     Align, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
 };
 
+use crate::measure::{prefix_cells, text_cells};
 use crate::picker::Picker;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
 use crate::theme::{
@@ -111,8 +112,8 @@ pub fn prompt_element(
     caret: Option<usize>,
     draw_order: i32,
 ) -> CreateElementBody {
-    let chars = line.chars().count() as f32;
-    let inner_w = chars.max(20.0);
+    let line_w = text_cells(line);
+    let inner_w = line_w.max(20.0);
     let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
     let box_h = 4.0_f32.min(host_h.saturating_sub(2) as f32);
 
@@ -134,11 +135,11 @@ pub fn prompt_element(
     });
 
     // The body line is center-aligned, so its left edge is
-    // `box_w/2 - chars/2`; the bar sits `caret` cells to the right of
-    // that (one glyph advance ≈ one cell, the same assumption the box
-    // sizing above makes).
+    // `box_w/2 - line_w/2`; the bar sits as many cells to the right of
+    // that as the text before the insertion point occupies — `caret` is
+    // a char index, which is not the column once a glyph is wide.
     if let Some(c) = caret {
-        let caret_x = box_w * 0.5 - chars * 0.5 + c.min(line.chars().count()) as f32;
+        let caret_x = box_w * 0.5 - line_w * 0.5 + prefix_cells(line, c);
         cmds.push(caret_bar(caret_x, 2.1, 2.9));
     }
 
@@ -192,15 +193,11 @@ pub fn picker_element<P>(
     // current matches) so the box keeps a stable width while filtering;
     // the input line can still widen it when a long command is typed.
     let input_line = format!("> {}", picker.editor.buffer);
-    let mut max_w = picker
-        .title
-        .chars()
-        .count()
-        .max(input_line.chars().count());
+    let mut max_w = text_cells(&picker.title).max(text_cells(&input_line));
     for it in &picker.items {
-        max_w = max_w.max(it.label.chars().count() + 3 + it.hint.chars().count());
+        max_w = max_w.max(text_cells(&it.label) + 3.0 + text_cells(&it.hint));
     }
-    let inner_w = (max_w as f32).max(26.0);
+    let inner_w = max_w.max(26.0);
     let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
     let box_h = (2 + visible_rows) as f32;
 
@@ -222,8 +219,8 @@ pub fn picker_element<P>(
         font_style: FontStyle(0x00),
         text: input_line,
     });
-    // Caret bar — "> " is 2 cells, then `cursor` glyphs in.
-    let caret_x = 1.0 + 2.0 + picker.editor.cursor.min(picker.editor.char_count()) as f32;
+    // Caret bar — "> " is 2 cells, then as many as the typed text takes.
+    let caret_x = 1.0 + 2.0 + picker.editor.cursor_cells();
     cmds.push(caret_bar(caret_x, 1.1, 1.9));
 
     for j in 0..visible_rows {
@@ -355,9 +352,9 @@ impl ScrollModal {
         let max_line = self
             .lines
             .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(20) as f32;
+            .map(|l| text_cells(l))
+            .max_by(f32::total_cmp)
+            .unwrap_or(20.0);
         let inner_w = max_line.max(self.min_inner_w);
         let box_w = (inner_w + self.pad_w).min(host_w.saturating_sub(2) as f32);
         let inner_h = self.lines.len() as f32;
@@ -692,6 +689,61 @@ mod tests {
         let (_, box_h) = m.box_size(80, 24);
         let max = m.body_window(box_h).1;
         assert_eq!(m.thumb_origin_y(box_h, max), m.thumb_origin_y(box_h, max + 99));
+    }
+
+    /// Box width back out of the centered origin: `origin_x` is
+    /// `floor((host_w - box_w) / 2)`.
+    fn box_w_of(el: &CreateElementBody, host_w: u32) -> f32 {
+        host_w as f32 - 2.0 * el.origin.x
+    }
+
+    #[test]
+    fn wide_glyphs_widen_the_prompt_box() {
+        // Past the 20-cell minimum, so the text drives the width. Ten
+        // wide glyphs are twenty cells, the same as twenty narrow ones.
+        let wide = prompt_element("p", 200, 24, "T", &"日".repeat(15), 10.0, 20.0, None, 0);
+        let narrow = prompt_element("p", 200, 24, "T", &"a".repeat(15), 10.0, 20.0, None, 0);
+        let same = prompt_element("p", 200, 24, "T", &"a".repeat(30), 10.0, 20.0, None, 0);
+        assert!(box_w_of(&wide, 200) > box_w_of(&narrow, 200));
+        assert_eq!(box_w_of(&wide, 200), box_w_of(&same, 200));
+    }
+
+    #[test]
+    fn prompt_caret_lands_on_a_column_not_a_char_index() {
+        let line = "日本語";
+        let el = prompt_element("p", 200, 24, "T", line, 10.0, 20.0, Some(2), 0);
+        let DrawCmd::FillPath { segments, .. } = el.commands.last().unwrap() else {
+            panic!("caret is a filled path");
+        };
+        // Two chars in is four columns from the (centered) left edge.
+        let box_w = box_w_of(&el, 200);
+        let left = box_w * 0.5 - text_cells(line) * 0.5;
+        // The bar is a zero-radius rect starting at its left edge.
+        let x = segments.first().unwrap().start.x + CARET_HALF_W;
+        assert!((x - (left + 4.0)).abs() < 1e-3, "{x} vs {}", left + 4.0);
+    }
+
+    #[test]
+    fn scroll_modal_width_follows_columns() {
+        let mut wide = ScrollModal::new(vec!["T".into(), "日".repeat(40)]);
+        let mut narrow = ScrollModal::new(vec!["T".into(), "a".repeat(40)]);
+        // Below the default 30-cell floor neither line would move the box.
+        wide.min_inner_w = 0.0;
+        narrow.min_inner_w = 0.0;
+        assert_eq!(wide.box_size(200, 24).0, narrow.box_size(200, 24).0 + 40.0);
+    }
+
+    #[test]
+    fn picker_box_widens_for_wide_labels() {
+        let el = |label: String| {
+            let items = vec![PickerItem::new(label, "", 0usize)];
+            let p = Picker::new("P", FilterMode::Whole, items);
+            box_w_of(&picker_element("k", 200, 24, &p, 10.0, 20.0, 0)[0], 200)
+        };
+        // All three clear the 26-cell minimum, so the label drives the
+        // width. Twenty wide glyphs must size the same as forty narrow.
+        assert_eq!(el("日".repeat(20)), el("a".repeat(40)));
+        assert!(el("日".repeat(20)) > el("a".repeat(20)));
     }
 
     #[test]

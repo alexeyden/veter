@@ -3199,6 +3199,7 @@ dependencies = [
 name = "vge-ui"
 version = "0.1.0"
 dependencies = [
+ "unicode-width",
  "vge-protocol",
 ]
 

@@ -7,10 +7,11 @@
 //! already-parsed [`crate::input::Event`], for clients that route
 //! everything through an [`crate::input::InputParser`].
 //!
-//! Byte input is ASCII-only (non-ASCII / non-printable bytes are
-//! dropped); `feed_event` accepts whatever character the parser decoded.
-//! Every operation routes through char positions, so the buffer stays
-//! UTF-8-correct either way.
+//! Both paths accept any character: [`LineEditor::feed`] decodes a
+//! multi-byte scalar out of the byte stream, and `feed_event` takes
+//! whatever the parser already decoded. Non-printable bytes are still
+//! dropped. Every operation routes through char positions, so the
+//! buffer stays UTF-8-correct either way.
 
 use crate::input::{Dir, Event, Nav};
 
@@ -62,6 +63,13 @@ impl LineEditor {
 
     pub fn char_count(&self) -> usize {
         self.buffer.chars().count()
+    }
+
+    /// The caret's column: how many cells the text before the cursor
+    /// occupies. Not the same as [`LineEditor::cursor`] once the buffer
+    /// holds a wide glyph — see [`crate::measure`].
+    pub fn cursor_cells(&self) -> f32 {
+        crate::measure::prefix_cells(&self.buffer, self.cursor)
     }
 
     /// Byte offset of char index `idx` (or buffer end if past the end).
@@ -216,6 +224,32 @@ impl LineEditor {
             0x20..=0x7E => {
                 self.insert(b as char);
                 (1, EditOutcome::Redraw)
+            }
+            0x80..=0xFF => {
+                // Multi-byte UTF-8. Terminals hand a typed character
+                // over as its encoded bytes, so refusing them here is
+                // what would make a rename prompt English-only.
+                let len = crate::input::utf8_len(b);
+                if len > bytes.len() {
+                    // Truncated tail — consume it rather than stall,
+                    // the same way a partial escape sequence is
+                    // swallowed. Callers advance by the returned count
+                    // and keep no remainder across reads.
+                    return (bytes.len(), EditOutcome::Noop);
+                }
+                match std::str::from_utf8(&bytes[..len])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    Some(c) => {
+                        self.insert(c);
+                        (len, EditOutcome::Redraw)
+                    }
+                    // Not valid UTF-8: drop the lead byte and resync on
+                    // the next one rather than swallowing `len` bytes
+                    // that may hold a good character.
+                    None => (1, EditOutcome::Noop),
+                }
             }
             _ => (1, EditOutcome::Noop),
         }
@@ -440,10 +474,60 @@ mod tests {
         assert_eq!(ed.buffer, "hllo ");
         assert_eq!(ed.feed_event(Event::Enter), EditOutcome::Commit);
         assert_eq!(ed.feed_event(Event::Escape), EditOutcome::Cancel);
-        // Non-ASCII typing survives the event path.
+        // Non-ASCII typing survives either path, identically.
+        let mut ev = LineEditor::new(String::new());
+        for c in "привет".chars() {
+            ev.feed_event(Event::Key(c));
+        }
+        let mut by = LineEditor::new(String::new());
+        let bytes = "привет".as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (n, _) = by.feed(&bytes[i..]);
+            i += n.max(1);
+        }
+        assert_eq!(by.buffer, "привет");
+        assert_eq!(by.buffer, ev.buffer);
+        assert_eq!(by.cursor, ev.cursor);
+    }
+
+    #[test]
+    fn the_byte_path_consumes_a_whole_scalar() {
         let mut ed = LineEditor::new(String::new());
-        ed.feed_event(Event::Key('é'));
-        assert_eq!(ed.buffer, "é");
+        // One call per character, each reporting its encoded length —
+        // a short count would re-feed the continuation bytes as text.
+        let (n, outcome) = ed.feed("日本".as_bytes());
+        assert_eq!(n, 3);
+        assert_eq!(outcome, EditOutcome::Redraw);
+        assert_eq!(ed.buffer, "日");
+        assert_eq!(ed.cursor, 1);
+    }
+
+    #[test]
+    fn a_truncated_or_invalid_scalar_is_dropped_not_inserted() {
+        // A split read: the caller keeps no remainder, so the partial
+        // tail is consumed rather than stalling the input loop.
+        let mut ed = LineEditor::new(String::new());
+        let (n, outcome) = ed.feed(&"ж".as_bytes()[..1]);
+        assert_eq!((n, outcome), (1, EditOutcome::Noop));
+        assert!(ed.buffer.is_empty());
+
+        // Invalid encoding resyncs on the next byte instead of eating it.
+        let (n, outcome) = ed.feed(&[0xC3, 0x28]);
+        assert_eq!((n, outcome), (1, EditOutcome::Noop));
+        assert!(ed.buffer.is_empty());
+    }
+
+    #[test]
+    fn the_max_length_counts_characters_not_bytes() {
+        let mut ed = LineEditor::with_max(String::new(), 3);
+        let bytes = "абвгд".as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (n, _) = ed.feed(&bytes[i..]);
+            i += n.max(1);
+        }
+        assert_eq!(ed.buffer, "абв", "three chars fit, not three bytes");
     }
 
     #[test]

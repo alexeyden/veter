@@ -204,7 +204,7 @@ impl InputParser {
 }
 
 /// Byte length of a UTF-8 scalar from its lead byte.
-fn utf8_len(lead: u8) -> usize {
+pub(crate) fn utf8_len(lead: u8) -> usize {
     match lead {
         0xC0..=0xDF => 2,
         0xE0..=0xEF => 3,
