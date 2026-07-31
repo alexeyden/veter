@@ -976,9 +976,10 @@ const MODAL_IDS: ModalIds<'static> = ModalIds {
     thumb: MODAL_THUMB_ID,
 };
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
-/// Floor on the per-tab label length when the bar is crowded. Labels
-/// shrink uniformly to reclaim space but never below this many
-/// characters (one glyph + `…`); past that the bar scrolls instead.
+/// Floor on the per-tab label width when the bar is crowded. Labels
+/// shrink uniformly to reclaim space but never below this many columns
+/// (one narrow glyph + `…`); past that the bar scrolls instead. A label
+/// this short whose first glyph is wide elides to the `…` alone.
 const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
@@ -988,29 +989,32 @@ const TABBAR_CHEVRON_W: f32 = 2.0;
 /// which split boundaries to draw.
 const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 
-/// Elide `label` to at most `max` characters, appending `…` when it had
-/// to be cut. `max` is expected to be at least [`TABBAR_MIN_LABEL`].
+/// Elide `label` to at most `max` grid columns, appending `…` when it
+/// had to be cut. `max` is expected to be at least [`TABBAR_MIN_LABEL`].
 fn elide_tab_label(label: &str, max: usize) -> String {
-    if label.chars().count() <= max {
-        return label.to_string();
-    }
-    let mut out: String = label.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    vge_ui::measure::elide(label, max)
 }
 
-/// Largest uniform label-character cap that still lets every tab fit on
+/// Largest uniform label-column cap that still lets every tab fit on
 /// row 0 at full width. Labels are only shortened to reclaim space:
 /// when they all fit, the cap covers the longest label (no truncation);
 /// when they don't, it shrinks but never below [`TABBAR_MIN_LABEL`].
 /// A cap pinned to the minimum means even minimal labels overflow and
 /// the bar will have to scroll.
+///
+/// Widths are grid columns, so a CJK tab name costs what it draws. An
+/// elided label can come out a column under its cap (a wide glyph is
+/// dropped rather than split), which only leaves the bar roomier than
+/// planned — the drawn widths are measured from the elided labels.
 fn tabbar_label_cap(labels: &[String], num_widths: &[f32], host_w: f32) -> usize {
     let n = labels.len();
     if n == 0 {
         return TABBAR_MIN_LABEL;
     }
-    let lens: Vec<usize> = labels.iter().map(|l| l.chars().count()).collect();
+    let lens: Vec<usize> = labels
+        .iter()
+        .map(|l| vge_ui::measure::text_cells(l) as usize)
+        .collect();
     // Fixed per-tab cost independent of the cap: the " N " number rect
     // plus the name rect's two padding cells. What's left is the budget
     // for label glyphs.
@@ -1180,7 +1184,7 @@ fn compute_tabbar_layout(
             return None;
         }
         let label = elide_tab_label(name, max_chars);
-        let w = (label.chars().count() + 2) as f32;
+        let w = vge_ui::measure::text_cells(&label) + 2.0;
         Some((label, w))
     });
     let session_w = session_seg.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
@@ -1199,7 +1203,7 @@ fn compute_tabbar_layout(
         labels.iter().map(|l| elide_tab_label(l, cap)).collect();
     let name_widths: Vec<f32> = elided
         .iter()
-        .map(|l| (l.chars().count() + 2) as f32)
+        .map(|l| vge_ui::measure::text_cells(l) + 2.0)
         .collect();
     let tab_widths: Vec<f32> =
         (0..n).map(|i| num_widths[i] + name_widths[i]).collect();
@@ -1278,7 +1282,7 @@ fn tabbar_hit(layout: &TabbarLayout, host_w: u32, col: f32) -> Option<TabbarHit>
 ///     right corner rounded) showing the tab title.
 ///
 /// When the tabs don't all fit on row 0, labels are first shortened —
-/// uniformly, down to [`TABBAR_MIN_LABEL`] characters — to reclaim
+/// uniformly, down to [`TABBAR_MIN_LABEL`] columns — to reclaim
 /// space. If even minimal labels overflow, the bar scrolls: `scroll`
 /// (the leftmost visible tab, carried across renders) is nudged the
 /// minimum amount needed to keep the active tab on screen, and `‹` / `›`
@@ -1517,7 +1521,7 @@ fn build_chrome_commands(
     // down by 1/4 of a cell so the thumb doesn't visually fuse with the
     // top edge of the pane.
     if show_title && !title.is_empty() {
-        let text_w = title.chars().count() as f32;
+        let text_w = vge_ui::measure::text_cells(title);
         let top_pad = 0.25;
         let text_origin_x = pw - 1.0;
         let text_origin_y = top_pad;
@@ -6022,6 +6026,32 @@ mod tests {
         let out = elide_tab_label("a-very-long-tab-name", 6);
         assert_eq!(out.chars().count(), 6);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn elide_caps_labels_by_column_not_by_character() {
+        // Six columns is three CJK glyphs; the third makes room for the
+        // marker instead, so the label draws five columns, never seven.
+        let out = elide_tab_label("日本語です", 6);
+        assert_eq!(out, "日本…");
+        assert_eq!(vge_ui::measure::text_cells(&out), 5.0);
+    }
+
+    #[test]
+    fn a_wide_label_costs_what_it_draws_in_the_cap() {
+        // Same character count, twice the width: the wide set must not
+        // be given the same cap, or the bar overflows row 0.
+        let wide: Vec<String> = (0..8).map(|_| "日本語です七".into()).collect();
+        let narrow: Vec<String> = (0..8).map(|_| "abcdefghijkl".into()).collect();
+        let num_widths = vec![3.0; 8];
+        let cap_wide = tabbar_label_cap(&wide, &num_widths, 80.0);
+        let cap_narrow = tabbar_label_cap(&narrow, &num_widths, 80.0);
+        assert_eq!(cap_wide, cap_narrow, "the cap is a column budget");
+        // And the elided labels honour it.
+        for l in &wide {
+            let e = elide_tab_label(l, cap_wide);
+            assert!(vge_ui::measure::text_cells(&e) <= cap_wide as f32, "{e}");
+        }
     }
 
     #[test]
