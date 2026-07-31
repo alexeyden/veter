@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use vft_client::cancel::{cancel_and_drain, CancelGuard};
+use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard};
 use vft_client::probe::{run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -142,20 +142,39 @@ fn main() -> Result<()> {
     });
     let begin_rid = next_req;
     next_req += 1;
+
+    // Arm the cancel-on-exit net *before* the first blocking wait, not
+    // after it. Any early exit (error return, panic, SIGTERM / SIGHUP)
+    // then emits a CancelTransfer so the host aborts the upload and
+    // drops its partial destination file instead of leaking a
+    // half-written one. Arming after the BeginUpload wait left that
+    // wait uncovered: a timeout there returned with no cancel sent and
+    // nothing drained, so a BeginUpload Ok that merely arrived late was
+    // delivered to the shell. Cancelling a transfer the host never
+    // opened is harmless — it answers err_unknown_transfer, which
+    // `cancel_and_drain` treats as "nothing more is coming".
+    // Disarmed once EndUpload is acknowledged.
+    let mut cancel = CancelGuard::new(&transfer_id);
+
     write_envelope(&build_envelope(&[(begin, begin_rid)]))?;
-    let resolved = wait_for_vft_ok(&stream, begin_rid, |body| {
+    let resolved = match wait_for_vft_ok(&stream, begin_rid, PROMPT_SILENCE_BUDGET, |body| {
         let mut r = Reader::new(body);
         Ok(r.string()
             .map_err(|_| anyhow!("BeginUpload Ok: missing resolved_path"))?
             .to_owned())
-    })?;
-
-    // Arm the cancel-on-exit net now that the upload is active on the
-    // host: any early exit (error return, panic, SIGTERM / SIGHUP) emits
-    // a CancelTransfer so the host aborts the upload and drops its
-    // partial destination file instead of leaking a half-written file.
-    // Disarmed once EndUpload is acknowledged.
-    let mut cancel = CancelGuard::new(&transfer_id);
+    }) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // No progress bar is up yet, so this path only has to make
+            // sure the host stops writing before we hand the tty back.
+            warn_if_undrained(
+                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                DRAIN_BUDGET,
+            );
+            cancel.disarm();
+            return Err(e);
+        }
+    };
 
     // Progress UI
     let delay = Duration::from_millis(cli.progress_delay_ms);
@@ -215,9 +234,17 @@ fn main() -> Result<()> {
             // TransferAborted event; the guard fires too late in the exit
             // sequence for anyone to read those, so they would land on the
             // shell's stdin, where zsh's zle turns the `ESC _` marker into
-            // `insert-last-word`. Draining them here is quick — an upload
-            // has no host→client data in flight, only the two replies.
-            cancel_and_drain(&stream, &transfer_id, Duration::from_secs(5));
+            // `insert-last-word` and `ESC H` into `run-help` — protocol
+            // bytes become an executed command line.
+            //
+            // The budget has to assume the host is *busy*, not idle:
+            // every path that lands here has already failed to hear from
+            // it, so the five seconds this used to allow were exactly
+            // the five the host was least likely to answer in.
+            warn_if_undrained(
+                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                DRAIN_BUDGET,
+            );
             cancel.disarm();
             Err(e)
         }
@@ -285,7 +312,10 @@ fn upload(
     let end_rid = *next_req;
     *next_req += 1;
     write_envelope(&build_envelope(&[(end, end_rid)]))?;
-    let final_path = wait_for_vft_ok(stream, end_rid, |body| {
+    // The host goes silent here while its worker fsyncs, so the budget
+    // scales with the file — see `finalize_silence_budget`.
+    let finalize_budget = finalize_silence_budget(total_bytes);
+    let final_path = wait_for_vft_ok(stream, end_rid, finalize_budget, |body| {
         let mut r = Reader::new(body);
         let path = r
             .string()
@@ -331,18 +361,55 @@ fn bytes_per_sec(offset: u64, started: Instant) -> f64 {
     }
 }
 
+/// Silence budget for a request whose reply is prompt: the host does
+/// the work inline and answers within a round trip.
+const PROMPT_SILENCE_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long to keep draining the host after cancelling. Reached only
+/// once something has already gone wrong, so it is bounded rather than
+/// scaled — but far above the round trip it normally takes, because
+/// giving up here is what spills protocol bytes onto the shell.
+const DRAIN_BUDGET: Duration = Duration::from_secs(60);
+
+/// Silence budget for the deferred `EndUpload` Ok.
+///
+/// The host answers `EndUpload` only after its worker has flushed and
+/// **fsynced** the destination (`libs/veter-host/src/vft/worker.rs`),
+/// and it sends nothing at all while that runs. So this bounds fsync
+/// time, not round-trip latency — and fsync cost scales with the bytes
+/// just pushed through the page cache. A flat budget that suits a small
+/// file therefore breaks silently on a large one: a 5 GB upload blew a
+/// flat 60s, vsend abandoned a transfer that had in fact *succeeded*,
+/// and the host's late replies landed on the shell's line editor.
+///
+/// Budget a deliberately pessimistic 5 MB/s on top of the flat floor,
+/// so the bound tracks the work the host actually has to do.
+fn finalize_silence_budget(total_bytes: u64) -> Duration {
+    const FSYNC_BYTES_PER_SEC: u64 = 5 * 1024 * 1024;
+    PROMPT_SILENCE_BUDGET + Duration::from_secs(total_bytes / FSYNC_BYTES_PER_SEC)
+}
+
 /// Block until a VFT response with the given `request_id` arrives.
 /// On RSP_OK, decode the body via `decode`; on RSP_ERR or
 /// TransferAborted, bail.
+///
+/// `silence_budget` bounds the gap between *frames*, not the total
+/// wait: any frame resets it, so a host that is still talking to us is
+/// never abandoned.
 fn wait_for_vft_ok<R>(
     stream: &ResponseStream,
     request_id: u32,
+    silence_budget: Duration,
     decode: impl FnOnce(&[u8]) -> Result<R>,
 ) -> Result<R> {
     loop {
-        let frame = stream
-            .recv_timeout(Duration::from_secs(60))
-            .ok_or_else(|| anyhow!("timed out waiting for response to req={request_id}"))?;
+        let frame = stream.recv_timeout(silence_budget).ok_or_else(|| {
+            anyhow!(
+                "timed out waiting for response to req={request_id} \
+                 ({}s without a frame from the host)",
+                silence_budget.as_secs()
+            )
+        })?;
         match frame {
             HostFrame::Vft {
                 frame_type,
@@ -402,4 +469,33 @@ fn decode_aborted(body: &[u8]) -> anyhow::Error {
     let reason = r.u8().unwrap_or(0);
     let msg = r.string().unwrap_or("").to_owned();
     anyhow!("transfer {id} aborted (reason={reason}): {msg}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_budget_covers_the_fsync_of_a_multi_gigabyte_upload() {
+        // A small file gets the flat floor: the host opens, writes and
+        // fsyncs it well inside one round trip.
+        assert_eq!(finalize_silence_budget(0), PROMPT_SILENCE_BUDGET);
+        assert_eq!(finalize_silence_budget(1024), PROMPT_SILENCE_BUDGET);
+
+        // The case that regressed: a 5 GB mp4 finished streaming, then
+        // the host went quiet fsyncing it and blew the old flat 60s
+        // budget — so vsend abandoned a transfer that had *succeeded*
+        // and its late replies were delivered to the shell as
+        // keystrokes. The budget must now comfortably exceed a minute.
+        let five_gb = 5_071_716_356u64;
+        let budget = finalize_silence_budget(five_gb);
+        assert!(
+            budget > Duration::from_secs(15 * 60),
+            "5 GB should buy well over 15 minutes of fsync, got {budget:?}"
+        );
+
+        // ...and it must scale with the file rather than being a bigger
+        // constant, or the next size up regresses the same way.
+        assert!(finalize_silence_budget(five_gb * 2) > budget);
+    }
 }

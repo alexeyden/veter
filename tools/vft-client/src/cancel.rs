@@ -205,27 +205,60 @@ impl Drop for CancelGuard {
     }
 }
 
+/// Say so when [`cancel_and_drain`] gave up before the host confirmed.
+///
+/// Anything the host writes from here on reaches a terminal already
+/// back in canonical mode, where the line editor takes protocol bytes
+/// for keystrokes — zsh binds `ESC _` to insert-last-word and `ESC H`
+/// to run-help, so a stray envelope becomes an executed command line.
+/// Without this note the corruption that follows looks like it came
+/// from nowhere.
+pub fn warn_if_undrained(drained: bool, budget: Duration) {
+    if drained {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = write!(
+        out,
+        "warning: host did not confirm the cancel within {}s; it may still \
+         write to this terminal. If the prompt misbehaves afterwards, press \
+         Enter and run `reset`.\r\n",
+        budget.as_secs()
+    );
+    let _ = out.flush();
+}
+
 /// Send `CancelTransfer` and then read-and-discard any further host
 /// frames for `transfer_id` until the host confirms the abort
-/// (`TransferAborted`) or `timeout` elapses. Used on the graceful
-/// download error paths so in-flight `DownloadChunk` bytes are consumed
+/// (`TransferAborted`) or `timeout` elapses. Used on the graceful error
+/// paths of both directions so in-flight host→client bytes are consumed
 /// by the client rather than leaking onto the shell once it exits.
 ///
-/// Best-effort: write / timeout failures are swallowed, since the caller
+/// Returns `true` if the host confirmed and it is therefore safe to
+/// exit, `false` if the deadline passed first — in which case the host
+/// may still write frames into a terminal whose line editor will treat
+/// them as keystrokes, and the caller should say so.
+///
+/// Best-effort otherwise: write failures are swallowed, since the caller
 /// is already on its way out with a more informative error.
-pub fn cancel_and_drain(stream: &ResponseStream, transfer_id: &str, timeout: Duration) {
+#[must_use = "a false return means frames may still leak onto the shell"]
+pub fn cancel_and_drain(
+    stream: &ResponseStream,
+    transfer_id: &str,
+    timeout: Duration,
+) -> bool {
     let env = cancel_envelope(transfer_id);
     {
         let mut out = std::io::stdout().lock();
         if out.write_all(&env).is_err() || out.flush().is_err() {
-            return;
+            return false;
         }
     }
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return;
+            return false;
         }
         // Poll in short slices: the in-flight chunks arrive continuously
         // while there is buffered data, so `None` here means either a
@@ -233,7 +266,9 @@ pub fn cancel_and_drain(stream: &ResponseStream, transfer_id: &str, timeout: Dur
         // EOF (input closed — nothing more can come, so stop).
         let Some(frame) = stream.recv_timeout(remaining.min(Duration::from_millis(250))) else {
             if stream.at_eof() {
-                return;
+                // Input closed: nothing more can arrive, so there is
+                // nothing left to leak.
+                return true;
             }
             continue;
         };
@@ -253,12 +288,12 @@ pub fn cancel_and_drain(stream: &ResponseStream, transfer_id: &str, timeout: Dur
             if frame_type == vft_protocol::frame::EVT_TRANSFER_ABORTED {
                 let mut r = vft_protocol::codec::Reader::new(&body);
                 if r.string().map(|id| id == transfer_id).unwrap_or(false) {
-                    return;
+                    return true;
                 }
             } else if frame_type == vft_protocol::frame::RSP_ERR
                 && request_id == CANCEL_REQUEST_ID
             {
-                return;
+                return true;
             }
         }
     }

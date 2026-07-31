@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use vft_client::cancel::{cancel_and_drain, CancelGuard};
+use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard};
 use vft_client::probe::{run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -188,7 +188,11 @@ fn main() -> Result<()> {
                 let _ = write!(out, "cancelling transfer...\r\n");
                 let _ = out.flush();
             }
-            cancel_and_drain(&stream, &transfer_id, Duration::from_secs(30));
+            const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+            warn_if_undrained(
+                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                DRAIN_BUDGET,
+            );
             cancel.disarm();
             let _ = std::fs::remove_file(&local_path);
             if !cli.no_progress && vge_probe.is_some() {

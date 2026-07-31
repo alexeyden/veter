@@ -101,9 +101,21 @@ impl Drop for RawTty {
     fn drop(&mut self) {
         if let Some(saved) = self.saved.take() {
             use nix::sys::termios::{tcsetattr, SetArg};
+            // TCSAFLUSH, not TCSANOW: discard anything still sitting
+            // unread on the input queue as part of the restore. Once
+            // canonical mode is back the shell's line editor owns
+            // stdin, and a host frame left in the queue is delivered to
+            // it as *keystrokes* — zsh binds `ESC _` to
+            // insert-last-word and `ESC H` to run-help, so a stray VFT
+            // envelope becomes an executed command line. This only
+            // covers what is already queued; frames that arrive after
+            // we exit cannot be caught here, which is why the transfer
+            // paths drain the host before returning. Nothing legitimate
+            // is lost: the response reader owns stdin for the lifetime
+            // of the transfer, so there is no user type-ahead here.
             let _ = unsafe {
                 let borrowed = std::os::fd::BorrowedFd::borrow_raw(self.fd);
-                tcsetattr(borrowed, SetArg::TCSANOW, &saved)
+                tcsetattr(borrowed, SetArg::TCSAFLUSH, &saved)
             };
         }
     }
