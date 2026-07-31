@@ -92,6 +92,22 @@ fn run_vplace(args: &[&str]) -> Vec<u8> {
     drain(&master)
 }
 
+/// Run `vplace` and return what it printed on stdout (`--measure`).
+fn run_vplace_stdout(args: &[&str]) -> String {
+    let (_master, slave) = open_pty();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vplace"))
+        .args(args)
+        .arg("--tty")
+        .arg(&slave)
+        .env("VETER", "test")
+        .env("VETER_LIMITS", "mib=268435456,mi=1024,enc=3,nest=16,mwb=1048576")
+        .env_remove("VMUX_PANE_TTY")
+        .output()
+        .expect("spawn vplace");
+    assert!(out.status.success(), "vplace --measure failed");
+    String::from_utf8(out.stdout).expect("measure output is utf8")
+}
+
 /// Play the application, then the terminal. Returns the engine and the
 /// parser so the caller can assert against both.
 fn apply(app_output: &[u8], envelope: &[u8]) -> (VgeEngine, vt100::Parser) {
@@ -122,7 +138,40 @@ fn marker_row(parser: &vt100::Parser, needle: &str) -> u16 {
 
 #[test]
 fn image_anchors_to_the_row_below_the_marker() {
+    // The default placement, and the reason the marker row survives:
+    // the image starts *under* it, so the line the application printed
+    // stays readable as a caption.
     let dir = std::env::temp_dir().join("vplace-e2e-anchor");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("t.png");
+    tiny_png(&png, 64, 32);
+
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: t1]"]);
+    assert!(!envelope.is_empty(), "vplace wrote nothing");
+
+    // The application prints context, the marker, then a reserved gap.
+    let app = b"hello\r\nworld\r\n[IMAGE: t1] t.png\r\n\r\n\r\n\r\n\r\n".to_vec();
+    let (engine, parser) = apply(&app, &envelope);
+
+    let els = engine.state.elements();
+    let el = els
+        .get("vplace.IMAGE-t1")
+        .expect("element was not created — check the id namespace");
+
+    let expected = engine.top_of_live_screen() + i64::from(marker_row(&parser, "[IMAGE: t1]")) + 1;
+    assert_eq!(
+        el.anchor_line, expected,
+        "image must anchor one row below the marker line"
+    );
+    assert!(el.is_visible);
+}
+
+#[test]
+fn offset_y_zero_places_over_the_marker_row() {
+    // The opt-out, for a host whose renderer leaves no blank spacing
+    // row under a paragraph. Nothing hides the marker text in this
+    // mode — the image simply starts on top of it.
+    let dir = std::env::temp_dir().join("vplace-e2e-offset0");
     std::fs::create_dir_all(&dir).unwrap();
     let png = dir.join("t.png");
     tiny_png(&png, 64, 32);
@@ -130,27 +179,19 @@ fn image_anchors_to_the_row_below_the_marker() {
     let envelope = run_vplace(&[
         png.to_str().unwrap(),
         "--marker",
-        "@@IMG:t1@@",
+        "[IMAGE: z0]",
         "--offset-y",
-        "1",
+        "0",
     ]);
-    assert!(!envelope.is_empty(), "vplace wrote nothing");
-
-    // The application prints context, the marker, then a reserved gap.
-    let app = b"hello\r\nworld\r\n@@IMG:t1@@ t.png\r\n\r\n\r\n\r\n\r\n".to_vec();
+    let app = b"[IMAGE: z0] t.png\r\n\r\n\r\n\r\n".to_vec();
     let (engine, parser) = apply(&app, &envelope);
 
-    let els = engine.state.elements();
-    let el = els
-        .get("vplace.IMG-t1")
-        .expect("element was not created — check the id namespace");
-
-    let expected = engine.top_of_live_screen() + i64::from(marker_row(&parser, "@@IMG:t1@@")) + 1;
+    let el = &engine.state.elements()["vplace.IMAGE-z0"];
     assert_eq!(
-        el.anchor_line, expected,
-        "image must anchor one row below the marker line"
+        el.anchor_line,
+        engine.top_of_live_screen() + i64::from(marker_row(&parser, "[IMAGE: z0]")),
+        "--offset-y 0 must land on the marker's own row"
     );
-    assert!(el.is_visible);
 }
 
 #[test]
@@ -164,25 +205,22 @@ fn anchor_is_the_marker_row_not_the_cursor() {
     let png = dir.join("t.png");
     tiny_png(&png, 32, 32);
 
-    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:m@@"]);
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: m]"]);
 
     // Marker near the top; then many more lines, leaving the cursor far
     // below it — exactly the situation a TUI's composer creates.
-    let mut app = b"@@IMG:m@@\r\n".to_vec();
+    let mut app = b"[IMAGE: m]\r\n".to_vec();
     app.extend_from_slice(&b"filler\r\n".repeat(10));
     let (engine, parser) = apply(&app, &envelope);
 
-    let row = marker_row(&parser, "@@IMG:m@@");
+    let row = marker_row(&parser, "[IMAGE: m]");
     let cursor_row = parser.screen().cursor_position().0;
     assert_ne!(row, cursor_row, "test is meaningless if they coincide");
 
-    // No `--offset-y` here, so this also pins the default: the marker's
-    // own row. (`image_anchors_to_the_row_below_the_marker` covers the
-    // explicit-offset path.)
-    let el = &engine.state.elements()["vplace.IMG-m"];
+    let el = &engine.state.elements()["vplace.IMAGE-m"];
     assert_eq!(
         el.anchor_line,
-        engine.top_of_live_screen() + i64::from(row),
+        engine.top_of_live_screen() + i64::from(row) + 1,
         "anchored to the cursor instead of the marker"
     );
 }
@@ -198,21 +236,21 @@ fn placement_survives_scrolling_into_scrollback() {
     let png = dir.join("t.png");
     tiny_png(&png, 32, 16);
 
-    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:s@@"]);
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: s]"]);
 
-    let app = b"@@IMG:s@@\r\n\r\n\r\n\r\n".to_vec();
+    let app = b"[IMAGE: s]\r\n\r\n\r\n\r\n".to_vec();
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
     drive_terminal_stage(&mut engine, &mut parser, &app);
     drive_terminal_stage(&mut engine, &mut parser, &envelope);
 
-    let before = engine.state.elements()["vplace.IMG-s"].anchor_line;
+    let before = engine.state.elements()["vplace.IMAGE-s"].anchor_line;
 
     // Push the marker well up into scrollback.
     drive_terminal_stage(&mut engine, &mut parser, &b"scroll\r\n".repeat(40));
 
-    let after = engine.state.elements()["vplace.IMG-s"].anchor_line;
+    let after = engine.state.elements()["vplace.IMAGE-s"].anchor_line;
     assert_eq!(before, after, "anchor must not move when content scrolls");
     assert!(
         engine.top_of_live_screen() > after,
@@ -221,14 +259,15 @@ fn placement_survives_scrolling_into_scrollback() {
 }
 
 #[test]
-fn cover_rect_spans_the_pane_and_sits_under_the_image() {
-    // The cover exists to hide the tail of the marker line that the
-    // image does not reach. So it has to span the *pane*, start at the
-    // pane's left edge regardless of `--offset-x`, and be drawn before
-    // the image rather than over it.
+fn the_marker_row_is_never_painted_over() {
+    // The caption contract: the element draws the image and nothing
+    // else, so whatever the application wrote on the marker row — id,
+    // path, a human title — survives above the image. This used to be
+    // a full-width rectangle painted over that row precisely because
+    // the image landed on it.
     use vge_protocol::command::DrawCmd;
 
-    let dir = std::env::temp_dir().join("vplace-e2e-cover");
+    let dir = std::env::temp_dir().join("vplace-e2e-caption");
     std::fs::create_dir_all(&dir).unwrap();
     let png = dir.join("t.png");
     tiny_png(&png, 48, 24);
@@ -236,36 +275,29 @@ fn cover_rect_spans_the_pane_and_sits_under_the_image() {
     let envelope = run_vplace(&[
         png.to_str().unwrap(),
         "--marker",
-        "@@IMG:cv@@",
+        "[IMAGE: cv]",
         "--offset-x",
         "2",
     ]);
-    let app = b"@@IMG:cv@@ /some/rather/long/path/to/an/image.png\r\n\r\n\r\n".to_vec();
-    let (engine, _parser) = apply(&app, &envelope);
-    let el = &engine.state.elements()["vplace.IMG-cv"];
+    let caption = "[IMAGE: cv] /some/rather/long/path/to/an/image.png";
+    let app = format!("{caption}\r\n\r\n\r\n").into_bytes();
+    let (engine, parser) = apply(&app, &envelope);
+    let el = &engine.state.elements()["vplace.IMAGE-cv"];
 
     assert_eq!(el.origin_x, 2.0, "--offset-x must indent the element");
-    match &el.commands[0] {
-        DrawCmd::FillRectangles { rects, .. } => {
-            let r = rects[0];
-            assert_eq!(r.x, -2.0, "cover must start at the pane edge, not the indent");
-            assert_eq!(r.w, COLS as f32, "cover must span the full pane width");
-            assert_eq!(r.h, 1.0, "cover is exactly the marker's row");
-        }
-        other => panic!("expected the cover rect first, got {other:?}"),
-    }
+    assert_eq!(el.commands.len(), 1, "the element must draw the image alone");
     assert!(
-        matches!(el.commands[1], DrawCmd::DrawImage { .. }),
-        "image must be drawn after the cover so it lands on top"
+        matches!(el.commands[0], DrawCmd::DrawImage { .. }),
+        "expected a lone DrawImage, got {:?}",
+        el.commands[0]
     );
 
-    // And --no-cover must leave the row alone.
-    let plain = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:nc@@", "--no-cover"]);
-    let app2 = b"@@IMG:nc@@ x\r\n\r\n\r\n".to_vec();
-    let (e2, _) = apply(&app2, &plain);
+    // The image starts strictly below the caption's row, so no part of
+    // the element overlaps the text.
+    let row = marker_row(&parser, "[IMAGE: cv]");
     assert!(
-        matches!(e2.state.elements()["vplace.IMG-nc"].commands[0], DrawCmd::DrawImage { .. }),
-        "--no-cover must emit the image alone"
+        el.anchor_line > engine.top_of_live_screen() + i64::from(row),
+        "element must begin below the caption row"
     );
 }
 
@@ -283,11 +315,11 @@ fn a_tall_image_is_scaled_to_fit_instead_of_overrunning() {
     // ~200 rows unclamped.
     tiny_png(&png, 400, 4000);
 
-    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:tall@@"]);
-    let app = b"@@IMG:tall@@\r\n\r\n\r\n".to_vec();
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: tall]"]);
+    let app = b"[IMAGE: tall]\r\n\r\n\r\n".to_vec();
     let (engine, _parser) = apply(&app, &envelope);
 
-    let el = &engine.state.elements()["vplace.IMG-tall"];
+    let el = &engine.state.elements()["vplace.IMAGE-tall"];
     let h = match el.commands.iter().find_map(|c| match c {
         DrawCmd::DrawImage { target_rect, .. } => Some(target_rect.h),
         _ => None,
@@ -316,13 +348,13 @@ fn max_rows_is_honoured_and_preserves_aspect() {
     let envelope = run_vplace(&[
         png.to_str().unwrap(),
         "--marker",
-        "@@IMG:mr@@",
+        "[IMAGE: mr]",
         "--max-rows",
         "4",
     ]);
-    let app = b"@@IMG:mr@@\r\n\r\n\r\n".to_vec();
+    let app = b"[IMAGE: mr]\r\n\r\n\r\n".to_vec();
     let (engine, _parser) = apply(&app, &envelope);
-    let el = &engine.state.elements()["vplace.IMG-mr"];
+    let el = &engine.state.elements()["vplace.IMAGE-mr"];
 
     let rect = el
         .commands
@@ -352,10 +384,10 @@ fn clear_sweeps_only_this_tools_namespace() {
     let png = dir.join("t.png");
     tiny_png(&png, 16, 16);
 
-    let place = run_vplace(&[png.to_str().unwrap(), "--marker", "@@IMG:c@@"]);
+    let place = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: c]"]);
     let clear = run_vplace(&["--clear"]);
 
-    let app = b"@@IMG:c@@\r\n\r\n\r\n".to_vec();
+    let app = b"[IMAGE: c]\r\n\r\n\r\n".to_vec();
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
@@ -380,15 +412,72 @@ fn clear_sweeps_only_this_tools_namespace() {
         vge_protocol::frame::REQ_ID_NO_RESPONSE,
     )]);
     drive_terminal_stage(&mut engine, &mut parser, &foreign);
-    assert!(engine.state.elements().contains_key("vplace.IMG-c"));
+    assert!(engine.state.elements().contains_key("vplace.IMAGE-c"));
 
     drive_terminal_stage(&mut engine, &mut parser, &clear);
     assert!(
-        !engine.state.elements().contains_key("vplace.IMG-c"),
+        !engine.state.elements().contains_key("vplace.IMAGE-c"),
         "--clear must remove this tool's elements"
     );
     assert!(
         engine.state.elements().contains_key("otherapp.keepme"),
         "--clear must not touch another client's ids"
+    );
+}
+
+#[test]
+fn measure_reports_the_gap_the_image_actually_fills() {
+    // The invariant tying `--measure` to the placement: the image
+    // starts on the *first* reserved row, so the blank-line count an
+    // application is told to reserve is the image's height exactly.
+    // Off by one here overruns the gap and paints over the paragraph
+    // below — and nothing on either side can notice, which is why this
+    // is pinned rather than left to the two call sites agreeing.
+    use vge_protocol::command::DrawCmd;
+
+    let dir = std::env::temp_dir().join("vplace-e2e-measure");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("m.png");
+    tiny_png(&png, 400, 200);
+
+    let out = run_vplace_stdout(&[png.to_str().unwrap(), "--measure", "--max-rows", "9"]);
+    let field = |k: &str| -> u32 {
+        out.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(k)?.parse().ok())
+            .unwrap_or_else(|| panic!("no {k} in {out:?}"))
+    };
+    let rows = field("rows=");
+    let gap = field("fence_blank_lines=");
+    assert_eq!(
+        gap, rows,
+        "an application reserving `fence_blank_lines` rows must get exactly the image's height"
+    );
+
+    // And the placed image really is that tall: within the gap, and not
+    // a whole row short of it either.
+    let envelope = run_vplace(&[
+        png.to_str().unwrap(),
+        "--marker",
+        "[IMAGE: ms]",
+        "--max-rows",
+        "9",
+    ]);
+    let app = b"[IMAGE: ms] m.png\r\n\r\n\r\n".to_vec();
+    let (engine, _parser) = apply(&app, &envelope);
+    let h = engine.state.elements()["vplace.IMAGE-ms"]
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCmd::DrawImage { target_rect, .. } => Some(target_rect.h),
+            _ => None,
+        })
+        .expect("no DrawImage");
+    assert!(
+        h <= gap as f32,
+        "image is {h} rows but the message reserves {gap}"
+    );
+    assert!(
+        h > gap as f32 - 1.0,
+        "image is {h} rows in a {gap}-row gap — a whole row is wasted"
     );
 }

@@ -24,6 +24,10 @@
 //!
 //! The terminal owns the grid, so it resolves the marker to a row. We
 //! never need to know where the cursor is.
+//!
+//! The marker's own row is left untouched — the image starts one row
+//! below it — so a marker written to be read (`[IMAGE: chart1]
+//! /path/chart.png`) doubles as the image's caption.
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -33,7 +37,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
-    Color, Command, CreateElementBody, DrawCmd, OriginAnchor, Retention, Style,
+    Command, CreateElementBody, DrawCmd, OriginAnchor, Retention,
     UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
@@ -80,13 +84,13 @@ struct Args {
 
     /// Rows below the marker to place at.
     ///
-    /// The default of `0` puts the image on the first row *after* the
-    /// marker's line, not on the marker itself: a markdown renderer
-    /// leaves a blank spacing row between a paragraph and the fenced
-    /// block under it, and that row is the top of the usable gap.
-    /// Measured against Claude Code's renderer — raise it by one if a
-    /// host leaves no such spacing row.
-    #[arg(long, default_value_t = 0.0)]
+    /// The default of `1` puts the image on the row *after* the
+    /// marker's, leaving the marker line itself readable as a caption
+    /// above the image. That row is also the first the application
+    /// reserved, so an `n`-row image at this offset fills exactly the
+    /// `n` rows a fence of `n` blank lines gives it (see `--measure`).
+    /// Drop it to `0` to place over the marker row instead.
+    #[arg(long, default_value_t = 1.0)]
     offset_y: f32,
 
     /// Columns to indent the image by, so it lines up with text the
@@ -106,23 +110,6 @@ struct Args {
     /// two thirds of the pane's height.
     #[arg(long)]
     max_rows: Option<u32>,
-
-    /// Leave the marker's own row visible.
-    ///
-    /// By default a full-width rectangle is painted over that row
-    /// first, because at the default `--offset-y` the image lands on
-    /// the marker line and hides only the part behind it — the tail of
-    /// a long path keeps showing past the image's right edge. Pass
-    /// this when the marker row holds something worth reading.
-    #[arg(long)]
-    no_cover: bool,
-
-    /// Colour of that rectangle, `#rrggbb`. Defaults to veter's
-    /// terminal background (`veter/src/main.rs` clears to rgb 30,30,30),
-    /// which is what makes the covered row look empty rather than
-    /// patched.
-    #[arg(long, default_value = "#1e1e1e")]
-    cover_color: String,
 
     /// Target tty. Defaults to `$VMUX_PANE_TTY`, then `/dev/tty`.
     #[arg(long)]
@@ -144,14 +131,11 @@ struct Args {
     clear: bool,
 }
 
-/// Extra rendered rows a fenced code block costs beyond the blank lines
-/// inside it, in Claude Code's markdown renderer: six blank body lines
-/// were measured to render as seven blank rows.
-///
-/// This is a property of one renderer, not of the terminal, which is
-/// why it only shows up in `--measure`'s advisory output and nowhere in
-/// the placement path.
-const FENCE_OVERHEAD_ROWS: u32 = 1;
+/// WebP quality for the out-of-band path, on the encoder's 0..=100
+/// scale. Matches `vplay`'s choice: the bytes cross a `WritePortal`
+/// relay, so payload size matters more here than encode time, but not
+/// enough to justify visible artefacts.
+const WEBP_QUALITY: f32 = 85.0;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -199,11 +183,15 @@ fn main() -> Result<()> {
     if args.measure {
         // stdout only, one `key=value` line, so a caller can read it
         // without parsing prose.
+        // A fence of N blank lines renders as N blank rows, the first
+        // of them directly under the marker — which is exactly where
+        // the default `--offset-y 1` starts drawing. So the image's
+        // height *is* the blank-line count, one for one. (It used to be
+        // one less, back when the image started on the marker's own row
+        // and spent it as the first of its rows.)
         println!(
             "rows={} cols={} fence_blank_lines={}",
-            placement.h_cells,
-            placement.w_cells,
-            placement.h_cells.saturating_sub(FENCE_OVERHEAD_ROWS).max(1),
+            placement.h_cells, placement.w_cells, placement.h_cells,
         );
         return Ok(());
     }
@@ -279,25 +267,10 @@ fn main() -> Result<()> {
         )]));
     }
 
-    // Command order is draw order: the cover goes down first so the
-    // image sits on top of it rather than behind.
-    let mut commands = Vec::new();
-    if !args.no_cover {
-        commands.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(parse_hex(&args.cover_color)?),
-            rects: vec![Rect {
-                // Element-local coordinates: the origin sits at
-                // `offset_x` columns in and on the anchored row, so
-                // `-offset_x` is the pane's left edge and `-offset_y`
-                // is the marker's own row whatever the offset.
-                x: -args.offset_x,
-                y: -args.offset_y,
-                w: caps.cols as f32,
-                h: 1.0,
-            }],
-        });
-    }
-    commands.push(DrawCmd::DrawImage {
+    // The marker's row is left alone: at the default `--offset-y` the
+    // image starts below it, so the line the application printed stays
+    // readable as a caption above its image.
+    let commands = vec![DrawCmd::DrawImage {
         target_rect: Rect {
             x: 0.0,
             y: 0.0,
@@ -306,7 +279,7 @@ fn main() -> Result<()> {
         },
         image_id: img_id,
         source_rect: None,
-    });
+    }];
 
     out.extend(build_envelope(&[(
         Command::CreateElement(CreateElementBody {
@@ -420,7 +393,11 @@ impl Caps {
             // `WritePortal` payload, so payload size costs more here
             // than encode time does.
             encoding: if supported & 0x02 != 0 {
-                Encoding::WebpLossy(0.85)
+                // Quality is 0..=100 (see `Encoding::WebpLossy`), not a
+                // 0..=1 fraction — a value like 0.85 is legal, passes
+                // the encoder's range check, and quietly produces the
+                // worst image WebP can make.
+                Encoding::WebpLossy(WEBP_QUALITY)
             } else {
                 Encoding::Raw
             },
@@ -481,16 +458,6 @@ fn fit_placement(
     }
 }
 
-/// Parse `#rrggbb` (or bare `rrggbb`) into a VGE colour.
-fn parse_hex(s: &str) -> Result<Color> {
-    let h = s.trim().trim_start_matches('#');
-    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("colour must be #rrggbb, got {s:?}");
-    }
-    let v = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap() as f32 / 255.0;
-    Ok(Color { r: v(0), g: v(2), b: v(4), a: 1.0 })
-}
-
 /// One `key=value` from `$VETER_LIMITS`. Unknown keys are ignored by
 /// construction and an unparseable value reads as absent, so the caller
 /// falls back to the §11 default rather than to zero.
@@ -505,10 +472,17 @@ fn limit(limits: &str, key: &str) -> Option<u64> {
 /// Derive a stable, id-safe slug from a marker so repeated placements
 /// under the same marker reuse one id instead of piling up.
 fn slugify(marker: &str) -> String {
-    let s: String = marker
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let mut s = String::with_capacity(marker.len());
+    for c in marker.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            // Runs collapse: a readable marker like `[IMAGE: chart1]`
+            // has punctuation-plus-space stretches, and `IMAGE--chart1`
+            // reads worse than `IMAGE-chart1` for no benefit.
+            s.push('-');
+        }
+    }
     let s = s.trim_matches('-').to_string();
     // Element ids are capped at 64 bytes (§6.8) and the namespace
     // prefix eats into that.
@@ -521,7 +495,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn webp_quality_is_on_the_hundred_scale() {
+        // `Encoding::WebpLossy` takes 0..=100, and the encoder's range
+        // check accepts anything in it — so a fraction like 0.85, meant
+        // as "85%", is legal and silently produces the worst image WebP
+        // can make. The only guard is knowing the scale.
+        assert!(
+            (50.0..=100.0).contains(&WEBP_QUALITY),
+            "WEBP_QUALITY is {WEBP_QUALITY} — a 0..=1 fraction slipped in?"
+        );
+    }
+
+    #[test]
     fn slug_is_id_safe_and_bounded() {
+        assert_eq!(slugify("[IMAGE: chart1]"), "IMAGE-chart1");
         assert_eq!(slugify("@@IMG:a1@@"), "IMG-a1");
         assert_eq!(slugify("⟦IMG:x⟧"), "IMG-x");
         let long = slugify(&"a".repeat(200));
@@ -534,8 +521,8 @@ mod tests {
         // the trailing byte must not become part of the substring the
         // terminal searches for, or nothing ever matches.
         let p = std::env::temp_dir().join("vplace-marker-test");
-        std::fs::write(&p, "@@IMG:x1@@\nignored\n").unwrap();
-        assert_eq!(resolve_marker(None, Some(&p)).unwrap(), "@@IMG:x1@@");
+        std::fs::write(&p, "[IMAGE: x1]\nignored\n").unwrap();
+        assert_eq!(resolve_marker(None, Some(&p)).unwrap(), "[IMAGE: x1]");
 
         std::fs::write(&p, "   \n").unwrap();
         assert!(
@@ -547,8 +534,8 @@ mod tests {
     #[test]
     fn inline_marker_wins_and_is_trimmed() {
         assert_eq!(
-            resolve_marker(Some("  @@IMG:y@@ ".into()), None).unwrap(),
-            "@@IMG:y@@"
+            resolve_marker(Some("  [IMAGE: y] ".into()), None).unwrap(),
+            "[IMAGE: y]"
         );
     }
 
