@@ -1,7 +1,7 @@
 // Client-side command body encoders (§3, §6, §7, §9).
 //
 // Mirrors the decoders in `command.rs` so commands can be round-tripped
-// in tests and emitted by the prt-cli helper.
+// in tests and emitted by vproto.
 
 use crate::codec::Writer;
 use crate::command::{

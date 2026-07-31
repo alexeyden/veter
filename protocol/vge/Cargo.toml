@@ -4,4 +4,16 @@ version = "0.1.0"
 edition = "2024"
 description = "VGE (Vector Graphics Extension) wire format: APC envelope, codec, command parser/encoder."
 
+# Optional JSON faces, both default-off so the wire crates stay
+# dependency-free for every existing consumer. `vproto` turns them on to
+# read commands as JSON and to emit a schema; nothing else does. Neither
+# adds state or I/O — they are alternative representations of the same
+# types the binary codec already covers.
+[features]
+default = []
+serde = ["dep:serde"]
+schemars = ["dep:schemars", "serde"]
+
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+schemars = { version = "1", optional = true }

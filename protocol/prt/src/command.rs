@@ -4,6 +4,8 @@ use super::codec::{DecodeError, DecodeResult, Reader};
 use super::frame::*;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum AnchorMode {
     Live,
     Scrollback,
@@ -27,12 +29,16 @@ impl AnchorMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum FocusTarget {
     Host,
     Portal(String),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum CursorStyle {
     Hidden,
     Hollow,
@@ -59,6 +65,8 @@ impl CursorStyle {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CreatePortalBody {
     pub id: String,
     pub size_w: u32,
@@ -74,6 +82,8 @@ pub struct CreatePortalBody {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UpdateOriginBody {
     pub id: String,
     pub new_origin_x: i32,
@@ -84,6 +94,8 @@ pub struct UpdateOriginBody {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WritePortalBody {
     pub id: String,
     pub data: Vec<u8>,
@@ -91,6 +103,8 @@ pub struct WritePortalBody {
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Command {
     Probe,
     CreatePortal(CreatePortalBody),

@@ -6,12 +6,16 @@ use super::frame::{
 };
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Point {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -24,6 +28,8 @@ pub struct Rect {
 /// part acts on the element's rendered pixel geometry; the
 /// translation `(e, f)` is in cell units.
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Transform {
     pub a: f32,
     pub b: f32,

@@ -10,6 +10,8 @@ use super::frame::*;
 use super::path::{read_path_segments, PathSegment};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Color {
     pub r: f32,
     pub g: f32,
@@ -18,6 +20,8 @@ pub struct Color {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Style {
     Flat(Color),
     LinearGradient {
@@ -38,6 +42,8 @@ pub enum Style {
 /// A style that can live in the global style table — Style minus Ref.
 /// SetGlobalStyle uses this so "no nested refs" is a type-level invariant.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum ConcreteStyle {
     Flat(Color),
     LinearGradient {
@@ -102,6 +108,8 @@ impl ConcreteStyle {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Align {
     Left,
     Center,
@@ -109,6 +117,8 @@ pub enum Align {
 }
 
 #[derive(Debug, Copy, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct FontStyle(pub u8);
 
 impl FontStyle {
@@ -132,6 +142,8 @@ impl FontStyle {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum DrawCmd {
     FillRectangles {
         fill: Style,
@@ -211,6 +223,8 @@ pub enum DrawCmd {
 /// other two modes let it name a position the terminal resolves on its
 /// behalf.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum OriginAnchor {
     /// Default (no flag bit): `origin.y` is relative to the top of the
     /// live screen at command-processing time.
@@ -229,6 +243,8 @@ pub enum OriginAnchor {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct CreateElementBody {
     pub id: String, // empty = anonymous
     pub commands: Vec<DrawCmd>,
@@ -247,12 +263,16 @@ pub struct CreateElementBody {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UpdateCommandsBody {
     pub id: String,
     pub commands: Vec<DrawCmd>,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UpdateCommandBody {
     pub id: String,
     pub index: usize,
@@ -260,12 +280,16 @@ pub struct UpdateCommandBody {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum UpdateTextRange {
     Whole,
     Range { start: usize, end: usize },
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UpdateTextBody {
     pub id: String,
     pub command_index: usize,
@@ -275,6 +299,8 @@ pub struct UpdateTextBody {
 
 /// Image lifetime policy (§8.2), chosen by the uploader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Retention {
     /// Reference-counted: the terminal drops the image automatically once
     /// no element draws it — i.e. the moment its reference count falls to
@@ -311,6 +337,8 @@ impl Retention {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UploadImageBody {
     pub id: String,
     /// 0x01 Raw, 0x02 WebP. Kept as raw u8 here so the engine can
@@ -339,6 +367,8 @@ pub struct UploadImageBody {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct UpdateImageBody {
     pub id: String,
     pub command_index: usize,
@@ -349,6 +379,8 @@ pub struct UpdateImageBody {
 // "variant ends with enum name" pattern is unavoidable.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Command {
     Probe,
     CreateElement(CreateElementBody),

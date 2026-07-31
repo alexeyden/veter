@@ -6,6 +6,8 @@ use super::frame::*;
 
 /// Client → host commands (marker `SES`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum Command {
     /// "Are you a session, and what is your name?" Empty body.
     Probe,
@@ -42,6 +44,8 @@ impl Command {
 /// Host → client responses (marker `ses`). Every command yields
 /// exactly one response, with the command's `request_id` echoed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum HostFrame {
     /// Command succeeded.
     Ok,

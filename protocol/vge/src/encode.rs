@@ -1,5 +1,5 @@
 // Command encoders — the inverse of command::parse. Used by clients
-// (and the vge-cli test harness) to produce wire bytes from typed
+// (and vproto's round-trip tests) to produce wire bytes from typed
 // commands. Each encoder produces just the *body*; pair with
 // `frame_type_for(...)` and `envelope::append_frame` /
 // `envelope::wrap_c2t_envelope` to get a full PTY-ready envelope.

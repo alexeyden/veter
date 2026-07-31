@@ -10,6 +10,8 @@ use std::f32::consts::{PI, TAU};
 use super::codec::{DecodeError, DecodeResult, Point, Reader};
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum PathNode {
     LineTo {
         dst: Point,
@@ -46,6 +48,8 @@ pub enum PathNode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct PathSegment {
     pub start: Point,
     pub nodes: Vec<PathNode>,

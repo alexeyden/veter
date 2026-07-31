@@ -1,7 +1,7 @@
 // APC envelope wrapping (§1.1–1.2) for both directions, plus host-side
 // body builders for ProbeResponse, Err, and every event in §8.
 
-use crate::codec::{stuff, Writer};
+use crate::codec::{Reader, stuff, Writer};
 use crate::frame::*;
 
 /// Build the body for a ProbeResponse (§2.1).
@@ -11,6 +11,8 @@ use crate::frame::*;
 /// source of truth, so omitting it (`None`) is equivalent to advertising
 /// "VGE-in-portal not supported" — clients reading a shorter body MUST
 /// treat missing trailing fields as zero.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProbeBody {
     pub protocol_version: u16,
     pub max_portals: u32,
@@ -52,6 +54,43 @@ impl ProbeBody {
             }
         }
         w.buf
+    }
+
+    /// Inverse of [`Self::encode`]. `vge_features` and `accent_rgba`
+    /// are positional tail fields, so a body that stops early decodes
+    /// with them `None` rather than failing — which is exactly how a
+    /// host that predates them replies.
+    pub fn decode(body: &[u8]) -> Result<Self, crate::codec::DecodeError> {
+        let mut r = Reader::new(body);
+        let protocol_version = r.u16()?;
+        let max_portals = r.u32()?;
+        let max_portal_cells_w = r.u32()?;
+        let max_portal_cells_h = r.u32()?;
+        let max_scrollback_lines = r.u32()?;
+        let max_write_bytes = r.u32()?;
+        let features = r.u8()?;
+        let max_nesting_depth = r.u8()?;
+        let vge_features = r.u8().ok();
+        let accent_rgba = if vge_features.is_some() {
+            match (r.u8(), r.u8(), r.u8(), r.u8()) {
+                (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            protocol_version,
+            max_portals,
+            max_portal_cells_w,
+            max_portal_cells_h,
+            max_scrollback_lines,
+            max_write_bytes,
+            features,
+            max_nesting_depth,
+            vge_features,
+            accent_rgba,
+        })
     }
 }
 

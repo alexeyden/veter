@@ -1,10 +1,12 @@
 // APC envelope wrapping (§1.1–1.2) for both directions, plus
 // per-response body builders (ProbeResponse, Err).
 
-use crate::codec::{stuff, Writer};
+use crate::codec::{Reader, stuff, Writer};
 use crate::frame::*;
 
 /// Build the body for a ProbeResponse (§2.1).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProbeBody {
     pub protocol_version: u16,
     pub cell_pixel_width: u16,
@@ -36,6 +38,26 @@ impl ProbeBody {
         w.u8(self.max_nesting_depth);
         w.buf
     }
+
+    /// Inverse of [`Self::encode`]. Fields added after v0 are optional
+    /// on the wire, so a short body from an older host decodes with
+    /// those left at their defaults rather than failing.
+    pub fn decode(body: &[u8]) -> Result<Self, crate::codec::DecodeError> {
+        let mut r = Reader::new(body);
+        Ok(Self {
+            protocol_version: r.u16()?,
+            cell_pixel_width: r.u16()?,
+            cell_pixel_height: r.u16()?,
+            scale_factor: r.f32()?,
+            max_elements: r.u32()?,
+            max_commands_per_element: r.u32()?,
+            max_text_bytes: r.u32()?,
+            max_image_bytes: r.u32()?,
+            max_images: r.u32()?,
+            supported_image_encodings: r.u8()?,
+            max_nesting_depth: r.u8().unwrap_or(0),
+        })
+    }
 }
 
 /// Build the body for an Err response (§4).
@@ -49,6 +71,8 @@ pub fn err_body(error_code: u16, message: &str) -> Vec<u8> {
 /// Body for a ChunkAck response (§4). Emitted by the host after it
 /// absorbs each `UploadImage` chunk, so the sender can show real
 /// upload progress instead of guessing from the local stdout pipe.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ChunkAckBody<'a> {
     pub image_id: &'a str,
     /// Cumulative bytes received for this image id so far (this chunk
