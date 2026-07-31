@@ -666,6 +666,22 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// The visible row at `row` as a cell slice, or an empty slice when
+    /// `row` is past the bottom of the grid.
+    ///
+    /// `cell` re-derives the visible-row iterator on every call, so
+    /// fingerprinting a whole grid through it costs one iterator walk
+    /// per *cell*. Callers that read a row end to end — the PRT
+    /// activity heuristic, `doc/portal-extension.md` §8.10 — take one
+    /// walk per *row* through this instead. Indexing the returned slice
+    /// by column is equivalent to `cell(row, col)`.
+    #[must_use]
+    pub fn visible_row_cells(&self, row: u16) -> &[crate::Cell] {
+        self.grid()
+            .visible_row(row)
+            .map_or(&[][..], crate::row::Row::cells_slice)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {

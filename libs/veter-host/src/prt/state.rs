@@ -260,7 +260,32 @@ pub struct PrtEngine {
     /// engine spawned in this scope so a `vsend` inside a nested
     /// portal reaches the same renderer as one on the host screen.
     vft_hooks: crate::vft::Hooks,
+    /// Floor on the interval between two §8.10 damage-rule evaluations
+    /// for the same portal. See `DEFAULT_DAMAGE_MIN_INTERVAL`. Zero
+    /// disables the rate limit (evaluate on every eligible write),
+    /// which is what the damage-rule unit tests want. Inherited by
+    /// sub-engines.
+    damage_min_interval: std::time::Duration,
 }
+
+/// Default floor between §8.10 damage-rule evaluations for one portal.
+///
+/// The rule's second half fingerprints the whole visible grid, so its
+/// cost is O(rows x cols) *per `WritePortal`* — independent of how many
+/// bytes the write carried. vmux emits one `WritePortal` per pty
+/// `read()`, so a pane streaming output drives it as fast as the reads
+/// come, and six such panes saturated a core.
+///
+/// Rate-limiting it is explicitly sanctioned: §8.10 says a host "MAY
+/// drop that fingerprint whenever it likes ... at the cost of one
+/// missed detection round while it is re-established". The cheap first
+/// half of the heuristic (a committed line) is unaffected and still
+/// runs on every write, so ordinary scrolling output still lights a
+/// pane up immediately. What this bounds is the in-place-repaint scan,
+/// where 20 Hz is far finer than the "background pane has new output"
+/// marker it feeds.
+pub const DEFAULT_DAMAGE_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 impl PrtEngine {
     /// Construct the host's top-level PRT engine with default cell
@@ -347,7 +372,16 @@ impl PrtEngine {
             pending_clipboard_writes: Vec::new(),
             vft_wakeup,
             vft_hooks,
+            damage_min_interval: DEFAULT_DAMAGE_MIN_INTERVAL,
         }
+    }
+
+    /// Override the §8.10 damage-rule rate limit. `Duration::ZERO`
+    /// evaluates the rule on every eligible write. Set on the
+    /// top-level engine after construction, like [`Self::set_vft_hooks`];
+    /// sub-engines spawned afterwards inherit it.
+    pub fn set_damage_min_interval(&mut self, interval: std::time::Duration) {
+        self.damage_min_interval = interval;
     }
 
     /// Install the host's desktop hooks for VFT (§7.1 file picker,
@@ -385,11 +419,11 @@ impl PrtEngine {
 
     /// Build a fresh child PrtEngine sized like one of this engine's
     /// portals (one nesting level deeper), inheriting `Limits`,
-    /// `cell_px`, `scale_factor`, and the VFT wakeup and hooks. Used by the
-    /// snapshot decoder before recursively populating the child's
-    /// state.
+    /// `cell_px`, `scale_factor`, the damage-rule rate limit, and the
+    /// VFT wakeup and hooks. Used by the snapshot decoder before
+    /// recursively populating the child's state.
     pub(in crate::prt) fn child_engine_scaffold(&self) -> Self {
-        Self::with_all(
+        let mut child = Self::with_all(
             self.limits,
             self.depth + 1,
             self.cell_px,
@@ -397,7 +431,9 @@ impl PrtEngine {
             self.vft_wakeup.clone(),
             self.vft_hooks.clone(),
             self.host_palette.clone(),
-        )
+        );
+        child.damage_min_interval = self.damage_min_interval;
+        child
     }
 
     /// Build a fresh per-portal VFT engine carrying this engine's
@@ -1102,7 +1138,7 @@ impl PrtEngine {
                 anchor_line: self.top_of_live_screen + i64::from(b.origin_y),
             },
         };
-        let child_engine = PrtEngine::with_all(
+        let mut child_engine = PrtEngine::with_all(
             self.limits,
             self.depth + 1,
             self.cell_px,
@@ -1111,6 +1147,7 @@ impl PrtEngine {
             self.vft_hooks.clone(),
             self.host_palette.clone(),
         );
+        child_engine.damage_min_interval = self.damage_min_interval;
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
         // §10 + §13.4 — leave PRT as the sole DSR responder inside the
         // portal so an inner `\x1b[6n` produces exactly one reply.
@@ -1149,6 +1186,7 @@ impl PrtEngine {
             pre_attach_backup: None,
             state_cache: initial_cache,
             damage_baseline: None,
+            last_damage_eval: None,
             pending_cursor_queries: 0,
         };
         set.portals.insert(b.id, portal);
@@ -1297,7 +1335,11 @@ impl PrtEngine {
     ///
     /// Suppressed on the alt screen for the same reason the event is
     /// (§8.10: full-screen TUIs run there and repaint constantly).
-    fn portal_activity(portal: &mut Portal, committed_line: bool) -> bool {
+    fn portal_activity(
+        portal: &mut Portal,
+        committed_line: bool,
+        min_interval: std::time::Duration,
+    ) -> bool {
         /// Rows an in-place update may rewrite without counting as new
         /// output. Two, not one: a status line paired with a counter or
         /// hint line below it is still one logical widget ticking.
@@ -1307,12 +1349,30 @@ impl PrtEngine {
             portal.damage_baseline = None;
             return committed_line;
         }
-        let now = RowDamage::from_screen(portal.vt.screen());
+        // Rate-limit the rescan (§8.10 permits dropping the
+        // fingerprint at will). Deliberately *not* reset on the cheap
+        // path above: this stamps when the expensive scan last ran, so
+        // a portal alternating scrolling and in-place writes is capped
+        // just the same. Skipping leaves `damage_baseline` untouched,
+        // so the next scan diffs against the last one it took and the
+        // changes made in between still count — a skipped round defers
+        // detection, it does not lose it.
+        if !min_interval.is_zero() {
+            let at = std::time::Instant::now();
+            if portal
+                .last_damage_eval
+                .is_some_and(|last| at.duration_since(last) < min_interval)
+            {
+                return false;
+            }
+            portal.last_damage_eval = Some(at);
+        }
+        let fresh = RowDamage::from_screen(portal.vt.screen());
         let changed = portal
             .damage_baseline
             .as_ref()
-            .and_then(|prev| now.changed_rows(prev));
-        portal.damage_baseline = Some(now);
+            .and_then(|prev| fresh.changed_rows(prev));
+        portal.damage_baseline = Some(fresh);
         changed.is_some_and(|n| n > MAX_IN_PLACE_ROWS)
     }
 
@@ -1333,6 +1393,8 @@ impl PrtEngine {
         // We collect everything into locals inside a borrow scope, then
         // emit events on `self` after the borrow ends — `emit_event`
         // takes `&mut self` and would otherwise alias.
+        // Read before the borrow scope below takes `self.state` mutably.
+        let damage_min_interval = self.damage_min_interval;
         let (raw_events, old_cache, new_cache, reverse_bytes, activity) = {
             let portal = self
                 .state
@@ -1470,7 +1532,8 @@ impl PrtEngine {
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
             let committed_line = portal.vt.screen().scroll_committed() != scroll_before
                 || cursor_row_after > cursor_row_before;
-            let activity = Self::portal_activity(portal, committed_line);
+            let activity =
+                Self::portal_activity(portal, committed_line, damage_min_interval);
             let raw_events = std::mem::take(&mut portal.vt.callbacks_mut().events);
 
             // 4. Re-read the children engine's line origin from the
@@ -2630,8 +2693,22 @@ mod tests {
     /// Bring a portal to the steady state the damage rule needs: a
     /// frame on screen and a fingerprint of it recorded. Returns the
     /// engine with portal "p" ready for the write under test.
+    ///
+    /// The damage-rule rate limit is off, so tests of the *rule* see it
+    /// evaluated on every write rather than silently passing because
+    /// the write landed inside a rate-limit window.
     fn portal_painting_in_place(height: usize) -> PrtEngine {
+        portal_painting_in_place_with_limit(height, std::time::Duration::ZERO)
+    }
+
+    /// `portal_painting_in_place` with an explicit rate limit, for the
+    /// test that exercises the limit itself.
+    fn portal_painting_in_place_with_limit(
+        height: usize,
+        damage_min_interval: std::time::Duration,
+    ) -> PrtEngine {
         let mut engine = PrtEngine::new();
+        engine.set_damage_min_interval(damage_min_interval);
         let _ = create_and_write(&mut engine, "p", 20, 12, &in_place_frame(height, 'a'));
         // The first quiet write only establishes the baseline — there
         // is nothing to diff against before it.
@@ -2691,6 +2768,44 @@ mod tests {
         let act = first_event(&frames, EVT_PORTAL_ACTIVITY).unwrap();
         let mut r = Reader::new(&act.body);
         assert_eq!(r.string().unwrap(), "p");
+    }
+
+    #[test]
+    fn damage_rule_is_rate_limited_per_portal() {
+        // The damage rescan is O(rows x cols) per WritePortal, so it is
+        // rate-limited (§8.10 permits dropping the fingerprint at
+        // will). Inside the window an in-place repaint carrying new
+        // content is not scanned and reports nothing; once the window
+        // passes the same shape of repaint is seen again.
+        //
+        // The skipped round defers detection rather than losing it: the
+        // suppressed write leaves the baseline alone, so the later scan
+        // still diffs against the frame from before the skip.
+        let interval = std::time::Duration::from_millis(25);
+        let mut engine = portal_painting_in_place_with_limit(8, interval);
+
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(8, 'b'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 4, &body);
+        assert_eq!(
+            event_count(&frames, EVT_PORTAL_ACTIVITY),
+            0,
+            "repaint inside the rate-limit window must not be scanned"
+        );
+
+        std::thread::sleep(interval * 3);
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".to_string(),
+            data: in_place_frame(8, 'c'),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 5, &body);
+        assert_eq!(
+            event_count(&frames, EVT_PORTAL_ACTIVITY),
+            1,
+            "once the window passes the repaint must be seen"
+        );
     }
 
     #[test]

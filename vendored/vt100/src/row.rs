@@ -33,6 +33,12 @@ impl Row {
         self.cells.iter()
     }
 
+    /// This row's cells as a slice, for consumers that read a row end
+    /// to end and want O(1) indexing rather than one `get` per cell.
+    pub fn cells_slice(&self) -> &[crate::Cell] {
+        &self.cells
+    }
+
     pub fn get(&self, col: u16) -> Option<&crate::Cell> {
         self.cells.get(usize::from(col))
     }

@@ -116,13 +116,24 @@ impl RowDamage {
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
     /// FNV-1a over each visible row's cell contents.
+    ///
+    /// Reads each row as a slice rather than calling `Screen::cell` per
+    /// cell: `cell` rebuilds the visible-row iterator on every call, so
+    /// going through it costs one iterator walk per cell instead of one
+    /// per row. Same fingerprint either way — `visible_row_cells(r)[c]`
+    /// is `cell(r, c)` — but ~4.7x cheaper on a 60x240 grid (289us ->
+    /// 61us), which matters because this runs on every non-scrolling
+    /// `WritePortal`.
     pub fn from_screen(screen: &Screen) -> Self {
         let (rows, cols) = screen.size();
         let hashes = (0..rows)
             .map(|r| {
+                let cells = screen.visible_row_cells(r);
                 let mut h = Self::FNV_OFFSET;
                 for c in 0..cols {
-                    let contents = screen.cell(r, c).map_or("", vt100::Cell::contents);
+                    let contents = cells
+                        .get(usize::from(c))
+                        .map_or("", vt100::Cell::contents);
                     for b in contents.as_bytes() {
                         h ^= u64::from(*b);
                         h = h.wrapping_mul(Self::FNV_PRIME);
@@ -259,6 +270,14 @@ pub struct Portal {
     /// stale, and re-deriving them on bulk output is exactly the cost
     /// the cheap rule exists to avoid).
     pub damage_baseline: Option<RowDamage>,
+    /// When the §8.10 damage rule was last *evaluated* for this portal
+    /// (not when it last fired). The rescan is O(rows x cols) and runs
+    /// per `WritePortal`, so a client that writes in small chunks —
+    /// vmux emits one `WritePortal` per pty `read()` — can drive it
+    /// thousands of times a second on a grid that changed by one cell.
+    /// `PrtEngine::damage_min_interval` rate-limits it against this
+    /// stamp. `None` before the first evaluation.
+    pub last_damage_eval: Option<std::time::Instant>,
     /// DSR cursor-position queries observed on inbound bytes that
     /// haven't yet been answered. Drained after `vt.process` so the
     /// reply reflects post-process cursor state (§13.4).

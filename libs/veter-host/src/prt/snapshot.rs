@@ -374,8 +374,11 @@ fn decode_portal(
         state_cache,
         // Not carried on the wire: the §8.10 damage baseline is a
         // local diffing aid, and the first quiet write after the
-        // attach re-establishes it against the restored grid.
+        // attach re-establishes it against the restored grid. Its
+        // rate-limit stamp goes with it, so the restored portal is
+        // free to evaluate on the very next write.
         damage_baseline: None,
+        last_damage_eval: None,
         pending_cursor_queries,
     })
 }
