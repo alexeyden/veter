@@ -28,7 +28,7 @@ pub trait DesktopHooks: Send + Sync {
     fn pick_file(&self, title: &str) -> Option<PathBuf>;
 
     /// Open `path` in the user's default application. Best-effort:
-    /// the file is already durable by the time this runs, so a
+    /// the file is complete and closed by the time this runs, so a
     /// failure to launch anything must not fail the transfer.
     fn open_path(&self, path: &Path);
 }

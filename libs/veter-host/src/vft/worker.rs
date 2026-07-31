@@ -65,12 +65,13 @@ pub enum WorkerCmd {
     /// Stop reading new chunks and exit. The download worker yields
     /// `Aborted { reason = client_cancel }` before exiting.
     Cancel,
-    /// Finalise the upload: flush, fsync, set permissions / mtime,
+    /// Finalise the upload: flush, set permissions / mtime,
     /// optionally launch the user's default app for the result, and
     /// reply with `Finalised`. `request_id` is echoed in the reply
     /// so the engine can match it to the originating EndUpload.
+    /// No fsync — see §6.3 and the note at the `Finalize` handler.
     /// `open_after` triggers `DesktopHooks::open_path(final_path)`
-    /// after the file is durable; used by deferred-form uploads
+    /// once the file is complete and closed; used by deferred-form uploads
     /// (§6.1) to hand the result to the user's default viewer.
     Finalize {
         request_id: u32,
@@ -147,14 +148,14 @@ pub fn run_upload(
                     });
                     return;
                 }
-                if let Err(e) = file.sync_all() {
-                    send(WorkerEvt::Aborted {
-                        reason: ABORT_IO_ERROR,
-                        message: format!("fsync: {e}"),
-                        pending_request_id: Some(request_id),
-                    });
-                    return;
-                }
+                // Deliberately no fsync (§6.3): VFT does not promise
+                // durability, only that the bytes reached the
+                // filesystem — the same guarantee `cp` and `scp` give.
+                // fsync'ing here cost time proportional to the file,
+                // during which the host answers nothing at all, and a
+                // multi-gigabyte upload could outlast any client's
+                // patience. What follows is metadata only, so the Ok
+                // now lands as soon as the writes are through.
                 drop(file);
                 if mode != 0 {
                     apply_mode(&final_path, mode);
@@ -163,9 +164,12 @@ pub fn run_upload(
                     apply_mtime(&final_path, mtime);
                 }
                 if open_after {
-                    // Best-effort by contract: the file is durable at
-                    // this point, so a launcher that does nothing (or
-                    // fails) must not fail the transfer.
+                    // Best-effort by contract: the file is complete and
+                    // closed at this point, so a launcher that does
+                    // nothing (or fails) must not fail the transfer.
+                    // The page cache is coherent, so a handler that
+                    // opens it reads the full contents whether or not
+                    // they have reached the disk yet.
                     hooks.open_path(&final_path);
                 }
                 let bytes_written = bytes_processed.load(Ordering::Relaxed);

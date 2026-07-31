@@ -437,7 +437,7 @@ Uploads and downloads differ here:
   layer. The host returns the standard per-command `Ok`/`Err`
   (§4.1) so the client knows the chunk parsed and was accepted into
   the transfer's byte stream, but it does **not** confirm that the
-  bytes have been written to disk or fsync'd. Uploads are paced by
+  bytes have been handed to the filesystem yet. Uploads are paced by
   the client (it decides when to send the next `UploadChunk`), so
   no host→client window is needed.
 - `DownloadChunk` events are **window-acknowledged** (§7.4). The
@@ -452,9 +452,10 @@ Uploads and downloads differ here:
 When the client wants confirmation of an *upload*, it sends
 `RequestAck` (§8.1). The host replies with the current
 `bytes_received` and `bytes_processed` for that transfer.
-"Processed" means the host has durably handed the bytes to its
-filesystem (write returned; fsync is implementation-defined but
-SHOULD be performed at `EndUpload`, not per chunk).
+"Processed" means the host has handed the bytes to its filesystem
+and the write returned. It does **not** mean they are on disk:
+VFT carries no durability guarantee anywhere, including at
+`EndUpload` (§6.3).
 
 For downloads, the client sends `ReportDownloadAck` (§7.4) to
 advance the flow-control window as it consumes chunks. A client
@@ -603,12 +604,13 @@ host MUST reject:
 
 On success the host advances `bytes_received` by `data.len()` and
 returns an empty `Ok`. The Ok confirms the chunk parsed and was
-accepted into the transfer's byte stream; durable-write
-confirmation is available separately via `RequestAck` (§8.1).
+accepted into the transfer's byte stream; how much has actually
+reached the filesystem is available separately via `RequestAck`
+(§8.1).
 
 Multiple `UploadChunk` frames may share an envelope; the host
 processes them in order. A client that wants a periodic
-durability checkpoint inserts a `RequestAck` between chunks at
+write-progress checkpoint inserts a `RequestAck` between chunks at
 whatever cadence it likes — that is the v1 mechanism for an
 ack-window.
 
@@ -624,14 +626,26 @@ Finalises the upload. The host:
 
 1. Verifies `bytes_received == total_bytes` if `total_bytes` was
    declared. Otherwise → `err_premature_end`.
-2. Flushes any buffered writes and (SHOULD) fsync's the
-   destination.
+2. Flushes any buffered writes.
 3. If the host implemented temp-file + rename for the explicit
    form (§6.1), renames into place now.
 4. Stamps `mode` and `mtime` from `BeginUpload` if applicable.
 5. For deferred form, optionally launches the user's default
    handler for the file type.
 6. Releases the `transfer_id`.
+
+**No durability guarantee.** The `Ok` means the bytes reached the
+host's filesystem — every write returned — not that they reached
+the disk. This is the guarantee `cp` and `scp` give, and it is
+deliberate: an fsync here costs time proportional to the file
+while the host answers nothing at all, so a large upload stalls
+behind it with no way for the client to tell a working host from
+a wedged one. Hosts MUST NOT fsync before answering. A host that
+wants the data durable does it after the `Ok`, out of band.
+
+Consequently a client MUST NOT treat a successful upload as
+crash-safe. Nothing in VFT reports durability; a client that needs
+it must arrange it by other means.
 
 Response: `Ok` with body
 
@@ -644,8 +658,9 @@ u64     bytes_written      ; should equal total_bytes (or bytes_received
 After `EndUpload`'s `Ok` response, the `transfer_id` is free; any
 further command that references it → `err_unknown_transfer`.
 
-If the host's finalisation fails (rename collision, fsync error,
-chmod failure), it returns `Err` and fires `TransferAborted`. The
+If the host's finalisation fails (rename collision, a write error
+surfacing at flush, chmod failure), it returns `Err` and fires
+`TransferAborted`. The
 partially-written file is the host's mess to clean up; the client
 SHOULD assume nothing about whether anything landed.
 
@@ -750,7 +765,7 @@ u64     bytes_confirmed    ; cumulative bytes the client has received
 
 The client's flow-control signal for downloads. `bytes_confirmed`
 is the cumulative count of bytes the client has received (and, if
-it likes, durably processed). It advances the **low edge** of the
+it likes, finished processing). It advances the **low edge** of the
 download window: after receiving this ack the host may have at most
 `bytes_confirmed + download_window` total bytes outstanding for the
 transfer, where `download_window` is a host-chosen constant. The
@@ -831,7 +846,8 @@ useful payload still rides an event:
 ```
 string  transfer_id
 u64     bytes_received     ; bytes the host has parsed from UploadChunks
-u64     bytes_processed    ; bytes the host has durably written to disk
+u64     bytes_processed    ; bytes the host has handed to the filesystem
+                           ;   (write returned; not necessarily on disk)
 ```
 
 `bytes_received >= bytes_processed`. After `EndUpload` succeeds,
@@ -1157,9 +1173,9 @@ UploadAck { transfer_id="vsend-1",
 ```
 
 The host's response and event together let the UI advance two
-counters: bytes accepted into the protocol stream vs. bytes
-durably on disk. A refusal to fsync per chunk (§5.5) means the
-two values normally differ; on `EndUpload` they converge.
+counters: bytes accepted into the protocol stream vs. bytes handed
+to the filesystem. A host that buffers writes means the two values
+normally differ; on `EndUpload` they converge.
 
 ### 12.7 Cancel mid-transfer
 

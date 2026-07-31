@@ -312,8 +312,9 @@ fn upload(
     let end_rid = *next_req;
     *next_req += 1;
     write_envelope(&build_envelope(&[(end, end_rid)]))?;
-    // The host goes silent here while its worker fsyncs, so the budget
-    // scales with the file — see `finalize_silence_budget`.
+    // The host goes silent here while its writer drains whatever is
+    // still queued, so the budget scales with the file — see
+    // `finalize_silence_budget`.
     let finalize_budget = finalize_silence_budget(total_bytes);
     let final_path = wait_for_vft_ok(stream, end_rid, finalize_budget, |body| {
         let mut r = Reader::new(body);
@@ -373,20 +374,22 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(60);
 
 /// Silence budget for the deferred `EndUpload` Ok.
 ///
-/// The host answers `EndUpload` only after its worker has flushed and
-/// **fsynced** the destination (`libs/veter-host/src/vft/worker.rs`),
-/// and it sends nothing at all while that runs. So this bounds fsync
-/// time, not round-trip latency — and fsync cost scales with the bytes
-/// just pushed through the page cache. A flat budget that suits a small
-/// file therefore breaks silently on a large one: a 5 GB upload blew a
-/// flat 60s, vsend abandoned a transfer that had in fact *succeeded*,
-/// and the host's late replies landed on the shell's line editor.
+/// The host no longer fsyncs before answering (§6.3 carries no
+/// durability guarantee), so this no longer has to cover a flush to
+/// disk — which is what made a flat 60s budget fail on a 5 GB upload,
+/// abandoning a transfer that had in fact *succeeded* and spilling the
+/// host's late replies onto the shell's line editor.
 ///
-/// Budget a deliberately pessimistic 5 MB/s on top of the flat floor,
-/// so the bound tracks the work the host actually has to do.
+/// It still scales, because what remains is not free: the host answers
+/// only once its writer thread has drained the chunks still queued
+/// behind the `EndUpload`, and that queue is unbounded, so on a link
+/// faster than the host's disk it can hold a large part of the file.
+/// Budget a pessimistic 50 MB/s of buffered writes over the flat floor
+/// — an order of magnitude under what a page-cache write sustains, and
+/// still far tighter than the old fsync-shaped allowance.
 fn finalize_silence_budget(total_bytes: u64) -> Duration {
-    const FSYNC_BYTES_PER_SEC: u64 = 5 * 1024 * 1024;
-    PROMPT_SILENCE_BUDGET + Duration::from_secs(total_bytes / FSYNC_BYTES_PER_SEC)
+    const WRITE_BYTES_PER_SEC: u64 = 50 * 1024 * 1024;
+    PROMPT_SILENCE_BUDGET + Duration::from_secs(total_bytes / WRITE_BYTES_PER_SEC)
 }
 
 /// Block until a VFT response with the given `request_id` arrives.
@@ -476,22 +479,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finalize_budget_covers_the_fsync_of_a_multi_gigabyte_upload() {
-        // A small file gets the flat floor: the host opens, writes and
-        // fsyncs it well inside one round trip.
+    fn finalize_budget_covers_a_multi_gigabyte_upload() {
+        // A small file gets the flat floor: the host has nothing queued
+        // to drain and answers within a round trip.
         assert_eq!(finalize_silence_budget(0), PROMPT_SILENCE_BUDGET);
         assert_eq!(finalize_silence_budget(1024), PROMPT_SILENCE_BUDGET);
 
-        // The case that regressed: a 5 GB mp4 finished streaming, then
-        // the host went quiet fsyncing it and blew the old flat 60s
-        // budget — so vsend abandoned a transfer that had *succeeded*
-        // and its late replies were delivered to the shell as
-        // keystrokes. The budget must now comfortably exceed a minute.
+        // The case that regressed: a 5 GB mp4 finished streaming, the
+        // host went quiet finalising it and blew a flat 60s budget — so
+        // vsend abandoned a transfer that had *succeeded* and its late
+        // replies were delivered to the shell as keystrokes. The budget
+        // must stay comfortably clear of that flat minute.
         let five_gb = 5_071_716_356u64;
         let budget = finalize_silence_budget(five_gb);
         assert!(
-            budget > Duration::from_secs(15 * 60),
-            "5 GB should buy well over 15 minutes of fsync, got {budget:?}"
+            budget > Duration::from_secs(2 * 60),
+            "5 GB should buy well over two minutes, got {budget:?}"
         );
 
         // ...and it must scale with the file rather than being a bigger

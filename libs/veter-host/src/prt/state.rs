@@ -1444,7 +1444,7 @@ impl PrtEngine {
 
             // Drain any worker events that arrived synchronously
             // during this command (e.g. a Finalised reply for an
-            // EndUpload that fsync'd very fast on local SSD).
+            // EndUpload whose writer had nothing left queued).
             portal.vft.drive();
 
             // 2c. VSS — extract any ESC_VSS envelopes carrying a

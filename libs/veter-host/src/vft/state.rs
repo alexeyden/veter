@@ -1159,6 +1159,88 @@ mod tests {
     }
 
     #[test]
+    fn end_upload_ok_lands_after_every_queued_chunk() {
+        // §6.3 dropped the fsync, so the finalise path no longer blocks
+        // on the disk — but the Ok is only *correct* if it still lands
+        // after the writer has drained the chunks queued behind it.
+        // Feeding the whole transfer and the EndUpload in one envelope
+        // gives the worker a real backlog at Finalize time, which a
+        // single-chunk round trip never exercises.
+        let dir = std::env::temp_dir().join(format!("vft-queued-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queued.bin");
+        let _ = std::fs::remove_file(&path);
+
+        const CHUNKS: u32 = 64;
+        const CHUNK_BYTES: usize = 4096;
+        let total = u64::from(CHUNKS) * CHUNK_BYTES as u64;
+
+        let mut cmds = vec![(
+            Command::BeginUpload(ULBody {
+                transfer_id: "t".into(),
+                host_path: path.to_string_lossy().into_owned(),
+                basename: "".into(),
+                total_bytes: total,
+                flags: 0,
+                mode: 0,
+                mtime: 0,
+            }),
+            1,
+        )];
+        for i in 0..CHUNKS {
+            cmds.push((
+                Command::UploadChunk(UCBody {
+                    transfer_id: "t".into(),
+                    offset: u64::from(i) * CHUNK_BYTES as u64,
+                    data: vec![b'z'; CHUNK_BYTES],
+                }),
+                i + 2,
+            ));
+        }
+        let end_rid = CHUNKS + 2;
+        cmds.push((
+            Command::EndUpload(EUBody {
+                transfer_id: "t".into(),
+            }),
+            end_rid,
+        ));
+
+        let mut e = VftEngine::new(|| {});
+        feed(&mut e, &cmds);
+
+        let mut end_frame = None;
+        let ok = drive_until(
+            &mut e,
+            |eng| {
+                for f in explicit_frames(eng) {
+                    if f.1 == end_rid {
+                        end_frame = Some(f);
+                    }
+                }
+                end_frame.is_some()
+            },
+            std::time::Duration::from_secs(10),
+        );
+        assert!(ok, "EndUpload did not finalise within timeout");
+
+        let (ft, _, body) = end_frame.unwrap();
+        assert_eq!(ft, RSP_OK);
+        let mut r = Reader::new(&body);
+        let final_path = r.string().unwrap().to_owned();
+        assert_eq!(
+            r.u64().unwrap(),
+            total,
+            "the Ok must report every queued byte as written"
+        );
+        assert_eq!(
+            std::fs::metadata(&final_path).unwrap().len(),
+            total,
+            "the file must be complete on disk by the time the Ok lands"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn upload_offset_mismatch_is_err() {
         let path = std::env::temp_dir().join(format!("vft-mismatch-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
