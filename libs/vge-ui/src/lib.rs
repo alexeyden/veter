@@ -23,7 +23,7 @@ pub mod theme;
 
 pub use edit::{EditOutcome, LineEditor};
 pub use input::{Button, Dir, Event, InputParser};
-pub use measure::{prefix_cells, text_cells};
+pub use measure::{elide, elide_front, prefix_cells, text_cells};
 pub use modal::{ModalIds, ScrollModal, picker_element, prompt_element};
 pub use picker::{FilterMode, Picker, PickerItem, PickerOutcome};
 pub use shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
