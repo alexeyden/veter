@@ -12,13 +12,14 @@ mod input;
 mod playlist;
 mod video;
 mod viewport;
+mod work;
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use vge_protocol::codec::{Point, Rect, Transform};
+use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{
     Align, Color, Command, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Retention, Style, UpdateCommandBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
 };
@@ -30,12 +31,12 @@ use vge_render::tty::{
     RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_and, poll_stdin_until, read_stdin,
     take_sigwinch, winsize,
 };
-use vge_render::upload::{Encoding, encode_payload};
+use vge_render::upload::Encoding;
 
-use image_src::{Frame, load_image};
+use image_src::Frame;
 use input::{Dir, Event, InputParser};
 use playlist::Playlist;
-use video::{Decode, DecodeState, VideoMeta, grab_one_frame, probe_frame_times, probe_video, start_decode};
+use video::{Decode, DecodeState, VideoMeta, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
 
 /// Namespace every element and image id shares (§6.8), so cleanup is one
@@ -46,8 +47,7 @@ const EL_BG: &str = "vplay-bg";
 const EL_IMG: &str = "vplay-img";
 const EL_STATUS: &str = "vplay-status";
 const EL_SEEK: &str = "vplay-seek";
-const EL_SPINNER: &str = "vplay-spin";
-const IMG_ID: &str = "vplay-tex";
+const EL_PROGRESS: &str = "vplay-prog";
 const IMG_ID_A: &str = "vplay-fa";
 const IMG_ID_B: &str = "vplay-fb";
 
@@ -56,42 +56,35 @@ const ACCENT: (f32, f32, f32) = (0.337, 0.475, 0.624); // #56799f
 /// Retention for every texture vplay uploads (§8.2).
 ///
 /// Manual — vplay owns its textures' lifetimes, because the host's `Auto`
-/// refcount does not survive either of the two things vplay does to a
-/// picture:
-///
-/// * **A resize.** The `SIGWINCH` path deletes every `vplay-` element and
-///   recreates the chrome, then recreates the image element over the
-///   texture it already uploaded. But deleting an element releases its
-///   `DrawImage` reference (§8.0), and an `Auto` image at zero refs is
-///   collected there and then — so the recreate would name a texture the
-///   host had just thrown away: `ERR_UNKNOWN_IMAGE`, silent (§4:
-///   unrequested commands get no response), and a blank picture.
-/// * **A same-id swap.** Cycling stills reuses the one still id
-///   (`DropImage`, `UploadImage`, retarget, one envelope) and the
-///   retarget releases the *old* `DrawImage` — which, under `Auto`,
-///   collects the pixels that landed under that id moments earlier. The
-///   video path ping-pongs between two ids instead, so there `Auto`
-///   collects the correct (outgoing) slot, and it is only the explicit
-///   `DropImage` that ends up a no-op.
+/// refcount does not survive what the `SIGWINCH` path does to a picture:
+/// it deletes every `vplay-` element and recreates the chrome, then
+/// recreates the image element over the texture it already uploaded. But
+/// deleting an element releases its `DrawImage` reference (§8.0), and an
+/// `Auto` image at zero refs is collected there and then — so the
+/// recreate would name a texture the host had just thrown away:
+/// `ERR_UNKNOWN_IMAGE`, silent (§4: unrequested commands get no
+/// response), and a blank picture.
 ///
 /// In exchange every id must be released by hand — which vplay already
-/// does: a swap drops the id it supersedes, `queue_frame_upload` drops a
-/// superseded in-flight upload, and `TermExit` sweeps the whole
-/// `vplay-` prefix (§8.2) on the way out. At most two frame textures and
-/// one still are ever live.
+/// does: the upload's final chunk drops the texture it supersedes,
+/// [`queue_upload`] drops a superseded in-flight upload, and `TermExit`
+/// sweeps the whole `vplay-` prefix (§8.2) on the way out. At most two
+/// textures are ever live: every picture, still or video frame, streams
+/// into whichever of the ping-pong pair the screen isn't using.
 const RETENTION: Retention = Retention::Manual;
 
-/// Spinner angular speed, rad/s (§9.12 UpdateTransform). Time-based so
-/// the rotation rate is independent of the loop's variable tick.
-const SPIN_SPEED: f32 = 5.5;
-/// Minimum interval between spinner transform updates.
-const SPIN_FRAME: Duration = Duration::from_millis(33);
-/// How long a decode must stay pending before its spinner appears, so
-/// quick seeks/steps don't flash an indicator.
-const SPIN_DELAY: Duration = Duration::from_millis(160);
-/// Frame uploads bigger than this stream chunk-by-chunk from the event
-/// loop (§8.2) so the spinner keeps animating during the transfer; one
-/// chunk's PTY write is short enough to not visibly stall the loop.
+/// Minimum interval between progress-panel repaints.
+const PROGRESS_FRAME: Duration = Duration::from_millis(33);
+/// How long the loop must stay busy before the progress panel appears,
+/// so quick seeks and steps don't flash an indicator.
+const BUSY_DELAY: Duration = Duration::from_millis(160);
+/// Sweeps per second of the indeterminate bar (one out-and-back is two
+/// sweeps). Time-based, so the rate is independent of the loop's tick.
+const SWEEP_SPEED: f32 = 1.1;
+/// Uploads bigger than this stream chunk-by-chunk from the event loop
+/// (§8.2) so the loop — and the progress panel — stays live during the
+/// transfer; one chunk's PTY write is short enough to not visibly stall
+/// the loop.
 const UPLOAD_CHUNK_BYTES: usize = 1 << 20;
 
 fn flat(r: f32, g: f32, b: f32, a: f32) -> Style {
@@ -222,46 +215,14 @@ fn pick_encoding(
     }
 }
 
-/// The single-shot upload of a still, under the one still texture id.
-/// Pinned — see [`RETENTION`].
-fn upload_cmd(
-    id: &str,
-    w: u32,
-    h: u32,
-    rgba: Vec<u8>,
-    supported: u8,
-    ssh: bool,
-    max_image_bytes: u32,
-) -> Result<Command> {
-    let enc = pick_encoding(w, h, supported, ssh, max_image_bytes)?;
-    let (encoding, payload) = encode_payload(rgba, w, h, enc)?;
-    if max_image_bytes > 0 && payload.len() > max_image_bytes as usize {
-        bail!(
-            "encoded {w}x{h} image ({} bytes) exceeds the host limit of {} bytes",
-            payload.len(),
-            max_image_bytes
-        );
-    }
-    Ok(Command::UploadImage(UploadImageBody {
-        retention: RETENTION,
-        id: id.into(),
-        encoding,
-        width: w,
-        height: h,
-        total_bytes: payload.len() as u32,
-        chunk_offset: 0,
-        is_last: true,
-        data: payload,
-    }))
-}
-
-/// A video-frame upload streamed chunk-by-chunk from the event loop
-/// (§8.2), so the loop — and the seek spinner — stays live during a
-/// multi-megabyte transfer. The element retarget is *not* baked in at
-/// queue time: the user may pan/zoom while the frame streams, so the
-/// caller builds the follow-up from the live viewport when the final
-/// chunk goes out, keeping the frame swap atomic with the upload's
-/// completion.
+/// A picture's upload, streamed chunk-by-chunk from the event loop
+/// (§8.2), so the loop — and the progress panel — stays live during a
+/// multi-megabyte transfer. Stills and video frames both take this path:
+/// a still is simply a picture that changes only when the user steps to
+/// the next file. The element retarget is *not* baked in at queue time:
+/// the user may pan/zoom while it streams, so the caller builds the
+/// follow-up from the live viewport when the final chunk goes out,
+/// keeping the swap atomic with the upload's completion.
 struct ChunkedUpload {
     id: String,
     encoding: u8,
@@ -283,9 +244,9 @@ impl ChunkedUpload {
         let end = (self.offset + UPLOAD_CHUNK_BYTES).min(self.payload.len());
         let is_last = end == self.payload.len();
         let mut cmds = vec![np(Command::UploadImage(UploadImageBody {
-            // Pinned, like the still (see `RETENTION`). Only the first
-            // chunk's flag is read by the host, but every chunk carries
-            // the same value so the body is self-consistent.
+            // Pinned — see `RETENTION`. Only the first chunk's flag is
+            // read by the host, but every chunk carries the same value
+            // so the body is self-consistent.
             retention: RETENTION,
             id: self.id.clone(),
             encoding: self.encoding,
@@ -447,65 +408,174 @@ fn update_seek(cols: u16, rows: u16, frac: f32) -> Vec<Command> {
     ]
 }
 
-/// A centred, initially-hidden spinner: a fat white arc over a faint
-/// ring, rotated via `UpdateTransform` (§9.11).
-///
-/// One element, geometry centred on the origin and aspect-compensated
-/// (`x` in cell widths, `y` in rows) so both circles are pixel-circular —
-/// the ring is rotation-invariant, so only the highlight arc appears to
-/// spin. The per-tick update is a pure rotation matrix (§9.13); the
-/// geometry is created once and never re-sent.
-fn create_spinner(cols: u16, media_rows: u16, cell_pw: f32, cell_ph: f32) -> Command {
-    let cx = cols as f32 / 2.0;
-    let cy = media_rows as f32 / 2.0;
-    let aspect = cell_ph / cell_pw;
+// --- the progress panel ---
 
-    let ry = 0.48_f32;
-    let rx = ry * aspect;
-    let arc_pt = |theta: f32| Point {
-        x: rx * theta.cos(),
-        y: ry * theta.sin(),
+/// What the loop is waiting on, and how far along it is. The three
+/// stages a picture goes through are visibly different work — decoded,
+/// encoded, then streamed to the terminal — so the panel names the one
+/// it is in instead of just saying "busy". Only the last can be
+/// measured; the other two report a name and sweep.
+enum Busy<'a> {
+    /// Producing the pixels: ffmpeg for a video frame, which reports the
+    /// fraction of it written back so far (see [`Decode::progress`]), or
+    /// the worker for a still, which can only name the file.
+    Decoding {
+        what: Option<&'a str>,
+        frac: Option<f32>,
+    },
+    /// Compressing the payload on the worker (WebP; a raw payload is a
+    /// copy, over before the panel could appear).
+    Encoding,
+    /// Streaming an encoded payload to the terminal, `done` of `total`
+    /// bytes handed to the PTY.
+    Sending { done: usize, total: usize },
+}
+
+impl Busy<'_> {
+    /// Fraction for the bar, or `None` when the phase can't be measured
+    /// and the bar should sweep instead.
+    fn frac(&self) -> Option<f32> {
+        match self {
+            Busy::Decoding { frac, .. } => *frac,
+            Busy::Encoding => None,
+            Busy::Sending { done, total } => Some(frac_of(*done, *total)),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Busy::Decoding {
+                what: Some(name), ..
+            } => format!("decoding {name}"),
+            Busy::Decoding {
+                frac: Some(f),
+                what: None,
+            } => format!("decoding  {:.0}%", f * 100.0),
+            Busy::Decoding {
+                frac: None,
+                what: None,
+            } => "decoding".to_string(),
+            Busy::Encoding => "encoding".to_string(),
+            Busy::Sending { done, total } => format!(
+                "sending  {:.0}%  {:.1}/{:.1} MB",
+                frac_of(*done, *total) * 100.0,
+                mib(*done),
+                mib(*total)
+            ),
+        }
+    }
+}
+
+fn frac_of(done: usize, total: usize) -> f32 {
+    if total == 0 {
+        1.0
+    } else {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn mib(bytes: usize) -> f32 {
+    bytes as f32 / (1024.0 * 1024.0)
+}
+
+/// Track rectangle of the progress bar and the origin of its label, both
+/// centred in the media area. Recomputed from the current size rather
+/// than stored, so the resize path's recreate lands in the right place.
+fn progress_rects(cols: u16, media_rows: u16) -> (Rect, Point) {
+    let w = (cols as f32 * 0.5).clamp(12.0, 48.0).min(cols as f32 - 2.0).max(2.0);
+    let row = (media_rows as f32 * 0.5).floor();
+    let track = Rect {
+        x: ((cols as f32 - w) * 0.5).round(),
+        y: row + 0.35,
+        w,
+        h: 0.3,
     };
-    use std::f32::consts::TAU;
+    let label = Point {
+        x: cols as f32 * 0.5,
+        y: (row - 1.0).max(0.0),
+    };
+    (track, label)
+}
 
+/// The initially-hidden progress panel: a bar over the media, with its
+/// phase and percentage on the row above. Command indices are fixed —
+/// 0 track, 1 fill, 2 label — and [`progress_fill`] / [`progress_label`]
+/// update the latter two in place.
+fn create_progress(cols: u16, media_rows: u16) -> Command {
+    let (track, label) = progress_rects(cols, media_rows);
     Command::CreateElement(CreateElementBody {
-        id: EL_SPINNER.into(),
+        id: EL_PROGRESS.into(),
         commands: vec![
-            // Faint full ring under the bright arc.
-            DrawCmd::DrawLineLoop {
-                stroke: flat(1.0, 1.0, 1.0, 0.25),
-                line_width: 0.2,
-                points: (0..32).map(|i| arc_pt(TAU * i as f32 / 32.0)).collect(),
+            DrawCmd::FillRectangles {
+                fill: flat(0.20, 0.22, 0.27, 0.9),
+                rects: vec![track],
             },
-            // The rotating highlight: a 120° arc.
-            DrawCmd::DrawLineStrip {
-                stroke: flat(1.0, 1.0, 1.0, 1.0),
-                line_width: 0.2,
-                points: (0..=14).map(|i| arc_pt(TAU / 3.0 * i as f32 / 14.0)).collect(),
+            DrawCmd::FillRectangles {
+                fill: flat(ACCENT.0, ACCENT.1, ACCENT.2, 1.0),
+                rects: vec![Rect { w: 0.0, ..track }],
+            },
+            DrawCmd::DrawText {
+                origin: label,
+                align: Align::Center,
+                fill: flat(0.86, 0.90, 0.96, 1.0),
+                font_style: FontStyle::default(),
+                text: String::new(),
             },
         ],
-        origin: Point { x: cx, y: cy },
+        origin: Point { x: 0.0, y: 0.0 },
         is_visible: false,
         draw_order: 20,
         parent: None,
         size: None,
-        transform: Some(Transform::IDENTITY),
+        transform: None,
         anchor: OriginAnchor::Viewport,
     })
 }
 
-fn spinner_angle(theta: f32) -> Command {
-    // Geometry is centred on the element's origin, so this is a pure
-    // rotation matrix — no cell-size math needed (§9.13).
-    Command::UpdateTransform {
-        id: EL_SPINNER.into(),
-        transform: Transform::rotate_about(theta, 0.0, 0.0, 1.0, 1.0),
-    }
+/// The bar's filled span: anchored left and proportional when the phase
+/// has a fraction, else a segment sliding out and back, which reads as
+/// "working, length unknown" rather than as a stuck bar. `t` is elapsed
+/// wall-clock seconds, so the sweep rate is independent of the tick.
+fn progress_fill(track: Rect, frac: Option<f32>, t: f32) -> Command {
+    let rect = match frac {
+        Some(f) => Rect {
+            w: track.w * f.clamp(0.0, 1.0),
+            ..track
+        },
+        None => {
+            let seg = track.w * 0.25;
+            // Triangle wave in 0..=1: out, then back.
+            let phase = (t * SWEEP_SPEED) % 2.0;
+            let k = if phase <= 1.0 { phase } else { 2.0 - phase };
+            Rect {
+                x: track.x + (track.w - seg) * k,
+                w: seg,
+                ..track
+            }
+        }
+    };
+    Command::UpdateCommand(UpdateCommandBody {
+        id: EL_PROGRESS.into(),
+        index: 1,
+        command: DrawCmd::FillRectangles {
+            fill: flat(ACCENT.0, ACCENT.1, ACCENT.2, 1.0),
+            rects: vec![rect],
+        },
+    })
 }
 
-fn spinner_show(visible: bool) -> Command {
+fn progress_label(text: String) -> Command {
+    Command::UpdateText(UpdateTextBody {
+        id: EL_PROGRESS.into(),
+        command_index: 2,
+        range: UpdateTextRange::Whole,
+        replacement: text,
+    })
+}
+
+fn progress_show(visible: bool) -> Command {
     Command::UpdateVisibility {
-        id: EL_SPINNER.into(),
+        id: EL_PROGRESS.into(),
         is_visible: visible,
     }
 }
@@ -527,19 +597,7 @@ fn cursor_readout(cur: &Option<(u32, u32, [u8; 4])>) -> String {
     }
 }
 
-// --- rendering the media element ---
-
-#[allow(clippy::too_many_arguments)]
-fn render_image_mode<W: Write>(out: &mut W, vp: &Viewport, created: &mut bool) {
-    let l = vp.layout();
-    let cmd = if *created {
-        update_image_el(l.target, IMG_ID, Some(l.source))
-    } else {
-        *created = true;
-        create_image_el(l.target, IMG_ID, Some(l.source))
-    };
-    send(out, &[np(cmd)]);
-}
+// --- driving the media element ---
 
 /// One keyboard pan step, in cells.
 const PAN_CELLS: f32 = 3.0;
@@ -555,97 +613,39 @@ fn pan(vp: &mut Viewport, dir: Dir) {
     }
 }
 
-/// Move the playlist cursor `delta` entries and prepare the first entry
-/// that both decodes and encodes, skipping the ones that don't — a
-/// directory listing is no promise that every file is a usable image.
-/// Returns the entry's path, its decoded pixels and the upload command
-/// that installs them, or `None` (cursor left where it started) when
-/// nothing else in the directory could be shown.
+/// Wrap a worker-encoded payload as a [`ChunkedUpload`] aimed at
+/// whichever half of the ping-pong pair the screen isn't showing —
+/// `cur_id` is the texture the element currently references (empty
+/// before the first upload lands), so the old picture stays drawable
+/// until the new one has fully arrived.
 ///
-/// Decoding is synchronous, as it is at startup: a still is one upload,
-/// with no seek spinner to keep alive.
-fn step_image(
-    pl: &mut Playlist,
-    delta: isize,
-    supported: u8,
-    ssh: bool,
-    max_image_bytes: u32,
-) -> Option<(std::path::PathBuf, Frame, Command)> {
-    let start = pl.index();
-    // At most every *other* entry, so a directory of undecodable files
-    // terminates instead of spinning.
-    for _ in 0..pl.len().saturating_sub(1) {
-        let path = pl.step(delta);
-        let Ok(f) = load_image(&path) else { continue };
-        // The upload is built here, before anything is sent, so a frame
-        // that busts the host's limits is skipped like an undecodable
-        // one rather than tearing down the picture on screen.
-        let Ok(up) = upload_cmd(
-            IMG_ID,
-            f.w,
-            f.h,
-            f.rgba.clone(),
-            supported,
-            ssh,
-            max_image_bytes,
-        ) else {
-            continue;
-        };
-        return Some((path, f, up));
+/// Nothing is sent here: the event loop pumps the chunks and builds the
+/// element retarget (with the viewport's then-current `source_rect`)
+/// when the final one goes out, so `cur_id` flips only then. Pan/zoom
+/// never re-enters this path — it is a host-side `source_rect` update on
+/// the already-uploaded texture.
+fn into_upload(cur_id: &str, frame: &Frame, encoding: u8, payload: Vec<u8>) -> ChunkedUpload {
+    let next_id = if cur_id == IMG_ID_A { IMG_ID_B } else { IMG_ID_A };
+    ChunkedUpload {
+        id: next_id.to_string(),
+        encoding,
+        width: frame.w,
+        height: frame.h,
+        payload,
+        offset: 0,
     }
-    pl.set_index(start);
-    None
 }
 
-/// Queue the full decoded frame for upload under the next ping-pong id
-/// as a [`ChunkedUpload`]. The event loop pumps the chunks and builds
-/// the element retarget (with the viewport's then-current `source_rect`)
-/// when the final chunk goes out; `cur_id` flips to the new texture only
-/// then. Pan/zoom never re-enters this path — it is a host-side
-/// `source_rect` update on the already-uploaded texture.
-fn queue_frame_upload<W: Write>(
-    out: &mut W,
-    full: &Frame,
-    cur_id: &str,
-    upload: &mut Option<ChunkedUpload>,
-    supported: u8,
-    ssh: bool,
-    max_image_bytes: u32,
-) -> Result<()> {
-    // Supersede a still-streaming previous frame: abort its upload
-    // host-side (§8.2 — DropImage on an in-progress id) and reuse the
-    // id. Its element retarget never went out, so there is nothing to
-    // roll back.
+/// Make `up` the in-flight upload. Any earlier one is superseded: its
+/// texture is aborted host-side (§8.2 — `DropImage` on an in-progress
+/// id) so `up` can stream into that slot, and since the superseded
+/// upload's element retarget never went out there is nothing to roll
+/// back on screen.
+fn queue_upload<W: Write>(out: &mut W, upload: &mut Option<ChunkedUpload>, up: ChunkedUpload) {
     if let Some(old) = upload.take() {
         send(out, &[np(Command::DropImage { id: old.id, by_prefix: false })]);
     }
-
-    // Same size-aware choice as the still path: raw locally, WebP when a
-    // full-resolution frame would exceed the host's advertised limit.
-    let enc = pick_encoding(full.w, full.h, supported, ssh, max_image_bytes)?;
-    let (encoding, payload) = encode_payload(full.rgba.clone(), full.w, full.h, enc)?;
-    if max_image_bytes > 0 && payload.len() > max_image_bytes as usize {
-        bail!(
-            "encoded {}x{} frame ({} bytes) exceeds the host limit of {} bytes",
-            full.w,
-            full.h,
-            payload.len(),
-            max_image_bytes
-        );
-    }
-
-    // `cur_id` is the texture the element currently references; the new
-    // frame streams into the other slot of the A/B pair.
-    let next_id = if cur_id == IMG_ID_A { IMG_ID_B } else { IMG_ID_A };
-    *upload = Some(ChunkedUpload {
-        id: next_id.to_string(),
-        encoding,
-        width: full.w,
-        height: full.h,
-        payload,
-        offset: 0,
-    });
-    Ok(())
+    *upload = Some(up);
 }
 
 fn main() -> Result<()> {
@@ -667,17 +667,14 @@ fn main() -> Result<()> {
     let path_str = cli.file.to_string_lossy().into_owned();
     let mut name = file_label(&cli.file);
 
-    // Probe video metadata / load the image up front so we fail before
-    // touching the terminal if the input is bad or ffmpeg is missing.
+    // Probe video metadata up front — it is cheap, and it fails before
+    // we touch the terminal if the input is bad or ffmpeg is missing.
+    // The pixels are decoded further down, after the chrome exists, so
+    // the wait has something to say for itself.
     let meta: Option<VideoMeta> = if is_video {
         Some(probe_video(&path_str)?)
     } else {
         None
-    };
-    let image_frame: Option<Frame> = if is_video {
-        None
-    } else {
-        Some(load_image(&cli.file)?)
     };
 
     // --- terminal setup ---
@@ -707,16 +704,35 @@ fn main() -> Result<()> {
     }
     let mut media_rows = rows - if is_video { 2 } else { 1 };
 
-    // Source dimensions for the viewport. Mutable: in image mode the
-    // left/right arrows swap in a sibling still of any size.
-    let (mut src_w, mut src_h) = match (&meta, &image_frame) {
-        (Some(m), _) => (m.width, m.height),
-        (_, Some(f)) => (f.w, f.h),
-        _ => unreachable!(),
+    // Chrome first, so the decode below has somewhere to report itself.
+    // The progress panel exists in both modes — a still's upload is as
+    // worth reporting as a frame's — and starts hidden.
+    let mut frac0 = 0.0f32;
+    send(
+        &mut out,
+        &[
+            np(create_bg(cols, media_rows)),
+            np(create_status(cols, rows)),
+            np(create_progress(cols, media_rows)),
+        ],
+    );
+    if is_video {
+        send(&mut out, &[np(create_seek(cols, rows, frac0))]);
+    }
+
+    // Source dimensions. Known up front for a video (ffprobe read them);
+    // for a still they arrive with the decoded picture, and stay zero
+    // until then — the status bar leaves the size out rather than
+    // claiming one, and every later still may differ again.
+    let (mut src_w, mut src_h) = match &meta {
+        Some(m) => (m.width, m.height),
+        None => (0, 0),
     };
+    // Rebuilt when the first still lands (see `apply_ready`); a video's
+    // is right from the start.
     let mut vp = Viewport::new(
-        src_w,
-        src_h,
+        src_w.max(1),
+        src_h.max(1),
         cell_pw,
         cell_ph,
         0.0,
@@ -725,30 +741,17 @@ fn main() -> Result<()> {
         media_rows as f32,
     );
 
-    // Chrome.
-    let mut frac0 = 0.0f32;
-    send(
-        &mut out,
-        &[
-            np(create_bg(cols, media_rows)),
-            np(create_status(cols, rows)),
-        ],
-    );
-    if is_video {
-        send(
-            &mut out,
-            &[
-                np(create_seek(cols, rows, frac0)),
-                np(create_spinner(cols, media_rows, cell_pw, cell_ph)),
-            ],
-        );
-    }
-
     // --- per-mode state ---
     let mut created_img = false;
-    let mut cur_id = IMG_ID.to_string();
-    let mut source_frame: Frame;
-    // A decoded frame streaming to the terminal chunk-by-chunk (§8.2).
+    // The texture the image element currently draws; empty until the
+    // first upload completes, which is also what tells the loop there is
+    // nothing to point an element at yet.
+    let mut cur_id = String::new();
+    // The picture's pixels, kept for the cursor's colour readout. A 1x1
+    // stand-in until the first one is decoded; `have_picture` says which.
+    let mut source_frame = Frame::new(1, 1, vec![0; 4]);
+    let mut have_picture = false;
+    // A picture streaming to the terminal chunk-by-chunk (§8.2).
     let mut upload: Option<ChunkedUpload> = None;
 
     // Video state. There is no continuous playback: the displayed frame
@@ -766,40 +769,42 @@ fn main() -> Result<()> {
         Some(Playlist::scan(&cli.file))
     };
 
+    // Decoding and encoding run on a worker (see `work`), so neither
+    // blocks the loop: keys keep working and the progress panel keeps
+    // animating through both.
+    let enc_params = work::EncodeParams {
+        supported,
+        ssh,
+        max_image_bytes,
+    };
+    let mut worker = work::Worker::spawn();
+    // Background decode of the frame the user just seeked to — ffmpeg,
+    // which is its own kind of worker. A newer seek replaces it (killing
+    // the superseded ffmpeg).
+    let mut pending: Option<Decode> = None;
+
+    // The first picture, started the same way every later one is: a
+    // still goes to the worker, a video frame to ffmpeg. The loop picks
+    // up whichever lands, so the wait is reported rather than sat on.
     if is_video {
         let m = meta.as_ref().unwrap();
-        // Grab and show the first frame. Queued, not sent — the event
-        // loop streams it in chunks like any later frame.
-        let first = grab_one_frame(&path_str, m.width, m.height, 0.0)?
-            .ok_or_else(|| anyhow::anyhow!("could not decode the first video frame"))?;
-        source_frame = Frame::new(m.width, m.height, first);
-        queue_frame_upload(
-            &mut out,
-            &source_frame,
-            &cur_id,
-            &mut upload,
-            supported,
-            ssh,
-            max_image_bytes,
-        )?;
+        pending = Some(start_decode(&path_str, m.width, m.height, 0.0)?);
     } else {
-        let f = image_frame.unwrap();
-        source_frame = f.clone();
-        // Upload the native image once; pan/zoom is source_rect-only.
-        send(
-            &mut out,
-            &[np(upload_cmd(
-                IMG_ID,
-                f.w,
-                f.h,
-                f.rgba,
-                supported,
-                ssh,
-                max_image_bytes,
-            )?)],
-        );
-        render_image_mode(&mut out, &vp, &mut created_img);
+        worker.load(cli.file.clone(), enc_params);
     }
+    // Name of the still being decoded, for the panel to show while the
+    // worker is on it. `None` in video mode, where the decode reports a
+    // fraction instead.
+    let mut loading: Option<String> = (!is_video).then(|| name.clone());
+    // The playlist walk a failed decode should continue: direction, the
+    // index to fall back to when the whole directory refuses, and how
+    // many entries have been tried.
+    let mut step_dir = 0isize;
+    let mut step_start = 0usize;
+    let mut step_tries = 0usize;
+    // Set when the file vplay was opened on turns out to be unusable.
+    // Reported after the loop, once the alt screen is back.
+    let mut fatal: Option<String> = None;
 
     // --- event loop ---
     let mut parser = InputParser::new();
@@ -811,14 +816,12 @@ fn main() -> Result<()> {
     let mut dirty_seek = is_video;
     let mut quit = false;
 
-    // Background decode of the frame the user just seeked to. While one is
-    // in flight the loop animates a spinner and stays responsive; a newer
-    // seek replaces it (killing the superseded ffmpeg).
-    let mut pending: Option<Decode> = None;
+    // Progress panel: when the current wait started (`None` = idle), so
+    // it can be held back for BUSY_DELAY, and the repaint rate limit.
     let mut busy_since: Option<Instant> = None;
-    let mut spinner_visible = false;
-    let spin_t0 = Instant::now();
-    let mut last_spin: Option<Instant> = None;
+    let mut progress_visible = false;
+    let busy_t0 = Instant::now();
+    let mut last_progress: Option<Instant> = None;
 
     // Exact per-frame presentation times (display order). When available
     // they are the source of truth for the frame count and for mapping a
@@ -861,20 +864,16 @@ fn main() -> Result<()> {
                 &[
                     np(create_bg(cols, media_rows)),
                     np(create_status(cols, rows)),
+                    np(create_progress(cols, media_rows)),
                 ],
             );
             if is_video {
-                send(
-                    &mut out,
-                    &[
-                        np(create_seek(cols, rows, frac0)),
-                        np(create_spinner(cols, media_rows, cell_pw, cell_ph)),
-                    ],
-                );
-                // The wipe took the spinner with it; let the loop
-                // re-show it if a decode is still pending.
-                spinner_visible = false;
+                send(&mut out, &[np(create_seek(cols, rows, frac0))]);
             }
+            // The wipe took the progress panel with it; the recreate
+            // above comes back hidden, so let the loop re-show it if
+            // there is still work in flight.
+            progress_visible = false;
             dirty_media = true;
             dirty_status = true;
             dirty_seek = is_video;
@@ -883,13 +882,14 @@ fn main() -> Result<()> {
         // How long to block waiting for input. With no continuous playback
         // the loop is event-driven; 50 ms keeps a lone ESC responsive. While
         // a decode is pending, wake more often (and on the decode's pipe) to
-        // animate the spinner — a ~50-byte UpdateTransform per tick — and
-        // apply the frame the moment it lands. While an upload is streaming,
-        // barely block at all: each iteration pushes one chunk, and the 1 ms
-        // poll keeps input (a superseding seek) flowing between chunks.
+        // repaint the progress panel — a bar rect plus a short label per
+        // tick — and apply the frame the moment it lands. While an upload
+        // is streaming, barely block at all: each iteration pushes one
+        // chunk, and the 1 ms poll keeps input (a superseding seek)
+        // flowing between chunks.
         let tick = if upload.is_some() {
             1
-        } else if pending.is_some() {
+        } else if pending.is_some() || worker.is_busy() {
             33
         } else {
             50
@@ -970,54 +970,18 @@ fn main() -> Result<()> {
                         && let Some(pl) = pl.as_mut()
                     {
                         // Image mode: walk the directory's stills.
-                        // Horizontal panning moves to `h`/`l`.
-                        let delta = if dir == Dir::Right { 1 } else { -1 };
-                        if let Some((path, f, up)) =
-                            step_image(pl, delta, supported, ssh, max_image_bytes)
-                        {
-                            name = file_label(&path);
-                            src_w = f.w;
-                            src_h = f.h;
-                            source_frame = f;
-                            let zoom  = vp.zoom;
-                            vp = Viewport::new(
-                                src_w,
-                                src_h,
-                                cell_pw,
-                                cell_ph,
-                                0.0,
-                                0.0,
-                                cols as f32,
-                                media_rows as f32,
-                            );
-                            vp.zoom = zoom;
-                            // The still texture is a single slot, so the
-                            // swap is drop-then-upload (sound only
-                            // because the still is pinned — see
-                            // `upload_cmd`), kept in one envelope
-                            // together with the element's new geometry so
-                            // no frame is ever composed with the old
-                            // source_rect over the new texture.
-                            let l = vp.layout();
-                            let el = if created_img {
-                                update_image_el(l.target, IMG_ID, Some(l.source))
-                            } else {
-                                created_img = true;
-                                create_image_el(l.target, IMG_ID, Some(l.source))
-                            };
-                            send(
-                                &mut out,
-                                &[
-                                    np(Command::DropImage {
-                                        id: IMG_ID.into(),
-                                        by_prefix: false,
-                                    }),
-                                    np(up),
-                                    np(el),
-                                ],
-                            );
-                            dirty_status = true;
-                        }
+                        // Horizontal panning moves to `h`/`l`. The
+                        // decode goes to the worker, so holding an arrow
+                        // down keeps stepping instead of stalling on
+                        // each file — every press supersedes the decode
+                        // still in flight.
+                        step_dir = if dir == Dir::Right { 1 } else { -1 };
+                        step_start = pl.index();
+                        step_tries = 0;
+                        let path = pl.step(step_dir);
+                        loading = Some(file_label(&path));
+                        worker.load(path, enc_params);
+                        dirty_status = true;
                     } else {
                         pan(&mut vp, dir);
                         dirty_media = true;
@@ -1111,63 +1075,125 @@ fn main() -> Result<()> {
         }
 
         // Apply a finished background decode (or discard a failed one). On
-        // EAGAIN it stays pending and the spinner keeps animating.
+        // EAGAIN it stays pending and the progress panel keeps reporting.
         if pending.is_some() {
             match pending.as_mut().unwrap().poll() {
                 DecodeState::Pending => {}
                 DecodeState::Done(rgba) => {
+                    // The pixels are here; the encode that turns them
+                    // into a payload goes to the worker, so the loop
+                    // stays live through it too.
                     let m = meta.as_ref().unwrap();
-                    source_frame = Frame::new(m.width, m.height, rgba);
                     pending = None;
-                    queue_frame_upload(
-                        &mut out,
-                        &source_frame,
-                        &cur_id,
-                        &mut upload,
-                        supported,
-                        ssh,
-                        max_image_bytes,
-                    )?;
+                    worker.encode(Frame::new(m.width, m.height, rgba), enc_params);
                     dirty_status = true;
                 }
                 DecodeState::Failed => pending = None,
             }
         }
 
-        // Coalesced redraws. Pan/zoom is pure host-side: re-point the
-        // element's source_rect at the already-uploaded full-frame
-        // texture — no pixels travel.
-        if dirty_media {
-            if is_video {
-                let l = vp.layout();
-                if created_img {
-                    send(
-                        &mut out,
-                        &[np(update_image_el(l.target, &cur_id, Some(l.source)))],
+        // A decoded / encoded picture from the worker. A still also
+        // brings its own dimensions and name; a video frame only had to
+        // be encoded, and keeps the geometry the stream already set.
+        match worker.poll() {
+            Some(work::Done::Ready(r)) => {
+                if let Some(path) = &r.path {
+                    name = file_label(path);
+                    // Every still may be a different size, so the
+                    // viewport is rebuilt around it — keeping the zoom
+                    // the user had chosen, except for the very first,
+                    // which fits.
+                    let zoom = have_picture.then_some(vp.zoom);
+                    src_w = r.frame.w;
+                    src_h = r.frame.h;
+                    vp = Viewport::new(
+                        src_w,
+                        src_h,
+                        cell_pw,
+                        cell_ph,
+                        0.0,
+                        0.0,
+                        cols as f32,
+                        media_rows as f32,
                     );
-                } else if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
-                    // After a resize the element is gone but the texture
-                    // survives in the session image table — recreate the
-                    // element over it, no re-upload. This is the reason
-                    // frames are pinned: releasing the deleted element's
-                    // reference would collect an `Auto` texture and this
-                    // would name a dead id (see `RETENTION`).
-                    send(
-                        &mut out,
-                        &[np(create_image_el(l.target, &cur_id, Some(l.source)))],
-                    );
-                    created_img = true;
+                    if let Some(z) = zoom {
+                        vp.zoom = z;
+                    }
                 }
-                // Otherwise no texture has finished uploading yet; the
-                // first upload's completion creates the element.
-            } else {
-                render_image_mode(&mut out, &vp, &mut created_img);
+                // The new picture streams into the other half of the
+                // ping-pong pair, so the one on screen stays drawable
+                // until the last chunk lands and the pump swaps them in
+                // a single envelope — no gap where the element points at
+                // a texture that isn't there yet.
+                let up = into_upload(&cur_id, &r.frame, r.encoding, r.payload);
+                queue_upload(&mut out, &mut upload, up);
+                source_frame = r.frame;
+                have_picture = true;
+                loading = None;
+                dirty_status = true;
             }
-            dirty_media = false;
-            dirty_status = true;
+            Some(work::Done::Failed { path, error, .. }) => {
+                // A directory listing is no promise that every file is a
+                // usable picture. If the user was walking one, keep
+                // going in the same direction; give up (cursor restored)
+                // once the whole directory has refused.
+                let walking = match (path.is_some(), pl.as_mut()) {
+                    (true, Some(pl)) if step_dir != 0 && step_tries + 1 < pl.len() => {
+                        step_tries += 1;
+                        let next = pl.step(step_dir);
+                        loading = Some(file_label(&next));
+                        worker.load(next, enc_params);
+                        true
+                    }
+                    (true, Some(pl)) if step_dir != 0 => {
+                        pl.set_index(step_start);
+                        step_dir = 0;
+                        false
+                    }
+                    _ => false,
+                };
+                if !walking {
+                    loading = None;
+                    // Nothing has ever reached the screen — the file
+                    // vplay was opened on, or a whole directory of
+                    // duds — so there is nothing to fall back to.
+                    // Report it and leave.
+                    if !have_picture {
+                        fatal = Some(error);
+                        quit = true;
+                    }
+                }
+                dirty_status = true;
+            }
+            None => {}
         }
 
-        // Stream the next chunk of an in-flight frame upload. The final
+        // Coalesced redraws. Pan/zoom is pure host-side: re-point the
+        // element's source_rect at the already-uploaded full-resolution
+        // texture — no pixels travel.
+        if dirty_media && !cur_id.is_empty() {
+            let l = vp.layout();
+            let cmd = if created_img {
+                update_image_el(l.target, &cur_id, Some(l.source))
+            } else {
+                // After a resize the element is gone but the texture
+                // survives in the session image table — recreate the
+                // element over it, no re-upload. This is the reason
+                // textures are pinned: releasing the deleted element's
+                // reference would collect an `Auto` texture and this
+                // would name a dead id (see `RETENTION`).
+                created_img = true;
+                create_image_el(l.target, &cur_id, Some(l.source))
+            };
+            send(&mut out, &[np(cmd)]);
+            dirty_status = true;
+        }
+        // Cleared even when there was no texture to point at yet: the
+        // first upload's completion creates the element from the live
+        // viewport anyway.
+        dirty_media = false;
+
+        // Stream the next chunk of an in-flight upload. The final
         // chunk carries the element retarget — built here, from the
         // viewport's current layout, so pans/zooms made while the frame
         // streamed are honoured — and the texture the element references
@@ -1183,11 +1209,11 @@ fn main() -> Result<()> {
                 created_img = true;
                 // Retire the texture the element previously referenced
                 // (also covers the one surviving a resize), or the next
-                // A/B flip would collide with it. Now that frames are
+                // A/B flip would collide with it. Now that textures are
                 // pinned this drop *is* the reclamation — under `Auto`
                 // the retarget above already collected the outgoing slot
                 // and this was a silent no-op.
-                if cur_id == IMG_ID_A || cur_id == IMG_ID_B {
+                if !cur_id.is_empty() {
                     fu.push(Command::DropImage {
                         id: cur_id.clone(),
                         by_prefix: false,
@@ -1230,8 +1256,16 @@ fn main() -> Result<()> {
                     None => String::new(),
                 };
                 (
-                    format!("{name}  {src_w}x{src_h}"),
-                    format!("{}%{pos}", vp.zoom_percent()),
+                    if have_picture {
+                        format!("{name}  {src_w}x{src_h}")
+                    } else {
+                        name.clone()
+                    },
+                    if have_picture {
+                        format!("{}%{pos}", vp.zoom_percent())
+                    } else {
+                        String::new()
+                    },
                     cursor_readout(&cur),
                 )
             };
@@ -1259,37 +1293,77 @@ fn main() -> Result<()> {
             dirty_seek = false;
         }
 
-        // Spinner: reveal once the picture has been stale for SPIN_DELAY
-        // — counting both the decode and the chunked upload that follows
-        // it — so quick seeks/steps don't flash it; hide it the moment
-        // the picture catches up. The angle is wall-clock based so
-        // the rotation rate is steady across tick lengths; updates are
-        // rate-limited to one transform per SPIN_FRAME.
-        match (pending.is_some() || upload.is_some(), busy_since) {
+        // The progress panel — which of the two phases the picture is in
+        // and how far through it. A pending decode outranks a streaming
+        // upload: a seek made mid-transfer supersedes that transfer, so
+        // the decode is the work the user is actually waiting on.
+        //
+        // Revealed only once the wait has lasted BUSY_DELAY, counting
+        // both phases, so quick seeks and steps don't flash it; hidden
+        // the moment the picture catches up. Repaints are rate-limited
+        // to one per PROGRESS_FRAME — an upload pumps a chunk every
+        // millisecond, which is far more often than a bar needs redrawing.
+        let busy = if let Some(d) = pending.as_ref() {
+            Some(Busy::Decoding {
+                what: None,
+                frac: d.progress(),
+            })
+        } else {
+            match worker.phase() {
+                work::Phase::Decoding => Some(Busy::Decoding {
+                    what: loading.as_deref(),
+                    frac: None,
+                }),
+                work::Phase::Encoding => Some(Busy::Encoding),
+                work::Phase::Idle => upload.as_ref().map(|u| Busy::Sending {
+                    done: u.offset,
+                    total: u.payload.len(),
+                }),
+            }
+        };
+        match (busy.is_some(), busy_since) {
             (true, None) => busy_since = Some(Instant::now()),
             (false, Some(_)) => busy_since = None,
             _ => {}
         }
-        let busy = busy_since.is_some_and(|t| t.elapsed() >= SPIN_DELAY);
-        if busy {
-            let mut cmds: Vec<(Command, u32)> = Vec::new();
-            if !spinner_visible {
-                spinner_visible = true;
-                cmds.push(np(spinner_show(true)));
+        match busy.filter(|_| busy_since.is_some_and(|t| t.elapsed() >= BUSY_DELAY)) {
+            Some(b) => {
+                let mut cmds: Vec<(Command, u32)> = Vec::new();
+                if !progress_visible {
+                    progress_visible = true;
+                    cmds.push(np(progress_show(true)));
+                    // Paint the panel in the same envelope that reveals
+                    // it, rather than showing a blank bar until the rate
+                    // limit next allows a repaint.
+                    last_progress = None;
+                }
+                if last_progress.is_none_or(|t| t.elapsed() >= PROGRESS_FRAME) {
+                    last_progress = Some(Instant::now());
+                    let (track, _) = progress_rects(cols, media_rows);
+                    cmds.push(np(progress_fill(
+                        track,
+                        b.frac(),
+                        busy_t0.elapsed().as_secs_f32(),
+                    )));
+                    cmds.push(np(progress_label(b.label())));
+                }
+                send(&mut out, &cmds);
             }
-            if last_spin.is_none_or(|t| t.elapsed() >= SPIN_FRAME) {
-                last_spin = Some(Instant::now());
-                cmds.push(np(spinner_angle(
-                    spin_t0.elapsed().as_secs_f32() * SPIN_SPEED,
-                )));
+            None => {
+                if progress_visible {
+                    progress_visible = false;
+                    send(&mut out, &[np(progress_show(false))]);
+                }
             }
-            send(&mut out, &cmds);
-        } else if spinner_visible {
-            spinner_visible = false;
-            send(&mut out, &[np(spinner_show(false))]);
         }
     }
 
+    // The opened file turned out to be undecodable, or too big for the
+    // host. Raised here rather than at the point of failure so `TermExit`
+    // has put the main screen back before anyone prints to it.
+    if let Some(e) = fatal {
+        bail!(e);
+    }
     Ok(())
 }
 
@@ -1408,6 +1482,133 @@ impl Drop for TermExit {
         let _ = o.write_all(&env);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn track() -> Rect {
+        progress_rects(80, 24).0
+    }
+
+    fn fill_rect(cmd: &Command) -> Rect {
+        match cmd {
+            Command::UpdateCommand(b) => match &b.command {
+                DrawCmd::FillRectangles { rects, .. } => rects[0],
+                _ => panic!("progress fill is not a rectangle"),
+            },
+            _ => panic!("progress fill is not an UpdateCommand"),
+        }
+    }
+
+    #[test]
+    fn sending_reports_bytes_and_percent() {
+        let b = Busy::Sending {
+            done: 5 * 1024 * 1024,
+            total: 20 * 1024 * 1024,
+        };
+        assert_eq!(b.frac(), Some(0.25));
+        assert_eq!(b.label(), "sending  25%  5.0/20.0 MB");
+    }
+
+    /// A zero-length payload is complete, not a division by zero.
+    #[test]
+    fn empty_payload_reads_as_done() {
+        let b = Busy::Sending { done: 0, total: 0 };
+        assert_eq!(b.frac(), Some(1.0));
+    }
+
+    /// Before ffmpeg writes anything there is no fraction to show, so
+    /// the bar sweeps rather than sitting at 0%.
+    #[test]
+    fn decode_without_bytes_is_indeterminate() {
+        let waiting = Busy::Decoding {
+            what: None,
+            frac: None,
+        };
+        assert_eq!(waiting.frac(), None);
+        assert_eq!(waiting.label(), "decoding");
+        assert_eq!(
+            Busy::Decoding {
+                what: None,
+                frac: Some(0.5)
+            }
+            .label(),
+            "decoding  50%"
+        );
+    }
+
+    /// A still's decode can only be named, never measured — so the
+    /// label carries the file and the bar sweeps.
+    #[test]
+    fn still_decode_names_the_file() {
+        let b = Busy::Decoding {
+            what: Some("photo.jpg"),
+            frac: None,
+        };
+        assert_eq!(b.frac(), None);
+        assert_eq!(b.label(), "decoding photo.jpg");
+    }
+
+    /// The encode is opaque too, and says so.
+    #[test]
+    fn encoding_is_indeterminate() {
+        assert_eq!(Busy::Encoding.frac(), None);
+        assert_eq!(Busy::Encoding.label(), "encoding");
+    }
+
+    #[test]
+    fn determinate_fill_grows_from_the_left() {
+        let t = track();
+        let empty = fill_rect(&progress_fill(t, Some(0.0), 0.0));
+        let half = fill_rect(&progress_fill(t, Some(0.5), 0.0));
+        let full = fill_rect(&progress_fill(t, Some(1.0), 0.0));
+        assert_eq!((empty.x, empty.w), (t.x, 0.0));
+        assert_eq!((half.x, half.w), (t.x, t.w * 0.5));
+        assert_eq!((full.x, full.w), (t.x, t.w));
+    }
+
+    /// Out-of-range fractions are clamped, so a bar can't spill past its
+    /// track if a byte count ever overshoots.
+    #[test]
+    fn determinate_fill_clamps() {
+        let t = track();
+        assert_eq!(fill_rect(&progress_fill(t, Some(2.0), 0.0)).w, t.w);
+        assert_eq!(fill_rect(&progress_fill(t, Some(-1.0), 0.0)).w, 0.0);
+    }
+
+    /// The sweeping segment stays inside the track at every phase of its
+    /// out-and-back travel.
+    #[test]
+    fn sweep_stays_inside_the_track() {
+        let t = track();
+        for i in 0..64 {
+            let r = fill_rect(&progress_fill(t, None, i as f32 * 0.05));
+            assert!(r.x >= t.x - 0.001, "left edge escaped at step {i}");
+            assert!(r.x + r.w <= t.x + t.w + 0.001, "right edge escaped at step {i}");
+            assert!(r.w > 0.0);
+        }
+    }
+
+    /// The panel is centred in the media area and its label sits above
+    /// the bar, not on top of it.
+    #[test]
+    fn panel_is_centred_with_the_label_above() {
+        let (track, label) = progress_rects(80, 24);
+        assert_eq!(track.x + track.w / 2.0, 40.0);
+        assert_eq!(label.x, 40.0);
+        assert!(label.y < track.y);
+    }
+
+    /// A terminal narrower than the preferred bar width still gets a bar
+    /// that fits inside it.
+    #[test]
+    fn narrow_terminal_keeps_the_bar_on_screen() {
+        let (track, _) = progress_rects(10, 6);
+        assert!(track.x >= 0.0);
+        assert!(track.x + track.w <= 10.0);
     }
 }
 

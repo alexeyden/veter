@@ -2,7 +2,6 @@
 //! frame decoding. No Rust media crate — both are spawned as external
 //! processes. Audio is ignored.
 
-use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
@@ -158,43 +157,10 @@ fn parse_fps(s: Option<&str>) -> Option<f64> {
     }
 }
 
-/// Decode exactly one frame at `time` seconds (accurate seek). vplay is
-/// scrub-only: every displayed frame comes from one of these calls.
-pub fn grab_one_frame(path: &str, w: u32, h: u32, time: f64) -> Result<Option<Vec<u8>>> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-hide_banner").args(["-loglevel", "error"]);
-    if time > 0.0 {
-        cmd.args(["-ss", &format!("{time}")]);
-    }
-    cmd.args(["-i", path]).args([
-        "-frames:v",
-        "1",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgba",
-        "-an",
-        "-sn",
-        "-",
-    ]);
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
-    let mut child = cmd.spawn().context("spawning ffmpeg")?;
-    let mut so = child.stdout.take().expect("piped stdout");
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-    let r = so.read_exact(&mut buf);
-    let _ = child.wait();
-    match r {
-        Ok(()) => Ok(Some(buf)),
-        Err(_) => Ok(None),
-    }
-}
-
 /// An ffmpeg single-frame decode running in the background. The event loop
-/// drains it incrementally with [`Decode::poll`] so it can animate a
-/// spinner (and stay responsive to input / newer seeks) while ffmpeg seeks
-/// and decodes. Dropping the handle kills ffmpeg — that is how a superseded
+/// drains it incrementally with [`Decode::poll`] so it can show progress
+/// (and stay responsive to input / newer seeks) while ffmpeg seeks and
+/// decodes. Dropping the handle kills ffmpeg — that is how a superseded
 /// seek (e.g. mid-drag) cancels the decode it replaced.
 pub struct Decode {
     child: Child,
@@ -219,6 +185,19 @@ impl Decode {
     /// finished decode wakes the loop promptly.
     pub fn fd(&self) -> RawFd {
         self.stdout.as_raw_fd()
+    }
+
+    /// Fraction of the frame ffmpeg has written back, or `None` before
+    /// the first byte arrives. The seek and the decode both happen
+    /// before ffmpeg writes anything, so that opening stretch is a wait
+    /// of unknown length rather than 0% of measurable work — reporting
+    /// it as a fraction would read as a stalled bar.
+    pub fn progress(&self) -> Option<f32> {
+        if self.filled == 0 || self.buf.is_empty() {
+            None
+        } else {
+            Some(self.filled as f32 / self.buf.len() as f32)
+        }
     }
 
     /// Drain whatever ffmpeg has written so far without blocking. The pipe
