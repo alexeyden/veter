@@ -123,13 +123,17 @@ impl Default for AccentConfig {
     }
 }
 
-/// `[search]` — search-chrome colors. `bar_bg` is optional and defaults
+/// `[search]` — search-chrome colors. `accent` is optional and defaults
 /// to the first accent color when unset.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SearchColors {
-    /// Search-bar background. `None` → first accent color.
-    pub bar_bg: Option<Rgba>,
+    /// Accent tint for the search panel's chrome (border, caret, chip
+    /// fills). `None` → first accent color, so the panel
+    /// follows `[accent]` unless it is given a colour of its own.
+    /// `bar_bg` is the pre-panel name for the same key.
+    #[serde(alias = "bar_bg")]
+    pub accent: Option<Rgba>,
     /// Search-bar text.
     pub bar_text: Rgba,
     /// The active match (the one `n`/`N` navigates to).
@@ -142,7 +146,7 @@ pub struct SearchColors {
 impl Default for SearchColors {
     fn default() -> Self {
         Self {
-            bar_bg: None,
+            accent: None,
             bar_text: Rgba::rgb(230, 230, 230),
             current_match: Rgba::rgb(220, 160, 0),
             match_color: Rgba::rgb(80, 80, 30),
@@ -558,10 +562,10 @@ impl Config {
         })
     }
 
-    /// Effective search-bar background: the configured `bar_bg`, else the
-    /// first accent color, else the built-in accent slot 0.
-    pub fn search_bar_bg(&self) -> Rgba {
-        self.search.bar_bg.unwrap_or_else(|| self.accent_primary())
+    /// Effective search-chrome accent: the configured `[search] accent`,
+    /// else the first accent color, else the built-in accent slot 0.
+    pub fn search_accent(&self) -> Rgba {
+        self.search.accent.unwrap_or_else(|| self.accent_primary())
     }
 
     pub fn key_bindings(&self) -> KeyBindings {

@@ -30,8 +30,11 @@
 # Search chrome colors
 # ---------------------------------------------------------------------------
 [search]
-# bar_bg        = "#56799f"   # search-bar background (default: accent slot 1)
-# bar_text      = "#e6e6e6"   # search-bar text
+# accent        = "#56799f"   # search-panel chrome: border, caret, chip fills
+#                             # (default: accent slot 1, so the panel follows
+#                             # the palette above). The old name `bar_bg`
+#                             # still works.
+# bar_text      = "#e6e6e6"   # query text in the search panel
 # current_match = "#dca000"   # the active match (the one n/N navigates to)
 # match         = "#50501e"   # all other matches
 

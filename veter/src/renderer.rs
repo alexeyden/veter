@@ -1004,7 +1004,7 @@ pub struct TerminalRenderer {
     // Search-chrome colors. Configurable via the user's config
     // (`[search]`); default to the values that were hardcoded here
     // before the config existed. Set via `set_search_colors`.
-    search_bar_bg: Color,
+    search_accent: Color,
     search_bar_text: Color,
     search_current_match: Color,
     search_match: Color,
@@ -1083,7 +1083,7 @@ impl TerminalRenderer {
             glyph_cache: GlyphCache::new(),
             gpu_image_handles: HashMap::new(),
             next_gpu_image_id: 0,
-            search_bar_bg: Color::rgb(0x56, 0x79, 0x9f),
+            search_accent: Color::rgb(0x56, 0x79, 0x9f),
             search_bar_text: Color::rgb(230, 230, 230),
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
@@ -1094,25 +1094,35 @@ impl TerminalRenderer {
     /// after construction; the defaults above stand in until then.
     pub fn set_search_colors(
         &mut self,
-        bar_bg: Color,
+        accent: Color,
         bar_text: Color,
         current_match: Color,
         other_match: Color,
     ) {
-        self.search_bar_bg = bar_bg;
+        self.search_accent = accent;
         self.search_bar_text = bar_text;
         self.search_current_match = current_match;
         self.search_match = other_match;
     }
 
-    /// Search-bar background color (for `draw_search_bar`).
-    pub fn search_bar_bg(&self) -> Color {
-        self.search_bar_bg
+    /// Accent tint for the search panel's chrome — its border, the caret
+    /// and the chip fills (`draw_search_bar`). Defaults to the first
+    /// `[accent]` slot, so a palette change restyles the panel;
+    /// `[search] accent` overrides it.
+    pub fn search_accent(&self) -> Color {
+        self.search_accent
     }
 
     /// Search-bar text color (for `draw_search_bar`).
     pub fn search_bar_text(&self) -> Color {
         self.search_bar_text
+    }
+
+    /// Colour of the active match in the grid. The search panel's match
+    /// counter is drawn in it too, so the count and the highlight it
+    /// points at share a colour.
+    pub fn search_current_match(&self) -> Color {
+        self.search_current_match
     }
 
     /// Allocate a fresh `GpuImageId` and record the renderer-side
