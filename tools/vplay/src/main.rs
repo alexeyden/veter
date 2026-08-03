@@ -829,19 +829,42 @@ fn main() -> Result<()> {
     // seeking frame-exact even for variable-frame-rate streams. Empty for
     // images, or videos whose container yields no usable packet index; the
     // seek path then falls back to the `index / fps` grid.
-    let frame_times = if is_video {
-        probe_frame_times(&path_str)
+    //
+    // Probed on a thread, because it costs one demux of the whole file:
+    // measured at ~140 packets/s on a 6.5 GB recording, which is two
+    // minutes of ffprobe for a file that long. Run inline it delayed the
+    // event loop — and therefore the first frame, which the loop is what
+    // applies — for exactly that long, with the chrome up and nothing in
+    // it. The grid fallback covers seeking until the table lands.
+    let mut frame_times: Vec<f64> = Vec::new();
+    let frame_times_rx = if is_video {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path_str.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_frame_times(&path));
+        });
+        Some(rx)
     } else {
-        Vec::new()
+        None
     };
-    let total_frames = if !frame_times.is_empty() {
-        Some(frame_times.len() as u64)
-    } else {
-        meta.as_ref().and_then(|m| m.total_frames())
-    };
+    let mut total_frames = meta.as_ref().and_then(|m| m.total_frames());
     let duration = meta.as_ref().map(|m| m.duration()).unwrap_or(0.0);
 
     while !quit {
+        // The packet index, if the probe thread has finished with it.
+        // Adopting it mid-session only sharpens seeking: the frame the
+        // user is on keeps its timestamp, and the count firms up from
+        // the container's estimate to the real one.
+        if let Some(rx) = frame_times_rx.as_ref()
+            && let Ok(times) = rx.try_recv()
+            && !times.is_empty()
+        {
+            total_frames = Some(times.len() as u64);
+            frame_times = times;
+            dirty_status = true;
+            dirty_seek = true;
+        }
+
         if take_sigwinch(winch)
             && let Some(ws) = winsize()
         {
@@ -1088,7 +1111,20 @@ fn main() -> Result<()> {
                     worker.encode(Frame::new(m.width, m.height, rgba), enc_params);
                     dirty_status = true;
                 }
-                DecodeState::Failed => pending = None,
+                DecodeState::Failed => {
+                    pending = None;
+                    // A seek that lands nowhere just leaves the current
+                    // frame up. The *first* decode failing is different:
+                    // there is nothing on screen and never will be, so
+                    // say so instead of sitting on empty chrome.
+                    if !have_picture {
+                        fatal = Some(format!(
+                            "could not decode the first frame of {path_str} \
+                             (ffmpeg produced none)"
+                        ));
+                        quit = true;
+                    }
+                }
             }
         }
 
