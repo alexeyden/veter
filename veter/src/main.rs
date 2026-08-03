@@ -2907,6 +2907,19 @@ impl App {
 
         let Some(search) = self.search.as_mut() else { return };
 
+        // Text this key contributes to the query. The space bar arrives
+        // as `NamedKey::Space` rather than `Character(" ")` — winit's
+        // naming, which the PTY path already knows about (see the
+        // Ctrl+Space arm in `handle_key_input`) — so folding it in here
+        // is what lets a query hold one. Without it the character arm
+        // never saw a space and the catch-all swallowed it, which made a
+        // multi-word search impossible to type.
+        let typed: Option<&str> = match &event.logical_key {
+            Key::Character(c) => Some(c.as_str()),
+            Key::Named(NamedKey::Space) => Some(" "),
+            _ => None,
+        };
+
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
                 // In expansion mode Enter commits: close the overlay,
@@ -2939,8 +2952,8 @@ impl App {
                     w.request_redraw();
                 }
             }
-            Key::Character(c) => {
-                let s = c.as_str();
+            _ => {
+                let Some(s) = typed else { return };
                 // Incremental-expansion mode: the committed label key
                 // grows the selection one word at a time toward EOL; any
                 // other plain key ends the mode and closes the overlay,
@@ -3005,10 +3018,13 @@ impl App {
                     }
                     return;
                 }
-                // Swallow any other Alt combo so it doesn't leak into the
-                // query (matches the pre-config behavior where only Alt+C
-                // did anything and every other Alt press was ignored).
-                if self.modifiers.alt_key() {
+                // Swallow any other Alt or Ctrl combo so it doesn't leak
+                // into the query (matches the pre-config behavior where
+                // only Alt+C did anything and every other Alt press was
+                // ignored). Ctrl matters more now that Space types: the
+                // Ctrl+Space that opens a vmux prefix would otherwise
+                // land in the query as a space.
+                if self.modifiers.alt_key() || self.modifiers.control_key() {
                     return;
                 }
                 if !search.editing {
@@ -3047,7 +3063,6 @@ impl App {
                     w.request_redraw();
                 }
             }
-            _ => {}
         }
     }
 

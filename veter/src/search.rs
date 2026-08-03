@@ -262,6 +262,26 @@ mod tests {
         assert!(find_matches(&idx, "", true).is_empty());
     }
 
+    /// A query may hold spaces — the row text keeps them, so a
+    /// multi-word phrase matches like any other substring. (Typing one
+    /// is the part that needed fixing: winit reports the space bar as
+    /// `NamedKey::Space`, so the search bar's character path never saw
+    /// it; see `App::handle_search_key_input`.)
+    #[test]
+    fn find_phrase_with_spaces() {
+        let mut p = parse(b"the quick brown fox\r\nthe quick red fox", 3, 30);
+        let idx = extract_indexed_text(&mut p, 0);
+        let m = find_matches(&idx, "quick brown", true);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].line, 0);
+        assert_eq!(m[0].col_start, 4);
+        assert_eq!(m[0].col_end, 15);
+        // Both rows share the shorter phrase.
+        assert_eq!(find_matches(&idx, "the quick", true).len(), 2);
+        // Trailing space narrows nothing away mid-line.
+        assert_eq!(find_matches(&idx, "fox ", true).len(), 0);
+    }
+
     #[test]
     fn wide_char_col_accounting() {
         // "あい" — two wide chars, each occupies 2 cells. "あ" is 3
