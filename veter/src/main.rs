@@ -8,6 +8,7 @@ use config::{HostAction, SearchAction};
 
 use std::io::Read;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -681,6 +682,17 @@ struct App {
     /// dragged off a button cancels rather than firing — which matters
     /// most for Quit.
     close_prompt_pressed: Option<PromptButton>,
+    /// Set when the last PTY drain pass stopped on [`PTY_DRAIN_BUDGET`]
+    /// with bytes still queued. `about_to_wait` clears it and asks for
+    /// another pass, once this frame has been drawn.
+    pty_backlog: bool,
+    /// True while a PTY wakeup is already queued but unhandled. The
+    /// reader thread checks it before posting, so a client writing
+    /// megabytes queues one event rather than thousands: winit
+    /// dispatches every pending user event before it emits
+    /// `RedrawRequested`, so an unthrottled reader starves the frame
+    /// the drain budget exists to produce.
+    pty_wake_pending: Arc<AtomicBool>,
 }
 
 /// One scrollback-search session, owned by `App::search`.
@@ -822,6 +834,46 @@ fn assign_jump_labels(
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_RADIUS_PX: f64 = 6.0;
+
+/// How long one `App::process_pty_output` pass may spend absorbing PTY
+/// bytes before handing the frame back to the renderer.
+///
+/// A client streaming a multi-megabyte image (vplay, vcat, vfm) keeps
+/// the channel non-empty for as long as its write takes, so an
+/// unbounded drain runs to completion and nothing is painted in
+/// between — including the client's own upload progress, which is
+/// exactly the thing that wants to be on screen while it waits. With a
+/// ceiling, each pass costs one frame and the terminal stays live under
+/// load; `about_to_wait` schedules the next pass once that frame is out.
+const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// How one [`App::process_pty_output`] pass ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PtyPass {
+    /// False once the child's PTY has closed: time to exit.
+    alive: bool,
+    /// True when the pass stopped on [`PTY_DRAIN_BUDGET`] with bytes
+    /// still queued, so another pass is owed after this frame.
+    backlog: bool,
+}
+
+impl PtyPass {
+    /// The queue ran dry.
+    const DRAINED: Self = Self {
+        alive: true,
+        backlog: false,
+    };
+    /// Out of budget, bytes still waiting.
+    const BACKLOG: Self = Self {
+        alive: true,
+        backlog: true,
+    };
+    /// The child is gone.
+    const DEAD: Self = Self {
+        alive: false,
+        backlog: false,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Overlay chrome
@@ -1499,6 +1551,8 @@ impl App {
             entry_command,
             close_prompt: false,
             close_prompt_pressed: None,
+            pty_backlog: false,
+            pty_wake_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3037,40 +3091,40 @@ impl App {
         }
     }
 
-    /// Process PTY output. Returns false if the child process has exited.
-    fn process_pty_output(&mut self) -> bool {
+    /// Process PTY output, for up to [`PTY_DRAIN_BUDGET`] of wall clock.
+    fn process_pty_output(&mut self) -> PtyPass {
         let rx = match &self.rx {
             Some(r) => r,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let parser = match &mut self.parser {
             Some(p) => p,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let engine = match &mut self.vge {
             Some(e) => e,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let prt = match &mut self.prt {
             Some(p) => p,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let vft = match &mut self.vft {
             Some(v) => v,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let vss = match &mut self.vss {
             Some(v) => v,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let ses = match &mut self.ses {
             Some(s) => s,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
         let vss_backup = &mut self.vss_pre_attach_backup;
         let pty = match &self.pty {
             Some(p) => p,
-            None => return false,
+            None => return PtyPass::DEAD,
         };
 
         // Drain VFT worker channels first so async events (download
@@ -3078,7 +3132,15 @@ impl App {
         // outgoing envelope even when no PTY input arrived this tick.
         vft.drive();
 
+        let deadline = Instant::now() + PTY_DRAIN_BUDGET;
         loop {
+            // Hand the frame back to the renderer once the budget is
+            // spent, leaving the rest of the queue for the next pass.
+            // The check is at the top of the loop, so a pass always
+            // absorbs at least one chunk and cannot livelock.
+            if Instant::now() >= deadline {
+                return PtyPass::BACKLOG;
+            }
             match rx.try_recv() {
                 Ok(data) => {
                     // Pipeline: a prefix of order-insensitive byte
@@ -3230,9 +3292,9 @@ impl App {
                     if !prt_resp.is_empty() {
                         let _ = pty.write_all(&prt_resp);
                     }
-                    return true;
+                    return PtyPass::DRAINED;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => return PtyPass::DEAD,
             }
         }
     }
@@ -3362,10 +3424,15 @@ impl ApplicationHandler for App {
         let (tx, rx) = mpsc::channel();
         let reader_fd = pty.dup_master().expect("Failed to dup master fd");
         let proxy = self.proxy.clone();
+        let wake_pending = self.pty_wake_pending.clone();
 
         std::thread::spawn(move || {
             let mut file = std::fs::File::from(reader_fd);
-            let mut buf = [0u8; 4096];
+            // Sized for the flood, not the keystroke: a client uploading
+            // an image writes megabytes, and a 4 KiB buffer turned that
+            // into one allocation, one channel send and one event-loop
+            // wakeup per 4 KiB. Short reads still return short.
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match file.read(&mut buf) {
                     Ok(0) => break,
@@ -3373,7 +3440,12 @@ impl ApplicationHandler for App {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
-                        let _ = proxy.send_event(());
+                        // One outstanding wakeup at a time; the data is
+                        // already in the channel, and the pass this
+                        // wakeup triggers drains whatever has piled up.
+                        if !wake_pending.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.send_event(());
+                        }
                     }
                     Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
                     Err(_) => break,
@@ -3946,7 +4018,11 @@ impl ApplicationHandler for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
-        let alive = self.process_pty_output();
+        // Cleared before the drain, so bytes arriving mid-pass queue a
+        // fresh wakeup instead of being stranded in the channel.
+        self.pty_wake_pending.store(false, Ordering::Release);
+        let pass = self.process_pty_output();
+        self.pty_backlog = pass.backlog;
         self.drain_pending_clipboard();
         self.validate_selection();
         // PTY output may have advanced the target parser's scrollback;
@@ -3961,12 +4037,23 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        if !alive {
+        if !pass.alive {
             event_loop.exit();
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A drain pass is owed: the last one stopped on its time budget
+        // so the frame it had produced could be drawn. Asking for it
+        // here — after this iteration's redraw, which winit dispatches
+        // before `about_to_wait` — is what stops a flooding client from
+        // starving the renderer while still consuming its output at
+        // full speed.
+        if self.pty_backlog {
+            self.pty_backlog = false;
+            let _ = self.proxy.send_event(());
+        }
+
         // Auto-scroll while a Shift+drag is in progress and the cursor
         // sits past the viewport edge. Schedule a wakeup at
         // `autoscroll_deadline`; once it elapses, scroll one row,
