@@ -669,6 +669,18 @@ struct App {
     /// `veter -e <command>` entry-point command: exec this instead of the
     /// default vmux/`$SHELL`. `None` for a normal launch.
     entry_command: Option<Vec<String>>,
+    /// True while the close-confirmation panel is up (`[window]
+    /// confirm_close`, default on). Modal like the search bar: keys and
+    /// clicks answer the prompt instead of reaching the focused PTY, and
+    /// the panel is drawn over everything else. Only the window
+    /// manager's close request raises it — a child that exits on its own
+    /// still ends the process without asking.
+    close_prompt: bool,
+    /// Button the left press landed on while the prompt is up. The
+    /// release only acts if it lands on that same button, so a press
+    /// dragged off a button cancels rather than firing — which matters
+    /// most for Quit.
+    close_prompt_pressed: Option<PromptButton>,
 }
 
 /// One scrollback-search session, owned by `App::search`.
@@ -983,6 +995,196 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     (to(r1), to(g1), to(b1))
 }
 
+// ---------------------------------------------------------------------------
+// Close confirmation
+// ---------------------------------------------------------------------------
+
+/// Prompt title and button labels. The parenthesised keys are the ones
+/// `App::answer_close_prompt` accepts, so the panel never advertises a
+/// binding the handler doesn't honour. Quitting is deliberately *not*
+/// on Enter — Enter is the key most likely to be pressed blind, so it
+/// cancels along with Esc, and only an explicit `y` closes the window.
+const CLOSE_PROMPT_TITLE: &str = "Close veter?";
+const CLOSE_PROMPT_CANCEL: &str = "Cancel (Esc)";
+const CLOSE_PROMPT_QUIT: &str = "Quit (y)";
+
+/// The two buttons of the close-confirmation panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromptButton {
+    Cancel,
+    Quit,
+}
+
+/// A pixel rectangle: `(x, y, w, h)`, physical pixels.
+type Rect = (f32, f32, f32, f32);
+
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    let (rx, ry, rw, rh) = rect;
+    x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
+/// Geometry of the close-confirmation panel. Computed from the window
+/// size and the cell metrics — so the panel scales with the configured
+/// font — and shared by the drawing code and the pointer hit-test, so
+/// the buttons the user sees are exactly the ones the click lands on.
+struct ClosePromptLayout {
+    panel: Rect,
+    title_center_x: f32,
+    title_baseline_y: f32,
+    cancel: Rect,
+    quit: Rect,
+}
+
+impl ClosePromptLayout {
+    /// Button under the pointer, if any.
+    fn hit(&self, x: f32, y: f32) -> Option<PromptButton> {
+        if rect_contains(self.cancel, x, y) {
+            Some(PromptButton::Cancel)
+        } else if rect_contains(self.quit, x, y) {
+            Some(PromptButton::Quit)
+        } else {
+            None
+        }
+    }
+}
+
+fn close_prompt_layout(
+    window_w_px: f32,
+    window_h_px: f32,
+    cell_w: f32,
+    cell_h: f32,
+    ascent: f32,
+) -> ClosePromptLayout {
+    // Everything is sized in cells so the panel keeps its proportions
+    // across font sizes and HiDPI scales.
+    let pad = cell_w * 2.0;
+    let label_cells = CLOSE_PROMPT_CANCEL
+        .chars()
+        .count()
+        .max(CLOSE_PROMPT_QUIT.chars().count()) as f32;
+    let button_w = (label_cells + 4.0) * cell_w;
+    let button_h = cell_h * 2.0;
+    let gap = cell_w * 2.0;
+    let buttons_w = button_w * 2.0 + gap;
+    let title_w = CLOSE_PROMPT_TITLE.chars().count() as f32 * cell_w;
+
+    let panel_w = buttons_w.max(title_w) + pad * 2.0;
+    let panel_h = pad * 2.0 + cell_h + cell_h + button_h;
+    let panel_x = ((window_w_px - panel_w) * 0.5).round();
+    let panel_y = ((window_h_px - panel_h) * 0.5).round();
+
+    let buttons_y = panel_y + panel_h - pad - button_h;
+    let buttons_x = panel_x + (panel_w - buttons_w) * 0.5;
+
+    ClosePromptLayout {
+        panel: (panel_x, panel_y, panel_w, panel_h),
+        title_center_x: panel_x + panel_w * 0.5,
+        title_baseline_y: panel_y + pad + ascent,
+        cancel: (buttons_x, buttons_y, button_w, button_h),
+        quit: (buttons_x + button_w + gap, buttons_y, button_w, button_h),
+    }
+}
+
+/// Draw the close-confirmation panel over the whole window: a dimming
+/// scrim, then the panel with its two buttons. Drawn last of everything
+/// so it sits above the grid, portals, VGE chrome and search bar — it is
+/// modal, and `window_event` routes keys and clicks to it while it is up.
+fn draw_close_prompt<T: femtovg::Renderer>(
+    canvas: &mut Canvas<T>,
+    tr: &mut renderer::TerminalRenderer,
+    accent: Color,
+    hover: Option<PromptButton>,
+    window_w_px: f32,
+    window_h_px: f32,
+) {
+    let layout = close_prompt_layout(
+        window_w_px,
+        window_h_px,
+        tr.cell_width,
+        tr.cell_height,
+        tr.ascent(),
+    );
+
+    // Scrim: dims the terminal behind the panel without hiding it, so
+    // the user can still read what they are about to close.
+    let mut scrim = femtovg::Path::new();
+    scrim.rect(0.0, 0.0, window_w_px, window_h_px);
+    canvas.fill_path(&scrim, &femtovg::Paint::color(Color::rgba(0, 0, 0, 150)));
+
+    let (px, py, pw, ph) = layout.panel;
+    let radius = tr.cell_height * 0.5;
+    let mut panel = femtovg::Path::new();
+    panel.rounded_rect(px, py, pw, ph, radius);
+    canvas.fill_path(&panel, &femtovg::Paint::color(Color::rgb(38, 38, 42)));
+    let mut border = femtovg::Paint::color(accent);
+    border.set_line_width(2.0);
+    canvas.stroke_path(&panel, &border);
+
+    tr.draw_vge_text(
+        canvas,
+        layout.title_center_x,
+        layout.title_baseline_y,
+        CLOSE_PROMPT_TITLE,
+        Color::rgb(235, 235, 235),
+        vge::command::Align::Center,
+        vge::command::FontStyle::default(),
+        1.0,
+    );
+
+    // Cancel is the safe answer and the one Enter/Esc give, so it is the
+    // filled accent button; Quit is outlined and warm-toned, an action
+    // you have to aim at. Hover lightens whichever the pointer is on.
+    for (button, rect, label) in [
+        (PromptButton::Cancel, layout.cancel, CLOSE_PROMPT_CANCEL),
+        (PromptButton::Quit, layout.quit, CLOSE_PROMPT_QUIT),
+    ] {
+        let (bx, by, bw, bh) = rect;
+        let hot = hover == Some(button);
+        let mut path = femtovg::Path::new();
+        path.rounded_rect(bx, by, bw, bh, radius * 0.6);
+        let (fill, text_color) = match button {
+            PromptButton::Cancel => (
+                if hot { lighten(accent, 0.25) } else { accent },
+                Color::rgb(245, 245, 245),
+            ),
+            PromptButton::Quit => (
+                if hot {
+                    Color::rgb(92, 44, 44)
+                } else {
+                    Color::rgb(52, 40, 42)
+                },
+                Color::rgb(232, 130, 130),
+            ),
+        };
+        canvas.fill_path(&path, &femtovg::Paint::color(fill));
+        if button == PromptButton::Quit {
+            let mut outline = femtovg::Paint::color(Color::rgb(150, 70, 70));
+            outline.set_line_width(1.0);
+            canvas.stroke_path(&path, &outline);
+        }
+        tr.draw_vge_text(
+            canvas,
+            bx + bw * 0.5,
+            by + (bh - tr.ascent()) * 0.5 + tr.ascent(),
+            label,
+            text_color,
+            vge::command::Align::Center,
+            vge::command::FontStyle::default(),
+            1.0,
+        );
+    }
+}
+
+/// Blend `color` toward white by `amount` (`0.0`..=`1.0`).
+fn lighten(color: Color, amount: f32) -> Color {
+    Color::rgbaf(
+        color.r + (1.0 - color.r) * amount,
+        color.g + (1.0 - color.g) * amount,
+        color.b + (1.0 - color.b) * amount,
+        color.a,
+    )
+}
+
 fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
     let mut bits = 0;
     if modifiers.shift_key() {
@@ -1033,6 +1235,51 @@ impl App {
             keys,
             selection_fresh: false,
             entry_command,
+            close_prompt: false,
+            close_prompt_pressed: None,
+        }
+    }
+
+    /// Geometry of the close-confirmation panel for the current window,
+    /// or `None` before the renderer/window exist. Same call the drawing
+    /// code makes, so pointer hit-tests agree with what is on screen.
+    fn close_prompt_layout(&self) -> Option<ClosePromptLayout> {
+        let window = self.window.as_ref()?;
+        let tr = self.term_renderer.as_ref()?;
+        let size = window.inner_size();
+        Some(close_prompt_layout(
+            size.width as f32,
+            size.height as f32,
+            tr.cell_width,
+            tr.cell_height,
+            tr.ascent(),
+        ))
+    }
+
+    /// Button the pointer is currently over, for the hover highlight.
+    fn close_prompt_hover(&self) -> Option<PromptButton> {
+        let pos = self.cursor_pos?;
+        self.close_prompt_layout()?
+            .hit(pos.x as f32, pos.y as f32)
+    }
+
+    /// Map a key press to a prompt answer. Only `y` quits; Esc, `n` and
+    /// Enter all cancel — Enter is the key most likely to be hit blind
+    /// by someone still typing at the shell, so it must not be the one
+    /// that closes the window. Everything else is swallowed rather than
+    /// reaching the PTY, so a stray keystroke can neither quit nor leak
+    /// into the shell behind the panel.
+    fn answer_close_prompt(&self, event: &winit::event::KeyEvent) -> Option<PromptButton> {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                Some(PromptButton::Cancel)
+            }
+            Key::Character(s) => match s.as_str() {
+                "y" | "Y" => Some(PromptButton::Quit),
+                "n" | "N" => Some(PromptButton::Cancel),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -2894,7 +3141,22 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // The window manager's close request. With `[window]
+            // confirm_close` on (the default) it raises the modal
+            // confirmation panel instead of quitting; a second request
+            // while the panel is already up changes nothing, since the
+            // answer has to come from the panel itself.
+            WindowEvent::CloseRequested => {
+                if !self.config.window.confirm_close {
+                    event_loop.exit();
+                } else if !self.close_prompt {
+                    self.close_prompt = true;
+                    self.close_prompt_pressed = None;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
 
             WindowEvent::Resized(size) => {
                 if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context) {
@@ -2935,6 +3197,14 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
+                // Under the prompt, motion only moves the hover
+                // highlight — it never reaches the inner program.
+                if self.close_prompt {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 let local_drag = matches!(&self.selection, Some(s) if s.dragging);
                 // When a local drag-select is in progress, motion
                 // belongs to the host (selection extension), not the
@@ -2953,6 +3223,32 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // Modal: a click either answers the prompt or is
+                // discarded. Acting on release (and only when the press
+                // landed on the same button) matches how buttons behave
+                // elsewhere — a press that drags off the button cancels.
+                if self.close_prompt {
+                    if button == MouseButton::Left {
+                        let hit = self.close_prompt_hover();
+                        match state {
+                            ElementState::Pressed => self.close_prompt_pressed = hit,
+                            ElementState::Released => {
+                                let armed = self.close_prompt_pressed.take();
+                                match hit.filter(|b| Some(*b) == armed) {
+                                    Some(PromptButton::Quit) => event_loop.exit(),
+                                    Some(PromptButton::Cancel) => {
+                                        self.close_prompt = false;
+                                        if let Some(w) = &self.window {
+                                            w.request_redraw();
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 let shift = self.modifiers.shift_key();
                 match (state, button) {
                     (ElementState::Pressed, MouseButton::Left) => {
@@ -3107,6 +3403,11 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // The close prompt swallows the wheel outright: nothing
+                // behind it should scroll while it is waiting on an answer.
+                if self.close_prompt {
+                    return;
+                }
                 // Search is modal: while the bar is open, the wheel
                 // navigates the search-target's scrollback directly
                 // (one tick = 3 lines, mirroring the standard host
@@ -3219,6 +3520,25 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // The close prompt is modal w.r.t. the focused PTY, the
+                // same way the search bar is: every key is consumed here
+                // while it is up, so typing can't leak into the shell
+                // behind it.
+                if self.close_prompt {
+                    if event.state == ElementState::Pressed {
+                        match self.answer_close_prompt(&event) {
+                            Some(PromptButton::Quit) => event_loop.exit(),
+                            Some(PromptButton::Cancel) => {
+                                self.close_prompt = false;
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    return;
+                }
                 self.handle_key_input(&event);
             }
 
@@ -3231,6 +3551,14 @@ impl ApplicationHandler for App {
                 self.recompute_labels();
 
                 let size = self.window.as_ref().unwrap().inner_size();
+                // Resolved before `canvas` takes its borrow of `self`,
+                // since both read the renderer's cell metrics.
+                let close_hover = if self.close_prompt {
+                    self.close_prompt_hover()
+                } else {
+                    None
+                };
+                let accent = self.config.accent_primary().to_femto();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
                 canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(30, 30, 30));
@@ -3324,6 +3652,23 @@ impl ApplicationHandler for App {
                         draw_jump_labels(canvas, tr, search, prt, parser);
                         draw_search_bar(canvas, tr, search, size.width as f32, size.height as f32);
                     }
+                }
+
+                // The close prompt is modal, so it goes on last — over
+                // the grid, the portals and the search chrome alike.
+                // Outside the `if let` above so it still draws if the
+                // engines aren't up yet (a close request during startup).
+                if self.close_prompt
+                    && let Some(tr) = &mut self.term_renderer
+                {
+                    draw_close_prompt(
+                        canvas,
+                        tr,
+                        accent,
+                        close_hover,
+                        size.width as f32,
+                        size.height as f32,
+                    );
                 }
 
                 canvas.flush();

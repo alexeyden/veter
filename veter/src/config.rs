@@ -6,7 +6,7 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Three things are configurable:
+//! Four things are configurable:
 //!
 //!  * `[accent]` — the shared accent palette the host publishes into the
 //!    reserved `host.*` VGE style namespace (see VGE §7.3). vmux and
@@ -15,6 +15,7 @@
 //!    highlights).
 //!  * `[keys]` — the host-intercepted key chords (search, scroll,
 //!    overlay, copy, paste) and the in-search-overlay modal keys.
+//!  * `[window]` — window-level behavior (the close confirmation).
 //!
 //! This is a binary-local module: nothing here touches the `veter-host`
 //! engine state, so `vsd` (which shares those engines) is unaffected and
@@ -145,6 +146,25 @@ impl Default for SearchColors {
             bar_text: Rgba::rgb(230, 230, 230),
             current_match: Rgba::rgb(220, 160, 0),
             match_color: Rgba::rgb(80, 80, 30),
+        }
+    }
+}
+
+/// `[window]` — window-level behavior.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WindowConfig {
+    /// Ask before acting on the window manager's close request. `false`
+    /// quits immediately, as veter did before the prompt existed. Only
+    /// the WM close path is guarded — the child exiting on its own still
+    /// ends the process without asking.
+    pub confirm_close: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            confirm_close: true,
         }
     }
 }
@@ -484,6 +504,7 @@ pub struct Config {
     pub accent: AccentConfig,
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
+    pub window: WindowConfig,
     /// User-defined commands run against the current selection. Empty by
     /// default — there are no built-in selection commands.
     pub selection_commands: Vec<SelectionCommandConfig>,
@@ -527,15 +548,20 @@ impl Config {
         .collect()
     }
 
+    /// First accent color, falling back to the built-in slot 0 when the
+    /// configured palette is empty. The tint host-drawn chrome uses when
+    /// it has no colour of its own.
+    pub fn accent_primary(&self) -> Rgba {
+        self.accent.palette.first().copied().unwrap_or_else(|| {
+            let (r, g, b) = DEFAULT_ACCENT[0];
+            Rgba::rgb(r, g, b)
+        })
+    }
+
     /// Effective search-bar background: the configured `bar_bg`, else the
     /// first accent color, else the built-in accent slot 0.
     pub fn search_bar_bg(&self) -> Rgba {
-        self.search.bar_bg.unwrap_or_else(|| {
-            self.accent.palette.first().copied().unwrap_or_else(|| {
-                let (r, g, b) = DEFAULT_ACCENT[0];
-                Rgba::rgb(r, g, b)
-            })
-        })
+        self.search.bar_bg.unwrap_or_else(|| self.accent_primary())
     }
 
     pub fn key_bindings(&self) -> KeyBindings {
