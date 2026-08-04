@@ -643,6 +643,88 @@ fn next_word_end_in_parser<CB: vt100::Callbacks>(
     result
 }
 
+/// Bounds of the *logical* line containing `line` — the whole
+/// soft-wrapped paragraph, not the one screen row. Returns
+/// `(start, end)` where `start` is column 0 of the first row in the
+/// wrap chain and `end` is the last non-blank cell in the chain.
+///
+/// `None` when the logical line holds nothing but whitespace, which is
+/// the same "there is nothing here to select" answer
+/// [`find_word_range_in_parser`] gives for a blank cell.
+///
+/// Leading whitespace is kept (indentation is part of the line, and
+/// this is what a triple-click elsewhere selects) while trailing
+/// whitespace is not — ending on the last non-blank cell makes the
+/// result identical to walking [`next_word_end_in_parser`] to
+/// exhaustion, which is exactly what repeatedly pressing the label key
+/// does.
+fn logical_line_bounds_in_parser<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    top_of_live_screen: i64,
+    line: i64,
+) -> Option<((i64, u16), (i64, u16))> {
+    let (_, cols) = parser.screen().size();
+    let saved = parser.screen().scrollback();
+
+    // Walk back to the head of the wrap chain. `row_wrapped_at` reports
+    // false for a line that has fallen out of scrollback, so this
+    // terminates at the buffer edge on its own.
+    let mut start_line = line;
+    while row_wrapped_at(parser, top_of_live_screen, start_line - 1) {
+        start_line -= 1;
+    }
+
+    // Then forward to its tail, remembering the last non-blank cell
+    // seen anywhere along the way — a chain can end with a row that is
+    // entirely blank.
+    let mut end: Option<(i64, u16)> = None;
+    let mut cur = start_line;
+    loop {
+        for col in 0..cols {
+            if matches!(
+                cell_char_at(parser, top_of_live_screen, cur, col),
+                Some(ch) if is_word_char(ch)
+            ) {
+                end = Some((cur, col));
+            }
+        }
+        if !row_wrapped_at(parser, top_of_live_screen, cur) {
+            break;
+        }
+        cur += 1;
+    }
+
+    parser.screen_mut().set_scrollback(saved);
+    end.map(|e| ((start_line, 0), e))
+}
+
+/// Decide where — or whether — to draw a whole-line marker for a match,
+/// given its logical line's `bounds` and the cell its word label already
+/// occupies. Pure so the placement rules can be tested without a live
+/// grid; [`App::whole_line_anchor`] supplies the bounds.
+///
+/// The marker goes one cell past the line's last non-blank, mirroring
+/// how the word label sits one past its word. It is suppressed when the
+/// line already carries one (every label on a line selects that same
+/// line, so one marker says it) or when it would land on the word label.
+fn whole_line_marker(
+    bounds: ((i64, u16), (i64, u16)),
+    cols: u16,
+    word_anchor: (i64, u16),
+    already_marked: &mut std::collections::HashSet<i64>,
+) -> Option<(i64, u16)> {
+    let ((start_line, _), (end_line, end_col)) = bounds;
+    if !already_marked.insert(start_line) {
+        return None;
+    }
+    let anchor = if end_col + 1 < cols {
+        (end_line, end_col + 1)
+    } else {
+        (end_line, end_col)
+    };
+    (anchor != word_anchor).then_some(anchor)
+}
+
 /// Host-level pre-attach state stashed on the first VSS
 /// `SnapshotBegin` so a `DetachNotify` later can roll back to the
 /// view the user had before they attached. Same idea as
@@ -846,6 +928,16 @@ struct JumpLabel {
     ch: char,
     anchor_line: i64,
     anchor_col: u16,
+    /// Where to draw the *shifted* form of `ch`, which selects the whole
+    /// logical line rather than the word (see [`App::select_line_at_match`]).
+    /// Sits just past the end of that line, so the pair reads as
+    /// "lowercase here takes the word, uppercase there takes the line".
+    ///
+    /// `None` when it would be noise: the line is blank, the glyph
+    /// would land on the word label, or another label on the same
+    /// logical line already carries it — every label on a line selects
+    /// the same line, so one marker is enough.
+    line_anchor: Option<(i64, u16)>,
 }
 
 impl SearchState {
@@ -872,6 +964,20 @@ impl SearchState {
 /// the query. `n`/`N` are reserved for match navigation and never used.
 const JUMP_LABEL_ALPHABET: &[char] =
     &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'];
+
+/// The label key `ch` is the shifted form of, if it is one. Labels are
+/// drawn lowercase, so `'A'` → `Some('a')` selects the whole line at
+/// the match `a` labels, while `'a'` → `None` is the plain word press.
+fn shifted_label(ch: char) -> Option<char> {
+    let mut lower = ch.to_lowercase();
+    let first = lower.next()?;
+    // Single-char lowering only, and only for something that actually
+    // changed case — otherwise `'a'` would masquerade as its own shift.
+    if lower.next().is_some() || first == ch {
+        return None;
+    }
+    JUMP_LABEL_ALPHABET.contains(&first).then_some(first)
+}
 
 /// Character starting at cell column `col` in an indexed search row, or
 /// `None` if `col` is past the row's content (e.g. the match ends at the
@@ -1115,13 +1221,15 @@ fn draw_search_bar<T: femtovg::Renderer>(
     // Key hint: whichever keys do something in the mode the session is
     // actually in (see `handle_search_key_input`), so the panel never
     // advertises a binding that would do nothing.
-    let hint = if search.expand.is_some() {
-        "Enter: done"
-    } else if search.editing {
-        "Enter: navigate"
-    } else {
-        "n/N: step"
+    // In expand mode it names the committed key's shifted form
+    // explicitly (`S: line`), which is how the whole-line gesture gets
+    // discovered: you learn it the first time you use a label.
+    let hint: String = match &search.expand {
+        Some(exp) => format!("{}: line · Enter: done", exp.ch.to_uppercase()),
+        None if search.editing => "Enter: navigate".to_string(),
+        None => "n/N: step".to_string(),
     };
+    let hint = hint.as_str();
 
     // Width: the fixed furniture first, then the query field takes the
     // slack. The hint goes overboard first when the window is too
@@ -1325,35 +1433,59 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
     let viewport_top = top - scrollback as i64;
     let ascent = tr.ascent();
 
-    for label_info in &search.labels {
-        let row_i = label_info.anchor_line - viewport_top;
+    // Each label is drawn twice over: lowercase where its word ends,
+    // and — when there is somewhere distinct to put it — uppercase where
+    // its *line* ends. Same colour for both, since they act on the same
+    // match; the case of the glyph is what says which one you get.
+    let draw_one = |tr: &mut renderer::TerminalRenderer,
+                        canvas: &mut femtovg::Canvas<T>,
+                        ch: char,
+                        colour_key: char,
+                        line: i64,
+                        col: u16| {
+        let row_i = line - viewport_top;
         if row_i < 0 || row_i >= rows as i64 {
-            continue;
+            return;
         }
-        let x = origin_x + label_info.anchor_col as f32 * cell_w;
+        let x = origin_x + col as f32 * cell_w;
         let y = origin_y + row_i as f32 * cell_h;
 
-        let (bg_color, fg_color) = jump_label_colors(label_info.ch);
+        let (bg_color, fg_color) = jump_label_colors(colour_key);
         let mut bg = femtovg::Path::new();
         bg.rect(x, y, cell_w, cell_h);
         canvas.fill_path(&bg, &femtovg::Paint::color(bg_color));
 
         let mut buf = [0u8; 4];
-        let label = label_info.ch.encode_utf8(&mut buf);
+        let label = ch.encode_utf8(&mut buf);
         // Baseline at `y + ascent` centres the glyph vertically: the cell is
         // exactly `ceil(ascent + descent)` tall, so the font em-box fills it
         // like any other terminal cell (see renderer's `cy + ascent`).
-        let text_y = y + ascent;
         tr.draw_vge_text(
             canvas,
             x,
-            text_y,
+            y + ascent,
             label,
             fg_color,
             vge::command::Align::Left,
             vge::command::FontStyle::default(),
             1.0,
         );
+    };
+
+    for label_info in &search.labels {
+        draw_one(
+            tr,
+            canvas,
+            label_info.ch,
+            label_info.ch,
+            label_info.anchor_line,
+            label_info.anchor_col,
+        );
+        if let Some((line, col)) = label_info.line_anchor {
+            for upper in label_info.ch.to_uppercase() {
+                draw_one(tr, canvas, upper, label_info.ch, line, col);
+            }
+        }
     }
 }
 
@@ -1942,11 +2074,21 @@ impl App {
                 let cols =
                     self.with_target_leaf_screen_mut(&path, |s| s.size().1).unwrap_or(0);
                 let anchor_col = if next_col + 1 < cols { next_col + 1 } else { next_col };
+                // The whole-line marker rides along while expanding, so
+                // the shortcut past the remaining words stays in view.
+                let line_anchor = self.whole_line_anchor(
+                    &exp.target,
+                    exp.head.0,
+                    cols,
+                    (next_line, anchor_col),
+                    &mut std::collections::HashSet::new(),
+                );
                 labels.push(JumpLabel {
                     match_idx: 0,
                     ch: exp.ch,
                     anchor_line: next_line,
                     anchor_col,
+                    line_anchor,
                 });
             }
             if let Some(s) = self.search.as_mut() {
@@ -2030,6 +2172,10 @@ impl App {
             SelectionTarget::Portal(path)
         };
         let mut jump_labels: Vec<JumpLabel> = Vec::with_capacity(assigned.len());
+        // Logical lines that already carry a whole-line marker, keyed by
+        // the head of their wrap chain so two matches in one wrapped
+        // paragraph don't each get one.
+        let mut lines_marked: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for (idx, ch) in assigned {
             let Some(m) = self.search.as_ref().and_then(|s| s.matches.get(idx).copied())
             else {
@@ -2043,7 +2189,20 @@ impl App {
                     // whitespace) — fall back to the match start.
                     None => (m.line, m.col_start),
                 };
-            jump_labels.push(JumpLabel { match_idx: idx, ch, anchor_line, anchor_col });
+            let line_anchor = self.whole_line_anchor(
+                &target,
+                m.line,
+                cols,
+                (anchor_line, anchor_col),
+                &mut lines_marked,
+            );
+            jump_labels.push(JumpLabel {
+                match_idx: idx,
+                ch,
+                anchor_line,
+                anchor_col,
+                line_anchor,
+            });
         }
         if let Some(s) = self.search.as_mut() {
             s.labels = jump_labels;
@@ -2716,6 +2875,117 @@ impl App {
         }
     }
 
+    /// Where the whole-line marker for a match on `line` should be
+    /// drawn: just past the end of its logical line, mirroring how the
+    /// word label sits just past its word. Records the line in
+    /// `already_marked` so only the first label on it gets one.
+    ///
+    /// `None` when the line is blank, when the marker would land on the
+    /// word label (the match's word already ends the line, so the two
+    /// glyphs would collide), or when the line already has one.
+    fn whole_line_anchor(
+        &mut self,
+        target: &SelectionTarget,
+        line: i64,
+        cols: u16,
+        word_anchor: (i64, u16),
+        already_marked: &mut std::collections::HashSet<i64>,
+    ) -> Option<(i64, u16)> {
+        let bounds = self.logical_line_bounds(target, line)?;
+        whole_line_marker(bounds, cols, word_anchor, already_marked)
+    }
+
+    /// [`logical_line_bounds_in_parser`] against whichever grid the
+    /// target names. Same host/portal dispatch as [`Self::next_word_end`].
+    fn logical_line_bounds(
+        &mut self,
+        target: &SelectionTarget,
+        line: i64,
+    ) -> Option<((i64, u16), (i64, u16))> {
+        match target {
+            SelectionTarget::Host => {
+                let parser = self.parser.as_mut()?;
+                let top_live = self.prt.as_ref()?.top_of_live_screen();
+                logical_line_bounds_in_parser(parser, top_live, line)
+            }
+            SelectionTarget::Portal(path) => {
+                let prt = self.prt.as_mut()?;
+                let portal = resolve_portal_target_mut(prt, path)?;
+                let top_live = portal.children.top_of_live_screen();
+                logical_line_bounds_in_parser(&mut portal.vt, top_live, line)
+            }
+        }
+    }
+
+    /// Select the whole logical line holding `line` in `target`, copy it
+    /// to PRIMARY and close the search overlay. The terminal state of
+    /// both label gestures: there is nothing coarser to grow into, so
+    /// there is nothing left for the overlay to do.
+    ///
+    /// Returns false (changing nothing) when the line is blank.
+    fn select_whole_line(&mut self, target: &SelectionTarget, line: i64) -> bool {
+        let Some(((s_line, s_col), (e_line, e_col))) = self.logical_line_bounds(target, line)
+        else {
+            return false;
+        };
+        self.vge_selection = None;
+        self.selection = Some(Selection {
+            target: target.clone(),
+            anchor_line: s_line,
+            anchor_col: s_col,
+            head_line: e_line,
+            head_col: e_col,
+            dragging: false,
+            block_cols: None,
+        });
+        self.copy_selection_to_clipboard(true);
+        self.selection_fresh = true;
+        self.search = None;
+        true
+    }
+
+    /// Shifted jump-label press: select the whole logical line the match
+    /// sits on, rather than its word. The coarse counterpart to
+    /// [`Self::select_word_at_match`] — `a` takes the word and then
+    /// grows a word at a time, `A` takes the line in one go.
+    fn select_line_at_match(&mut self, idx: usize) {
+        let (m, target) = match self.search.as_ref() {
+            Some(s) => {
+                let Some(m) = s.matches.get(idx).copied() else { return };
+                let target = if s.target_path.is_empty() {
+                    SelectionTarget::Host
+                } else {
+                    SelectionTarget::Portal(s.target_path.clone())
+                };
+                (m, target)
+            }
+            None => return,
+        };
+        if !self.select_whole_line(&target, m.line) {
+            // Nothing but whitespace on that line — close the overlay
+            // rather than leave it up with no selection, matching what
+            // `select_word_at_match` does off a word-less match.
+            self.search = None;
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Incremental-expansion escape hatch: jump straight from
+    /// word-by-word growth to the whole logical line. Bound to the
+    /// shifted form of the committed label key, so `a a a …` walks and
+    /// `A` finishes.
+    fn expand_to_whole_line(&mut self) {
+        let Some(exp) = self.search.as_ref().and_then(|s| s.expand.clone()) else {
+            return;
+        };
+        self.select_whole_line(&exp.target, exp.head.0);
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
     /// First jump-label press for key `ch`: select the word at match
     /// `idx` — the same word a double-click on its first cell would —
     /// then enter incremental-expansion mode instead of closing the
@@ -3359,6 +3629,10 @@ impl App {
                 {
                     if ch == exp_ch {
                         self.extend_expand();
+                    } else if shifted_label(ch) == Some(exp_ch) {
+                        // The shifted form of the committed key skips to
+                        // the whole line instead of stepping a word.
+                        self.expand_to_whole_line();
                     } else {
                         self.search = None;
                         if let Some(w) = &self.window {
@@ -3381,8 +3655,19 @@ impl App {
                     && !self.modifiers.control_key()
                     && let Some(ch) = s.chars().next()
                     && s.chars().count() == 1
-                    && let Some(match_idx) =
-                        search.labels.iter().find(|l| l.ch == ch).map(|l| l.match_idx)
+                    // A label key selects its word; the shifted form of
+                    // the same key selects the whole line it sits on.
+                    && let Some((match_idx, whole_line)) = shifted_label(ch)
+                        .and_then(|lower| {
+                            search.labels.iter().find(|l| l.ch == lower).map(|l| (l.match_idx, true))
+                        })
+                        .or_else(|| {
+                            search
+                                .labels
+                                .iter()
+                                .find(|l| l.ch == ch)
+                                .map(|l| (l.match_idx, false))
+                        })
                 {
                     let would_narrow = search.editing
                         && match &search.cache {
@@ -3395,7 +3680,11 @@ impl App {
                             None => false,
                         };
                     if !would_narrow {
-                        self.select_word_at_match(match_idx, ch);
+                        if whole_line {
+                            self.select_line_at_match(match_idx);
+                        } else {
+                            self.select_word_at_match(match_idx, ch);
+                        }
                         return;
                     }
                 }
@@ -4696,6 +4985,121 @@ mod jump_label_tests {
         assert!(p.screen().row_wrapped(0));
         assert_eq!(next_word_end_in_parser(&mut p, 0, 0, 3), Some((1, 2)));
         assert_eq!(next_word_end_in_parser(&mut p, 0, 1, 2), None);
+    }
+
+    #[test]
+    fn logical_line_bounds_spans_one_row() {
+        let mut p = parse(b"hello world", 2, 20);
+        // Column 0 through the last non-blank cell — trailing blanks
+        // are not part of the line, leading ones would be.
+        assert_eq!(
+            logical_line_bounds_in_parser(&mut p, 0, 0),
+            Some(((0, 0), (0, 10)))
+        );
+    }
+
+    #[test]
+    fn logical_line_bounds_keeps_indentation() {
+        let mut p = parse(b"    indented", 2, 20);
+        // Starts at column 0, not at the first word: indentation is
+        // part of the line.
+        assert_eq!(
+            logical_line_bounds_in_parser(&mut p, 0, 0),
+            Some(((0, 0), (0, 11)))
+        );
+    }
+
+    #[test]
+    fn logical_line_bounds_follows_soft_wrap_both_ways() {
+        // cols=4: "abcd" fills row 0 and wraps into " ef" on row 1.
+        let mut p = parse(b"abcd ef", 2, 4);
+        assert!(p.screen().row_wrapped(0));
+        let expected = Some(((0, 0), (1, 2)));
+        // Same answer from anywhere in the chain — the walk goes back to
+        // the head as well as forward to the tail.
+        assert_eq!(logical_line_bounds_in_parser(&mut p, 0, 0), expected);
+        assert_eq!(logical_line_bounds_in_parser(&mut p, 0, 1), expected);
+    }
+
+    #[test]
+    fn logical_line_bounds_matches_walking_words_to_the_end() {
+        // The whole-line gesture must land exactly where repeatedly
+        // pressing the label key lands, or `A` and `aaa…` would
+        // disagree about the same line.
+        let mut p = parse(b"one two three", 2, 20);
+        let (_, end) = logical_line_bounds_in_parser(&mut p, 0, 0).unwrap();
+        let mut head = (0i64, 0u16);
+        while let Some(next) = next_word_end_in_parser(&mut p, 0, head.0, head.1) {
+            head = next;
+        }
+        assert_eq!(head, end);
+    }
+
+    #[test]
+    fn logical_line_bounds_rejects_a_blank_line() {
+        let mut p = parse(b"   ", 2, 20);
+        assert_eq!(logical_line_bounds_in_parser(&mut p, 0, 0), None);
+    }
+
+    #[test]
+    fn whole_line_marker_sits_past_the_line_end() {
+        let mut seen = HashSet::new();
+        // Line ends at col 10 of row 3; the word label is elsewhere.
+        assert_eq!(
+            whole_line_marker(((3, 0), (3, 10)), 20, (3, 4), &mut seen),
+            Some((3, 11))
+        );
+    }
+
+    #[test]
+    fn whole_line_marker_clamps_at_the_last_column() {
+        let mut seen = HashSet::new();
+        // A line filling the row has nowhere past it to draw, so the
+        // marker lands on the last cell rather than off-screen.
+        assert_eq!(
+            whole_line_marker(((0, 0), (0, 19)), 20, (0, 4), &mut seen),
+            Some((0, 19))
+        );
+    }
+
+    #[test]
+    fn whole_line_marker_yields_to_the_word_label() {
+        let mut seen = HashSet::new();
+        // The match's word ends the line, so both glyphs want the same
+        // cell — the word label keeps it.
+        assert_eq!(
+            whole_line_marker(((2, 0), (2, 7)), 20, (2, 8), &mut seen),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_line_marker_is_once_per_logical_line() {
+        let mut seen = HashSet::new();
+        // Two matches on the same wrapped paragraph (chain head line 5)
+        // share one marker: pressing either shifted key selects the same
+        // line, so a second glyph would be noise.
+        assert!(whole_line_marker(((5, 0), (6, 3)), 20, (5, 2), &mut seen).is_some());
+        assert_eq!(
+            whole_line_marker(((5, 0), (6, 3)), 20, (6, 1), &mut seen),
+            None
+        );
+        // A different line still gets its own.
+        assert!(whole_line_marker(((9, 0), (9, 3)), 20, (9, 1), &mut seen).is_some());
+    }
+
+    #[test]
+    fn shifted_label_maps_only_real_shifts() {
+        assert_eq!(shifted_label('A'), Some('a'));
+        assert_eq!(shifted_label('S'), Some('s'));
+        // A lowercase label is the plain word press, not its own shift.
+        assert_eq!(shifted_label('a'), None);
+        // Not in the alphabet: 'n'/'N' are reserved for navigation.
+        assert_eq!(shifted_label('N'), None);
+        assert_eq!(shifted_label('Z'), None);
+        // Non-alphabetic and multi-char lowerings map to nothing.
+        assert_eq!(shifted_label('1'), None);
+        assert_eq!(shifted_label('İ'), None);
     }
 
     #[test]
