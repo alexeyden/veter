@@ -96,7 +96,10 @@ FENCE_RE = re.compile(r"[ \t]*\n[ \t]*(?:\n[ \t]*)?```[^\n]*\n(.*?)\n?```", re.S
 
 
 def reserved_rows(text, marker_end):
-    """Rows the message actually reserved after a marker, or None.
+    """Rows the message actually reserved after a marker.
+
+    Returns the row count; 0 if a gap was written but renders as no
+    rows at all; None if there is no gap to read.
 
     The instruction tells Claude to size the gap from `vplace --measure`,
     but that is a counting step done by hand, and getting it wrong draws
@@ -122,6 +125,14 @@ def reserved_rows(text, marker_end):
     body = m.group(1)
     if body.strip():
         return None  # a real code block, not a reserved gap
+    if not text[m.end():].strip():
+        # A gap that ends the message reserves nothing. The renderer
+        # trims the message's trailing whitespace, which for a body of
+        # nothing but blank lines empties the block, and an empty block
+        # draws no rows. This is the one place where the message text
+        # and the screen disagree, so the count cannot come from the
+        # body -- counting it drew a full-height image over the prompt.
+        return 0
     return body.count("\n") + 1
 
 # Images are decorative; a hook that fails must never break the
@@ -240,9 +251,13 @@ _SELF_TESTS = [
     ("correct 5-line gap", "[IMAGE: a] /x.png\n```\n\n\n\n\n\n```\nafter", 5),
     ("undersized gap", "[IMAGE: a] /x.png\n```\n\n\n```\nafter", 2),
     ("blank line before fence", "[IMAGE: a] /x.png\n\n```\n\n\n\n```\nafter", 3),
-    ("language-tagged fence", "[IMAGE: a] /x.png\n```text\n\n\n\n```\n", 3),
+    ("language-tagged fence", "[IMAGE: a] /x.png\n```text\n\n\n\n```\nafter", 3),
     ("no fence", "[IMAGE: a] /x.png\nplain text", None),
     ("real code block", "[IMAGE: a] /x.png\n```\nfn main() {}\n```\n", None),
+    # A gap the renderer trims away. Reads as a correct message and
+    # parses as one; the rows are simply not on screen.
+    ("gap ends the message", "[IMAGE: a] /x.png\n```\n\n\n\n\n\n```", 0),
+    ("gap ends the message, trailing newline", "[IMAGE: a] /x.png\n```\n\n\n```\n", 0),
     # The caption form: prose after the path must not hide the fence.
     (
         "caption prose after the path",
@@ -339,6 +354,15 @@ def main():
             continue
         seen.add(ident)
         rows = reserved_rows(text, m.end())
+        if rows == 0:
+            # The gap was written but ends the message, so it rendered
+            # as nothing and there is no room to draw into. Nothing can
+            # be done from out here -- space is reserved in-band or not
+            # at all -- so degrade to the caption line, which still
+            # names the file. Drawing anyway covers whatever the
+            # renderer put below, up to and including the prompt.
+            log(f"  {ident}: SKIP, gap fence ends the message (reserves no rows)")
+            continue
         # Markers inside the message are relative to where the session
         # is running, matching how Claude writes paths.
         resolved = path if os.path.isabs(path) else os.path.join(cwd, path)
