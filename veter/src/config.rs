@@ -14,7 +14,8 @@
 //!  * `[search]` — the search-chrome colors (search bar + match
 //!    highlights).
 //!  * `[keys]` — the host-intercepted key chords (search, scroll,
-//!    overlay, copy, paste) and the in-search-overlay modal keys.
+//!    overlay, copy, paste, save-image) and the in-search-overlay modal
+//!    keys.
 //!  * `[window]` — window-level behavior (the close confirmation).
 //!
 //! This is a binary-local module: nothing here touches the `veter-host`
@@ -186,6 +187,11 @@ pub enum HostAction {
     ScrollPageDown,
     Copy,
     Paste,
+    /// Write the selected VGE image to a file the user picks. Only
+    /// consumed when an image is actually selected; otherwise the chord
+    /// falls through to the inner program, so binding a common key
+    /// costs nothing the rest of the time.
+    SaveImage,
 }
 
 /// In-search-overlay modal actions.
@@ -342,6 +348,7 @@ pub struct KeyBindingsConfig {
     pub scroll_page_down: String,
     pub copy: String,
     pub paste: String,
+    pub save_image: String,
     pub search: SearchKeysConfig,
 }
 
@@ -354,6 +361,7 @@ impl Default for KeyBindingsConfig {
             scroll_page_down: "Shift+PageDown".into(),
             copy: "Ctrl+Shift+C".into(),
             paste: "Ctrl+Shift+V".into(),
+            save_image: "Ctrl+Shift+S".into(),
             search: SearchKeysConfig::default(),
         }
     }
@@ -441,6 +449,10 @@ impl KeyBindings {
             ),
             (parse(&cfg.copy, &defaults.copy), HostAction::Copy),
             (parse(&cfg.paste, &defaults.paste), HostAction::Paste),
+            (
+                parse(&cfg.save_image, &defaults.save_image),
+                HostAction::SaveImage,
+            ),
         ];
 
         let s = &cfg.search;
@@ -609,7 +621,7 @@ mod tests {
     fn default_config_parses_all_chords() {
         // build() must never hit its error branch for the defaults.
         let keys = KeyBindings::build(&KeyBindingsConfig::default(), &[]);
-        assert_eq!(keys.host.len(), 6);
+        assert_eq!(keys.host.len(), 7);
         assert_eq!(keys.search.len(), 6);
         assert!(keys.selection.is_empty());
     }

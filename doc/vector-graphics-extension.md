@@ -1659,11 +1659,15 @@ behind an intermediary that does not relay APC envelopes. A client that
 
 - A bell, scroll, or any normal text output does not affect VGE state.
 - Cursor position is independent of element origins.
-- Selection, search, and scrollback navigation operate on the text layer;
-  they do not visually mask VGE elements unless explicitly rendered as a
-  selection rectangle on top of them. Selecting a region that contains
-  graphics yields the underlying text only (graphics are not
-  copy/pasteable in any form by this protocol).
+- Grid selection, search, and scrollback navigation operate on the text
+  layer; they do not visually mask VGE elements unless explicitly
+  rendered as a selection rectangle on top of them. A grid selection
+  spanning a region that contains graphics yields the underlying cells
+  only.
+- A terminal MAY additionally let the user select and copy the contents
+  of VGE elements — see §14. That is a terminal-local affordance, not
+  protocol state: it generates no frames in either direction and needs
+  no client participation.
 - VGE issues no DA/DA2/DA3 changes; clients detect support solely via §2.
 
 ## 13. Open issues / future work
@@ -1688,3 +1692,59 @@ These are intentionally deferred and are not part of v1:
 - Element-level animation slots (pre-register N images on an element,
   advance by index). May beat per-frame `UpdateImage` if profiling
   reveals it matters; deferred until that data exists.
+
+## 14. Host-side selection and copy (informational)
+
+Nothing in this section is protocol. It describes an affordance a
+terminal MAY offer over content a client has already drawn, and exists
+so clients know what a user can do with their `DrawText` and what that
+implies for how they use it.
+
+A terminal knows the string behind every `DrawText` and the geometry it
+painted it at, so it can let the user select a range of that text with
+the pointer and copy it — the same gesture that selects cells in the
+text grid. This is **terminal-local**: no frame is sent in either
+direction, no element state changes, and the client is not told. There
+is nothing to opt into and nothing to implement.
+
+Consequences worth knowing when writing a client:
+
+- **`DrawText` content is user-copyable.** Use it for text the user
+  might reasonably want — labels, filenames, titles, messages. Text
+  that is really decoration (an icon assembled from glyphs, a spinner
+  frame, a box-drawing rule) is better drawn as paths, or the user will
+  eventually copy it and get nonsense.
+- **Shaping is the terminal's.** A run is measured with the terminal's
+  own font metrics (§7.4), which is why a client cannot predict where a
+  character boundary falls; `libs/vge-ui`'s `unicode-width` estimate is
+  an approximation for layout, not a mapping the terminal shares.
+- **It does not compete with a mouse-driven client.** VGE delivers no
+  mouse events (§9.10), and a client that has enabled VT100 mouse
+  reporting keeps receiving every event it did before. A terminal
+  offering this affordance is expected to put it behind a gesture that
+  is already reserved for the terminal itself — in the reference
+  implementation, holding Shift, which is what suppresses mouse
+  reporting there.
+- **Selection is per-run.** A run is the unit: elements float free of
+  the grid and of each other, so there is no defined reading order
+  between two runs, or between a run and the cells beneath one.
+- **A selection does not pin anything.** It is anchored to an element
+  that can be deleted, re-drawn, evicted from scrollback (§5.2) or
+  wiped by a reset (§5.6) at any time; the terminal drops it when that
+  happens. Clients need do nothing to make that safe.
+
+The same reasoning extends to `DrawImage`, for a terminal that keeps
+the decoded pixels around. Two differences from text:
+
+- **The unit is the whole drawable.** There is no sub-rect selection: a
+  `DrawImage` is one thing, and narrowing it further is what
+  `source_rect_px` is for.
+- **What is copied is what is sampled** — the `source_rect_px` region
+  (§7.5), not the atlas behind it. A client animating a sprite sheet by
+  advancing `source_rect_px` (§6.5) therefore hands the user the current
+  frame, which is what they pointed at.
+
+Retention (§8.0) does not enter into it. The copy is taken from the
+image as it stands when the user asks; a later `DropImage`, or an Auto
+image falling to zero references, affects nothing already on the
+clipboard.

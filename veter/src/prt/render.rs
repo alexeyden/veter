@@ -71,6 +71,7 @@ pub fn render_layers<T: Renderer>(
     scrollback: usize,
     portal_selection: Option<&PortalSelectionCtx>,
     search_overlay: Option<&PortalSearchCtx>,
+    vge_selection: Option<&vge::pick::VgeSelection>,
 ) {
     let mut layers: Vec<(i32, u64, Layer)> = Vec::new();
     for el in vge_state.top_level_sorted() {
@@ -89,6 +90,8 @@ pub fn render_layers<T: Renderer>(
     // unfocused per §13.5).
     let focus_chain = prt_state.focus_chain();
 
+    let host_ctx = vge::render::PickCtx::host(vge_state.on_alt(), vge_selection);
+
     for (_, _, layer) in layers {
         match layer {
             Layer::Vge(el) => {
@@ -100,6 +103,7 @@ pub fn render_layers<T: Renderer>(
                     top_of_live_screen,
                     screen_rows,
                     scrollback,
+                    host_ctx,
                 );
             }
             Layer::Portal(portal) => {
@@ -142,6 +146,9 @@ pub fn render_layers<T: Renderer>(
                     &focus_chain,
                     sub_sel.as_ref(),
                     sub_search.as_ref(),
+                    &[],
+                    vge::pick::PickRect::UNBOUNDED,
+                    vge_selection,
                 );
             }
         }
@@ -169,6 +176,9 @@ fn render_portal_at<T: Renderer>(
     focus_chain: &[&str],
     portal_selection: Option<&PortalSelectionCtx>,
     search_overlay: Option<&PortalSearchCtx>,
+    parent_path: &[String],
+    parent_clip: vge::pick::PickRect,
+    vge_selection: Option<&vge::pick::VgeSelection>,
 ) {
     if !portal.is_visible {
         return;
@@ -206,6 +216,23 @@ fn render_portal_at<T: Renderer>(
     // with any enclosing clip already in force (e.g. a parent portal's
     // bounds), so nested clips compose correctly.
     canvas.intersect_scissor(ox_px, oy_px, w_px, h_px);
+
+    // This portal's pick scope: its id appended to the path its parent
+    // was drawn under, and its bounds folded into the clip. Portal
+    // origins are already absolute canvas pixels here (the canvas
+    // matrix is only translated further down, per VGE element), so the
+    // clip needs no transform.
+    let path: Vec<String> = parent_path
+        .iter()
+        .cloned()
+        .chain(std::iter::once(portal.id.clone()))
+        .collect();
+    let pick_ctx = vge::render::PickCtx {
+        path_id: term_renderer.pick.intern_path(&path),
+        on_alt: portal.vge.state.on_alt(),
+        clip: parent_clip.intersect(vge::pick::PickRect::new(ox_px, oy_px, w_px, h_px)),
+        sel: vge_selection,
+    };
 
     // 1. Cells. The focused leaf passes its cursor cell down so
     //    `draw_screen_at` inverts that cell's fg/bg the same way the
@@ -330,6 +357,7 @@ fn render_portal_at<T: Renderer>(
                     portal.vge.top_of_live_screen(),
                     portal.size_h as u16,
                     portal_scrollback,
+                    pick_ctx,
                 );
                 canvas.restore();
             }
@@ -373,6 +401,9 @@ fn render_portal_at<T: Renderer>(
                     sub_focus_chain,
                     next_sel.as_ref(),
                     next_search.as_ref(),
+                    &path,
+                    pick_ctx.clip,
+                    vge_selection,
                 );
             }
         }

@@ -1160,6 +1160,13 @@ chrome it wants on its side. Copying selected inner-portal text is
 the client's job — the host has no API for "give me the cells in
 this rect of portal X" in v1.
 
+None of that changes if the host separately offers its own selection
+over VGE content (`vector-graphics-extension.md` §14). That affordance
+reaches into per-portal VGE the same way it reaches host-level VGE —
+the element is identified by its portal path — but it is terminal-local
+and generates no PRT traffic, so a client's own selection model is
+unaffected either way.
+
 ## 12. Limits and budgeting
 
 The host advertises hard caps via the probe response. Over-limit ops

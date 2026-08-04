@@ -34,7 +34,10 @@ libc = "0.2"
 rgb = "0.8"
 imgref = "1"
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# `image-data` backs copying a VGE raster image to the clipboard
+# (`vector-graphics-extension.md` §14); it re-encodes the RGBA we hand
+# it as PNG for the X11 / Wayland offer.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 # Backing for `vft::RendererHooks` — the native file dialog VFT
 # opens for a deferred-form transfer (§7.1) and the launcher that
 # hands a finished download to the user's default app (§6.1).

@@ -3,6 +3,7 @@
 // femtovg / the live `TerminalRenderer`. Re-export the state surface
 // here so existing `crate::vge::*` call sites keep working.
 
+pub mod pick;
 pub mod render;
 
 pub use veter_host::vge::*;

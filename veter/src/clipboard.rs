@@ -31,6 +31,31 @@ impl ClipboardManager {
         self.inner.as_mut().and_then(|cb| cb.get_text().ok())
     }
 
+    /// Put a raster image on the clipboard. `rgba` is straight-alpha
+    /// RGBA8, `width * height * 4` bytes — the form VGE keeps uploaded
+    /// images in (§8.1), so no conversion happens on the way out.
+    /// arboard re-encodes it as PNG for the X11 / Wayland offer.
+    ///
+    /// CLIPBOARD only: PRIMARY is a text convention, and pasting an
+    /// image with middle-click is not a thing anyone expects.
+    pub fn set_image(&mut self, width: u32, height: u32, rgba: &[u8]) -> bool {
+        let Some(cb) = &mut self.inner else {
+            return false;
+        };
+        let data = arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: std::borrow::Cow::Borrowed(rgba),
+        };
+        match cb.set_image(data) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("veter: clipboard: image copy failed: {e}");
+                false
+            }
+        }
+    }
+
     /// Linux PRIMARY selection (auto-populated on text selection,
     /// pasted by middle-click). On Wayland this rides on the
     /// `wayland-data-control` protocol; on X11 it's a separate

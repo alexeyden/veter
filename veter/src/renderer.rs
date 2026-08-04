@@ -203,9 +203,19 @@ fn ansi_color(idx: u8) -> Color {
     }
 }
 
+/// Terminal default background. Also the "selected" foreground for VGE
+/// text (`draw_vge_text_selected`), which reverse-videos against the
+/// text's own colour the way a selected cell does.
+const DEFAULT_BG: Color = Color {
+    r: 30.0 / 255.0,
+    g: 30.0 / 255.0,
+    b: 30.0 / 255.0,
+    a: 1.0,
+};
+
 fn resolve_cell_colors(cell: &vt100::Cell, is_cursor: bool, is_selected: bool) -> (Color, Color) {
     let default_fg = Color::rgb(204, 204, 204);
-    let default_bg = Color::rgb(30, 30, 30);
+    let default_bg = DEFAULT_BG;
 
     let mut fg = match cell.fgcolor() {
         vt100::Color::Default => default_fg,
@@ -877,6 +887,117 @@ fn resolve_fallback(
 
 // --- Glyph-batch helpers (used by both DrawText render paths) ---
 
+/// Horizontal extent of a drawn VGE text run, in device pixels.
+/// `start_x` is the run's left edge after `align` has been applied to
+/// its anchor, so it is not generally the `x_px` that was passed in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextExtent {
+    pub start_x: f32,
+    pub total_width: f32,
+}
+
+/// One glyph of a plain (unstyled) run. `x` is the offset from the
+/// run's `start_x`.
+struct PlainGlyph {
+    ch: char,
+    glyph_id: u16,
+    font_id: u16,
+    x: f32,
+}
+
+/// One glyph of a Parley-shaped run. `x`/`y` are offsets from the run's
+/// `start_x` and baseline respectively.
+struct StyledGlyph {
+    x: f32,
+    y: f32,
+    glyph_id: u16,
+    font_id: u16,
+}
+
+enum LayoutGlyphs {
+    Plain(Vec<PlainGlyph>),
+    Styled(Vec<StyledGlyph>),
+}
+
+/// A shaped VGE text run: everything needed to draw it, plus the map
+/// from horizontal position back to a byte offset in the source string.
+///
+/// Produced by [`TerminalRenderer::layout_vge_text`] and consumed both
+/// by drawing and by pointer hit-testing, so a click can never resolve
+/// to a different character than the one painted under it.
+pub struct TextLayout {
+    /// Left edge of the run in device pixels, after alignment.
+    pub start_x: f32,
+    /// Total advance width in device pixels.
+    pub total_width: f32,
+    /// Rasterisation size (`font_size · scale`).
+    font_px: f32,
+    /// Character boundaries as `(byte offset, x offset from
+    /// `start_x`)`, ascending in both, terminated by a
+    /// `(text.len(), total_width)` sentinel.
+    stops: Vec<(usize, f32)>,
+    glyphs: LayoutGlyphs,
+}
+
+impl TextLayout {
+    pub fn extent(&self) -> TextExtent {
+        TextExtent {
+            start_x: self.start_x,
+            total_width: self.total_width,
+        }
+    }
+
+    /// The character boundary nearest a device-pixel x — a caret
+    /// position, so clicking the left half of a glyph lands before it
+    /// and the right half after it. Clamped to the run.
+    pub fn byte_offset_at(&self, x_px: f32) -> usize {
+        let rel = x_px - self.start_x;
+        let mut best = self.stops.first().map_or(0, |(off, _)| *off);
+        let mut best_dist = f32::INFINITY;
+        for (off, x) in &self.stops {
+            let dist = (x - rel).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = *off;
+            } else if dist > best_dist {
+                // `stops` ascends in x, so distance is unimodal: once it
+                // starts growing there is nothing better ahead. Equal
+                // distances are *not* a stopping point — a character
+                // with no glyph contributes zero advance, so several
+                // boundaries can share an x.
+                break;
+            }
+        }
+        best
+    }
+
+    /// The byte range of the character *under* a device-pixel x, or
+    /// `None` when the position falls outside the run. Unlike
+    /// [`Self::byte_offset_at`] this never rounds to a neighbour, which
+    /// is what "select the thing I clicked on" wants.
+    pub fn char_range_at(&self, x_px: f32) -> Option<(usize, usize)> {
+        let rel = x_px - self.start_x;
+        if rel < 0.0 || rel > self.total_width {
+            return None;
+        }
+        self.stops
+            .windows(2)
+            .find(|w| rel >= w[0].1 && rel < w[1].1)
+            .map(|w| (w[0].0, w[1].0))
+    }
+
+    /// The x offset in device pixels of a byte offset, clamped to the
+    /// run. Used to place a selection highlight over the run.
+    pub fn x_of_byte(&self, byte_off: usize) -> f32 {
+        for (off, x) in &self.stops {
+            if *off >= byte_off {
+                return self.start_x + x;
+            }
+        }
+        self.start_x + self.total_width
+    }
+}
+
 fn align_offset(anchor_x: f32, total_width: f32, align: vge::command::Align) -> f32 {
     match align {
         vge::command::Align::Left => anchor_x,
@@ -1001,6 +1122,11 @@ pub struct TerminalRenderer {
     gpu_image_handles: HashMap<crate::vge::GpuImageId, femtovg::ImageId>,
     next_gpu_image_id: u64,
 
+    /// Pointer hit-test index for VGE content, rebuilt by every render
+    /// pass (see `vge::pick`). Public because the event loop reads it
+    /// on the next pointer event.
+    pub pick: crate::vge::pick::PickList,
+
     // Search-chrome colors. Configurable via the user's config
     // (`[search]`); default to the values that were hardcoded here
     // before the config existed. Set via `set_search_colors`.
@@ -1008,6 +1134,10 @@ pub struct TerminalRenderer {
     search_bar_text: Color,
     search_current_match: Color,
     search_match: Color,
+    /// Outline colour for a selected VGE image. Defaults to the
+    /// built-in accent slot 0; `set_selection_accent` overrides it from
+    /// `[accent]`.
+    selection_accent: Color,
 }
 
 impl TerminalRenderer {
@@ -1083,11 +1213,23 @@ impl TerminalRenderer {
             glyph_cache: GlyphCache::new(),
             gpu_image_handles: HashMap::new(),
             next_gpu_image_id: 0,
+            pick: crate::vge::pick::PickList::new(),
             search_accent: Color::rgb(0x56, 0x79, 0x9f),
             search_bar_text: Color::rgb(230, 230, 230),
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
+            selection_accent: Color::rgb(0x56, 0x79, 0x9f),
         }
+    }
+
+    /// Override the VGE selection outline colour from user config.
+    pub fn set_selection_accent(&mut self, accent: Color) {
+        self.selection_accent = accent;
+    }
+
+    /// Outline tint for a selected VGE image (`vge::render`).
+    pub fn selection_accent(&self) -> Color {
+        self.selection_accent
     }
 
     /// Override the search-chrome colors from user config. Called once
@@ -1203,6 +1345,9 @@ impl TerminalRenderer {
     /// gets resolved; plain text uses the cell renderer's faster
     /// per-char path. Underline and strikethrough are applied as
     /// horizontal rules over the rendered glyphs.
+    ///
+    /// Returns the run's horizontal extent so the caller can record a
+    /// hit-test box for it (`vge::pick`).
     #[allow(clippy::too_many_arguments)]
     pub fn draw_vge_text<T: Renderer>(
         &mut self,
@@ -1214,141 +1359,22 @@ impl TerminalRenderer {
         align: vge::command::Align,
         font_style: vge::command::FontStyle,
         scale: f32,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-
-        // `scale` is the element's composed on-screen scale (VGE §9.11). We
-        // rasterise glyphs at `font_size · scale` so a zoomed-in text element
-        // is drawn crisp at its final pixel size rather than magnified from a
-        // cell-size atlas. `x_px`/`y_px` already arrive in device pixels.
-        let font_px = self.font_size * scale;
-
-        // Render the glyphs themselves and recover the actual rendered
-        // extent (start_x, total_width) so we can stack underline /
-        // strikethrough rules on top.
-        let (start_x, total_width) = if font_style.bold() || font_style.italic() {
-            self.draw_text_styled(canvas, x_px, y_px, text, color, align, font_style, font_px)
-        } else {
-            self.draw_text_plain(canvas, x_px, y_px, text, color, align, font_px)
-        };
-
-        if font_style.underline() || font_style.strikethrough() {
-            let mut path = Path::new();
-            let thickness = (font_px / 16.0).max(1.0);
-            if font_style.underline() {
-                let uy = y_px + (self.cell_height - self.ascent) * 0.5 * scale;
-                path.rect(start_x, uy, total_width, thickness);
-            }
-            if font_style.strikethrough() {
-                let sy = y_px - self.ascent * 0.35 * scale;
-                path.rect(start_x, sy, total_width, thickness);
-            }
-            canvas.fill_path(&path, &Paint::color(color));
-        }
+    ) -> TextExtent {
+        self.draw_vge_text_selected(
+            canvas, x_px, y_px, text, color, align, font_style, scale, None,
+        )
     }
 
-    /// Per-char glyph rendering for plain (no bold/italic) text. Reuses
-    /// the cell renderer's primary font + fallback chain. Returns
-    /// `(start_x, total_width)` for stacking underline/strike.
-    fn draw_text_plain<T: Renderer>(
-        &mut self,
-        canvas: &mut Canvas<T>,
-        x_px: f32,
-        y_px: f32,
-        text: &str,
-        color: Color,
-        align: vge::command::Align,
-        font_px: f32,
-    ) -> (f32, f32) {
-        struct CharInfo {
-            ch: char,
-            glyph_id: u16,
-            font_id: u16,
-            advance: f32,
-        }
-        let mut infos: Vec<CharInfo> = Vec::with_capacity(text.len());
-        let mut total_width = 0.0f32;
-        for ch in text.chars() {
-            let Some((glyph_id, font_id)) = self.resolve_glyph(ch) else {
-                continue;
-            };
-            let font_ref = self.font_ref_for(font_id);
-            let advance = font_ref
-                .glyph_metrics(&[])
-                .scale(font_px)
-                .advance_width(glyph_id);
-            total_width += advance;
-            infos.push(CharInfo {
-                ch,
-                glyph_id,
-                font_id,
-                advance,
-            });
-        }
-
-        let start_x = align_offset(x_px, total_width, align);
-
-        let mut alpha_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
-        let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
-        let mut x = start_x;
-        for info in &infos {
-            if info.ch == ' ' {
-                x += info.advance;
-                continue;
-            }
-            let rendered = if info.font_id == 0 {
-                let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
-                self.glyph_cache.get_or_render(
-                    canvas,
-                    &mut self.scale_cx,
-                    fr,
-                    info.glyph_id,
-                    font_px,
-                    0,
-                )
-            } else {
-                let fb = &self.fallback_fonts[(info.font_id - 1) as usize];
-                let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
-                self.glyph_cache.get_or_render(
-                    canvas,
-                    &mut self.scale_cx,
-                    fr,
-                    info.glyph_id,
-                    font_px,
-                    info.font_id,
-                )
-            };
-            let rendered = match rendered {
-                Some(r) => r,
-                None => {
-                    x += info.advance;
-                    continue;
-                }
-            };
-            push_glyph_quad(
-                &mut alpha_batches,
-                &mut color_batches,
-                rendered,
-                x,
-                y_px,
-            );
-            x += info.advance;
-        }
-
-        emit_glyph_batches(canvas, &self.glyph_cache, alpha_batches, color_batches, color);
-        (start_x, total_width)
-    }
-
-    /// Bold/italic-capable text rendering via Parley layout. Asks
-    /// Parley to resolve a font face that matches the requested weight
-    /// and slant, walks the resulting GlyphRuns, and routes each glyph
-    /// through the existing GlyphCache. Different font faces (regular
-    /// vs bold vs italic) end up under distinct font_ids in
-    /// `fallback_fonts` and so cache independently.
+    /// [`Self::draw_vge_text`] with a byte range drawn selected.
+    ///
+    /// The selected span gets the grid's reverse-video treatment rather
+    /// than a translucent wash: the run paints normally, a bar in the
+    /// text's own colour covers the selected span, and the run is
+    /// redrawn in the terminal background colour scissored to that bar.
+    /// Both passes come off the same [`TextLayout`], so the highlight
+    /// cannot land half a glyph away from the text it marks.
     #[allow(clippy::too_many_arguments)]
-    fn draw_text_styled<T: Renderer>(
+    pub fn draw_vge_text_selected<T: Renderer>(
         &mut self,
         canvas: &mut Canvas<T>,
         x_px: f32,
@@ -1357,8 +1383,155 @@ impl TerminalRenderer {
         color: Color,
         align: vge::command::Align,
         font_style: vge::command::FontStyle,
+        scale: f32,
+        selected: Option<(usize, usize)>,
+    ) -> TextExtent {
+        if text.is_empty() {
+            return TextExtent {
+                start_x: x_px,
+                total_width: 0.0,
+            };
+        }
+
+        let layout = self.layout_vge_text(text, x_px, align, font_style, scale);
+        let extent = layout.extent();
+        self.draw_run(canvas, &layout, y_px, scale, font_style, color);
+
+        if let Some((start, end)) = selected
+            && end > start
+        {
+            let x0 = layout.x_of_byte(start);
+            let x1 = layout.x_of_byte(end);
+            if x1 > x0 {
+                let top = y_px - self.ascent * scale;
+                let height = self.cell_height * scale;
+                let mut bar = Path::new();
+                bar.rect(x0, top, x1 - x0, height);
+                canvas.fill_path(&bar, &Paint::color(color));
+
+                canvas.save();
+                canvas.intersect_scissor(x0, top, x1 - x0, height);
+                self.draw_run(canvas, &layout, y_px, scale, font_style, DEFAULT_BG);
+                canvas.restore();
+            }
+        }
+
+        extent
+    }
+
+    /// Glyphs plus any underline / strikethrough rules, in one colour.
+    fn draw_run<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        layout: &TextLayout,
+        y_px: f32,
+        scale: f32,
+        font_style: vge::command::FontStyle,
+        color: Color,
+    ) {
+        self.draw_text_layout(canvas, layout, y_px, color);
+
+        if font_style.underline() || font_style.strikethrough() {
+            let mut path = Path::new();
+            let thickness = (layout.font_px / 16.0).max(1.0);
+            if font_style.underline() {
+                let uy = y_px + (self.cell_height - self.ascent) * 0.5 * scale;
+                path.rect(layout.start_x, uy, layout.total_width, thickness);
+            }
+            if font_style.strikethrough() {
+                let sy = y_px - self.ascent * 0.35 * scale;
+                path.rect(layout.start_x, sy, layout.total_width, thickness);
+            }
+            canvas.fill_path(&path, &Paint::color(color));
+        }
+    }
+
+    /// Shape one VGE text run: resolve its glyphs, measure it, and
+    /// record where each character boundary falls.
+    ///
+    /// Both the draw path and pointer hit-testing go through this, so
+    /// the character a click resolves to is by construction the one
+    /// that was painted there — there is no second measurement to drift
+    /// out of step. `x_px` is the run's anchor in device pixels and
+    /// `align` decides which edge of the run it pins (§7.4).
+    pub fn layout_vge_text(
+        &mut self,
+        text: &str,
+        x_px: f32,
+        align: vge::command::Align,
+        font_style: vge::command::FontStyle,
+        scale: f32,
+    ) -> TextLayout {
+        // `scale` is the element's composed on-screen scale (VGE §9.11).
+        // We shape and rasterise at `font_size · scale` so a zoomed-in
+        // text element is drawn crisp at its final pixel size rather
+        // than magnified from a cell-size atlas.
+        let font_px = self.font_size * scale;
+        if font_style.bold() || font_style.italic() {
+            self.layout_text_styled(text, x_px, align, font_style, font_px)
+        } else {
+            self.layout_text_plain(text, x_px, align, font_px)
+        }
+    }
+
+    /// Per-char shaping for plain (no bold/italic) text. Reuses the
+    /// cell renderer's primary font + fallback chain.
+    fn layout_text_plain(
+        &mut self,
+        text: &str,
+        x_px: f32,
+        align: vge::command::Align,
         font_px: f32,
-    ) -> (f32, f32) {
+    ) -> TextLayout {
+        let mut glyphs: Vec<PlainGlyph> = Vec::with_capacity(text.len());
+        let mut stops: Vec<(usize, f32)> = Vec::with_capacity(text.len() + 1);
+        let mut w = 0.0f32;
+        for (byte_off, ch) in text.char_indices() {
+            // Every character gets a stop, including ones with no glyph:
+            // they still occupy bytes, and a boundary list with holes in
+            // it would let a click land on an offset that can't be sliced.
+            stops.push((byte_off, w));
+            let Some((glyph_id, font_id)) = self.resolve_glyph(ch) else {
+                continue;
+            };
+            let advance = self
+                .font_ref_for(font_id)
+                .glyph_metrics(&[])
+                .scale(font_px)
+                .advance_width(glyph_id);
+            glyphs.push(PlainGlyph {
+                ch,
+                glyph_id,
+                font_id,
+                x: w,
+            });
+            w += advance;
+        }
+        stops.push((text.len(), w));
+
+        TextLayout {
+            start_x: align_offset(x_px, w, align),
+            total_width: w,
+            font_px,
+            stops,
+            glyphs: LayoutGlyphs::Plain(glyphs),
+        }
+    }
+
+    /// Bold/italic-capable shaping via Parley. Asks Parley to resolve a
+    /// font face matching the requested weight and slant, walks the
+    /// resulting runs, and registers each face as a fallback font so
+    /// the glyph cache can key on it. Different faces (regular vs bold
+    /// vs italic) end up under distinct `font_id`s and so cache
+    /// independently.
+    fn layout_text_styled(
+        &mut self,
+        text: &str,
+        x_px: f32,
+        align: vge::command::Align,
+        font_style: vge::command::FontStyle,
+        font_px: f32,
+    ) -> TextLayout {
         use parley::style::{FontStyle as PStyle, FontWeight};
 
         let weight = if font_style.bold() {
@@ -1393,18 +1566,12 @@ impl TerminalRenderer {
         layout.align(None, Alignment::Start, AlignmentOptions::default());
 
         let total_width = layout.width();
-        let start_x = align_offset(x_px, total_width, align);
 
-        // Pass 1: walk runs, register fonts, collect per-glyph info
-        // (since iterating mutates self.fallback_fonts and we need
-        // independent borrows for cache lookups in pass 2).
-        struct G {
-            x: f32,
-            y: f32,
-            glyph_id: u16,
-            font_id: u16,
-        }
-        let mut glyphs: Vec<G> = Vec::new();
+        // Walk runs, registering fonts and collecting per-glyph info.
+        // Cluster boundaries come off the same runs, so the stop list
+        // and the glyphs agree about where each character sits.
+        let mut glyphs: Vec<StyledGlyph> = Vec::new();
+        let mut stops: Vec<(usize, f32)> = Vec::new();
         for line in layout.lines() {
             for item in line.items() {
                 if let PositionedLayoutItem::GlyphRun(run_layout) = item {
@@ -1414,9 +1581,11 @@ impl TerminalRenderer {
                     let font_index = font.index as usize;
                     let source_ptr = data_ref.as_ptr() as usize;
 
-                    let font_id = match self.fallback_fonts.iter().position(|fb| {
-                        fb.source_ptr == source_ptr && fb.index == font_index
-                    }) {
+                    let font_id = match self
+                        .fallback_fonts
+                        .iter()
+                        .position(|fb| fb.source_ptr == source_ptr && fb.index == font_index)
+                    {
                         Some(i) => (i + 1) as u16,
                         None => {
                             let i = self.fallback_fonts.len();
@@ -1429,6 +1598,12 @@ impl TerminalRenderer {
                         }
                     };
 
+                    let mut cluster_x = run_layout.offset();
+                    for cluster in run.clusters() {
+                        stops.push((cluster.text_range().start, cluster_x));
+                        cluster_x += cluster.advance();
+                    }
+
                     // Parley's `glyphs()` returns un-positioned glyphs
                     // — each `glyph.x` is a per-glyph offset (kerning
                     // / cluster nudge), `glyph.advance` is the step to
@@ -1439,7 +1614,7 @@ impl TerminalRenderer {
                     // per-char plain path computes positions).
                     let mut pen_x = run_layout.offset();
                     for glyph in run_layout.glyphs() {
-                        glyphs.push(G {
+                        glyphs.push(StyledGlyph {
                             x: pen_x + glyph.x,
                             y: glyph.y,
                             glyph_id: glyph.id as u16,
@@ -1450,36 +1625,98 @@ impl TerminalRenderer {
                 }
             }
         }
+        // Runs arrive in visual order, which is not byte order for
+        // bidi text. Sorting keeps the list bisectable; a genuinely
+        // RTL run still maps a click to the wrong end, which is the
+        // same approximation §7.4's single-line model already makes.
+        stops.sort_by_key(|(off, _)| *off);
+        stops.push((text.len(), total_width));
 
-        // Pass 2: render with disjoint borrows.
+        TextLayout {
+            start_x: align_offset(x_px, total_width, align),
+            total_width,
+            font_px,
+            stops,
+            glyphs: LayoutGlyphs::Styled(glyphs),
+        }
+    }
+
+    /// Rasterise an already-shaped run at a pixel baseline.
+    fn draw_text_layout<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        layout: &TextLayout,
+        y_px: f32,
+        color: Color,
+    ) {
+        let start_x = layout.start_x;
+        let font_px = layout.font_px;
         let mut alpha_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
         let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
-        for g in &glyphs {
-            let fb = &self.fallback_fonts[(g.font_id - 1) as usize];
-            let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
-            let rendered = self.glyph_cache.get_or_render(
-                canvas,
-                &mut self.scale_cx,
-                fr,
-                g.glyph_id,
-                font_px,
-                g.font_id,
-            );
-            let rendered = match rendered {
-                Some(r) => r,
-                None => continue,
-            };
-            push_glyph_quad(
-                &mut alpha_batches,
-                &mut color_batches,
-                rendered,
-                start_x + g.x,
-                y_px + g.y,
-            );
+
+        match &layout.glyphs {
+            LayoutGlyphs::Plain(glyphs) => {
+                for g in glyphs {
+                    if g.ch == ' ' {
+                        continue;
+                    }
+                    let rendered = if g.font_id == 0 {
+                        let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
+                        self.glyph_cache.get_or_render(
+                            canvas,
+                            &mut self.scale_cx,
+                            fr,
+                            g.glyph_id,
+                            font_px,
+                            0,
+                        )
+                    } else {
+                        let fb = &self.fallback_fonts[(g.font_id - 1) as usize];
+                        let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
+                        self.glyph_cache.get_or_render(
+                            canvas,
+                            &mut self.scale_cx,
+                            fr,
+                            g.glyph_id,
+                            font_px,
+                            g.font_id,
+                        )
+                    };
+                    let Some(rendered) = rendered else { continue };
+                    push_glyph_quad(
+                        &mut alpha_batches,
+                        &mut color_batches,
+                        rendered,
+                        start_x + g.x,
+                        y_px,
+                    );
+                }
+            }
+            LayoutGlyphs::Styled(glyphs) => {
+                for g in glyphs {
+                    let fb = &self.fallback_fonts[(g.font_id - 1) as usize];
+                    let fr = FontRef::from_index(&fb.data, fb.index).unwrap();
+                    let rendered = self.glyph_cache.get_or_render(
+                        canvas,
+                        &mut self.scale_cx,
+                        fr,
+                        g.glyph_id,
+                        font_px,
+                        g.font_id,
+                    );
+                    let Some(rendered) = rendered else { continue };
+                    push_glyph_quad(
+                        &mut alpha_batches,
+                        &mut color_batches,
+                        rendered,
+                        start_x + g.x,
+                        y_px + g.y,
+                    );
+                }
+            }
         }
 
         emit_glyph_batches(canvas, &self.glyph_cache, alpha_batches, color_batches, color);
-        (start_x, total_width)
     }
 
     /// Draw the cells of `screen` into the canvas at the given pixel
@@ -1503,7 +1740,7 @@ impl TerminalRenderer {
         search_highlights: Option<&[HighlightSpan]>,
     ) {
         let (rows, cols) = screen.size();
-        let default_bg = Color::rgb(30, 30, 30);
+        let default_bg = DEFAULT_BG;
         let selected = |r, c| selection.map(|s| s.contains(r, c)).unwrap_or(false);
         // Per-cell search-highlight color, or None if cell is unhit.
         // The current match takes precedence over other matches on the
@@ -1733,10 +1970,14 @@ impl TerminalRenderer {
         selection: Option<&SelectionRange>,
         portal_selection: Option<&prt::render::PortalSelectionCtx>,
         search_overlay: Option<&prt::render::PortalSearchCtx>,
+        vge_selection: Option<&crate::vge::pick::VgeSelection>,
     ) {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
+        // The VGE hit-test index is a by-product of this pass; last
+        // frame's entries describe a screen that no longer exists.
+        self.pick.clear();
         // §9.1 — the host's text-grid cursor renders only when host
         // focus is on the host itself; if focus has been routed into a
         // portal, the host cursor is suppressed and the focused-leaf
@@ -1788,6 +2029,7 @@ impl TerminalRenderer {
             screen.scrollback(),
             portal_selection,
             search_overlay,
+            vge_selection,
         );
 
         // Draw scrollbar when scrolled back
@@ -1808,5 +2050,158 @@ impl TerminalRenderer {
             path.rounded_rect(bar_x, thumb_y, bar_width, thumb_height, 3.0);
             canvas.fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, 90)));
         }
+    }
+}
+
+#[cfg(test)]
+mod text_layout_tests {
+    use super::*;
+    use femtovg::renderer::Void;
+    use vge::command::{Align, FontStyle};
+
+    fn harness() -> (Canvas<Void>, TerminalRenderer) {
+        let mut canvas = Canvas::new(Void).unwrap();
+        canvas.set_size(800, 600, 1.0);
+        let tr = TerminalRenderer::new(&mut canvas, 14.0);
+        (canvas, tr)
+    }
+
+    fn layout(tr: &mut TerminalRenderer, text: &str, x: f32, align: Align) -> TextLayout {
+        tr.layout_vge_text(text, x, align, FontStyle(0), 1.0)
+    }
+
+    #[test]
+    fn stops_cover_every_boundary_and_ascend() {
+        let (_canvas, mut tr) = harness();
+        let text = "héllo wörld";
+        let l = layout(&mut tr, text, 0.0, Align::Left);
+
+        assert_eq!(l.stops.len(), text.chars().count() + 1);
+        assert_eq!(l.stops.first().unwrap().0, 0);
+        assert_eq!(l.stops.last().unwrap().0, text.len());
+        for w in l.stops.windows(2) {
+            assert!(w[0].0 < w[1].0, "byte offsets must ascend");
+            assert!(w[1].1 >= w[0].1, "x must not go backwards");
+            // Every offset is a real char boundary, so slicing there
+            // can never panic.
+            assert!(text.is_char_boundary(w[0].0));
+        }
+        assert!(l.total_width > 0.0);
+    }
+
+    #[test]
+    fn alignment_pins_the_requested_edge() {
+        let (_canvas, mut tr) = harness();
+        let left = layout(&mut tr, "abcd", 100.0, Align::Left);
+        let centre = layout(&mut tr, "abcd", 100.0, Align::Center);
+        let right = layout(&mut tr, "abcd", 100.0, Align::Right);
+        let w = left.total_width;
+
+        assert!((left.start_x - 100.0).abs() < 1e-3);
+        assert!((centre.start_x - (100.0 - w / 2.0)).abs() < 1e-3);
+        assert!((right.start_x - (100.0 - w)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn byte_offset_at_is_a_caret_position() {
+        let (_canvas, mut tr) = harness();
+        let l = layout(&mut tr, "abcd", 50.0, Align::Left);
+        let cw = l.total_width / 4.0;
+
+        // Clamped at both ends.
+        assert_eq!(l.byte_offset_at(-1000.0), 0);
+        assert_eq!(l.byte_offset_at(50.0 + l.total_width + 1000.0), 4);
+        // Left third of the first glyph rounds before it, right third
+        // after it.
+        assert_eq!(l.byte_offset_at(50.0 + cw * 0.2), 0);
+        assert_eq!(l.byte_offset_at(50.0 + cw * 0.8), 1);
+        assert_eq!(l.byte_offset_at(50.0 + cw * 2.1), 2);
+    }
+
+    #[test]
+    fn char_range_at_never_rounds_to_a_neighbour() {
+        let (_canvas, mut tr) = harness();
+        let text = "aé z";
+        let l = layout(&mut tr, text, 0.0, Align::Left);
+        let cw = l.total_width / 4.0;
+
+        assert_eq!(l.char_range_at(cw * 0.5), Some((0, 1)));
+        // 'é' is two bytes; the range has to reflect that or slicing
+        // the copied text would split a code point.
+        assert_eq!(l.char_range_at(cw * 1.5), Some((1, 3)));
+        assert_eq!(&text[1..3], "é");
+        assert_eq!(l.char_range_at(-1.0), None);
+        assert_eq!(l.char_range_at(l.total_width + 1.0), None);
+    }
+
+    #[test]
+    fn x_of_byte_round_trips_the_run_edges() {
+        let (_canvas, mut tr) = harness();
+        let l = layout(&mut tr, "hello", 30.0, Align::Left);
+
+        assert!((l.x_of_byte(0) - l.start_x).abs() < 1e-3);
+        assert!((l.x_of_byte(5) - (l.start_x + l.total_width)).abs() < 1e-3);
+        // Monotonic in between.
+        for b in 0..5 {
+            assert!(l.x_of_byte(b) <= l.x_of_byte(b + 1));
+        }
+        // Past the end clamps rather than panicking.
+        assert!((l.x_of_byte(99) - (l.start_x + l.total_width)).abs() < 1e-3);
+    }
+
+    /// Bold and italic take the Parley path, where the stop list comes
+    /// from shaped clusters rather than per-char advances. It has to
+    /// come out with the same shape as the plain one.
+    #[test]
+    fn styled_runs_produce_the_same_stop_shape() {
+        let (_canvas, mut tr) = harness();
+        let text = "Bold text";
+        for bits in [0x01u8, 0x02, 0x03] {
+            let l = tr.layout_vge_text(text, 0.0, Align::Left, FontStyle(bits), 1.0);
+            assert!(l.total_width > 0.0, "style {bits:#x} measured to nothing");
+            assert_eq!(l.stops.first().unwrap().0, 0);
+            assert_eq!(l.stops.last().unwrap().0, text.len());
+            for w in l.stops.windows(2) {
+                assert!(w[0].0 <= w[1].0, "style {bits:#x}: offsets must ascend");
+                assert!(text.is_char_boundary(w[0].0));
+            }
+            assert_eq!(l.byte_offset_at(-1000.0), 0);
+            assert_eq!(l.byte_offset_at(l.total_width + 1000.0), text.len());
+        }
+    }
+
+    /// Mapping a click to a character re-lays-out the run as `Left` at
+    /// the left edge recorded in the pick index, whatever alignment it
+    /// was originally drawn with. That shortcut is only sound if the
+    /// two layouts are identical — this pins it.
+    #[test]
+    fn realigning_at_start_x_reproduces_the_layout() {
+        let (_canvas, mut tr) = harness();
+        let text = "some label";
+        for align in [Align::Left, Align::Center, Align::Right] {
+            let drawn = tr.layout_vge_text(text, 137.0, align, FontStyle(0), 1.0);
+            let relaid =
+                tr.layout_vge_text(text, drawn.start_x, Align::Left, FontStyle(0), 1.0);
+
+            assert!((relaid.start_x - drawn.start_x).abs() < 1e-4, "{align:?}");
+            assert!(
+                (relaid.total_width - drawn.total_width).abs() < 1e-4,
+                "{align:?}"
+            );
+            assert_eq!(relaid.stops, drawn.stops, "{align:?}");
+            // And so every position maps to the same character.
+            for i in 0..=20 {
+                let x = drawn.start_x + drawn.total_width * (i as f32 / 20.0);
+                assert_eq!(relaid.byte_offset_at(x), drawn.byte_offset_at(x), "{align:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_run_has_no_width() {
+        let (_canvas, mut tr) = harness();
+        let l = layout(&mut tr, "", 12.0, Align::Left);
+        assert_eq!(l.total_width, 0.0);
+        assert_eq!(l.byte_offset_at(1000.0), 0);
     }
 }

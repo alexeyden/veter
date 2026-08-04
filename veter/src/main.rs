@@ -146,6 +146,30 @@ impl Selection {
     }
 }
 
+/// A VGE text run resolved out of the pick index and live element
+/// state — everything needed to re-shape it, so a pointer position can
+/// be turned into a byte offset, plus the coordinates that identify it
+/// for [`vge::pick::VgeTextSelection`].
+///
+/// There is no `align` field on purpose: `start_x` is the run's already
+/// aligned left edge, so re-laying it out as `Left` at `start_x`
+/// reproduces the shaping that was painted, whatever the original
+/// alignment was.
+struct VgeRunHit {
+    path: Vec<String>,
+    on_alt: bool,
+    creation_seq: u64,
+    cmd_index: u32,
+    text: String,
+    font_style: vge::command::FontStyle,
+    /// Composed on-screen scale (§9.11) the run was rasterised at.
+    scale: f32,
+    /// Left edge of the run in its own pre-transform space.
+    start_x: f32,
+    /// Pointer position mapped into that same space.
+    local_x: f32,
+}
+
 /// Borrowed snapshot of a portal-tree walk: the leaf portal targeted
 /// by a selection plus its pixel origin in canvas coords. Used for
 /// hit-testing and pointer→cell projection during a drag.
@@ -304,6 +328,49 @@ fn extract_text_from_parser<CB: vt100::Callbacks>(
     }
     parser.screen_mut().set_scrollback(saved);
     text
+}
+
+/// Copy an uploaded image out as clipboard-ready straight-alpha RGBA8,
+/// cropped to `roi` (a `DrawImage` `source_rect_px`, §7.5) when the
+/// command samples a sub-region. `None` if the crop comes out empty.
+///
+/// The clamping mirrors `vge::render::ensure_image_paint` so what lands
+/// on the clipboard is the region that was actually drawn, including
+/// for an over-large ROI the renderer would itself have clamped.
+fn crop_uploaded_image(
+    img: &vge::state::UploadedImage,
+    roi: Option<vge::codec::Rect>,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use rgb::ComponentBytes;
+
+    let (iw, ih) = (img.width, img.height);
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let Some(r) = roi else {
+        return Some((iw, ih, img.pixels.as_bytes().to_vec()));
+    };
+    if !(r.x.is_finite() && r.y.is_finite() && r.w.is_finite() && r.h.is_finite()) {
+        return None;
+    }
+    // Round outward, so a sub-pixel ROI still yields the pixels it
+    // touched rather than nothing at all.
+    let x0 = (r.x.floor().max(0.0) as u32).min(iw);
+    let y0 = (r.y.floor().max(0.0) as u32).min(ih);
+    let x1 = (((r.x + r.w).ceil().max(0.0)) as u32).min(iw);
+    let y1 = (((r.y + r.h).ceil().max(0.0)) as u32).min(ih);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in y0..y1 {
+        let start = (row * iw + x0) as usize;
+        let end = start + w as usize;
+        out.extend_from_slice(img.pixels[start..end].as_bytes());
+    }
+    Some((w, h, out))
 }
 
 /// Word-boundary classifier. A "word" is any contiguous run of
@@ -629,6 +696,18 @@ struct App {
     /// Shift+drag; cleared on next non-shift click. `dragging` field
     /// tracks whether the mouse is still held.
     selection: Option<Selection>,
+    /// Active or last-finalized selection inside a VGE `DrawText` run.
+    /// Mutually exclusive with `selection` — the two address different
+    /// coordinate spaces and there is no defined reading order between
+    /// a floating run and the grid rows under it, so a new selection of
+    /// either kind clears the other.
+    vge_selection: Option<vge::pick::VgeSelection>,
+    /// A left-press that landed on a VGE image, held until release.
+    /// Selecting an image is a *click*, not a drag, so the decision
+    /// can't be made until we know whether the pointer travelled — a
+    /// press that turns into a drag belongs to the grid selection
+    /// underneath instead.
+    pending_image_click: Option<(vge::pick::VgeSelection, winit::dpi::PhysicalPosition<f64>)>,
     /// Deadline for the next auto-scroll step while dragging past the
     /// viewport edge. None when not auto-scrolling.
     autoscroll_deadline: Option<Instant>,
@@ -1540,6 +1619,8 @@ impl App {
             cursor_pos: None,
             clipboard: clipboard::ClipboardManager::new(),
             selection: None,
+            vge_selection: None,
+            pending_image_click: None,
             autoscroll_deadline: None,
             last_click: None,
             mouse_buttons_held: 0,
@@ -2083,6 +2164,293 @@ impl App {
         }
     }
 
+    /// The VGE element table a portal path names. Empty path = the
+    /// host's own. `None` if any id along the path is gone.
+    fn vge_state_for_path(&self, path: &[String]) -> Option<&vge::VgeState> {
+        if path.is_empty() {
+            return self.vge.as_ref().map(|e| &e.state);
+        }
+        let mut set = self.prt.as_ref()?.state.current();
+        let mut last: Option<&prt::Portal> = None;
+        for id in path {
+            let portal = set.portals.get(id)?;
+            last = Some(portal);
+            set = portal.children.state.current();
+        }
+        last.map(|p| &p.vge.state)
+    }
+
+    /// Turn a pick item into a re-shapeable run. Shared by the press
+    /// path (topmost run under the pointer) and the drag path (the run
+    /// the selection is already anchored to).
+    fn vge_run_from_item(
+        &self,
+        item: &vge::pick::PickItem,
+        path: Vec<String>,
+        local_x: f32,
+    ) -> Option<VgeRunHit> {
+        let vge::pick::PickKind::Text { scale, .. } = item.kind else {
+            return None;
+        };
+        let state = self.vge_state_for_path(&path)?;
+        let vge::command::DrawCmd::DrawText {
+            text, font_style, ..
+        } = item.resolve(state)?
+        else {
+            return None;
+        };
+        Some(VgeRunHit {
+            path,
+            on_alt: item.loc.on_alt,
+            creation_seq: item.loc.creation_seq,
+            cmd_index: item.loc.cmd_index,
+            text: text.clone(),
+            font_style: *font_style,
+            scale,
+            start_x: item.local.x,
+            local_x,
+        })
+    }
+
+    /// The topmost VGE text run under a pointer position, if any. VGE
+    /// paints above the text grid, so this gets first refusal on a
+    /// click that would otherwise start a grid selection.
+    fn vge_run_at(&self, pos: winit::dpi::PhysicalPosition<f64>) -> Option<VgeRunHit> {
+        let tr = self.term_renderer.as_ref()?;
+        let hit = tr
+            .pick
+            .hit_matching(pos.x as f32, pos.y as f32, |i| {
+                matches!(i.kind, vge::pick::PickKind::Text { .. })
+            })?;
+        let path = tr.pick.path(hit.item.loc.path_id).to_vec();
+        let (item, local_x) = (*hit.item, hit.local_x);
+        self.vge_run_from_item(&item, path, local_x)
+    }
+
+    /// The topmost VGE image under a pointer position, as a selection
+    /// ready to commit. Uses the plain topmost hit rather than
+    /// filtering for images, so a text run drawn over an image still
+    /// wins — the pointer should select what it looks like it is on.
+    fn vge_image_at(
+        &self,
+        pos: winit::dpi::PhysicalPosition<f64>,
+    ) -> Option<vge::pick::VgeSelection> {
+        let tr = self.term_renderer.as_ref()?;
+        let hit = tr.pick.hit(pos.x as f32, pos.y as f32)?;
+        if !matches!(hit.item.kind, vge::pick::PickKind::Image) {
+            return None;
+        }
+        Some(vge::pick::VgeSelection {
+            path: tr.pick.path(hit.item.loc.path_id).to_vec(),
+            on_alt: hit.item.loc.on_alt,
+            creation_seq: hit.item.loc.creation_seq,
+            cmd_index: hit.item.loc.cmd_index,
+            kind: vge::pick::VgeSelKind::Image,
+        })
+    }
+
+    /// Re-locate the run an active VGE selection is anchored to in the
+    /// current frame's index, with the pointer mapped into its space.
+    /// The run may have scrolled or been re-laid-out since the drag
+    /// started, so its geometry is looked up fresh rather than cached;
+    /// the clip is ignored so a drag that wanders off the run still
+    /// moves the head, like a grid drag past the viewport edge.
+    fn vge_run_for_selection(&self) -> Option<VgeRunHit> {
+        let pos = self.cursor_pos?;
+        let sel = self.vge_selection.as_ref()?;
+        let tr = self.term_renderer.as_ref()?;
+        let item = *tr.pick.find(sel)?;
+        let path = tr.pick.path(item.loc.path_id).to_vec();
+        let (local_x, _) = item.local_point_unclipped(pos.x as f32, pos.y as f32)?;
+        self.vge_run_from_item(&item, path, local_x)
+    }
+
+    /// The byte offset in `run` its pointer position maps to.
+    fn vge_offset_in_run(&mut self, run: &VgeRunHit) -> Option<usize> {
+        let tr = self.term_renderer.as_mut()?;
+        let layout = tr.layout_vge_text(
+            &run.text,
+            run.start_x,
+            vge::command::Align::Left,
+            run.font_style,
+            run.scale,
+        );
+        Some(layout.byte_offset_at(run.local_x))
+    }
+
+    /// Begin a character-range selection in `run` at the pointer.
+    fn start_vge_selection(&mut self, run: &VgeRunHit) {
+        let Some(offset) = self.vge_offset_in_run(run) else {
+            return;
+        };
+        self.selection = None;
+        self.vge_selection = Some(vge::pick::VgeSelection {
+            path: run.path.clone(),
+            on_alt: run.on_alt,
+            creation_seq: run.creation_seq,
+            cmd_index: run.cmd_index,
+            kind: vge::pick::VgeSelKind::Text {
+                anchor: offset,
+                head: offset,
+                dragging: true,
+            },
+        });
+    }
+
+    /// Select a whole run — the double-click gesture. VGE runs are
+    /// single-line by construction (§7.4) and in practice are one
+    /// filename, label or title, so the whole run is the useful unit;
+    /// splitting it into words the way the grid does would mostly get
+    /// in the way.
+    fn select_whole_vge_run(&mut self, run: &VgeRunHit) {
+        self.selection = None;
+        self.vge_selection = Some(vge::pick::VgeSelection {
+            path: run.path.clone(),
+            on_alt: run.on_alt,
+            creation_seq: run.creation_seq,
+            cmd_index: run.cmd_index,
+            kind: vge::pick::VgeSelKind::Text {
+                anchor: 0,
+                head: run.text.len(),
+                dragging: false,
+            },
+        });
+    }
+
+    /// Track the pointer with the head of an in-progress VGE drag.
+    fn update_vge_selection_head(&mut self) {
+        let Some(run) = self.vge_run_for_selection() else {
+            return;
+        };
+        let Some(offset) = self.vge_offset_in_run(&run) else {
+            return;
+        };
+        if let Some(vge::pick::VgeSelKind::Text { head, dragging: true, .. }) =
+            self.vge_selection.as_mut().map(|s| &mut s.kind)
+        {
+            *head = offset;
+        }
+    }
+
+    /// The full text of the run the VGE selection points at, or `None`
+    /// once that run has gone: element deleted, evicted from scrollback
+    /// (§5.2), wiped by an erase (§5.7), the screen swapped, or the
+    /// command replaced by something that isn't text. Also `None` if
+    /// the run was rewritten (`UpdateText`, §6.4) such that the stored
+    /// offsets no longer land on character boundaries.
+    fn vge_selection_run(&self) -> Option<&str> {
+        let sel = self.vge_selection.as_ref()?;
+        let state = self.vge_state_for_path(&sel.path)?;
+        if state.on_alt() != sel.on_alt {
+            return None;
+        }
+        let el = vge::pick::element_by_seq(state, sel.creation_seq)?;
+        let vge::command::DrawCmd::DrawText { text, .. } =
+            el.commands.get(sel.cmd_index as usize)?
+        else {
+            return None;
+        };
+        let (start, end) = sel.text_range()?;
+        if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some(text.as_str())
+    }
+
+    /// The selected slice of that run. `None` for a zero-width
+    /// selection — a drag that hasn't moved yet — which is live but
+    /// has nothing to copy.
+    fn extract_vge_selection_text(&self) -> Option<String> {
+        let sel = self.vge_selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (start, end) = sel.text_range()?;
+        Some(self.vge_selection_run()?[start..end].to_string())
+    }
+
+    /// The selected image's pixels, as straight-alpha RGBA8 ready for
+    /// the clipboard, cropped to the `source_rect_px` region the
+    /// `DrawImage` actually samples (§7.5) — what the user sees, not
+    /// the whole uploaded atlas behind it.
+    fn extract_vge_selection_image(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let sel = self.vge_selection.as_ref()?;
+        if !sel.is_image() {
+            return None;
+        }
+        let state = self.vge_state_for_path(&sel.path)?;
+        if state.on_alt() != sel.on_alt {
+            return None;
+        }
+        let el = vge::pick::element_by_seq(state, sel.creation_seq)?;
+        let vge::command::DrawCmd::DrawImage {
+            image_id,
+            source_rect,
+            ..
+        } = el.commands.get(sel.cmd_index as usize)?
+        else {
+            return None;
+        };
+        let img = state.shared.images.get(image_id)?;
+        crop_uploaded_image(img, *source_rect)
+    }
+
+    /// Write the selected VGE image to a file the user picks. Returns
+    /// false — without opening anything — when no image is selected, so
+    /// the caller can let the chord through to the inner program.
+    ///
+    /// PNG is what gets written, always: the clipboard form is already
+    /// RGBA and re-encoding is cheap, whereas handing back the original
+    /// upload bytes would mean the extension depended on how the client
+    /// happened to transmit the image (§8.1) rather than on what the
+    /// user typed.
+    fn save_selected_image(&mut self) -> bool {
+        let Some((w, h, rgba)) = self.extract_vge_selection_image() else {
+            return false;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save image")
+            .set_file_name("image.png")
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            // Dialog cancelled — still the host's keystroke, so it is
+            // consumed rather than reaching the inner program.
+            return true;
+        };
+        match image::RgbaImage::from_raw(w, h, rgba) {
+            Some(buf) => {
+                if let Err(e) = buf.save(&path) {
+                    eprintln!("veter: could not write {}: {e}", path.display());
+                }
+            }
+            None => eprintln!("veter: image buffer does not match {w}x{h}"),
+        }
+        true
+    }
+
+    /// Is the VGE selection still anchored to something that exists?
+    /// Kind-aware: a text selection needs a live run whose offsets
+    /// still land on character boundaries, an image selection needs a
+    /// live `DrawImage`.
+    fn vge_selection_is_live(&self) -> bool {
+        match self.vge_selection.as_ref() {
+            None => true,
+            Some(s) if s.is_image() => self.extract_vge_selection_image().is_some(),
+            Some(_) => self.vge_selection_run().is_some(),
+        }
+    }
+
+    /// Drop every kind of selection, grid and VGE alike.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.vge_selection = None;
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection.is_some() || self.vge_selection.is_some()
+    }
+
     /// Convert a physical-pixel cursor position to (abs_line, col) in
     /// the given target's vt100, clamped to that grid's bounds. None
     /// when state isn't ready or the target portal no longer exists.
@@ -2158,6 +2526,9 @@ impl App {
     /// get a `\n`. Saves and restores the target's scrollback offset
     /// so the user's view isn't disturbed.
     fn extract_selection_text(&mut self) -> Option<String> {
+        if self.selection.is_none() {
+            return self.extract_vge_selection_text();
+        }
         let sel = self.selection.as_ref()?.clone();
         if sel.is_empty() {
             return None;
@@ -2376,6 +2747,7 @@ impl App {
             }
             return;
         };
+        self.vge_selection = None;
         self.selection = Some(Selection {
             target: target.clone(),
             anchor_line: s_line,
@@ -2443,6 +2815,16 @@ impl App {
     /// Ctrl+Shift+C and similar explicit copy actions write the main
     /// clipboard too.
     fn copy_selection_to_clipboard(&mut self, primary_only: bool) {
+        // A selected image goes to CLIPBOARD only, and only on an
+        // explicit copy: PRIMARY is a text convention, and the
+        // `primary_only` path is drag-completion, which never produces
+        // an image selection anyway.
+        if !primary_only
+            && let Some((w, h, rgba)) = self.extract_vge_selection_image()
+        {
+            self.clipboard.set_image(w, h, &rgba);
+            return;
+        }
         let Some(text) = self.extract_selection_text() else {
             return;
         };
@@ -2646,7 +3028,7 @@ impl App {
         // host chords (which win on conflict) and before the key reaches
         // the shell. Running consumes the selection, like copy.
         if self.selection_fresh
-            && self.selection.is_some()
+            && self.has_selection()
             && let Some(command) =
                 self.keys.resolve_selection_command(&event.logical_key, &self.modifiers)
         {
@@ -2656,7 +3038,7 @@ impl App {
                     run_selection_command(&command, sel);
                 }
             }
-            self.selection = None;
+            self.clear_selection();
             self.selection_fresh = false;
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -2714,6 +3096,15 @@ impl App {
             self.set_target_scrollback(&path, 0);
         }
 
+        // Save-image is consumed only when there is an image to save,
+        // so the chord stays available to the inner program the rest of
+        // the time (Ctrl+Shift+S by default — a key plenty of editors
+        // want). Handled before the `pty` borrow: it writes a file, not
+        // input.
+        if host_action == Some(HostAction::SaveImage) && self.save_selected_image() {
+            return;
+        }
+
         let pty = match &self.pty {
             Some(p) => p,
             None => return,
@@ -2732,8 +3123,8 @@ impl App {
         if host_action == Some(HostAction::Copy) {
             self.copy_selection_to_clipboard(false);
             // Reset the selection after copying so the highlight clears.
-            if self.selection.is_some() {
-                self.selection = None;
+            if self.has_selection() {
+                self.clear_selection();
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -3086,6 +3477,11 @@ impl App {
             self.selection = None;
             self.autoscroll_deadline = None;
         }
+
+        // A VGE selection dies with the command it points at.
+        if !self.vge_selection_is_live() {
+            self.vge_selection = None;
+        }
     }
 
     /// Apply OSC 52 set requests buffered since the last drain. Two
@@ -3379,6 +3775,7 @@ impl ApplicationHandler for App {
             self.config.search.current_match.to_femto(),
             self.config.search.match_color.to_femto(),
         );
+        term_renderer.set_selection_accent(self.config.accent_primary().to_femto());
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
         // VGE engine: needs cell pixel dimensions and HiDPI scale factor.
@@ -3555,16 +3952,25 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let local_drag = matches!(&self.selection, Some(s) if s.dragging);
+                let vge_drag = matches!(&self.vge_selection, Some(s) if s.is_dragging());
                 // When a local drag-select is in progress, motion
                 // belongs to the host (selection extension), not the
                 // inner program. Shift held means the user is in
                 // local-interaction mode regardless of mouse mode.
-                if !self.modifiers.shift_key() && !local_drag {
+                if !self.modifiers.shift_key() && !local_drag && !vge_drag {
                     self.try_forward_mouse_motion();
                 }
                 if local_drag {
                     self.update_selection_head();
                     self.maybe_arm_autoscroll();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+                if vge_drag {
+                    // No autoscroll: a text run is on screen by
+                    // definition, so there is nowhere to scroll to.
+                    self.update_vge_selection_head();
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -3602,6 +4008,7 @@ impl ApplicationHandler for App {
                 match (state, button) {
                     (ElementState::Pressed, MouseButton::Left) => {
                         self.mouse_buttons_held |= 1;
+                        self.pending_image_click = None;
                         if !shift && self.try_forward_mouse_button(0, true) {
                             return;
                         }
@@ -3621,11 +4028,41 @@ impl ApplicationHandler for App {
                                 dx * dx + dy * dy
                                     <= DOUBLE_CLICK_RADIUS_PX * DOUBLE_CLICK_RADIUS_PX
                             });
+                        let alt = self.modifiers.alt_key();
+                        // An image under the pointer is a *candidate*:
+                        // whether this press selects it depends on
+                        // whether the pointer travels before release, so
+                        // it is parked and everything below still runs.
+                        self.pending_image_click = self.vge_image_at(pos).map(|s| (s, pos));
+                        // VGE text paints above the grid, so a run under
+                        // the pointer answers the click first — but only
+                        // for the gestures that would have started a
+                        // selection anyway. Shift+Alt is left to the
+                        // grid: smart pane select is about the text
+                        // grid's geometry, not a floating run's.
+                        if (is_double || (shift && !alt))
+                            && let Some(run) = self.vge_run_at(pos)
+                        {
+                            if is_double {
+                                self.select_whole_vge_run(&run);
+                                self.copy_selection_to_clipboard(true);
+                                self.selection_fresh = true;
+                                self.last_click = None;
+                            } else {
+                                self.start_vge_selection(&run);
+                                self.last_click = Some((now, target.clone(), pos));
+                            }
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
                         if is_double
                             && let Some((line, col)) = self.cursor_to_abs(pos, &target)
                             && let Some(((s_line, s_col), (e_line, e_col))) =
                                 self.find_word_range(&target, line, col)
                         {
+                            self.vge_selection = None;
                             self.selection = Some(Selection {
                                 target,
                                 anchor_line: s_line,
@@ -3644,7 +4081,6 @@ impl ApplicationHandler for App {
                             return;
                         }
                         self.last_click = Some((now, target.clone(), pos));
-                        let alt = self.modifiers.alt_key();
                         if shift && alt {
                             // Smart pane-aware select: detect the column
                             // bounds of the pane under the click and use
@@ -3657,6 +4093,7 @@ impl ApplicationHandler for App {
                                     self.detect_pane_cols_for(&target, line, col)
                             {
                                 let c = col.clamp(left, right);
+                                self.vge_selection = None;
                                 self.selection = Some(Selection {
                                     target,
                                     anchor_line: line,
@@ -3672,6 +4109,7 @@ impl ApplicationHandler for App {
                             }
                         } else if shift {
                             if let Some((line, col)) = self.cursor_to_abs(pos, &target) {
+                                self.vge_selection = None;
                                 self.selection = Some(Selection {
                                     target,
                                     anchor_line: line,
@@ -3685,11 +4123,11 @@ impl ApplicationHandler for App {
                                     w.request_redraw();
                                 }
                             }
-                        } else if self.selection.is_some() {
+                        } else if self.has_selection() {
                             // Plain click in a non-mouse-mode terminal
                             // clears the highlight; matches standard
                             // terminal/text-editor behavior.
-                            self.selection = None;
+                            self.clear_selection();
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -3697,12 +4135,43 @@ impl ApplicationHandler for App {
                     }
                     (ElementState::Released, MouseButton::Left) => {
                         self.mouse_buttons_held &= !1;
+                        let pending_image = self.pending_image_click.take();
                         if !shift && self.try_forward_mouse_button(0, false) {
                             return;
                         }
-                        let was_dragging = matches!(&self.selection, Some(s) if s.dragging);
+                        // A press on an image that never turned into a
+                        // drag selects it. The same radius that
+                        // distinguishes a double-click from two clicks
+                        // decides "didn't move" here.
+                        if let Some((sel, press_pos)) = pending_image
+                            && let Some(pos) = self.cursor_pos
+                        {
+                            let dx = pos.x - press_pos.x;
+                            let dy = pos.y - press_pos.y;
+                            if dx * dx + dy * dy <= DOUBLE_CLICK_RADIUS_PX * DOUBLE_CLICK_RADIUS_PX
+                            {
+                                self.selection = None;
+                                self.vge_selection = Some(sel);
+                                // Deliberately not `selection_fresh`:
+                                // that arms `[[selection_commands]]`,
+                                // which run a shell command on selected
+                                // *text*. An image has none, so arming
+                                // them would swallow the bound key and
+                                // clear the selection for nothing.
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                            }
+                        }
+                        let was_dragging = matches!(&self.selection, Some(s) if s.dragging)
+                            || matches!(&self.vge_selection, Some(s) if s.is_dragging());
                         if let Some(s) = &mut self.selection {
                             s.dragging = false;
+                        }
+                        if let Some(vge::pick::VgeSelKind::Text { dragging, .. }) =
+                            self.vge_selection.as_mut().map(|s| &mut s.kind)
+                        {
+                            *dragging = false;
                         }
                         self.autoscroll_deadline = None;
                         if was_dragging {
@@ -3992,6 +4461,7 @@ impl ApplicationHandler for App {
                         host_sel_range.as_ref(),
                         portal_sel_ctx.as_ref(),
                         search_ctx.as_ref(),
+                        self.vge_selection.as_ref(),
                     );
 
                     // Jump labels, then the search input bar — both drawn
@@ -4293,5 +4763,99 @@ mod jump_label_tests {
         let labels = assign_jump_labels(&visible, &HashSet::new());
         assert_eq!(labels.len(), n);
         assert_eq!(labels.last().unwrap().0, n - 1);
+    }
+}
+
+#[cfg(test)]
+mod image_crop_tests {
+    use super::*;
+    use rgb::RGBA8;
+    use std::cell::Cell;
+
+    /// A `w`×`h` image whose every pixel encodes its own coordinates,
+    /// so a crop can be checked by reading the pixels back.
+    fn coded_image(w: u32, h: u32) -> vge::state::UploadedImage {
+        let pixels = (0..h)
+            .flat_map(|y| (0..w).map(move |x| RGBA8::new(x as u8, y as u8, 0, 255)))
+            .collect();
+        vge::state::UploadedImage {
+            width: w,
+            height: h,
+            pixels,
+            gpu: Cell::new(None),
+            source_encoding: 0x01,
+            source_data: Vec::new(),
+            refs: 1,
+            was_referenced: true,
+            pinned: false,
+        }
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> vge::codec::Rect {
+        vge::codec::Rect { x, y, w, h }
+    }
+
+    /// The (x, y) each pixel was tagged with, in row-major order.
+    fn coords(rgba: &[u8]) -> Vec<(u8, u8)> {
+        rgba.chunks_exact(4).map(|p| (p[0], p[1])).collect()
+    }
+
+    #[test]
+    fn no_roi_copies_the_whole_image() {
+        let img = coded_image(3, 2);
+        let (w, h, bytes) = crop_uploaded_image(&img, None).unwrap();
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(bytes.len(), 3 * 2 * 4);
+        assert_eq!(
+            coords(&bytes),
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
+        );
+    }
+
+    #[test]
+    fn roi_selects_the_sampled_region() {
+        let img = coded_image(4, 4);
+        // The 2x2 block at (1, 2) — what a sprite-sheet frame looks like.
+        let (w, h, bytes) = crop_uploaded_image(&img, Some(rect(1.0, 2.0, 2.0, 2.0))).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(coords(&bytes), vec![(1, 2), (2, 2), (1, 3), (2, 3)]);
+    }
+
+    #[test]
+    fn roi_is_clamped_to_the_image() {
+        let img = coded_image(4, 4);
+        // Overruns the right and bottom edges; the renderer clamps the
+        // same way, so the copy must match what was drawn.
+        let (w, h, bytes) = crop_uploaded_image(&img, Some(rect(3.0, 3.0, 99.0, 99.0))).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(coords(&bytes), vec![(3, 3)]);
+
+        // Negative origin clamps to zero rather than wrapping.
+        let (w, h, _) = crop_uploaded_image(&img, Some(rect(-5.0, -5.0, 7.0, 7.0))).unwrap();
+        assert_eq!((w, h), (2, 2));
+    }
+
+    #[test]
+    fn subpixel_roi_rounds_outward() {
+        let img = coded_image(4, 4);
+        // A region strictly inside one pixel still yields that pixel —
+        // rounding inward would produce an empty copy.
+        let (w, h, bytes) = crop_uploaded_image(&img, Some(rect(1.2, 1.2, 0.4, 0.4))).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(coords(&bytes), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn degenerate_rois_yield_nothing() {
+        let img = coded_image(4, 4);
+        // Zero-area is legal on the wire (§7.5) and renders nothing.
+        assert!(crop_uploaded_image(&img, Some(rect(1.0, 1.0, 0.0, 2.0))).is_none());
+        // Entirely outside the image.
+        assert!(crop_uploaded_image(&img, Some(rect(10.0, 10.0, 2.0, 2.0))).is_none());
+        // Non-finite components can't be rounded into indices.
+        assert!(crop_uploaded_image(&img, Some(rect(f32::NAN, 0.0, 2.0, 2.0))).is_none());
+        assert!(crop_uploaded_image(&img, Some(rect(0.0, 0.0, f32::INFINITY, 2.0))).is_none());
+        // A zero-sized image has nothing to copy either.
+        assert!(crop_uploaded_image(&coded_image(0, 0), None).is_none());
     }
 }
