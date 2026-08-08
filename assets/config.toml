@@ -44,12 +44,13 @@
 [keys]
 # open_search      = "/"                 # open search (only while scrolled back)
 # open_overlay     = "Ctrl+Shift+Space"  # open the scrollback/search overlay
+# open_hints       = "Ctrl+Shift+F"      # open the overlay in hint mode
 # scroll_page_up   = "Shift+PageUp"
 # scroll_page_down = "Shift+PageDown"
 # copy             = "Ctrl+Shift+C"
 # paste            = "Ctrl+Shift+V"
 
-# In-search-overlay keys.
+# In-overlay keys.
 [keys.search]
 # close       = "Escape"
 # next_match  = "n"
@@ -57,6 +58,48 @@
 # toggle_case = "Alt+C"
 # page_up     = "PageUp"
 # page_down   = "PageDown"
+# toggle_hints = "Tab"   # switch between typed-query search and hints.
+#                        # Keep this a non-printable chord: a plain letter
+#                        # would shadow a hint label / a query character.
+
+# ---------------------------------------------------------------------------
+# Hint mode
+# ---------------------------------------------------------------------------
+# Ctrl+Shift+F labels every URL, path, hash and so on already on screen — no
+# query to type. Press a label to select exactly that text; the overlay closes
+# leaving the selection fresh, so a `[[selection_commands]]` key below acts on
+# it straight away. Paging (PageUp/PageDown) re-labels what is on screen; any
+# key that isn't a label closes the overlay.
+#
+# Detectors, and what each one recognises:
+#
+#   url     http(s)/ftp/file/ssh/git/… schemes and bare `www.` hosts. Trailing
+#           sentence punctuation is trimmed and parens are balanced, so
+#           `(see https://x/Foo_(bar))` yields the link and not the `)`.
+#   email   user@host.tld
+#   uuid    8-4-4-4-12 hex
+#   ip      IPv4, with an optional `:port`
+#   path    anything containing a `/` (plus `~/…`), keeping a trailing
+#           `:line[:col]` — so a grep or rustc location comes back whole.
+#   file    a bare `name.ext` with no slash — `Cargo.toml`, `README.md`,
+#           `main.rs:42` — plus dotfiles like `.gitignore`. The extension
+#           must be one veter knows (see extra_file_extensions below): a
+#           plain `{name}.{ext}` shape cannot tell `main.rs` from
+#           `self.name`, so a screenful of source would otherwise label
+#           every field access on it.
+#   hash    7–64 lowercase hex digits: git revisions, docker ids, sha sums.
+#   color   #rgb / #rgba / #rrggbb / #rrggbbaa
+#
+# `kinds` is both the enable list and the priority order — when two detectors
+# claim overlapping text, the one listed first wins. Drop a name to switch that
+# detector off. A URL that wraps across the right margin is detected whole.
+[hints]
+# kinds = ["url", "email", "uuid", "ip", "path", "file", "hash", "color"]
+#
+# Extensions the `file` detector should accept on top of its built-in list
+# (source, config, documents, images, audio/video, archives, build output,
+# fonts). Leading dot optional, case-insensitive.
+# extra_file_extensions = [".myext", "dat"]
 
 # ---------------------------------------------------------------------------
 # Selection commands
@@ -73,9 +116,14 @@
 #
 #   input   = "…"   Type the text back into the terminal, as if you had typed
 #                   it yourself. `%` is replaced by the selection, `%q` by the
-#                   shell-quoted selection, `%%` by a literal `%`. Use a
-#                   double-quoted TOML string so `\n` is a real newline —
-#                   that is what presses Enter.
+#                   shell-quoted selection, `%k` by the hint kind, `%%` by a
+#                   literal `%`. Use a double-quoted TOML string so `\n` is a
+#                   real newline — that is what presses Enter.
+#
+# When the selection came from a hint label (see [hints] above), what it was
+# recognised as is exported as $VETER_HINT_KIND — "url", "path", "hash", … —
+# and is empty for a selection made any other way. That is what lets one key
+# do the right thing for both: see the `o` example below.
 #
 # Bare letters are case-sensitive: "o" is the o key, "O" is Shift+o. Chords
 # with modifiers work too (e.g. "Ctrl+O"). There are no defaults — nothing
@@ -84,6 +132,20 @@
 # [[selection_commands]]
 # key = "o"                                  # open a path/URL with the default app
 # command = 'xdg-open "$VETER_SELECTION"'
+#
+# The same key, branching on what hint mode recognised: edit a file, open
+# everything else. `path` and `file` hints keep their `:line:col` suffix,
+# which is exactly what `$EDITOR +line file` wants — hence the split.
+# [[selection_commands]]
+# key = "o"
+# description = "open URLs, edit paths"
+# command = '''
+# case "$VETER_HINT_KIND" in
+#   path|file) f=${1%%:*}; rest=${1#"$f"}; l=${rest#:}; l=${l%%:*}
+#              "${VETER_EXE:-veter}" -e "${EDITOR:-vim}" ${l:++$l} "$f" ;;
+#   *)         xdg-open "$1" ;;
+# esac
+# '''
 #
 # Select a directory name in `ls` output and press C to cd into it.
 # [[selection_commands]]

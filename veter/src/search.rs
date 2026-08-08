@@ -7,12 +7,16 @@
 //! * Substring (literal), not regex.
 //! * Case-insensitive folding is ASCII-only — non-ASCII bytes match
 //!   case-sensitively.
-//! * Matches don't cross row boundaries. A query that visually spans
-//!   a soft-wrap won't match — covers the common case, ducks the
+//! * Query matches don't cross row boundaries. A query that visually
+//!   spans a soft-wrap won't match — covers the common case, ducks the
 //!   wrap-spanning row→col split that would otherwise complicate the
-//!   highlight renderer.
+//!   highlight renderer. ([`MatchSpan`] can still describe a multi-row
+//!   span, and [`crate::hints`] produces them: a wrapped URL has to come
+//!   back whole or not at all.)
 //! * Empty cells in a row are treated as space (`' '`) so leading
-//!   indentation is searchable; trailing spaces are stripped.
+//!   indentation is searchable; trailing spaces are stripped — except on
+//!   a soft-wrapped row, where they are content the next row continues
+//!   from (see [`IndexedRow::wrapped`]).
 
 use vt100::Callbacks;
 
@@ -42,15 +46,43 @@ pub struct IndexedRow {
     /// column just past the last cell — used to compute end-of-match
     /// coords.
     pub byte_to_col: Vec<u16>,
+    /// This row soft-wraps into the next one, i.e. the two are halves of
+    /// one logical line. [`crate::hints`] joins such runs before
+    /// scanning, so a URL broken by the right margin is detected whole.
+    /// Trailing spaces are left on a wrapped row for the same reason:
+    /// stripping them would silently shorten the joined text and shift
+    /// every column mapping after it.
+    pub wrapped: bool,
 }
 
+/// A span of cells in a target parser's absolute scrollback coords.
+///
+/// Query matches are always single-row (`end_line == line`); hint spans
+/// may cover a soft-wrap chain, in which case the covered cells are
+/// `col_start..cols` on `line`, all of every row between, and
+/// `0..col_end` on `end_line`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchSpan {
     pub line: i64,
     pub col_start: u16,
-    /// Exclusive end-cell column. Always `> col_start` (zero-width
-    /// matches are dropped to keep the highlight visible).
+    /// Row the span ends on. Equal to `line` for a single-row span.
+    pub end_line: i64,
+    /// Exclusive end-cell column, on `end_line`. For a single-row span
+    /// always `> col_start` (zero-width matches are dropped to keep the
+    /// highlight visible).
     pub col_end: u16,
+}
+
+impl MatchSpan {
+    /// A span confined to one row.
+    pub fn row(line: i64, col_start: u16, col_end: u16) -> Self {
+        Self {
+            line,
+            col_start,
+            end_line: line,
+            col_end,
+        }
+    }
 }
 
 /// Walk every row currently in `parser`'s buffer (scrollback + live
@@ -98,6 +130,7 @@ pub fn extract_indexed_text<CB: Callbacks>(
 }
 
 fn index_row(screen: &vt100::Screen, row: u16, cols: u16, line: i64) -> IndexedRow {
+    let wrapped = screen.row_wrapped(row);
     let mut text = String::with_capacity(cols as usize);
     let mut text_lower: Vec<u8> = Vec::with_capacity(cols as usize);
     let mut byte_to_col: Vec<u16> = Vec::with_capacity(cols as usize + 1);
@@ -124,13 +157,18 @@ fn index_row(screen: &vt100::Screen, row: u16, cols: u16, line: i64) -> IndexedR
     }
     byte_to_col.push(col);
 
-    while text.ends_with(' ') {
-        text.pop();
-        text_lower.pop();
-        byte_to_col.pop();
+    // A wrapped row keeps its trailing spaces: the logical line runs on
+    // into the next row, so those cells sit *inside* the joined text and
+    // dropping them would splice two halves that aren't adjacent.
+    if !wrapped {
+        while text.ends_with(' ') {
+            text.pop();
+            text_lower.pop();
+            byte_to_col.pop();
+        }
     }
 
-    IndexedRow { line, text, text_lower, byte_to_col }
+    IndexedRow { line, text, text_lower, byte_to_col, wrapped }
 }
 
 /// Search `index` for non-overlapping occurrences of `query`. Empty
@@ -179,7 +217,7 @@ pub fn find_matches(
             let col_start = row.byte_to_col[abs];
             let col_end = row.byte_to_col[end_byte];
             if col_end > col_start {
-                spans.push(MatchSpan { line: row.line, col_start, col_end });
+                spans.push(MatchSpan::row(row.line, col_start, col_end));
             }
             // Non-overlapping: advance past the match.
             search_start = end_byte;
@@ -209,6 +247,22 @@ mod tests {
         assert_eq!(idx.rows[1].text, "rust");
         assert_eq!(idx.rows[2].text, "");
         assert_eq!(idx.rows[3].text, "");
+    }
+
+    /// The wrap flag is what lets `hints` rejoin a logical line, so it
+    /// has to survive extraction. A row that ran into the right margin
+    /// is flagged; the row that ends the chain is not.
+    #[test]
+    fn extract_records_the_wrap_flag() {
+        // 12 chars into a 5-column screen: rows 0 and 1 wrap, row 2 ends
+        // the chain.
+        let mut p = parse(b"abcdefghijkl", 4, 5);
+        let idx = extract_indexed_text(&mut p, 0);
+        assert_eq!(idx.rows[0].text, "abcde");
+        assert!(idx.rows[0].wrapped);
+        assert!(idx.rows[1].wrapped);
+        assert_eq!(idx.rows[2].text, "kl");
+        assert!(!idx.rows[2].wrapped);
     }
 
     #[test]

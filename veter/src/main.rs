@@ -1,7 +1,7 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
 // re-imports them for in-file references. vsd and other workspace
 // crates pull the same code through `veter::*`.
-use veter::{clipboard, prt, pty, renderer, search, ses, vft, vge, vss};
+use veter::{clipboard, hints, prt, pty, renderer, search, ses, vft, vge, vss};
 
 mod config;
 use config::{HostAction, SearchAction, SelectionAction};
@@ -84,11 +84,20 @@ fn host_accent_palette(config: &config::Config) -> vge::HostThemePalette {
 /// the selection exported as `$VETER_SELECTION` and passed as positional
 /// `$1` (so `xdg-open "$1"` and `xdg-open "$VETER_SELECTION"` both work).
 ///
+/// `kind` is what the overlay's hint mode recognised the text as, when
+/// the selection came from a hint label — exported as `$VETER_HINT_KIND`
+/// (empty for a selection made any other way). It is what lets a single
+/// binding do the right thing for both halves of the feature:
+///
+/// ```toml
+/// command = 'case "$VETER_HINT_KIND" in path) $EDITOR "$1";; *) xdg-open "$1";; esac'
+/// ```
+///
 /// Fire-and-forget: the child is detached into its own session
 /// (`setsid`) with null stdio so a browser/`xdg-open` outlives veter and
 /// isn't hit by terminal signals; a short reaper thread waits on it so it
 /// doesn't linger as a zombie. Never blocks the UI thread.
-fn run_selection_command(command: &str, selection: &str) {
+fn run_selection_command(command: &str, selection: &str, kind: Option<hints::HintKind>) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -100,6 +109,7 @@ fn run_selection_command(command: &str, selection: &str) {
         .arg("veter-selection")
         .arg(selection)
         .env("VETER_SELECTION", selection)
+        .env("VETER_HINT_KIND", kind.map(|k| k.name()).unwrap_or(""))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -164,6 +174,13 @@ struct Selection {
     /// panel, …) detected at drag-start (Shift+Alt) instead of
     /// bleeding across borders.
     block_cols: Option<(u16, u16)>,
+    /// What the overlay's hint mode recognised this text as, when the
+    /// selection came from a hint label. Reaches a
+    /// `[[selection_commands]]` command as `$VETER_HINT_KIND`, so one
+    /// binding can open a URL and edit a path. `None` for every other way
+    /// a selection is made — carried on the selection itself rather than
+    /// beside it precisely so it can't outlive the text it describes.
+    hint_kind: Option<hints::HintKind>,
 }
 
 impl Selection {
@@ -862,6 +879,10 @@ struct App {
     config: config::Config,
     /// Compiled key chord → action tables, derived from `config.keys`.
     keys: config::KeyBindings,
+    /// What hint mode looks for, resolved from `[hints]` once at
+    /// startup — the resolver warns about unknown names, so it must not
+    /// run per keystroke.
+    hint_config: hints::HintConfig,
     /// True while the current selection is "fresh" — made since the last
     /// key was sent to the shell. Gates `[[selection_commands]]` so a
     /// lingering highlight can't hijack normal typing: the first key
@@ -900,6 +921,29 @@ struct App {
     window_title: String,
 }
 
+/// What filled [`SearchState::matches`] — the one thing that genuinely
+/// differs between the overlay's two modes.
+///
+/// Everything downstream of the match list (labels, highlights,
+/// scroll-to-match, portal targeting) is written against `matches` alone
+/// and so is shared verbatim. What the mode changes is the producer, the
+/// meaning of a keypress, and what a label press selects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OverlayMode {
+    /// Typed-query substring search.
+    Query,
+    /// Auto-detected hints. `kinds[i]` is what `matches[i]` was
+    /// recognised as — the two are filled together by
+    /// [`App::recompute_search_matches`] and are always the same length.
+    Hints { kinds: Vec<hints::HintKind> },
+}
+
+impl OverlayMode {
+    fn is_hints(&self) -> bool {
+        matches!(self, OverlayMode::Hints { .. })
+    }
+}
+
 /// One scrollback-search session, owned by `App::search`.
 ///
 /// The session captures `target_path` at open time so focus changes
@@ -907,7 +951,11 @@ struct App {
 /// `editing`, typed characters edit the query and matches recompute
 /// live; after the first Enter, n/N navigate without further query
 /// edits (typing a fresh char re-enters editing with a new query).
+///
+/// In [`OverlayMode::Hints`] there is no query at all: `query` stays
+/// empty, `editing` stays false, and every printable key is a label.
 struct SearchState {
+    mode: OverlayMode,
     query: String,
     /// Default true — terminal text is usually skimmed, not grepped.
     /// Toggled by Alt+C in the search bar.
@@ -987,6 +1035,7 @@ struct JumpLabel {
 impl SearchState {
     fn new(target_path: Vec<String>, saved_scrollback: usize) -> Self {
         Self {
+            mode: OverlayMode::Query,
             query: String::new(),
             case_insensitive: true,
             editing: true,
@@ -999,6 +1048,25 @@ impl SearchState {
             expand: None,
         }
     }
+
+    /// A session that opens straight into hint mode. `editing` is false
+    /// from the start: there is no query to type, so nothing may be
+    /// mistaken for one.
+    fn new_hints(target_path: Vec<String>, saved_scrollback: usize) -> Self {
+        Self {
+            mode: OverlayMode::Hints { kinds: Vec::new() },
+            editing: false,
+            ..Self::new(target_path, saved_scrollback)
+        }
+    }
+
+    /// Hint kind of match `idx`, or `None` in query mode.
+    fn hint_kind(&self, idx: usize) -> Option<hints::HintKind> {
+        match &self.mode {
+            OverlayMode::Query => None,
+            OverlayMode::Hints { kinds } => kinds.get(idx).copied(),
+        }
+    }
 }
 
 /// Home-row alphabet for flash-style jump labels, assigned in order to
@@ -1008,6 +1076,18 @@ impl SearchState {
 /// the query. `n`/`N` are reserved for match navigation and never used.
 const JUMP_LABEL_ALPHABET: &[char] =
     &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'];
+
+/// Label alphabet for hint mode. Hint mode has no query, so no key can
+/// be mistaken for query input: the reservations that shrink
+/// [`JUMP_LABEL_ALPHABET`] don't apply and the whole keyboard is
+/// available. Home row first (same muscle memory), then the rest of the
+/// letters, then digits — a screen of `ls -la` output can easily carry
+/// thirty hints, and running out means the tail of the screen silently
+/// has no labels.
+const HINT_LABEL_ALPHABET: &[char] = &[
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
+    'z', 'x', 'c', 'v', 'b', 'n', 'm', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+];
 
 /// The label key `ch` is the shifted form of, if it is one. Labels are
 /// drawn lowercase, so `'A'` → `Some('a')` selects the whole line at
@@ -1039,19 +1119,18 @@ fn char_at_col(row: &search::IndexedRow, col: u16) -> Option<char> {
 }
 
 /// Assign jump labels to `visible` match indices (in reading order) from
-/// [`JUMP_LABEL_ALPHABET`], skipping any char in `excluded` (chars that
-/// could continue the query). Stops when the usable alphabet runs out,
-/// leaving surplus matches unlabelled. Pure — the I/O-free core of
-/// [`App::recompute_labels`], split out so it can be unit-tested.
+/// `alphabet`, skipping any char in `excluded` (in query mode, chars that
+/// could continue the query; in hint mode nothing is excluded). Stops
+/// when the usable alphabet runs out, leaving surplus matches unlabelled.
+/// Pure — the I/O-free core of [`App::recompute_labels`], split out so it
+/// can be unit-tested.
 fn assign_jump_labels(
     visible: &[usize],
     excluded: &std::collections::HashSet<char>,
+    alphabet: &[char],
 ) -> Vec<(usize, char)> {
     let mut out = Vec::new();
-    let mut alpha = JUMP_LABEL_ALPHABET
-        .iter()
-        .copied()
-        .filter(|c| !excluded.contains(c));
+    let mut alpha = alphabet.iter().copied().filter(|c| !excluded.contains(c));
     for &idx in visible {
         match alpha.next() {
             Some(ch) => out.push((idx, ch)),
@@ -1221,23 +1300,32 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let text_w = |s: &str| s.chars().count() as f32 * cell_w;
     let chip_w = |s: &str| (text_w(s) + cell_w * 1.5).round();
 
+    let hints_mode = search.mode.is_hints();
+
     // Right-hand chips, in the order they are built. The counter is
     // absent until there is something to count; a query that matches
     // nothing turns it into the warm chip instead.
     let mut chips: Vec<Chip> = Vec::new();
     if !search.matches.is_empty() {
         chips.push(Chip {
-            label: format!("{}/{}", search.current + 1, search.matches.len()),
+            // Hint mode has no cursor through the list — every hint on
+            // screen is reachable by its own label — so it counts rather
+            // than numbers.
+            label: if hints_mode {
+                format!("{}", search.matches.len())
+            } else {
+                format!("{}/{}", search.current + 1, search.matches.len())
+            },
             fill: mix(panel_bg(), accent, 0.3),
             border: None,
             // The counter is drawn in the current-match colour, so the
             // number and the highlight it points at agree on screen.
             text: tr.search_current_match(),
         });
-    } else if !search.query.is_empty() {
+    } else if hints_mode || !search.query.is_empty() {
         let (fill, border, text) = warn_colors();
         chips.push(Chip {
-            label: "no matches".to_string(),
+            label: if hints_mode { "no hints" } else { "no matches" }.to_string(),
             fill,
             border: Some(border),
             text,
@@ -1245,22 +1333,25 @@ fn draw_search_bar<T: femtovg::Renderer>(
     }
     // Case toggle: lit when matching is case-*sensitive*, since that is
     // the state the user has to be able to see (Alt+C toggles it, and
-    // insensitive is the default).
-    chips.push(if search.case_insensitive {
-        Chip {
-            label: "Aa".to_string(),
-            fill: panel_inset_bg(),
-            border: Some(fade(text_color, 0.22)),
-            text: fade(text_color, 0.5),
-        }
-    } else {
-        Chip {
-            label: "Aa".to_string(),
-            fill: accent,
-            border: None,
-            text: on_accent_text(),
-        }
-    });
+    // insensitive is the default). Nothing to fold in hint mode, so the
+    // chip would only be a dead control.
+    if !hints_mode {
+        chips.push(if search.case_insensitive {
+            Chip {
+                label: "Aa".to_string(),
+                fill: panel_inset_bg(),
+                border: Some(fade(text_color, 0.22)),
+                text: fade(text_color, 0.5),
+            }
+        } else {
+            Chip {
+                label: "Aa".to_string(),
+                fill: accent,
+                border: None,
+                text: on_accent_text(),
+            }
+        });
+    }
 
     // Key hint: whichever keys do something in the mode the session is
     // actually in (see `handle_search_key_input`), so the panel never
@@ -1268,12 +1359,38 @@ fn draw_search_bar<T: femtovg::Renderer>(
     // In expand mode it names the committed key's shifted form
     // explicitly (`S: line`), which is how the whole-line gesture gets
     // discovered: you learn it the first time you use a label.
-    let hint: String = match &search.expand {
-        Some(exp) => format!("{}: line · Enter: done", exp.ch.to_uppercase()),
-        None if search.editing => "Enter: navigate".to_string(),
-        None => "n/N: step".to_string(),
+    let hint: String = if hints_mode {
+        "Tab: search · Esc: close".to_string()
+    } else {
+        match &search.expand {
+            Some(exp) => format!("{}: line · Enter: done", exp.ch.to_uppercase()),
+            None if search.editing => "Enter: navigate".to_string(),
+            None => "n/N: step".to_string(),
+        }
     };
     let hint = hint.as_str();
+
+    // What sits where the query field would be. In hint mode there is
+    // nothing to type, so the space names the mode and the kinds
+    // actually found on screen — which doubles as the answer to "why
+    // isn't that thing labelled?".
+    let field_text = if hints_mode {
+        let mut seen: Vec<&str> = Vec::new();
+        if let OverlayMode::Hints { kinds } = &search.mode {
+            for k in kinds {
+                if !seen.contains(&k.name()) {
+                    seen.push(k.name());
+                }
+            }
+        }
+        if seen.is_empty() {
+            "hints".to_string()
+        } else {
+            format!("hints · {}", seen.join(" "))
+        }
+    } else {
+        search.query.clone()
+    };
 
     // Width: the fixed furniture first, then the query field takes the
     // slack. The hint goes overboard first when the window is too
@@ -1282,11 +1399,16 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let hint_w = text_w(hint) + gap;
     let fixed_w = pad_x * 2.0 + chips_w;
     // Wide enough for the placeholder and its caret, so an empty field
-    // never clips its own prompt text.
-    let min_field_w = cell_w * (SEARCH_PLACEHOLDER.chars().count() as f32 + 2.0);
+    // never clips its own prompt text. Hint mode has no placeholder —
+    // its label is the content, so that is what it sizes to.
+    let min_field_w = if hints_mode {
+        text_w(&field_text) + cell_w * 2.0
+    } else {
+        cell_w * (SEARCH_PLACEHOLDER.chars().count() as f32 + 2.0)
+    };
     let max_panel_w = (window_w_px - cell_w * 2.0).max(cell_w * 10.0);
     let min_panel_w = (cell_w * 40.0).min(max_panel_w);
-    let panel_w = (fixed_w + hint_w + (text_w(&search.query) + cell_w * 2.0).max(min_field_w))
+    let panel_w = (fixed_w + hint_w + (text_w(&field_text) + cell_w * 2.0).max(min_field_w))
         .clamp(min_panel_w, max_panel_w)
         .round();
     let show_hint = panel_w - fixed_w - hint_w >= min_field_w;
@@ -1325,25 +1447,35 @@ fn draw_search_bar<T: femtovg::Renderer>(
     canvas.stroke_path(&panel, &border);
 
     // The query field, recessed so it reads as something you type into.
+    // Hint mode leaves it flat: there is nothing to type, and a recessed
+    // box that ignores the keyboard would be a lie.
     let field_x = panel_x + pad_x;
-    let mut field = femtovg::Path::new();
-    field.rounded_rect(field_x, row_y, field_w, chip_h, chip_radius);
-    canvas.fill_path(&field, &femtovg::Paint::color(panel_inset_bg()));
+    if !hints_mode {
+        let mut field = femtovg::Path::new();
+        field.rounded_rect(field_x, row_y, field_w, chip_h, chip_radius);
+        canvas.fill_path(&field, &femtovg::Paint::color(panel_inset_bg()));
+    }
 
-    // Elide from the left: the tail is the interesting end while typing,
-    // and it is where the caret sits. One cell of the budget is kept
-    // clear for the caret itself.
     let inner_x = field_x + cell_w * 0.5;
     let budget = (((field_w - cell_w) / cell_w).floor() as usize)
         .saturating_sub(1)
         .max(1);
-    let query_chars = search.query.chars().count();
-    let shown: String = if query_chars > budget {
-        std::iter::once('…')
-            .chain(search.query.chars().skip(query_chars - (budget - 1)))
+    let field_chars = field_text.chars().count();
+    let shown: String = if field_chars <= budget {
+        field_text.clone()
+    } else if hints_mode {
+        // A label reads from its head, so it loses its tail.
+        field_text
+            .chars()
+            .take(budget.saturating_sub(1))
+            .chain(std::iter::once('…'))
             .collect()
     } else {
-        search.query.clone()
+        // A query elides from the left instead: the tail is the
+        // interesting end while typing, and it is where the caret sits.
+        std::iter::once('…')
+            .chain(field_text.chars().skip(field_chars - (budget - 1)))
+            .collect()
     };
     let caret_w = (cell_w * 0.15).max(2.0);
     // An empty field shows the placeholder, nudged past the caret so the
@@ -1368,7 +1500,11 @@ fn draw_search_bar<T: femtovg::Renderer>(
             inner_x,
             row_baseline,
             &shown,
-            text_color,
+            if hints_mode {
+                fade(text_color, 0.75)
+            } else {
+                text_color
+            },
             vge::command::Align::Left,
             vge::command::FontStyle::default(),
             1.0,
@@ -1775,6 +1911,7 @@ impl App {
         entry_command: Option<Vec<String>>,
     ) -> Self {
         let keys = config.key_bindings();
+        let hint_config = config.hint_config();
         Self {
             window: None,
             gl_surface: None,
@@ -1804,6 +1941,7 @@ impl App {
             search: None,
             config,
             keys,
+            hint_config,
             selection_fresh: false,
             entry_command,
             close_prompt: false,
@@ -2078,11 +2216,26 @@ impl App {
                 search.cache = idx;
             }
         }
-        let Some(search) = self.search.as_mut() else { return };
-        let matches = match &search.cache {
-            Some(idx) => search::find_matches(idx, &search.query, search.case_insensitive),
-            None => Vec::new(),
+        // Produce the match list against an immutable borrow, so hint
+        // mode can read `self.hint_config` at the same time.
+        let Some(search) = self.search.as_ref() else { return };
+        let (matches, kinds) = match (&search.mode, &search.cache) {
+            (_, None) => (Vec::new(), Vec::new()),
+            (OverlayMode::Query, Some(idx)) => (
+                search::find_matches(idx, &search.query, search.case_insensitive),
+                Vec::new(),
+            ),
+            (OverlayMode::Hints { .. }, Some(idx)) => {
+                hints::find_hints(idx, &self.hint_config)
+                    .into_iter()
+                    .map(|h| (h.span, h.kind))
+                    .unzip()
+            }
         };
+        let Some(search) = self.search.as_mut() else { return };
+        if let OverlayMode::Hints { kinds: slot } = &mut search.mode {
+            *slot = kinds;
+        }
         search.matches = matches;
         if search.matches.is_empty() {
             search.current = 0;
@@ -2165,6 +2318,10 @@ impl App {
         };
         let viewport_top = top - scrollback as i64;
 
+        let hints_mode = self
+            .search
+            .as_ref()
+            .is_some_and(|s| s.mode.is_hints());
         let assigned = {
             let Some(search) = self.search.as_ref() else { return };
             // line -> cache row, for O(1) exclusion-char lookup.
@@ -2179,6 +2336,24 @@ impl App {
                 std::collections::HashSet::new();
             let mut visible: Vec<usize> = Vec::new();
             for (idx, m) in search.matches.iter().enumerate() {
+                // Hint mode has no query, so no keystroke can be
+                // ambiguous and nothing needs excluding — which is also
+                // why it gets the longer alphabet below.
+                //
+                // Visibility is judged on the row the *label* lands on
+                // (`end_line`, where the glyph is anchored below), not on
+                // where the hint starts. The two differ only for a
+                // wrapped hint straddling the viewport edge, and testing
+                // the anchor is what keeps "labelled" and "drawn"
+                // the same set — a label off the bottom of the screen
+                // would still answer its key while showing nothing.
+                if hints_mode {
+                    let row_i = m.end_line - viewport_top;
+                    if (0..rows as i64).contains(&row_i) {
+                        visible.push(idx);
+                    }
+                    continue;
+                }
                 // Build the exclusion set from *every* match in the buffer,
                 // not just the on-screen ones. A label char is only genuine
                 // if appending it to the query narrows to nothing anywhere —
@@ -2204,7 +2379,12 @@ impl App {
                 }
                 visible.push(idx);
             }
-            assign_jump_labels(&visible, &excluded)
+            let alphabet = if hints_mode {
+                HINT_LABEL_ALPHABET
+            } else {
+                JUMP_LABEL_ALPHABET
+            };
+            assign_jump_labels(&visible, &excluded, alphabet)
         };
 
         // Anchor each label just past the end of its match's word, so the
@@ -2225,21 +2405,35 @@ impl App {
             else {
                 continue;
             };
-            let (anchor_line, anchor_col) =
+            // A hint already knows its own extent — that's the whole
+            // point of detecting it — so the label goes just past the
+            // span rather than past the word the span starts in. `col_end`
+            // is exclusive, so it *is* the cell after the hint.
+            let (anchor_line, anchor_col) = if hints_mode {
+                (m.end_line, m.col_end.min(cols.saturating_sub(1)))
+            } else {
                 match self.find_word_range(&target, m.line, m.col_start) {
                     Some((_, (e_line, e_col))) if e_col + 1 < cols => (e_line, e_col + 1),
                     Some((_, (e_line, e_col))) => (e_line, e_col),
                     // Match start isn't a word cell (e.g. query was
                     // whitespace) — fall back to the match start.
                     None => (m.line, m.col_start),
-                };
-            let line_anchor = self.whole_line_anchor(
-                &target,
-                m.line,
-                cols,
-                (anchor_line, anchor_col),
-                &mut lines_marked,
-            );
+                }
+            };
+            // No whole-line markers in hint mode: the span is exact, so
+            // the coarser "take the line" action has nothing to add, and
+            // a screen carrying thirty hints would carry thirty markers.
+            let line_anchor = if hints_mode {
+                None
+            } else {
+                self.whole_line_anchor(
+                    &target,
+                    m.line,
+                    cols,
+                    (anchor_line, anchor_col),
+                    &mut lines_marked,
+                )
+            };
             jump_labels.push(JumpLabel {
                 match_idx: idx,
                 ch,
@@ -2994,6 +3188,7 @@ impl App {
             head_col: e_col,
             dragging: false,
             block_cols: None,
+            hint_kind: None,
         });
         self.copy_selection_to_clipboard(true);
         self.selection_fresh = true;
@@ -3083,6 +3278,7 @@ impl App {
             head_col: e_col,
             dragging: false,
             block_cols: None,
+            hint_kind: None,
         });
         self.copy_selection_to_clipboard(true);
         self.selection_fresh = true;
@@ -3101,6 +3297,52 @@ impl App {
         } else {
             self.search = None;
         }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Hint-label press: select exactly the detected span and close the
+    /// overlay, leaving a fresh selection for `[[selection_commands]]` to
+    /// act on.
+    ///
+    /// No expansion mode and no word-range lookup, unlike
+    /// [`Self::select_word_at_match`]: a hint's extent came from the
+    /// detector that recognised it, and growing it word-by-word would
+    /// only ever break it (a URL's word range stops at the first `/`).
+    /// The kind is remembered so the command that runs next can tell a
+    /// URL from a path.
+    fn select_hint(&mut self, idx: usize) {
+        let (m, kind, target) = match self.search.as_ref() {
+            Some(s) => {
+                let Some(m) = s.matches.get(idx).copied() else {
+                    return;
+                };
+                let target = if s.target_path.is_empty() {
+                    SelectionTarget::Host
+                } else {
+                    SelectionTarget::Portal(s.target_path.clone())
+                };
+                (m, s.hint_kind(idx), target)
+            }
+            None => return,
+        };
+        self.vge_selection = None;
+        self.selection = Some(Selection {
+            target,
+            anchor_line: m.line,
+            anchor_col: m.col_start,
+            head_line: m.end_line,
+            // A selection head is the last selected cell; `col_end` is
+            // one past it.
+            head_col: m.col_end.saturating_sub(1),
+            dragging: false,
+            block_cols: None,
+            hint_kind: kind,
+        });
+        self.copy_selection_to_clipboard(true);
+        self.selection_fresh = true;
+        self.search = None;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -3347,6 +3589,22 @@ impl App {
             return;
         }
 
+        // Same overlay, opened straight into hint mode: labels appear on
+        // every detected URL / path / hash without a query being typed.
+        // Matches are computed here rather than waiting for the frame's
+        // `recompute_search_matches`, so the labels are on screen with
+        // the panel instead of one frame later.
+        if host_action == Some(HostAction::OpenHints) {
+            let path = self.focused_leaf_path();
+            let saved = self.focused_leaf_scrollback();
+            self.search = Some(SearchState::new_hints(path, saved));
+            self.recompute_search_matches();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
         // Custom selection actions (`[[selection_commands]]`). While a
         // *fresh* selection exists, a bound key acts on the selected text
         // instead of reaching the PTY — either spawning the user's shell
@@ -3361,13 +3619,16 @@ impl App {
             && let Some(action) =
                 self.keys.resolve_selection_action(&event.logical_key, &self.modifiers)
         {
+            let kind = self.selection.as_ref().and_then(|s| s.hint_kind);
             if let Some(text) = self.extract_selection_text() {
                 let sel = text.trim();
                 if !sel.is_empty() {
                     match &action {
-                        SelectionAction::Command(command) => run_selection_command(command, sel),
+                        SelectionAction::Command(command) => {
+                            run_selection_command(command, sel, kind)
+                        }
                         SelectionAction::Input(template) => {
-                            let bytes = config::expand_selection_input(template, sel);
+                            let bytes = config::expand_selection_input(template, sel, kind);
                             if let Some(pty) = &self.pty {
                                 trace_keyboard_send(bytes.as_bytes());
                                 let _ = pty.write_all(bytes.as_bytes());
@@ -3640,6 +3901,32 @@ impl App {
                 }
                 return;
             }
+            // Flip between typed-query search and hints without losing
+            // the target leaf or the scroll position. Dispatched up front
+            // like Close/paging, so the chord should be a non-printable
+            // one (default Tab) — a printable binding would shadow a
+            // label letter or a query character.
+            Some(SearchAction::ToggleHints) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.mode = match s.mode {
+                        OverlayMode::Query => OverlayMode::Hints { kinds: Vec::new() },
+                        OverlayMode::Hints { .. } => OverlayMode::Query,
+                    };
+                    // Query state is meaningless in the other mode, and a
+                    // half-grown expansion belongs to the label press that
+                    // started it.
+                    s.query.clear();
+                    s.editing = !s.mode.is_hints();
+                    s.current = 0;
+                    s.expand = None;
+                    s.labels.clear();
+                }
+                self.recompute_search_matches();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -3657,6 +3944,49 @@ impl App {
             Key::Named(NamedKey::Space) => Some(" "),
             _ => None,
         };
+
+        // Hint mode: there is no query, so the whole key dispatch is the
+        // label table. A printable key either selects its hint or ends
+        // the overlay (the same "anything else is done here" rule expand
+        // mode uses); non-printable keys are ignored so reaching for a
+        // chord — or a lone Shift — can't dismiss it.
+        if search.mode.is_hints() {
+            if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                self.search = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+            let Some(s) = typed else { return };
+            if self.modifiers.alt_key() || self.modifiers.control_key() {
+                return;
+            }
+            let hit = s
+                .chars()
+                .next()
+                .filter(|_| s.chars().count() == 1)
+                .and_then(|ch| {
+                    // Shift isn't used for anything here, so a capital
+                    // (stray Shift, Caps Lock) still finds its label.
+                    let lower = ch.to_ascii_lowercase();
+                    search
+                        .labels
+                        .iter()
+                        .find(|l| l.ch == ch || l.ch == lower)
+                })
+                .map(|l| l.match_idx);
+            match hit {
+                Some(idx) => self.select_hint(idx),
+                None => {
+                    self.search = None;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            return;
+        }
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
@@ -4471,6 +4801,7 @@ impl ApplicationHandler for App {
                                 head_col: e_col,
                                 dragging: false,
                                 block_cols: None,
+                                hint_kind: None,
                             });
                             self.copy_selection_to_clipboard(true);
                             self.selection_fresh = true;
@@ -4502,6 +4833,7 @@ impl ApplicationHandler for App {
                                     head_col: c,
                                     dragging: true,
                                     block_cols: Some((left, right)),
+                                    hint_kind: None,
                                 });
                                 if let Some(w) = &self.window {
                                     w.request_redraw();
@@ -4518,6 +4850,7 @@ impl ApplicationHandler for App {
                                     head_col: col,
                                     dragging: true,
                                     block_cols: None,
+                                    hint_kind: None,
                                 });
                                 if let Some(w) = &self.window {
                                     w.request_redraw();
@@ -5216,7 +5549,7 @@ mod jump_label_tests {
 
     #[test]
     fn labels_assigned_in_order() {
-        let labels = assign_jump_labels(&[0, 1, 2], &HashSet::new());
+        let labels = assign_jump_labels(&[0, 1, 2], &HashSet::new(), JUMP_LABEL_ALPHABET);
         let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
         let idxs: Vec<usize> = labels.iter().map(|(i, _)| *i).collect();
         assert_eq!(idxs, vec![0, 1, 2]);
@@ -5229,7 +5562,7 @@ mod jump_label_tests {
         // Exclude 'a' and 'd' (chars that could continue a match): the
         // assignment must not hand them out, falling through to 's', 'f'.
         let excluded: HashSet<char> = ['a', 'd'].into_iter().collect();
-        let labels = assign_jump_labels(&[10, 11], &excluded);
+        let labels = assign_jump_labels(&[10, 11], &excluded, JUMP_LABEL_ALPHABET);
         let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
         assert_eq!(chars, vec!['s', 'f']);
         // The original match indices are preserved.
@@ -5263,7 +5596,7 @@ mod jump_label_tests {
             }
         }
         assert!(excluded.contains(&'i'), "expected 'i' excluded, got {excluded:?}");
-        let labels = assign_jump_labels(&visible, &excluded);
+        let labels = assign_jump_labels(&visible, &excluded, JUMP_LABEL_ALPHABET);
         assert!(
             labels.iter().all(|(_, c)| *c != 'i'),
             "no label should be 'i': {labels:?}"
@@ -5276,9 +5609,95 @@ mod jump_label_tests {
         // labelled, the rest are dropped (still nav-reachable via n/N).
         let n = JUMP_LABEL_ALPHABET.len();
         let visible: Vec<usize> = (0..n + 5).collect();
-        let labels = assign_jump_labels(&visible, &HashSet::new());
+        let labels = assign_jump_labels(&visible, &HashSet::new(), JUMP_LABEL_ALPHABET);
         assert_eq!(labels.len(), n);
         assert_eq!(labels.last().unwrap().0, n - 1);
+    }
+
+    /// Hint mode reaches further than search does before it runs out of
+    /// labels — a screen of `ls -la` output carries far more hints than a
+    /// query carries matches, and an unlabelled hint is unreachable (there
+    /// is no `n`/`N` in that mode).
+    #[test]
+    fn hint_alphabet_is_the_longer_one() {
+        assert!(HINT_LABEL_ALPHABET.len() > JUMP_LABEL_ALPHABET.len());
+        // Every label is distinct — a duplicate would silently make one
+        // hint unreachable.
+        let unique: HashSet<char> = HINT_LABEL_ALPHABET.iter().copied().collect();
+        assert_eq!(unique.len(), HINT_LABEL_ALPHABET.len());
+        // The home row still comes first, so the muscle memory carries
+        // over from search.
+        assert_eq!(
+            &HINT_LABEL_ALPHABET[..JUMP_LABEL_ALPHABET.len()],
+            JUMP_LABEL_ALPHABET
+        );
+    }
+
+    /// Hint mode has no query, so nothing is ever excluded: the label a
+    /// hint gets depends only on its position.
+    #[test]
+    fn hint_labels_ignore_the_exclusion_set() {
+        let visible: Vec<usize> = (0..4).collect();
+        let labels = assign_jump_labels(&visible, &HashSet::new(), HINT_LABEL_ALPHABET);
+        let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
+        assert_eq!(chars, vec!['a', 's', 'd', 'f']);
+    }
+
+    /// End-to-end for the one conversion `App::select_hint` performs:
+    /// a hint's exclusive `col_end` becomes an inclusive selection head.
+    /// Run through the real extraction path, so an off-by-one here shows
+    /// up as the wrong text on the clipboard — which is the only place
+    /// the user would ever notice it.
+    fn hint_selection_text(text: &str, cols: u16, kind: hints::HintKind) -> Vec<String> {
+        let mut p = parse(text.as_bytes(), 24, cols);
+        let idx = search::extract_indexed_text(&mut p, 0);
+        let found = hints::find_hints(
+            &idx,
+            &hints::HintConfig {
+                kinds: vec![kind],
+                extra_file_extensions: Vec::new(),
+            },
+        );
+        found
+            .into_iter()
+            .map(|h| {
+                let sel = Selection {
+                    target: SelectionTarget::Host,
+                    anchor_line: h.span.line,
+                    anchor_col: h.span.col_start,
+                    head_line: h.span.end_line,
+                    head_col: h.span.col_end.saturating_sub(1),
+                    dragging: false,
+                    block_cols: None,
+                    hint_kind: Some(h.kind),
+                };
+                extract_text_from_parser(&mut p, 0, &sel)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selecting_a_hint_copies_exactly_the_hint() {
+        assert_eq!(
+            hint_selection_text("see https://example.com/a/b now", 80, hints::HintKind::Url),
+            vec!["https://example.com/a/b"]
+        );
+        assert_eq!(
+            hint_selection_text("edit src/main.rs:42:7 please", 80, hints::HintKind::Path),
+            vec!["src/main.rs:42:7"]
+        );
+    }
+
+    /// The wrapped case: the selection spans two rows, and the extraction
+    /// path joins them without a newline (the row is soft-wrapped), so
+    /// the URL comes back in one piece.
+    #[test]
+    fn selecting_a_wrapped_hint_copies_it_whole() {
+        let url = "https://example.com/very/long/path/that/wraps";
+        assert_eq!(
+            hint_selection_text(url, 20, hints::HintKind::Url),
+            vec![url]
+        );
     }
 }
 

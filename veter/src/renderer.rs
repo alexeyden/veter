@@ -92,28 +92,41 @@ pub struct HighlightSpan {
 /// Project all matches in `matches` into [`HighlightSpan`]s for the
 /// currently-visible viewport of a parser at `top_of_live_screen` /
 /// `scrollback`. `current` is the index of the active match; the
-/// resulting span for that match (if visible) has `is_current = true`.
+/// resulting spans for that match (if visible) have `is_current = true`.
 /// Off-screen matches contribute no spans.
+///
+/// A match that crosses a soft wrap (hint mode detects those; a typed
+/// query never produces one) yields one span per row it covers, each
+/// clipped to the viewport — so a URL broken by the right margin
+/// highlights as the one run of text it visually is.
 pub fn search_highlights_for_viewport(
     matches: &[crate::search::MatchSpan],
     current: usize,
     top_of_live_screen: i64,
     scrollback: usize,
     rows: u16,
+    cols: u16,
 ) -> Vec<HighlightSpan> {
     let viewport_top = top_of_live_screen - scrollback as i64;
     let mut out = Vec::new();
     for (i, m) in matches.iter().enumerate() {
-        let row_i = m.line - viewport_top;
-        if row_i < 0 || row_i >= rows as i64 {
-            continue;
+        for line in m.line..=m.end_line.max(m.line) {
+            let row_i = line - viewport_top;
+            if row_i < 0 || row_i >= rows as i64 {
+                continue;
+            }
+            let col_start = if line == m.line { m.col_start } else { 0 };
+            let col_end = if line == m.end_line { m.col_end } else { cols };
+            if col_end <= col_start {
+                continue;
+            }
+            out.push(HighlightSpan {
+                row: row_i as u16,
+                col_start,
+                col_end,
+                is_current: i == current,
+            });
         }
-        out.push(HighlightSpan {
-            row: row_i as u16,
-            col_start: m.col_start,
-            col_end: m.col_end,
-            is_current: i == current,
-        });
     }
     out
 }
@@ -2009,6 +2022,7 @@ impl TerminalRenderer {
                     top_of_live_screen,
                     screen.scrollback(),
                     rows,
+                    cols,
                 ))
             });
         self.draw_screen_at(
@@ -2058,6 +2072,88 @@ impl TerminalRenderer {
             path.rounded_rect(bar_x, thumb_y, bar_width, thumb_height, 3.0);
             canvas.fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, 90)));
         }
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    use crate::search::MatchSpan;
+
+    /// Viewport of `rows` rows showing lines `0..rows`, i.e. live screen
+    /// with no scrollback.
+    fn project(matches: &[MatchSpan], rows: u16, cols: u16) -> Vec<(u16, u16, u16)> {
+        search_highlights_for_viewport(matches, 0, 0, 0, rows, cols)
+            .into_iter()
+            .map(|h| (h.row, h.col_start, h.col_end))
+            .collect()
+    }
+
+    #[test]
+    fn single_row_span_projects_to_one_highlight() {
+        let spans = project(&[MatchSpan::row(2, 3, 8)], 10, 40);
+        assert_eq!(spans, vec![(2, 3, 8)]);
+    }
+
+    /// A hint that crossed a soft wrap paints as one run: the tail of its
+    /// first row, all of the middle, the head of its last.
+    #[test]
+    fn multi_row_span_covers_every_row() {
+        let span = MatchSpan {
+            line: 1,
+            col_start: 30,
+            end_line: 3,
+            col_end: 12,
+        };
+        assert_eq!(project(&[span], 10, 40), vec![(1, 30, 40), (2, 0, 40), (3, 0, 12)]);
+    }
+
+    /// Scrolled so only the span's tail is on screen: the off-screen rows
+    /// contribute nothing rather than clamping onto row 0.
+    #[test]
+    fn rows_outside_the_viewport_are_dropped() {
+        let span = MatchSpan {
+            line: -2,
+            col_start: 30,
+            end_line: 1,
+            col_end: 5,
+        };
+        assert_eq!(project(&[span], 10, 40), vec![(0, 0, 40), (1, 0, 5)]);
+    }
+
+    /// A wrapped span whose last row ends at column 0 has nothing to
+    /// paint there — an empty span would draw as a zero-width artefact.
+    #[test]
+    fn empty_trailing_row_is_dropped() {
+        let span = MatchSpan {
+            line: 0,
+            col_start: 10,
+            end_line: 1,
+            col_end: 0,
+        };
+        assert_eq!(project(&[span], 10, 40), vec![(0, 10, 40)]);
+    }
+
+    #[test]
+    fn current_match_is_flagged_on_all_its_rows() {
+        let spans = search_highlights_for_viewport(
+            &[
+                MatchSpan::row(0, 0, 4),
+                MatchSpan {
+                    line: 1,
+                    col_start: 0,
+                    end_line: 2,
+                    col_end: 3,
+                },
+            ],
+            1,
+            0,
+            0,
+            10,
+            40,
+        );
+        let flags: Vec<bool> = spans.iter().map(|s| s.is_current).collect();
+        assert_eq!(flags, vec![false, true, true]);
     }
 }
 

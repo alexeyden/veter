@@ -6,7 +6,7 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Four things are configurable:
+//! Five things are configurable:
 //!
 //!  * `[accent]` — the shared accent palette the host publishes into the
 //!    reserved `host.*` VGE style namespace (see VGE §7.3). vmux and
@@ -14,9 +14,11 @@
 //!  * `[search]` — the search-chrome colors (search bar + match
 //!    highlights).
 //!  * `[keys]` — the host-intercepted key chords (search, scroll,
-//!    overlay, copy, paste, save-image) and the in-search-overlay modal
+//!    overlay, hints, copy, paste, save-image) and the in-overlay modal
 //!    keys.
 //!  * `[window]` — window-level behavior (the close confirmation).
+//!  * `[hints]` — which detectors the overlay's hint mode runs, and in
+//!    what priority order.
 //!
 //! This is a binary-local module: nothing here touches the `veter-host`
 //! engine state, so `vsd` (which shares those engines) is unaffected and
@@ -27,6 +29,8 @@ use std::path::PathBuf;
 use femtovg::Color;
 use serde::Deserialize;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+use veter::hints::{HintConfig, HintKind};
 
 /// Built-in accent palette (muted blue / olive / violet). Slot N maps to
 /// `host.accent.{N+1}`; the contextual `host.accent` rotates through the
@@ -183,6 +187,9 @@ impl Default for WindowConfig {
 pub enum HostAction {
     OpenSearch,
     OpenOverlay,
+    /// Open the overlay straight into hint mode — labels on every
+    /// auto-detected URL / path / hash on screen, no query to type.
+    OpenHints,
     ScrollPageUp,
     ScrollPageDown,
     Copy,
@@ -203,6 +210,9 @@ pub enum SearchAction {
     ToggleCase,
     PageUp,
     PageDown,
+    /// Flip the open overlay between typed-query search and hint mode,
+    /// keeping the target leaf and scroll position.
+    ToggleHints,
 }
 
 /// How a chord's terminal key is matched against a winit event.
@@ -344,6 +354,7 @@ fn parse_key_token(tok: &str, spec: &str) -> Result<KeyMatch, String> {
 pub struct KeyBindingsConfig {
     pub open_search: String,
     pub open_overlay: String,
+    pub open_hints: String,
     pub scroll_page_up: String,
     pub scroll_page_down: String,
     pub copy: String,
@@ -357,6 +368,7 @@ impl Default for KeyBindingsConfig {
         Self {
             open_search: "/".into(),
             open_overlay: "Ctrl+Shift+Space".into(),
+            open_hints: "Ctrl+Shift+F".into(),
             scroll_page_up: "Shift+PageUp".into(),
             scroll_page_down: "Shift+PageDown".into(),
             copy: "Ctrl+Shift+C".into(),
@@ -377,6 +389,7 @@ pub struct SearchKeysConfig {
     pub toggle_case: String,
     pub page_up: String,
     pub page_down: String,
+    pub toggle_hints: String,
 }
 
 impl Default for SearchKeysConfig {
@@ -388,6 +401,33 @@ impl Default for SearchKeysConfig {
             toggle_case: "Alt+C".into(),
             page_up: "PageUp".into(),
             page_down: "PageDown".into(),
+            toggle_hints: "Tab".into(),
+        }
+    }
+}
+
+/// `[hints]` — which detectors hint mode runs, in priority order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HintsConfig {
+    /// Detector names (`url`, `email`, `uuid`, `ip`, `path`, `file`,
+    /// `hash`, `color`). Order is priority: when two detectors claim
+    /// overlapping text the earlier one wins. Drop a name to disable it.
+    pub kinds: Vec<String>,
+    /// Extra extensions the `file` detector should accept, on top of its
+    /// built-in list (`veter::hints::FILE_EXTENSIONS`). Written with or
+    /// without the leading dot; matched case-insensitively.
+    pub extra_file_extensions: Vec<String>,
+}
+
+impl Default for HintsConfig {
+    fn default() -> Self {
+        Self {
+            kinds: HintKind::DEFAULT_ORDER
+                .iter()
+                .map(|k| k.name().to_string())
+                .collect(),
+            extra_file_extensions: Vec::new(),
         }
     }
 }
@@ -458,6 +498,10 @@ impl KeyBindings {
                 HostAction::OpenOverlay,
             ),
             (
+                parse(&cfg.open_hints, &defaults.open_hints),
+                HostAction::OpenHints,
+            ),
+            (
                 parse(&cfg.scroll_page_up, &defaults.scroll_page_up),
                 HostAction::ScrollPageUp,
             ),
@@ -485,6 +529,10 @@ impl KeyBindings {
             ),
             (parse(&s.page_up, &ds.page_up), SearchAction::PageUp),
             (parse(&s.page_down, &ds.page_down), SearchAction::PageDown),
+            (
+                parse(&s.toggle_hints, &ds.toggle_hints),
+                SearchAction::ToggleHints,
+            ),
         ];
 
         // Selection commands have no built-in defaults; a bad chord — or
@@ -556,12 +604,18 @@ impl KeyBindings {
 /// * `%`  — the selection, verbatim.
 /// * `%q` — the selection, POSIX-shell-quoted, so `cd %q` survives a
 ///   path with spaces or quotes in it.
+/// * `%k` — the hint kind (`url`, `path`, …) when the selection came
+///   from a hint label, and the empty string otherwise.
 /// * `%%` — a literal `%`.
 ///
 /// Everything else is copied through untouched, including the newline a
 /// TOML basic string already produced from `\n` — which is what makes
 /// `input = "cd %q\n"` press Enter as well as type the line.
-pub fn expand_selection_input(template: &str, selection: &str) -> String {
+pub fn expand_selection_input(
+    template: &str,
+    selection: &str,
+    kind: Option<HintKind>,
+) -> String {
     let mut out = String::with_capacity(template.len() + selection.len());
     let mut chars = template.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -577,6 +631,10 @@ pub fn expand_selection_input(template: &str, selection: &str) -> String {
             Some('q') => {
                 chars.next();
                 out.push_str(&shell_quote(selection));
+            }
+            Some('k') => {
+                chars.next();
+                out.push_str(kind.map(|k| k.name()).unwrap_or(""));
             }
             _ => out.push_str(selection),
         }
@@ -611,6 +669,7 @@ pub struct Config {
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
     pub window: WindowConfig,
+    pub hints: HintsConfig,
     /// User-defined commands run against the current selection. Empty by
     /// default — there are no built-in selection commands.
     pub selection_commands: Vec<SelectionCommandConfig>,
@@ -638,6 +697,28 @@ impl Config {
                 eprintln!("veter: config: parse error in {}: {e}", path.display());
                 Config::default()
             }
+        }
+    }
+
+    /// What hint mode should look for. Unknown detector names are
+    /// reported and skipped; a list that ends up empty falls back to the
+    /// built-in order, since an overlay with no detectors at all would
+    /// just look broken.
+    pub fn hint_config(&self) -> HintConfig {
+        let mut kinds = Vec::with_capacity(self.hints.kinds.len());
+        for name in &self.hints.kinds {
+            match HintKind::parse(name) {
+                Some(k) if !kinds.contains(&k) => kinds.push(k),
+                Some(_) => {}
+                None => eprintln!("veter: config: unknown hint kind '{name}'; skipping"),
+            }
+        }
+        if kinds.is_empty() {
+            kinds.extend_from_slice(HintKind::DEFAULT_ORDER);
+        }
+        HintConfig {
+            kinds,
+            extra_file_extensions: self.hints.extra_file_extensions.clone(),
         }
     }
 
@@ -711,9 +792,28 @@ mod tests {
     fn default_config_parses_all_chords() {
         // build() must never hit its error branch for the defaults.
         let keys = KeyBindings::build(&KeyBindingsConfig::default(), &[]);
-        assert_eq!(keys.host.len(), 7);
-        assert_eq!(keys.search.len(), 6);
+        assert_eq!(keys.host.len(), 8);
+        assert_eq!(keys.search.len(), 7);
         assert!(keys.selection.is_empty());
+    }
+
+    #[test]
+    fn hint_kinds_default_to_the_built_in_order() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hint_config().kinds, HintKind::DEFAULT_ORDER.to_vec());
+    }
+
+    #[test]
+    fn hint_kinds_follow_the_configured_order_and_drop_junk() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [hints]
+            kinds = ["path", "nonsense", "url", "path"]
+            "#,
+        )
+        .unwrap();
+        // Order preserved, unknown name skipped, duplicate ignored.
+        assert_eq!(cfg.hint_config().kinds, vec![HintKind::Path, HintKind::Url]);
     }
 
     #[test]
@@ -768,22 +868,36 @@ mod tests {
         };
         // TOML's `\n` is already a newline by the time we see it.
         assert_eq!(template, "cd %q\n");
-        assert_eq!(expand_selection_input(&template, "veter"), "cd 'veter'\n");
+        assert_eq!(expand_selection_input(&template, "veter", None), "cd 'veter'\n");
     }
 
     #[test]
     fn expand_selection_input_placeholders() {
         // Bare `%` is verbatim, `%q` quotes, `%%` is a literal percent.
-        assert_eq!(expand_selection_input("cd %", "veter"), "cd veter");
-        assert_eq!(expand_selection_input("cd %q", "my dir"), "cd 'my dir'");
-        assert_eq!(expand_selection_input("cd %q", "it's"), r#"cd 'it'\''s'"#);
-        assert_eq!(expand_selection_input("100%% of %", "x"), "100% of x");
+        assert_eq!(expand_selection_input("cd %", "veter", None), "cd veter");
+        assert_eq!(expand_selection_input("cd %q", "my dir", None), "cd 'my dir'");
+        assert_eq!(expand_selection_input("cd %q", "it's", None), r#"cd 'it'\''s'"#);
+        assert_eq!(expand_selection_input("100%% of %", "x", None), "100% of x");
         // A trailing `%` still substitutes; a template with no
         // placeholder is sent as-is.
-        assert_eq!(expand_selection_input("echo %", "hi"), "echo hi");
-        assert_eq!(expand_selection_input("clear\n", "hi"), "clear\n");
+        assert_eq!(expand_selection_input("echo %", "hi", None), "echo hi");
+        assert_eq!(expand_selection_input("clear\n", "hi", None), "clear\n");
         // Every occurrence is replaced, not just the first.
-        assert_eq!(expand_selection_input("% %", "a"), "a a");
+        assert_eq!(expand_selection_input("% %", "a", None), "a a");
+    }
+
+    #[test]
+    fn expand_selection_input_kind_placeholder() {
+        assert_eq!(
+            expand_selection_input("open %k %q", "/tmp/a", Some(HintKind::Path)),
+            "open path '/tmp/a'"
+        );
+        // A selection that didn't come from a hint has no kind, and `%k`
+        // expands to nothing rather than to a placeholder word.
+        assert_eq!(
+            expand_selection_input("open %k %q", "/tmp/a", None),
+            "open  '/tmp/a'"
+        );
     }
 
     #[test]

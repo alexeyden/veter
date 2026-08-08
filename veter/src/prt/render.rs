@@ -298,6 +298,7 @@ fn render_portal_at<T: Renderer>(
                 content.children.top_of_live_screen(),
                 portal.view_offset as usize,
                 content.size_h as u16,
+                content.size_w as u16,
             ))
         });
     term_renderer.draw_screen_at(
