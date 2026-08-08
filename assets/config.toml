@@ -61,13 +61,21 @@
 # ---------------------------------------------------------------------------
 # Selection commands
 # ---------------------------------------------------------------------------
-# Run a shell command on the selected text. While a *fresh* selection is
-# active — one you just made, before typing anything else in the shell — the
-# bound key runs the command instead of going to the shell. The first normal
-# key you type disarms it, so a lingering highlight never hijacks your typing.
+# Act on the selected text. While a *fresh* selection is active — one you just
+# made, before typing anything else in the shell — the bound key fires the
+# action instead of going to the shell. The first normal key you type disarms
+# it, so a lingering highlight never hijacks your typing.
 #
-# The command runs via `$SHELL -c` (detached), with the selected text
-# available as $VETER_SELECTION and as the positional $1.
+# Each entry has a `key` and exactly one of:
+#
+#   command = '…'   Run it via `$SHELL -c` (detached), with the selected text
+#                   available as $VETER_SELECTION and as the positional $1.
+#
+#   input   = "…"   Type the text back into the terminal, as if you had typed
+#                   it yourself. `%` is replaced by the selection, `%q` by the
+#                   shell-quoted selection, `%%` by a literal `%`. Use a
+#                   double-quoted TOML string so `\n` is a real newline —
+#                   that is what presses Enter.
 #
 # Bare letters are case-sensitive: "o" is the o key, "O" is Shift+o. Chords
 # with modifiers work too (e.g. "Ctrl+O"). There are no defaults — nothing
@@ -76,6 +84,17 @@
 # [[selection_commands]]
 # key = "o"                                  # open a path/URL with the default app
 # command = 'xdg-open "$VETER_SELECTION"'
+#
+# Select a directory name in `ls` output and press C to cd into it.
+# [[selection_commands]]
+# key = "C"
+# description = "cd into the selection"      # optional, ignored at runtime
+# input = "cd %q\n"
+#
+# Type the selection into the shell without running it, ready to edit.
+# [[selection_commands]]
+# key = "Ctrl+Alt+V"
+# input = "%"
 #
 # Edit the selection in vim, then run the edited text as a command in $SHELL.
 # Opens a veter window (vim needs a terminal); on save & quit the edited

@@ -4,7 +4,7 @@
 use veter::{clipboard, prt, pty, renderer, search, ses, vft, vge, vss};
 
 mod config;
-use config::{HostAction, SearchAction};
+use config::{HostAction, SearchAction, SelectionAction};
 
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -33,6 +33,38 @@ use winit::window::{Icon, Window, WindowAttributes, WindowId};
 /// title-bar icon from the window's app_id matching `veter.desktop`,
 /// which is set via the platform-Wayland `with_name` extension below.
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/128x128/veter.png");
+
+/// Application name in the window title. A child that announces a title
+/// (OSC 0/2) is shown as `"<child title> — Veter"`, the way Konsole
+/// shows its active tab; with no title it's just this.
+const APP_NAME: &str = "Veter";
+
+/// Cap on a child-supplied title, in characters. Long enough for a path
+/// plus a command, short enough that a program spewing a kilobyte into
+/// OSC 2 doesn't reach the compositor.
+const MAX_TITLE_CHARS: usize = 256;
+
+/// Clean a child-supplied window title: drop control characters (a
+/// title lands in the compositor's UI, not a terminal grid) and clamp
+/// the length. An all-control or empty title comes back empty, which
+/// the caller reads as "no title".
+fn sanitize_window_title(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TITLE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The full window title for a child-announced `title`.
+fn window_title_for(title: &str) -> String {
+    if title.is_empty() {
+        APP_NAME.to_string()
+    } else {
+        format!("{title} — {APP_NAME}")
+    }
+}
 
 /// Host accent palette published into the reserved `host.*` VGE style
 /// namespace (`doc/vector-graphics-extension.md` §7.3). Slot N maps to
@@ -174,7 +206,11 @@ struct VgeRunHit {
 /// by a selection plus its pixel origin in canvas coords. Used for
 /// hit-testing and pointer→cell projection during a drag.
 struct PortalTargetInfo<'a> {
+    /// The view: origin, anchor, and its own scroll offset.
     portal: &'a prt::Portal,
+    /// The buffer it shows. Separate because two forked views resolve
+    /// to the same content at different origins and offsets.
+    content: &'a prt::PortalContent,
     origin_x_px: f32,
     origin_y_px: f32,
 }
@@ -198,10 +234,11 @@ fn resolve_portal_target<'a, CB: vt100::Callbacks>(
     let mut parent_top = prt.top_of_live_screen();
     let mut parent_scrollback = parser.screen().scrollback();
     let mut current_set = prt.state.current();
-    let mut last: Option<&prt::Portal> = None;
+    let mut last: Option<(&prt::Portal, &prt::PortalContent)> = None;
 
     for id in path {
         let portal = current_set.portals.get(id)?;
+        let content = current_set.contents.get(&portal.content)?;
         let visible_top = parent_top - parent_scrollback as i64;
         let row_f = match portal.anchor {
             prt::PortalAnchor::Live { origin_y: oy } => oy as f32,
@@ -212,13 +249,15 @@ fn resolve_portal_target<'a, CB: vt100::Callbacks>(
         origin_x += portal.origin_x as f32 * cell_w;
         origin_y += row_f * cell_h;
 
-        last = Some(portal);
-        parent_top = portal.children.top_of_live_screen();
-        parent_scrollback = portal.vt.screen().scrollback();
-        current_set = portal.children.state.current();
+        last = Some((portal, content));
+        parent_top = content.children.top_of_live_screen();
+        // This view's offset, not the buffer's — the buffer never moves.
+        parent_scrollback = portal.view_offset as usize;
+        current_set = content.children.state.current();
     }
-    last.map(|p| PortalTargetInfo {
+    last.map(|(p, c)| PortalTargetInfo {
         portal: p,
+        content: c,
         origin_x_px: origin_x,
         origin_y_px: origin_y,
     })
@@ -232,7 +271,7 @@ fn resolve_portal_target<'a, CB: vt100::Callbacks>(
 fn resolve_portal_target_mut<'a>(
     prt: &'a mut prt::PrtEngine,
     path: &[String],
-) -> Option<&'a mut prt::Portal> {
+) -> Option<&'a mut prt::PortalContent> {
     descend_portal_set_mut(prt.state.current_mut(), path)
 }
 
@@ -246,10 +285,10 @@ fn portal_path_exists(prt: &prt::PrtEngine, path: &[String]) -> bool {
     }
     let mut current_set = prt.state.current();
     for id in path {
-        let Some(portal) = current_set.portals.get(id) else {
+        let Some(content) = current_set.content(id) else {
             return false;
         };
-        current_set = portal.children.state.current();
+        current_set = content.children.state.current();
     }
     true
 }
@@ -257,15 +296,15 @@ fn portal_path_exists(prt: &prt::PrtEngine, path: &[String]) -> bool {
 fn descend_portal_set_mut<'a>(
     set: &'a mut prt::PortalSet,
     path: &[String],
-) -> Option<&'a mut prt::Portal> {
+) -> Option<&'a mut prt::PortalContent> {
     if path.is_empty() {
         return None;
     }
-    let portal = set.portals.get_mut(&path[0])?;
+    let content = set.content_mut(&path[0])?;
     if path.len() == 1 {
-        Some(portal)
+        Some(content)
     } else {
-        descend_portal_set_mut(portal.children.state.current_mut(), &path[1..])
+        descend_portal_set_mut(content.children.state.current_mut(), &path[1..])
     }
 }
 
@@ -854,6 +893,11 @@ struct App {
     /// `RedrawRequested`, so an unthrottled reader starves the frame
     /// the drain budget exists to produce.
     pty_wake_pending: Arc<AtomicBool>,
+    /// Title currently on the window, so a child that re-announces the
+    /// same title every prompt doesn't drive a compositor round trip
+    /// each time. Also the title the window is created with, since the
+    /// child may speak before the window exists.
+    window_title: String,
 }
 
 /// One scrollback-search session, owned by `App::search`.
@@ -1425,9 +1469,9 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
         let Some(info) = resolve_portal_target(prt, parser, cell_w, cell_h, path) else {
             return;
         };
-        let top = info.portal.children.top_of_live_screen();
-        let sb = info.portal.vt.screen().scrollback();
-        let (rows, _) = info.portal.vt.screen().size();
+        let top = info.content.children.top_of_live_screen();
+        let sb = info.portal.view_offset as usize;
+        let (rows, _) = info.content.vt.screen().size();
         (info.origin_x_px, info.origin_y_px, top, sb, rows)
     };
     let viewport_top = top - scrollback as i64;
@@ -1766,6 +1810,7 @@ impl App {
             close_prompt_pressed: None,
             pty_backlog: false,
             pty_wake_pending: Arc::new(AtomicBool::new(false)),
+            window_title: APP_NAME.to_string(),
         }
     }
 
@@ -1883,14 +1928,13 @@ impl App {
         }
         let mut current_set = prt.state.current();
         for id in &path[..path.len() - 1] {
-            let portal = current_set.portals.get(id.as_str())?;
-            current_set = portal.children.state.current();
+            let content = current_set.content(id.as_str())?;
+            current_set = content.children.state.current();
         }
         let last = path[path.len() - 1].as_str();
         current_set
-            .portals
-            .get(last)
-            .map(|p| p.children.top_of_live_screen())
+            .content(last)
+            .map(|c| c.children.top_of_live_screen())
     }
 
     /// Set `search.current` to the first match that falls within the
@@ -2223,13 +2267,13 @@ impl App {
         }
         let mut current_set = prt.state.current();
         for id in &chain[..chain.len() - 1] {
-            let Some(portal) = current_set.portals.get(*id) else { return 0 };
-            current_set = portal.children.state.current();
+            let Some(content) = current_set.content(*id) else { return 0 };
+            current_set = content.children.state.current();
         }
         current_set
             .portals
             .get(chain[chain.len() - 1])
-            .map(|p| p.vt.screen().scrollback())
+            .map(|p| p.view_offset as usize)
             .unwrap_or(0)
     }
 
@@ -2243,8 +2287,8 @@ impl App {
                 p.state
                     .focus_chain()
                     .first()
-                    .and_then(|id| p.state.current().portals.get(*id))
-                    .map(|portal| portal.vt.screen().bracketed_paste())
+                    .and_then(|id| p.state.current().content(*id))
+                    .map(|content| content.vt.screen().bracketed_paste())
             })
             .unwrap_or_else(|| {
                 self.parser
@@ -2279,11 +2323,20 @@ impl App {
         let mut current_set = prt.state.current();
 
         loop {
-            let mut best: Option<(&prt::Portal, f32, f32, (i32, u64))> = None;
+            let mut best: Option<(
+                &prt::Portal,
+                &prt::PortalContent,
+                f32,
+                f32,
+                (i32, u64),
+            )> = None;
             for portal in current_set.portals.values() {
                 if !portal.is_visible {
                     continue;
                 }
+                let Some(content) = current_set.contents.get(&portal.content) else {
+                    continue;
+                };
                 let visible_top = parent_top - parent_scrollback as i64;
                 let row_f = match portal.anchor {
                     prt::PortalAnchor::Live { origin_y: oy } => oy as f32,
@@ -2293,24 +2346,24 @@ impl App {
                 };
                 let ox = origin_x + portal.origin_x as f32 * cell_w;
                 let oy = origin_y + row_f * cell_h;
-                let w = portal.size_w as f32 * cell_w;
-                let h = portal.size_h as f32 * cell_h;
+                let w = content.size_w as f32 * cell_w;
+                let h = content.size_h as f32 * cell_h;
                 if px >= ox && px < ox + w && py >= oy && py < oy + h {
                     let score = (portal.draw_order, portal.creation_seq);
-                    if best.map(|b| score > b.3).unwrap_or(true) {
-                        best = Some((portal, ox, oy, score));
+                    if best.map(|b| score > b.4).unwrap_or(true) {
+                        best = Some((portal, content, ox, oy, score));
                     }
                 }
             }
 
             match best {
-                Some((portal, ox, oy, _)) => {
+                Some((portal, content, ox, oy, _)) => {
                     path.push(portal.id.clone());
                     origin_x = ox;
                     origin_y = oy;
-                    parent_top = portal.children.top_of_live_screen();
-                    parent_scrollback = portal.vt.screen().scrollback();
-                    current_set = portal.children.state.current();
+                    parent_top = content.children.top_of_live_screen();
+                    parent_scrollback = portal.view_offset as usize;
+                    current_set = content.children.state.current();
                 }
                 None => break,
             }
@@ -2330,13 +2383,13 @@ impl App {
             return self.vge.as_ref().map(|e| &e.state);
         }
         let mut set = self.prt.as_ref()?.state.current();
-        let mut last: Option<&prt::Portal> = None;
+        let mut last: Option<&prt::PortalContent> = None;
         for id in path {
-            let portal = set.portals.get(id)?;
-            last = Some(portal);
-            set = portal.children.state.current();
+            let content = set.content(id)?;
+            last = Some(content);
+            set = content.children.state.current();
         }
-        last.map(|p| &p.vge.state)
+        last.map(|c| &c.vge.state)
     }
 
     /// Turn a pick item into a re-shapeable run. Shared by the press
@@ -2639,14 +2692,18 @@ impl App {
                 let info =
                     resolve_portal_target(prt, parser, cell_w as f32, cell_h as f32, path)?;
                 let portal = info.portal;
+                let content = info.content;
                 let local_x = pos.x - info.origin_x_px as f64;
                 let local_y = pos.y - info.origin_y_px as f64;
                 let row_f = (local_y / cell_h).floor() as i32;
                 let col_f = (local_x / cell_w).floor() as i32;
-                let row = row_f.clamp(0, portal.size_h as i32 - 1) as u16;
-                let col = col_f.clamp(0, portal.size_w as i32 - 1) as u16;
-                let portal_top = portal.children.top_of_live_screen();
-                let portal_scrollback = portal.vt.screen().scrollback();
+                let row = row_f.clamp(0, content.size_h as i32 - 1) as u16;
+                let col = col_f.clamp(0, content.size_w as i32 - 1) as u16;
+                let portal_top = content.children.top_of_live_screen();
+                // Which line the pointer landed on depends on where
+                // *this view* is scrolled, so a click in the scrolled-back
+                // twin resolves against the text drawn under it.
+                let portal_scrollback = portal.view_offset as usize;
                 let viewport_top = portal_top - portal_scrollback as i64;
                 Some((viewport_top + row as i64, col))
             }
@@ -3147,7 +3204,7 @@ impl App {
                 let info =
                     resolve_portal_target(prt, parser, tr.cell_width, tr.cell_height, path)?;
                 let oy = info.origin_y_px as f64;
-                let h = info.portal.size_h as f64 * tr.cell_height as f64;
+                let h = info.content.size_h as f64 * tr.cell_height as f64;
                 if pos.y < oy {
                     Some(-1)
                 } else if pos.y >= oy + h {
@@ -3290,22 +3347,42 @@ impl App {
             return;
         }
 
-        // Custom selection commands (`[[selection_commands]]`). While a
-        // *fresh* selection exists, a bound key runs the user's shell
-        // command on the selected text instead of reaching the PTY.
-        // Fresh = made since the last key sent to the shell, so a
-        // lingering highlight never hijacks normal typing. Checked after
-        // host chords (which win on conflict) and before the key reaches
-        // the shell. Running consumes the selection, like copy.
+        // Custom selection actions (`[[selection_commands]]`). While a
+        // *fresh* selection exists, a bound key acts on the selected text
+        // instead of reaching the PTY — either spawning the user's shell
+        // command (`command = …`) or typing a template back into the
+        // terminal (`input = …`). Fresh = made since the last key sent to
+        // the shell, so a lingering highlight never hijacks normal
+        // typing. Checked after host chords (which win on conflict) and
+        // before the key reaches the shell. Firing consumes the
+        // selection, like copy.
         if self.selection_fresh
             && self.has_selection()
-            && let Some(command) =
-                self.keys.resolve_selection_command(&event.logical_key, &self.modifiers)
+            && let Some(action) =
+                self.keys.resolve_selection_action(&event.logical_key, &self.modifiers)
         {
             if let Some(text) = self.extract_selection_text() {
                 let sel = text.trim();
                 if !sel.is_empty() {
-                    run_selection_command(&command, sel);
+                    match &action {
+                        SelectionAction::Command(command) => run_selection_command(command, sel),
+                        SelectionAction::Input(template) => {
+                            let bytes = config::expand_selection_input(template, sel);
+                            if let Some(pty) = &self.pty {
+                                trace_keyboard_send(bytes.as_bytes());
+                                let _ = pty.write_all(bytes.as_bytes());
+                            }
+                            // This is input, so — like any keystroke that
+                            // reaches the shell — snap the host leaf back
+                            // to live, or the user wouldn't see what the
+                            // line they just typed produced. Portal leaves
+                            // own their own scroll mode (see below).
+                            let path = self.focused_leaf_path();
+                            if path.is_empty() && self.focused_leaf_scrollback() > 0 {
+                                self.set_target_scrollback(&path, 0);
+                            }
+                        }
+                    }
                 }
             }
             self.clear_selection();
@@ -3450,8 +3527,8 @@ impl App {
                 p.state
                     .focus_chain()
                     .first()
-                    .and_then(|id| p.state.current().portals.get(*id))
-                    .map(|portal| portal.vt.screen().application_cursor())
+                    .and_then(|id| p.state.current().content(*id))
+                    .map(|content| content.vt.screen().application_cursor())
             })
             .unwrap_or_else(|| {
                 self.parser
@@ -3791,6 +3868,36 @@ impl App {
         }
     }
 
+    /// Apply the OSC 0/2 title the host-direct child last asked for.
+    ///
+    /// Konsole's rule — the window title is the active tab's title — is
+    /// what this reproduces, with the multiplexer as the tab authority:
+    /// `vmux` re-announces its active tab's label as OSC 2 whenever the
+    /// tab bar changes, so the two agree by construction. A portal's own
+    /// title never reaches here: PRT already delivers it to the client
+    /// as `TitleChange` (§8.2), and the client decides what the window
+    /// should say — a pane's raw title, a rename, a tab name. Without a
+    /// multiplexer this is just the ordinary terminal behavior: the
+    /// shell titles the window.
+    ///
+    /// An empty title (`ESC ] 2 ; BEL`) restores the bare app name.
+    fn drain_pending_window_title(&mut self) {
+        let Some(parser) = &mut self.parser else {
+            return;
+        };
+        let Some(raw) = parser.callbacks_mut().pending_title.take() else {
+            return;
+        };
+        let title = window_title_for(&sanitize_window_title(&raw));
+        if title == self.window_title {
+            return;
+        }
+        self.window_title = title;
+        if let Some(w) = &self.window {
+            w.set_title(&self.window_title);
+        }
+    }
+
     /// Process PTY output, for up to [`PTY_DRAIN_BUDGET`] of wall clock.
     fn process_pty_output(&mut self) -> PtyPass {
         let rx = match &self.rx {
@@ -4006,8 +4113,12 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // `window_title` rather than the bare app name: the child can
+        // have announced a title before the window existed (the PTY is
+        // spawned below, but a `resumed` after a suspend re-creates the
+        // window against a child that has been running for a while).
         let window_attrs = WindowAttributes::default()
-            .with_title("Veter")
+            .with_title(self.window_title.as_str())
             .with_window_icon(load_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(800u32, 600u32));
 
@@ -4798,6 +4909,7 @@ impl ApplicationHandler for App {
         let pass = self.process_pty_output();
         self.pty_backlog = pass.backlog;
         self.drain_pending_clipboard();
+        self.drain_pending_window_title();
         self.validate_selection();
         // PTY output may have advanced the target parser's scrollback;
         // rebuild the search index so live matches stay accurate.
@@ -5261,5 +5373,49 @@ mod image_crop_tests {
         assert!(crop_uploaded_image(&img, Some(rect(0.0, 0.0, f32::INFINITY, 2.0))).is_none());
         // A zero-sized image has nothing to copy either.
         assert!(crop_uploaded_image(&coded_image(0, 0), None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod window_title_tests {
+    use super::*;
+
+    #[test]
+    fn title_is_shown_against_the_app_name() {
+        assert_eq!(window_title_for("Claude Code"), "Claude Code — Veter");
+        // No title (or one that sanitized down to nothing) leaves the
+        // bare app name rather than a dangling separator.
+        assert_eq!(window_title_for(""), "Veter");
+    }
+
+    #[test]
+    fn sanitize_drops_control_chars_and_clamps() {
+        assert_eq!(sanitize_window_title("  vim \x07~/notes\x1b  "), "vim ~/notes");
+        let long = "x".repeat(MAX_TITLE_CHARS * 2);
+        assert_eq!(sanitize_window_title(&long).chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(sanitize_window_title("\x01\x02"), "");
+    }
+
+    #[test]
+    fn host_callbacks_capture_osc_0_and_2() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, clipboard::HostCallbacks::default());
+        parser.process(b"\x1b]2;second\x07");
+        assert_eq!(parser.callbacks_mut().pending_title.take().as_deref(), Some("second"));
+        // OSC 0 sets icon name and title together; the title half lands.
+        parser.process(b"\x1b]0;both\x1b\\");
+        assert_eq!(parser.callbacks_mut().pending_title.take().as_deref(), Some("both"));
+        // Only the most recent one survives an undrained burst.
+        parser.process(b"\x1b]2;a\x07\x1b]2;b\x07");
+        assert_eq!(parser.callbacks_mut().pending_title.take().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn an_empty_title_restores_the_app_name() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, clipboard::HostCallbacks::default());
+        parser.process(b"\x1b]2;busy\x07\x1b]2;\x07");
+        let raw = parser.callbacks_mut().pending_title.take().unwrap();
+        assert_eq!(window_title_for(&sanitize_window_title(&raw)), "Veter");
     }
 }

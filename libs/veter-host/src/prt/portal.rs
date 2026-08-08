@@ -217,23 +217,57 @@ fn map_mouse_encoding(e: MouseProtocolEncoding) -> u8 {
     }
 }
 
-/// One portal in the host's table.
+/// Identifier for a [`PortalContent`] within one [`PortalSet`].
 ///
-/// The portal owns its own `vt100::Parser<PortalCallbacks>` (sized as
-/// `rows = size_h, cols = size_w`, with a scrollback ring of
-/// `scrollback_lines`) and a recursively-nested `PrtEngine` that holds
-/// any sub-portals created inside it.
-#[allow(dead_code)] // id/creation_seq/scrollback_lines are read by Phase 6 rendering
+/// Deliberately *not* on the wire. A client names views (portals); the
+/// buffer behind them is implicit, created with the first view and
+/// destroyed with the last. See `doc/portal-extension.md` §6.9.
+pub type ContentId = u64;
+
+/// One portal in the host's table — a **view** onto a
+/// [`PortalContent`].
+///
+/// This is what the protocol calls a portal: the thing a client names,
+/// positions, shows, hides and writes to. Everything here is per-view,
+/// so two views forked onto one buffer can sit at different origins,
+/// draw orders and scroll offsets while showing the same text.
+#[allow(dead_code)] // creation_seq is read by Phase 6 rendering
 pub struct Portal {
     pub id: String,
-    pub size_w: u32,
-    pub size_h: u32,
+    /// The buffer this view shows. Multiple views may name the same
+    /// content; see [`PortalContent::views`].
+    pub content: ContentId,
     pub origin_x: i32,
     pub anchor: PortalAnchor,
     pub is_visible: bool,
     pub draw_order: i32,
     pub creation_seq: u64,
+    /// §9.3 — this view's scrollback offset into the shared buffer, in
+    /// rows above the live region. The buffer itself always sits live
+    /// (its grid's own offset stays 0); every read goes through
+    /// `vt100::Screen::cell_at` with this value, which is what lets two
+    /// views of one buffer scroll independently.
+    pub view_offset: u32,
+}
+
+/// The buffer behind one or more [`Portal`] views: the inner vt100 and
+/// every engine scoped to it.
+///
+/// Sized as `rows = size_h, cols = size_w` with a scrollback ring of
+/// `scrollback_lines`, and owning a recursively-nested `PrtEngine` for
+/// any sub-portals created inside it. Geometry lives here rather than
+/// on the view because there is only one grid: forked views show the
+/// same cells, so they necessarily share its dimensions.
+#[allow(dead_code)] // scrollback_lines is read by Phase 6 rendering
+pub struct PortalContent {
+    pub size_w: u32,
+    pub size_h: u32,
     pub scrollback_lines: u32,
+    /// How many views currently reference this content (§6.2). The
+    /// buffer and its whole sub-portal subtree are torn down when this
+    /// reaches zero, and not before — deleting one view of a forked
+    /// pair must leave the survivor fully working.
+    pub views: u32,
     pub vt: Parser<PortalCallbacks>,
     pub children: PrtEngine,
     /// §10 — every portal owns its own VGE engine that operates in
@@ -284,12 +318,13 @@ pub struct Portal {
     pub pending_cursor_queries: u32,
 }
 
-impl Portal {
+impl PortalContent {
     /// Drain every GPU image handle owned (directly or transitively
-    /// via sub-portals) by this portal's VGE engines. Invoked by the
-    /// PRT engine right before removing the portal from its scope, so
-    /// the renderer can `canvas.delete_image()` each ID and the
-    /// femtovg cache doesn't leak when a portal goes away.
+    /// via sub-portals) by this buffer's VGE engines. Invoked by the
+    /// PRT engine right before dropping the content from its scope —
+    /// i.e. when its last view goes away — so the renderer can
+    /// `canvas.delete_image()` each ID and the femtovg cache doesn't
+    /// leak.
     pub fn drain_for_destroy(&mut self) -> Vec<crate::vge::GpuImageId> {
         let mut deletes = Vec::new();
         // Already-scheduled deletes from in-flight DropImage commands.
@@ -307,23 +342,128 @@ impl Portal {
 
 /// Per-screen portal table (§5.4: main and alt screens have independent
 /// tables).
+///
+/// Two maps, not one: `portals` holds the client-visible views keyed by
+/// portal id (§6.8), `contents` holds the buffers they share keyed by an
+/// id that never leaves the host. The common case is a 1:1 pairing; a
+/// forked view (§6.9) is the case where two entries in `portals` name
+/// the same entry in `contents`.
 pub struct PortalSet {
     pub portals: HashMap<String, Portal>,
+    pub contents: HashMap<ContentId, PortalContent>,
     pub creation_counter: u64,
+    content_counter: ContentId,
 }
 
 impl PortalSet {
     pub fn new() -> Self {
         Self {
             portals: HashMap::new(),
+            contents: HashMap::new(),
             creation_counter: 0,
+            content_counter: 0,
         }
+    }
+
+    /// Rebuild from already-decoded parts. The intended caller is the
+    /// snapshot decoder in [`crate::prt::snapshot`].
+    pub(in crate::prt) fn from_raw_parts(
+        portals: HashMap<String, Portal>,
+        contents: HashMap<ContentId, PortalContent>,
+        creation_counter: u64,
+        content_counter: ContentId,
+    ) -> Self {
+        Self { portals, contents, creation_counter, content_counter }
+    }
+
+    /// The next content id this set will hand out — serialized so a
+    /// restored set doesn't reissue ids that are already in use.
+    pub(in crate::prt) fn content_counter(&self) -> ContentId {
+        self.content_counter
     }
 
     pub fn next_seq(&mut self) -> u64 {
         let n = self.creation_counter;
         self.creation_counter += 1;
         n
+    }
+
+    /// Install a new buffer and return its id. The caller is
+    /// responsible for creating the first view referencing it;
+    /// `content.views` should already account for that view.
+    pub fn insert_content(&mut self, content: PortalContent) -> ContentId {
+        let id = self.content_counter;
+        self.content_counter += 1;
+        self.contents.insert(id, content);
+        id
+    }
+
+    /// The buffer behind view `id`.
+    pub fn content(&self, id: &str) -> Option<&PortalContent> {
+        self.contents.get(&self.portals.get(id)?.content)
+    }
+
+    /// Mutable [`content`](Self::content).
+    pub fn content_mut(&mut self, id: &str) -> Option<&mut PortalContent> {
+        let key = self.portals.get(id)?.content;
+        self.contents.get_mut(&key)
+    }
+
+    /// Both halves of view `id` at once. Views and contents live in
+    /// separate maps, so this hands out two disjoint mutable borrows
+    /// without any interior mutability.
+    pub fn split_mut(
+        &mut self,
+        id: &str,
+    ) -> Option<(&mut Portal, &mut PortalContent)> {
+        let Self { portals, contents, .. } = self;
+        let view = portals.get_mut(id)?;
+        let content = contents.get_mut(&view.content)?;
+        Some((view, content))
+    }
+
+    /// Every buffer in this scope. Used by the broadcast paths (metrics,
+    /// host palette, image-delete collection) that act per buffer rather
+    /// than per view — going through views would visit a forked buffer
+    /// twice.
+    pub fn contents_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut PortalContent> {
+        self.contents.values_mut()
+    }
+
+    /// Drop one reference to `content`, returning the buffer when that
+    /// was the last view (§6.2). `None` means other views survive and
+    /// the buffer must stay live.
+    pub fn release(&mut self, content: ContentId) -> Option<PortalContent> {
+        let entry = self.contents.get_mut(&content)?;
+        entry.views = entry.views.saturating_sub(1);
+        if entry.views == 0 {
+            self.contents.remove(&content)
+        } else {
+            None
+        }
+    }
+
+    /// Remove view `id`, returning its buffer **only if that was the
+    /// last view of it** — in which case the caller owns the teardown
+    /// (`drain_for_destroy`, and any recursive sub-portal cleanup).
+    ///
+    /// Every path that drops a single portal goes through here:
+    /// `DeletePortal`, the two erase-display culls, and scrollback
+    /// eviction. `None` is the forked case — the view is gone, the
+    /// shell behind it is not.
+    pub fn remove_view(&mut self, id: &str) -> Option<PortalContent> {
+        let view = self.portals.remove(id)?;
+        self.release(view.content)
+    }
+
+    /// Drain every buffer in this scope. For the paths that wipe the
+    /// whole set at once (RIS/DECSTR, alt-screen exit, `ClearAll`),
+    /// where refcounting each view down individually would be busywork.
+    /// The caller is responsible for draining `portals` too.
+    pub fn drain_contents(&mut self) -> Vec<PortalContent> {
+        self.contents.drain().map(|(_, c)| c).collect()
     }
 }
 

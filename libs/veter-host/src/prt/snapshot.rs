@@ -13,7 +13,9 @@
 
 use vge_protocol::codec::{Reader, Writer};
 
-use super::portal::{PolledStateCache, Portal, PortalAnchor, PortalSet};
+use super::portal::{
+    PolledStateCache, Portal, PortalAnchor, PortalContent, PortalSet,
+};
 use super::state::{FocusKind, PrtEngine, PrtState};
 use prt_protocol::command::CursorStyle;
 
@@ -21,6 +23,10 @@ use prt_protocol::command::CursorStyle;
 /// match — see [`PrtEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v4: split each portal into a view and a shared `PortalContent`.
+///   Buffers are serialized once per set and views carry a content id,
+///   so a forked pair (§6.9) comes back still sharing one grid instead
+///   of silently unsharing into two divergent ones.
 /// - v3: drop `top_of_live_screen` — the line origin
 ///   `PortalAnchor::Scrollback { anchor_line }` values reference now
 ///   lives in (and is restored by) the vt100 snapshot that always
@@ -29,7 +35,7 @@ use prt_protocol::command::CursorStyle;
 ///   `PortalAnchor::Scrollback { anchor_line }` values stay aligned
 ///   with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
 
 /// Error returned when a PRT binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -240,13 +246,25 @@ fn decode_anchor(r: &mut Reader) -> Result<PortalAnchor, SnapshotError> {
 
 // ---- PortalSet --------------------------------------------------------
 
+/// Buffers first, then the views that reference them.
+///
+/// The sharing graph has to survive the wire: serializing each view's
+/// buffer inline would silently unshare a forked pair on reattach,
+/// turning two views of one shell into two independent (and instantly
+/// divergent) grids.
 fn encode_portal_set(set: &PortalSet, w: &mut Writer) {
+    w.varu(set.contents.len() as u64);
+    for (cid, content) in &set.contents {
+        w.u64(*cid);
+        encode_content(content, w);
+    }
     w.varu(set.portals.len() as u64);
     for (key, portal) in &set.portals {
         w.str(key);
         encode_portal(portal, w);
     }
     w.u64(set.creation_counter);
+    w.u64(set.content_counter());
 }
 
 fn decode_portal_set(
@@ -254,60 +272,105 @@ fn decode_portal_set(
     parent_engine: &PrtEngine,
 ) -> Result<PortalSet, SnapshotError> {
     let n = r.varu()? as usize;
+    let mut contents = std::collections::HashMap::with_capacity(n);
+    for _ in 0..n {
+        let cid = r.u64()?;
+        let content = decode_content(r, parent_engine)?;
+        contents.insert(cid, content);
+    }
+
+    let n = r.varu()? as usize;
     let mut portals = std::collections::HashMap::with_capacity(n);
     for _ in 0..n {
         let key = r.string()?.to_owned();
-        let portal = decode_portal(r, parent_engine)?;
+        let portal = decode_portal(r)?;
         portals.insert(key, portal);
     }
     let creation_counter = r.u64()?;
-    Ok(PortalSet {
+    let content_counter = r.u64()?;
+
+    // Rebuild the refcounts from the views rather than trusting a
+    // number on the wire — they cannot then disagree with each other.
+    // A view naming a missing buffer, or a buffer nothing references,
+    // means the two halves of the snapshot don't match.
+    for content in contents.values_mut() {
+        content.views = 0;
+    }
+    for portal in portals.values() {
+        let Some(content) = contents.get_mut(&portal.content) else {
+            return Err(SnapshotError::Inconsistent);
+        };
+        content.views += 1;
+    }
+    if contents.values().any(|c| c.views == 0) {
+        return Err(SnapshotError::Inconsistent);
+    }
+
+    Ok(PortalSet::from_raw_parts(
         portals,
+        contents,
         creation_counter,
-    })
+        content_counter,
+    ))
 }
 
-// ---- Portal -----------------------------------------------------------
+// ---- Portal (view) ----------------------------------------------------
 
 fn encode_portal(p: &Portal, w: &mut Writer) {
     w.str(&p.id);
-    w.u32(p.size_w);
-    w.u32(p.size_h);
+    w.u64(p.content);
     w.i32(p.origin_x);
     encode_anchor(p.anchor, w);
     w.bool(p.is_visible);
     w.i32(p.draw_order);
     w.u64(p.creation_seq);
-    w.u32(p.scrollback_lines);
+    w.u32(p.view_offset);
+}
+
+fn decode_portal(r: &mut Reader) -> Result<Portal, SnapshotError> {
+    Ok(Portal {
+        id: r.string()?.to_owned(),
+        content: r.u64()?,
+        origin_x: r.i32()?,
+        anchor: decode_anchor(r)?,
+        is_visible: r.bool()?,
+        draw_order: r.i32()?,
+        creation_seq: r.u64()?,
+        view_offset: r.u32()?,
+    })
+}
+
+// ---- PortalContent (shared buffer) ------------------------------------
+
+fn encode_content(c: &PortalContent, w: &mut Writer) {
+    w.u32(c.size_w);
+    w.u32(c.size_h);
+    w.u32(c.scrollback_lines);
+    // `views` is not written: the decoder recounts it from the views,
+    // so the refcount cannot disagree with the graph it describes.
 
     // Nested sub-snapshots as length-prefixed byte blobs so the
     // decoder can hand each one to the right deserializer without
     // needing intricate framing.
-    let vt_bytes = p.vt.screen().binary_snapshot();
+    let vt_bytes = c.vt.screen().binary_snapshot();
     w.bytes(&vt_bytes);
-    let vge_bytes = p.vge.binary_snapshot();
+    let vge_bytes = c.vge.binary_snapshot();
     w.bytes(&vge_bytes);
-    // Recursive PRT snapshot for the portal's children sub-engine.
+    // Recursive PRT snapshot for the buffer's children sub-engine.
     let mut children_bytes = Vec::new();
-    encode_engine(&p.children, &mut children_bytes);
+    encode_engine(&c.children, &mut children_bytes);
     w.bytes(&children_bytes);
 
-    encode_polled(&p.state_cache, w);
-    w.u32(p.pending_cursor_queries);
+    encode_polled(&c.state_cache, w);
+    w.u32(c.pending_cursor_queries);
 }
 
-fn decode_portal(
+fn decode_content(
     r: &mut Reader,
     parent_engine: &PrtEngine,
-) -> Result<Portal, SnapshotError> {
-    let id = r.string()?.to_owned();
+) -> Result<PortalContent, SnapshotError> {
     let size_w = r.u32()?;
     let size_h = r.u32()?;
-    let origin_x = r.i32()?;
-    let anchor = decode_anchor(r)?;
-    let is_visible = r.bool()?;
-    let draw_order = r.i32()?;
-    let creation_seq = r.u64()?;
     let scrollback_lines = r.u32()?;
 
     let vt_bytes = r.bytes()?;
@@ -317,7 +380,7 @@ fn decode_portal(
     let state_cache = decode_polled(r)?;
     let pending_cursor_queries = r.u32()?;
 
-    // Build a fresh portal scaffold the way `cmd_create_portal` does.
+    // Build a fresh buffer scaffold the way `cmd_create_portal` does.
     let rows = size_h as u16;
     let cols = size_w as u16;
     let mut vt = vt100::Parser::new_with_callbacks(
@@ -354,16 +417,12 @@ fn decode_portal(
     // fresh, non-session engine, same as VSS/VFT.
     let ses = crate::ses::SesEngine::new();
 
-    Ok(Portal {
-        id,
+    Ok(PortalContent {
         size_w,
         size_h,
-        origin_x,
-        anchor,
-        is_visible,
-        draw_order,
-        creation_seq,
         scrollback_lines,
+        // Recomputed by `decode_portal_set` once the views are in.
+        views: 0,
         vt,
         children,
         vge,

@@ -239,6 +239,66 @@ fn placement_survives_scrolling_into_scrollback() {
 }
 
 #[test]
+fn two_reserved_regions_in_one_message_both_land_on_their_markers() {
+    // The regression: a message carrying two images is taller than the
+    // screen, so the first marker has already scrolled off by the time
+    // anything anchors to it. Resolving against the live screen alone
+    // lost it, fell back to the viewport, and dropped the first image
+    // on top of the text at the top of the screen — which read as "only
+    // one image was placed".
+    let dir = std::env::temp_dir().join("vplace-e2e-two");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("t.png");
+    tiny_png(&png, 64, 32);
+
+    const GAP: usize = 12; // rows each image reserves; two exceed ROWS
+
+    // Built as lines so a marker's index *is* its absolute scrollback
+    // line: a fresh parser starts at line 0 and every line is CRLF.
+    let mut lines: Vec<String> = vec!["Two frames:".into(), String::new()];
+    let a_line = lines.len();
+    lines.push("[IMAGE: two-a] t.png - first".into());
+    lines.extend(std::iter::repeat_n(String::new(), GAP));
+    lines.push("And the second:".into());
+    let b_line = lines.len();
+    lines.push("[IMAGE: two-b] t.png - second".into());
+    lines.extend(std::iter::repeat_n(String::new(), GAP));
+    lines.push("Both are above.".into());
+    let app = (lines.join("\r\n") + "\r\n").into_bytes();
+
+    let gap = GAP.to_string();
+    let envelopes: Vec<Vec<u8>> = ["[IMAGE: two-a]", "[IMAGE: two-b]"]
+        .iter()
+        .map(|m| run_vplace(&[png.to_str().unwrap(), "--marker", m, "--max-rows", &gap]))
+        .collect();
+
+    let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
+    let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
+    engine.after_vt100_process(&mut parser);
+    drive_terminal_stage(&mut engine, &mut parser, &app);
+    // Both envelopes after the whole message, which is when the hook
+    // runs: it reads the finished turn and places each marker in turn.
+    for env in &envelopes {
+        drive_terminal_stage(&mut engine, &mut parser, env);
+    }
+
+    let top = engine.top_of_live_screen();
+    let els = engine.state.elements();
+    let a = els["vplace.IMAGE-two-a"].anchor_line;
+    let b = els["vplace.IMAGE-two-b"].anchor_line;
+
+    assert!(
+        (a_line as i64) < top,
+        "test is meaningless unless the first marker has scrolled off \
+         (marker line {a_line}, live screen starts at {top})"
+    );
+    assert_eq!(a, a_line as i64 + 1, "first image left its marker");
+    assert_eq!(b, b_line as i64 + 1, "second image left its marker");
+    assert_ne!(a, top + 1, "first image took the viewport fallback");
+    assert!(b - a >= GAP as i64, "the two images landed on top of each other");
+}
+
+#[test]
 fn the_marker_row_is_never_painted_over() {
     // The caption contract: the element draws the image and nothing
     // else, so whatever the application wrote on the marker row -- id,

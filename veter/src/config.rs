@@ -392,14 +392,21 @@ impl Default for SearchKeysConfig {
     }
 }
 
-/// One user-defined command run against the current selection.
+/// One user-defined action run against the current selection. Exactly
+/// one of `command` (spawn a shell) or `input` (type text back into the
+/// terminal) must be present.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SelectionCommandConfig {
     /// Chord that triggers it (see [`Chord`] for syntax).
     pub key: String,
     /// Shell command, run via `$SHELL -c` with the selection in
     /// `$VETER_SELECTION` and `$1`.
-    pub command: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Text template written to the PTY as if typed, with `%`
+    /// substitutions expanded (see [`expand_selection_input`]).
+    #[serde(default)]
+    pub input: Option<String>,
     /// Optional human note; accepted for self-documentation but unused
     /// at runtime.
     #[serde(default)]
@@ -407,12 +414,23 @@ pub struct SelectionCommandConfig {
     pub description: Option<String>,
 }
 
+/// What a bound selection chord does when it fires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionAction {
+    /// Run this shell command via `$SHELL -c`, detached. The selection
+    /// reaches it through the environment and argv, not the string.
+    Command(String),
+    /// Write this template to the PTY as if the user had typed it, after
+    /// expanding its `%` placeholders against the selection.
+    Input(String),
+}
+
 /// Compiled chord → action tables, resolved from [`KeyBindingsConfig`].
 pub struct KeyBindings {
     host: Vec<(Chord, HostAction)>,
     search: Vec<(Chord, SearchAction)>,
-    /// Chord → shell command for selection commands (in config order).
-    selection: Vec<(Chord, String)>,
+    /// Chord → action for selection commands (in config order).
+    selection: Vec<(Chord, SelectionAction)>,
 }
 
 impl KeyBindings {
@@ -469,12 +487,31 @@ impl KeyBindings {
             (parse(&s.page_down, &ds.page_down), SearchAction::PageDown),
         ];
 
-        // Selection commands have no built-in defaults; a bad chord is
-        // skipped (its command simply won't be bound) with a warning.
+        // Selection commands have no built-in defaults; a bad chord — or
+        // an entry that names neither or both of `command` / `input` — is
+        // skipped (it simply won't be bound) with a warning.
         let mut selection = Vec::new();
         for sc in selection_cmds {
+            let action = match (&sc.command, &sc.input) {
+                (Some(c), None) => SelectionAction::Command(c.clone()),
+                (None, Some(i)) => SelectionAction::Input(i.clone()),
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "veter: config: selection command '{}': `command` and `input` are mutually exclusive; skipping",
+                        sc.key
+                    );
+                    continue;
+                }
+                (None, None) => {
+                    eprintln!(
+                        "veter: config: selection command '{}': needs either `command` or `input`; skipping",
+                        sc.key
+                    );
+                    continue;
+                }
+            };
             match Chord::parse(&sc.key) {
-                Ok(c) => selection.push((c, sc.command.clone())),
+                Ok(c) => selection.push((c, action)),
                 Err(e) => eprintln!("veter: config: selection command: {e}; skipping"),
             }
         }
@@ -500,14 +537,67 @@ impl KeyBindings {
             .map(|(_, action)| *action)
     }
 
-    /// The shell command bound to this key, if any. Returns an owned
-    /// `String` so the caller can then take `&mut self`.
-    pub fn resolve_selection_command(&self, key: &Key, mods: &ModifiersState) -> Option<String> {
+    /// The selection action bound to this key, if any. Returns an owned
+    /// value so the caller can then take `&mut self`.
+    pub fn resolve_selection_action(
+        &self,
+        key: &Key,
+        mods: &ModifiersState,
+    ) -> Option<SelectionAction> {
         self.selection
             .iter()
             .find(|(chord, _)| chord.matches(key, mods))
-            .map(|(_, command)| command.clone())
+            .map(|(_, action)| action.clone())
     }
+}
+
+/// Expand a selection `input` template against the selected text.
+///
+/// * `%`  — the selection, verbatim.
+/// * `%q` — the selection, POSIX-shell-quoted, so `cd %q` survives a
+///   path with spaces or quotes in it.
+/// * `%%` — a literal `%`.
+///
+/// Everything else is copied through untouched, including the newline a
+/// TOML basic string already produced from `\n` — which is what makes
+/// `input = "cd %q\n"` press Enter as well as type the line.
+pub fn expand_selection_input(template: &str, selection: &str) -> String {
+    let mut out = String::with_capacity(template.len() + selection.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some('q') => {
+                chars.next();
+                out.push_str(&shell_quote(selection));
+            }
+            _ => out.push_str(selection),
+        }
+    }
+    out
+}
+
+/// POSIX single-quote a string: wrap in `'…'`, and render any embedded
+/// `'` as `'\''`. Safe for arbitrary text including spaces and `$`.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -644,19 +734,82 @@ mod tests {
         let none = ModifiersState::empty();
         let ctrl = ModifiersState::CONTROL;
         assert_eq!(
-            keys.resolve_selection_command(&Key::Character("o".into()), &none)
-                .as_deref(),
-            Some(r#"xdg-open "$VETER_SELECTION""#)
+            keys.resolve_selection_action(&Key::Character("o".into()), &none),
+            Some(SelectionAction::Command(
+                r#"xdg-open "$VETER_SELECTION""#.into()
+            ))
         );
         assert_eq!(
-            keys.resolve_selection_command(&Key::Character("b".into()), &ctrl)
-                .as_deref(),
-            Some(r#"firefox "$1""#)
+            keys.resolve_selection_action(&Key::Character("b".into()), &ctrl),
+            Some(SelectionAction::Command(r#"firefox "$1""#.into()))
         );
         // Unbound key → None.
         assert!(keys
-            .resolve_selection_command(&Key::Character("z".into()), &none)
+            .resolve_selection_action(&Key::Character("z".into()), &none)
             .is_none());
+    }
+
+    #[test]
+    fn selection_input_binds_and_expands() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[selection_commands]]
+            key = "C"
+            input = "cd %q\n"
+            "#,
+        )
+        .unwrap();
+        let keys = cfg.key_bindings();
+        let template = match keys
+            .resolve_selection_action(&Key::Character("C".into()), &ModifiersState::empty())
+        {
+            Some(SelectionAction::Input(t)) => t,
+            other => panic!("expected an input action, got {other:?}"),
+        };
+        // TOML's `\n` is already a newline by the time we see it.
+        assert_eq!(template, "cd %q\n");
+        assert_eq!(expand_selection_input(&template, "veter"), "cd 'veter'\n");
+    }
+
+    #[test]
+    fn expand_selection_input_placeholders() {
+        // Bare `%` is verbatim, `%q` quotes, `%%` is a literal percent.
+        assert_eq!(expand_selection_input("cd %", "veter"), "cd veter");
+        assert_eq!(expand_selection_input("cd %q", "my dir"), "cd 'my dir'");
+        assert_eq!(expand_selection_input("cd %q", "it's"), r#"cd 'it'\''s'"#);
+        assert_eq!(expand_selection_input("100%% of %", "x"), "100% of x");
+        // A trailing `%` still substitutes; a template with no
+        // placeholder is sent as-is.
+        assert_eq!(expand_selection_input("echo %", "hi"), "echo hi");
+        assert_eq!(expand_selection_input("clear\n", "hi"), "clear\n");
+        // Every occurrence is replaced, not just the first.
+        assert_eq!(expand_selection_input("% %", "a"), "a a");
+    }
+
+    #[test]
+    fn selection_entry_needs_exactly_one_of_command_and_input() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[selection_commands]]
+            key = "a"
+
+            [[selection_commands]]
+            key = "b"
+            command = "true"
+            input = "true\n"
+
+            [[selection_commands]]
+            key = "c"
+            input = "true\n"
+            "#,
+        )
+        .unwrap();
+        // Only the last entry is well-formed.
+        let keys = cfg.key_bindings();
+        assert_eq!(keys.selection.len(), 1);
+        assert!(keys
+            .resolve_selection_action(&Key::Character("c".into()), &ModifiersState::empty())
+            .is_some());
     }
 
     #[test]
@@ -677,7 +830,7 @@ mod tests {
         let keys = cfg.key_bindings();
         assert_eq!(keys.selection.len(), 1);
         assert!(keys
-            .resolve_selection_command(&Key::Character("o".into()), &ModifiersState::empty())
+            .resolve_selection_action(&Key::Character("o".into()), &ModifiersState::empty())
             .is_some());
     }
 

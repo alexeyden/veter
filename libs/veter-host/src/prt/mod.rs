@@ -11,7 +11,7 @@ pub mod portal;
 pub mod snapshot;
 pub mod state;
 
-pub use portal::{Portal, PortalAnchor, PortalSet};
+pub use portal::{ContentId, Portal, PortalAnchor, PortalContent, PortalSet};
 pub use snapshot::SnapshotError;
 pub use state::{FocusKind, Limits, PrtEngine, PrtState};
 

@@ -5,7 +5,8 @@
 
 use crate::codec::Writer;
 use crate::command::{
-    Command, CreatePortalBody, CursorStyle, FocusTarget, UpdateOriginBody, WritePortalBody,
+    Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody, UpdateOriginBody,
+    WritePortalBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
 use crate::frame::*;
@@ -29,6 +30,20 @@ pub fn create_portal_body(b: &CreatePortalBody) -> Vec<u8> {
     w.i32(b.draw_order);
     w.u8(b.flags);
     w.u32(b.scrollback_lines);
+    w.buf
+}
+
+pub fn fork_portal_body(b: &ForkPortalBody) -> Vec<u8> {
+    let mut w =
+        Writer::with_capacity(2 + b.src_id.len() + b.new_id.len() + 4 * 3 + 3);
+    w.str(&b.src_id);
+    w.str(&b.new_id);
+    w.i32(b.origin_x);
+    w.i32(b.origin_y);
+    w.u8(b.anchor_mode.as_u8());
+    w.u8(u8::from(b.is_visible));
+    w.i32(b.draw_order);
+    w.u8(b.flags);
     w.buf
 }
 
@@ -122,6 +137,7 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::SetFocus { .. } => CMD_SET_FOCUS,
         Command::SetCursorStyle { .. } => CMD_SET_CURSOR_STYLE,
         Command::SetPortalScrollback { .. } => CMD_SET_PORTAL_SCROLLBACK,
+        Command::ForkPortal(_) => CMD_FORK_PORTAL,
     }
 }
 
@@ -146,6 +162,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::SetPortalScrollback { id, lines } => {
             set_portal_scrollback_body(id, *lines)
         }
+        Command::ForkPortal(b) => fork_portal_body(b),
     }
 }
 
@@ -164,6 +181,57 @@ pub fn build_envelope(commands: &[(Command, u32)]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::command::parse;
+
+    #[test]
+    fn fork_portal_round_trips() {
+        let b = ForkPortalBody {
+            src_id: "left".into(),
+            new_id: "left.mirror".into(),
+            origin_x: 40,
+            origin_y: 2,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+        };
+        let body = fork_portal_body(&b);
+        let cmd = parse(CMD_FORK_PORTAL, &body).unwrap();
+        let Command::ForkPortal(parsed) = cmd else {
+            panic!()
+        };
+        assert_eq!(parsed.src_id, b.src_id);
+        assert_eq!(parsed.new_id, b.new_id);
+        assert_eq!(parsed.origin_x, b.origin_x);
+        assert_eq!(parsed.origin_y, b.origin_y);
+        assert_eq!(parsed.anchor_mode, b.anchor_mode);
+        assert_eq!(parsed.is_visible, b.is_visible);
+        assert_eq!(parsed.draw_order, b.draw_order);
+        assert_eq!(parsed.flags, b.flags);
+    }
+
+    #[test]
+    fn fork_portal_rejects_reserved_flags_and_trailing_bytes() {
+        let b = ForkPortalBody {
+            src_id: "a".into(),
+            new_id: "b".into(),
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+        };
+        let mut body = fork_portal_body(&b);
+        // Trailing garbage is a hard structural error, as everywhere else.
+        body.push(0xAA);
+        assert!(parse(CMD_FORK_PORTAL, &body).is_err());
+
+        // Reserved flags byte must be zero (§6.9).
+        let mut body = fork_portal_body(&b);
+        let last = body.len() - 1;
+        body[last] = 1;
+        assert!(parse(CMD_FORK_PORTAL, &body).is_err());
+    }
 
     #[test]
     fn create_portal_round_trips() {

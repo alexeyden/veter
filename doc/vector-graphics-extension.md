@@ -1268,22 +1268,43 @@ parent-relative.
   caller still has to know how far the cursor has drifted from the rows
   it means.
 - **`bit4` — marker-anchored.** The trailing `marker` string is searched
-  for in the live screen's rows; `anchor_line` is derived from the
-  **bottom-most** row whose text contains it, so an application that
-  reprints its token each frame anchors to the latest one. This is the
-  better fit for the driving case: the application prints a token on the
-  first row it reserved, and the terminal — which owns the grid —
-  resolves it. No cursor arithmetic and no assumption about the
-  application's live-region height.
+  for in the live screen's rows and in whatever scrollback the terminal
+  still holds; `anchor_line` is derived from the **bottom-most** row
+  whose text contains it, so an application that reprints its token each
+  frame anchors to the latest one. The live screen is searched first and
+  wins outright: a token on screen is never passed over for an older
+  copy in history. This is the better fit for the driving case: the
+  application prints a token on the first row it reserved, and the
+  terminal — which owns the grid — resolves it. No cursor arithmetic and
+  no assumption about the application's live-region height.
+
+  A match in scrollback resolves to an `anchor_line` **above** the live
+  screen, and that is not an error. `anchor_line` is absolute (§5.2), so
+  the marker names the same text line whether or not it is on screen —
+  and it often will not be, because the message that reserved the space
+  is frequently taller than the screen. A client that reserves two
+  regions in one message has already scrolled the first marker away by
+  the time it draws into it. Searching only the live screen would lose
+  that first marker, fall back to the viewport, and place the element
+  over whatever the scroll left at the top of the screen.
+
+  The search domain is bounded by the terminal's scrollback, so a marker
+  whose row has aged out of it matches nothing and takes the fallback
+  below. Terminals SHOULD NOT bound it any more tightly than that.
 
 The sub-row fraction (§5.2) is unchanged in both modes, so half-cell
 placement still works.
 
 Setting both bits is `err_bad_payload`: they name the same thing two
-ways. If the marker matches no row, or the terminal has no live screen
+ways. If the marker matches no row — never printed, misspelled, or
+scrolled out of scrollback entirely — or the terminal has no live screen
 to resolve against, the origin falls back to viewport-relative rather
-than failing — the element lands where a default-anchored one would,
+than failing: the element lands where a default-anchored one would,
 which is visibly wrong rather than silently displaced.
+
+Neither mode is affected by where the *user* has scrolled the view.
+Scroll position is a property of the view; the anchor is a property of
+the text, and the two must not be able to change each other.
 
 **Space is reserved in-band, by the application.** These modes only let
 a client *name* a location; they do not create room for it. A client

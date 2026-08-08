@@ -22,6 +22,7 @@ pub const CMD_WRITE_PORTAL: u8 = 0x09;
 pub const CMD_SET_FOCUS: u8 = 0x0A;
 pub const CMD_SET_CURSOR_STYLE: u8 = 0x0B;
 pub const CMD_SET_PORTAL_SCROLLBACK: u8 = 0x0C;
+pub const CMD_FORK_PORTAL: u8 = 0x0D;
 
 // §4.1 response codes (host → client, low half)
 pub const RSP_OK: u8 = 0x01;

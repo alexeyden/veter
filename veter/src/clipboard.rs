@@ -9,6 +9,8 @@
 //!    (e.g. anything spawned without going through vmux/PRT), decodes
 //!    base64, and buffers the text for the App to apply. OSC 52 query
 //!    is left as the default no-op (refuse policy — see plan stage 1).
+//!    It also buffers OSC 0/2 window titles, which the App applies to
+//!    the winit window.
 
 pub struct ClipboardManager {
     inner: Option<arboard::Clipboard>,
@@ -82,10 +84,16 @@ impl ClipboardManager {
 }
 
 /// vt100 callbacks installed on the host parser. Buffers OSC 52 set
-/// payloads (decoded from base64) for the App to drain each tick.
+/// payloads (decoded from base64) and OSC 0/2 window titles for the App
+/// to drain each tick.
 #[derive(Default)]
 pub struct HostCallbacks {
     pub pending_set: Vec<String>,
+    /// Most recent OSC 0/2 title the child asked for, `None` once the
+    /// App has applied it. Only the last one matters — a program that
+    /// retitles per prompt would otherwise queue a burst of titles the
+    /// window can never show.
+    pub pending_title: Option<String>,
 }
 
 impl vt100::Callbacks for HostCallbacks {
@@ -109,6 +117,13 @@ impl vt100::Callbacks for HostCallbacks {
     // paste_from_clipboard intentionally left as the default no-op:
     // OSC 52 query is refused. Programs that issue it just don't get
     // a reply.
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        // OSC 0 sets icon name *and* title; we only track the title,
+        // since a window with no icon-name concept has nowhere to put
+        // the other half.
+        self.pending_title = Some(String::from_utf8_lossy(title).into_owned());
+    }
 }
 
 /// Build the byte sequence to write to the PTY when pasting `text`.

@@ -300,6 +300,49 @@ mod tests {
     }
 
     #[test]
+    fn marker_anchor_reaches_a_row_already_in_scrollback() {
+        // The driving case: a message that reserves two regions is
+        // taller than the screen, so by the time a client anchors to
+        // the first marker that row has scrolled off. The marker still
+        // names its own line — resolving to an absolute line is the
+        // whole point — and only a live-screen search would lose it and
+        // fall back to the viewport, drawing over the text up there.
+        let (mut engine, mut parser) = engine_and_parser();
+        // 4-row screen: <<tok>> is committed at line 0, then six more
+        // lines push it three rows past the top of the live screen.
+        let mut chunk = b"<<tok>>\r\na\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec();
+        chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+
+        let top = engine.top_of_live_screen();
+        assert_eq!(top, 4, "six lines after the marker on a 4-row screen");
+        assert_eq!(engine.state.elements()["m"].anchor_line, 0);
+        // Not the viewport fallback, which is what the bug produced.
+        assert_ne!(engine.state.elements()["m"].anchor_line, top);
+    }
+
+    #[test]
+    fn a_scrollback_marker_anchor_is_not_evicted_on_arrival() {
+        // Anchoring into scrollback puts an element at a line the
+        // eviction sweep is already walking past. It must survive its
+        // own creation — the ring still holds the row — and go only
+        // when that row does.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"<<tok>>\r\n".to_vec();
+        chunk.extend_from_slice(&b"x\r\n".repeat(6));
+        chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        assert!(engine.state.elements().contains_key("m"));
+
+        // Scroll far enough to push line 0 out of the 100-row ring.
+        drive_terminal_stage(&mut engine, &mut parser, &b"y\r\n".repeat(120));
+        assert!(
+            !engine.state.elements().contains_key("m"),
+            "the element goes when the row it named falls out of scrollback"
+        );
+    }
+
+    #[test]
     fn unmatched_marker_falls_back_to_the_viewport() {
         // Wrong-but-sane beats silently off by an unpredictable amount.
         let (mut engine, mut parser) = engine_and_parser();

@@ -172,6 +172,25 @@ impl Screen {
         self.grid.scrollback_fill()
     }
 
+    /// Offset from the live screen's first row to the bottom-most row
+    /// whose text contains `needle`, or `None` if no row does. Negative
+    /// reaches into scrollback, `-1` being the row just above the live
+    /// screen; adding [`top_of_live_screen`](Self::top_of_live_screen)
+    /// gives the matched row's absolute line index.
+    ///
+    /// Searches the *current* screen, so while the alternate screen is
+    /// up the answer is a plain live-row index — the alternate grid
+    /// keeps no scrollback, and `top_of_live_screen` is frozen at the
+    /// main screen's value, which together make an alt-screen marker
+    /// resolve exactly like the viewport-relative offset it is.
+    ///
+    /// Unaffected by the user's scroll position: where the view is
+    /// scrolled to must not change which row a marker names.
+    #[must_use]
+    pub fn last_row_offset_containing(&self, needle: &str) -> Option<i64> {
+        self.grid().last_row_offset_containing(needle)
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain
@@ -666,6 +685,23 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// [`cell`](Self::cell), but reading the grid as if the scroll
+    /// offset were `offset` rather than the grid's own.
+    ///
+    /// Two PRT views sharing one buffer scroll independently, so the
+    /// offset belongs to the view and the render path passes it in.
+    /// `offset` is clamped to the available history.
+    #[must_use]
+    pub fn cell_at(
+        &self,
+        offset: usize,
+        row: u16,
+        col: u16,
+    ) -> Option<&crate::Cell> {
+        self.grid()
+            .visible_cell_at(offset, crate::grid::Pos { row, col })
+    }
+
     /// The visible row at `row` as a cell slice, or an empty slice when
     /// `row` is past the bottom of the grid.
     ///
@@ -679,6 +715,19 @@ impl Screen {
     pub fn visible_row_cells(&self, row: u16) -> &[crate::Cell] {
         self.grid()
             .visible_row(row)
+            .map_or(&[][..], crate::row::Row::cells_slice)
+    }
+
+    /// [`visible_row_cells`](Self::visible_row_cells) at an explicit
+    /// view offset. Same one-walk-per-row property.
+    #[must_use]
+    pub fn visible_row_cells_at(
+        &self,
+        offset: usize,
+        row: u16,
+    ) -> &[crate::Cell] {
+        self.grid()
+            .visible_row_at(offset, row)
             .map_or(&[][..], crate::row::Row::cells_slice)
     }
 
@@ -1835,6 +1884,113 @@ mod top_of_live_screen_tests {
     }
 }
 
+/// Marker search, the other half of that coordinate space: an offset
+/// from the top of the live screen that `top_of_live_screen` turns into
+/// an absolute line.
+#[cfg(test)]
+mod marker_search_tests {
+    use crate::Parser;
+
+    /// `n` numbered lines on a 5-row screen. Line `i` is written at
+    /// absolute line `i`, so a search answer is checkable against the
+    /// number printed on the row. Bracketed so that `row[1]` is not
+    /// also a substring of `row[10]`.
+    fn numbered(n: usize, scrollback: usize) -> Parser {
+        let mut p = Parser::new(5, 20, scrollback);
+        for i in 0..n {
+            p.process(format!("row[{i}]\r\n").as_bytes());
+        }
+        p
+    }
+
+    /// Absolute line the search resolves `needle` to.
+    fn line_of(p: &Parser, needle: &str) -> Option<i64> {
+        Some(
+            p.screen().top_of_live_screen()
+                + p.screen().last_row_offset_containing(needle)?,
+        )
+    }
+
+    #[test]
+    fn a_live_row_is_a_non_negative_offset() {
+        let p = numbered(4, 100);
+        // Nothing has scrolled, so offsets and absolute lines coincide.
+        assert_eq!(p.screen().last_row_offset_containing("row[2]"), Some(2));
+        assert_eq!(p.screen().top_of_live_screen(), 0);
+    }
+
+    #[test]
+    fn a_scrolled_off_row_is_a_negative_offset() {
+        // The bug this exists for: two reserved regions in one message
+        // scroll the first marker away before anything anchors to it.
+        // 12 lines on a 5-row screen leaves `row[0]`..`row[7]` in
+        // history.
+        let p = numbered(12, 100);
+        assert_eq!(p.screen().top_of_live_screen(), 8);
+        assert_eq!(p.screen().last_row_offset_containing("row[1]"), Some(-7));
+        // Which is still the row that printed it.
+        assert_eq!(line_of(&p, "row[1]"), Some(1));
+        assert_eq!(line_of(&p, "row[9]"), Some(9));
+    }
+
+    #[test]
+    fn the_live_screen_wins_over_scrollback() {
+        // An application that reprints its token every frame anchors to
+        // the copy on screen, never to a stale one in history.
+        let mut p = numbered(12, 100);
+        p.process(b"row[1] again\r\n");
+        assert_eq!(line_of(&p, "row[1]"), Some(12));
+    }
+
+    #[test]
+    fn the_users_scroll_position_is_not_an_input() {
+        // The offset is relative to the live screen, which is the space
+        // `top_of_live_screen` names. Scrolling the *view* must not
+        // move a marker's line, or an anchor placed while the user
+        // happened to be scrolled up would land somewhere else.
+        let mut p = numbered(12, 100);
+        let live = p.screen().last_row_offset_containing("row[1]");
+        p.screen_mut().set_scrollback(6);
+        assert_eq!(p.screen().last_row_offset_containing("row[1]"), live);
+        p.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(p.screen().last_row_offset_containing("row[1]"), live);
+    }
+
+    #[test]
+    fn a_row_dropped_from_the_ring_is_gone() {
+        // Past the ring there is no row to name, and no way to tell how
+        // far back it went — `None`, so the caller can fall back rather
+        // than anchor to a guess.
+        let p = numbered(12, 2);
+        assert_eq!(p.screen().last_row_offset_containing("row[1]"), None);
+        assert_eq!(p.screen().last_row_offset_containing("row[6]"), Some(-2));
+    }
+
+    #[test]
+    fn absent_and_empty_needles_match_nothing() {
+        let p = numbered(4, 100);
+        assert_eq!(p.screen().last_row_offset_containing("nope"), None);
+        // An empty needle trivially matches every row; refusing it
+        // keeps a client from anchoring to the bottom row by accident.
+        assert_eq!(p.screen().last_row_offset_containing(""), None);
+    }
+
+    #[test]
+    fn the_alternate_screen_searches_itself() {
+        // No scrollback there, and `top_of_live_screen` stays frozen at
+        // the main screen's value, so an alt-screen marker resolves as
+        // the viewport offset it is.
+        let mut p = numbered(12, 100);
+        let frozen = p.screen().top_of_live_screen();
+        p.process(b"\x1b[?1049h");
+        p.process(b"alt-token\r\n");
+        assert_eq!(p.screen().last_row_offset_containing("alt-token"), Some(0));
+        // The main screen's rows are not visible from here.
+        assert_eq!(p.screen().last_row_offset_containing("row[9]"), None);
+        assert_eq!(p.screen().top_of_live_screen(), frozen);
+    }
+}
+
 #[cfg(test)]
 mod binary_snapshot_tests {
     use crate::Parser;
@@ -1893,6 +2049,38 @@ mod binary_snapshot_tests {
         // this sanity-check just confirms the scrollback is populated.
         let sb = restored.screen().grid().scrollback_rows().count();
         assert!(sb >= 7, "expected >= 7 scrollback rows, got {sb}");
+    }
+
+    #[test]
+    fn cell_at_reads_at_a_view_offset_without_moving_the_grid() {
+        // 3 visible rows, 10 lines written — 8 land in scrollback.
+        let mut p = Parser::new(3, 10, 100);
+        for i in 0..10 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        let row_at = |off: usize, row: u16| -> String {
+            (0..10)
+                .filter_map(|c| p.screen().cell_at(off, row, c))
+                .map(crate::Cell::contents)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // A view offset of k shifts the window k lines up, so row r at
+        // offset k is the same text as row r-k at offset 0. This is the
+        // whole contract two PRT views on one buffer depend on.
+        assert_eq!(row_at(1, 1), row_at(0, 0));
+        assert_eq!(row_at(1, 2), row_at(0, 1));
+        assert_eq!(row_at(2, 2), row_at(0, 0));
+        // ...and the offsets genuinely differ, so the assertions above
+        // aren't comparing an all-blank grid to itself.
+        assert_ne!(row_at(0, 0), row_at(2, 0));
+
+        // Reading never moves the buffer: it stays live for everyone.
+        assert_eq!(p.screen().scrollback(), 0);
+        // An offset past the ring clamps instead of underflowing.
+        let _ = row_at(9_999, 0);
     }
 
     #[test]

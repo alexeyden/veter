@@ -15,7 +15,7 @@ use femtovg::{Canvas, Color, Paint, Path, Renderer};
 
 use prt_protocol::command::CursorStyle;
 
-use veter_host::prt::portal::{Portal, PortalAnchor};
+use veter_host::prt::portal::{Portal, PortalAnchor, PortalContent};
 use veter_host::prt::state::PrtState;
 use crate::renderer::TerminalRenderer;
 use crate::vge;
@@ -53,7 +53,10 @@ pub struct PortalSearchCtx<'a> {
 /// element or a host portal.
 enum Layer<'a> {
     Vge(&'a vge::state::Element),
-    Portal(&'a Portal),
+    /// A view plus the buffer it shows. Resolved when the layer list is
+    /// built so the render arms don't each repeat the lookup — and so a
+    /// view whose buffer somehow went missing is skipped once, here.
+    Portal(&'a Portal, &'a PortalContent),
 }
 
 /// Walk top-level VGE elements and host portals in
@@ -77,8 +80,16 @@ pub fn render_layers<T: Renderer>(
     for el in vge_state.top_level_sorted() {
         layers.push((el.draw_order, el.creation_seq, Layer::Vge(el)));
     }
-    for portal in prt_state.current().portals.values() {
-        layers.push((portal.draw_order, portal.creation_seq, Layer::Portal(portal)));
+    let set = prt_state.current();
+    for portal in set.portals.values() {
+        let Some(content) = set.contents.get(&portal.content) else {
+            continue;
+        };
+        layers.push((
+            portal.draw_order,
+            portal.creation_seq,
+            Layer::Portal(portal, content),
+        ));
     }
     layers.sort_by_key(|(d, c, _)| (*d, *c));
 
@@ -106,7 +117,7 @@ pub fn render_layers<T: Renderer>(
                     host_ctx,
                 );
             }
-            Layer::Portal(portal) => {
+            Layer::Portal(portal, content) => {
                 let sub_sel = portal_selection.and_then(|s| {
                     let first = s.remaining_path.first().map(|s| s.as_str())?;
                     if first != portal.id.as_str() {
@@ -136,6 +147,7 @@ pub fn render_layers<T: Renderer>(
                     canvas,
                     term_renderer,
                     portal,
+                    content,
                     0.0,
                     0.0,
                     top_of_live_screen,
@@ -166,6 +178,7 @@ fn render_portal_at<T: Renderer>(
     canvas: &mut Canvas<T>,
     term_renderer: &mut TerminalRenderer,
     portal: &Portal,
+    content: &PortalContent,
     parent_origin_x_px: f32,
     parent_origin_y_px: f32,
     parent_top_of_live_screen: i64,
@@ -191,8 +204,8 @@ fn render_portal_at<T: Renderer>(
     };
     let ox_px = parent_origin_x_px + portal.origin_x as f32 * cell_w;
     let oy_px = parent_origin_y_px + row_f * cell_h;
-    let w_px = portal.size_w as f32 * cell_w;
-    let h_px = portal.size_h as f32 * cell_h;
+    let w_px = content.size_w as f32 * cell_w;
+    let h_px = content.size_h as f32 * cell_h;
 
     // Resolve this portal's role in the focus chain.
     //   chain == [..., self.id]      ⇒ self is the focused leaf.
@@ -229,7 +242,7 @@ fn render_portal_at<T: Renderer>(
         .collect();
     let pick_ctx = vge::render::PickCtx {
         path_id: term_renderer.pick.intern_path(&path),
-        on_alt: portal.vge.state.on_alt(),
+        on_alt: content.vge.state.on_alt(),
         clip: parent_clip.intersect(vge::pick::PickRect::new(ox_px, oy_px, w_px, h_px)),
         sel: vge_selection,
     };
@@ -238,15 +251,17 @@ fn render_portal_at<T: Renderer>(
     //    `draw_screen_at` inverts that cell's fg/bg the same way the
     //    host cursor renders. Non-leaf portals pass `None` and draw
     //    their unfocused-style cursor below.
-    let cursor_pos = portal.vt.screen().cursor_position();
+    let cursor_pos = content.vt.screen().cursor_position();
     // Mirror the host text grid (§9.1): the cursor is anchored to the
     // live screen, but `draw_screen_at` paints scrollback-adjusted
     // cells. When this portal is scrolled back, the live cursor row is
     // off-viewport, so suppress it rather than letting it float over
     // scrollback content at its fixed logical row.
-    let cursor_visible = portal.state_cache.cursor_visible
-        && !portal.vt.screen().hide_cursor()
-        && portal.vt.screen().scrollback() == 0;
+    // ...and it is *this view's* offset that decides, so a forked
+    // pair shows the cursor in whichever view is at live.
+    let cursor_visible = content.state_cache.cursor_visible
+        && !content.vt.screen().hide_cursor()
+        && portal.view_offset == 0;
     let focused_cursor = if is_focused_leaf && cursor_visible {
         Some(cursor_pos)
     } else {
@@ -258,8 +273,8 @@ fn render_portal_at<T: Renderer>(
         if !s.remaining_path.is_empty() {
             return None;
         }
-        let portal_top = portal.children.top_of_live_screen();
-        let portal_scrollback = portal.vt.screen().scrollback();
+        let portal_top = content.children.top_of_live_screen();
+        let portal_scrollback = portal.view_offset as usize;
         crate::renderer::selection_range_from_abs(
             s.anchor_line,
             s.anchor_col,
@@ -268,8 +283,8 @@ fn render_portal_at<T: Renderer>(
             s.block_cols,
             portal_top,
             portal_scrollback,
-            portal.size_h as u16,
-            portal.size_w as u16,
+            content.size_h as u16,
+            content.size_w as u16,
         )
     });
     let portal_highlights: Option<Vec<crate::renderer::HighlightSpan>> =
@@ -280,14 +295,15 @@ fn render_portal_at<T: Renderer>(
             Some(crate::renderer::search_highlights_for_viewport(
                 o.matches,
                 o.current,
-                portal.children.top_of_live_screen(),
-                portal.vt.screen().scrollback(),
-                portal.size_h as u16,
+                content.children.top_of_live_screen(),
+                portal.view_offset as usize,
+                content.size_h as u16,
             ))
         });
     term_renderer.draw_screen_at(
         canvas,
-        portal.vt.screen(),
+        content.vt.screen(),
+        portal.view_offset as usize,
         ox_px,
         oy_px,
         focused_cursor,
@@ -324,16 +340,24 @@ fn render_portal_at<T: Renderer>(
     //    host's. Sub-portal `origin_x` / anchor row are in cells from
     //    the parent portal's top-left, so pixel origin is
     //    `(ox_px, oy_px)` plus the cell offset.
-    let portal_scrollback = portal.vt.screen().scrollback();
-    let sub_top = portal.children.top_of_live_screen();
-    let sub_scrollback = portal.vt.screen().scrollback();
+    let portal_scrollback = portal.view_offset as usize;
+    let sub_top = content.children.top_of_live_screen();
+    let sub_scrollback = portal.view_offset as usize;
 
     let mut layers: Vec<(i32, u64, Layer<'_>)> = Vec::new();
-    for el in portal.vge.state.top_level_sorted() {
+    for el in content.vge.state.top_level_sorted() {
         layers.push((el.draw_order, el.creation_seq, Layer::Vge(el)));
     }
-    for sub in portal.children.state.current().portals.values() {
-        layers.push((sub.draw_order, sub.creation_seq, Layer::Portal(sub)));
+    let sub_set = content.children.state.current();
+    for sub in sub_set.portals.values() {
+        let Some(sub_content) = sub_set.contents.get(&sub.content) else {
+            continue;
+        };
+        layers.push((
+            sub.draw_order,
+            sub.creation_seq,
+            Layer::Portal(sub, sub_content),
+        ));
     }
     // `top_level_sorted` already returns elements in (draw_order,
     // creation_seq) order, but we re-sort the merged list to interleave
@@ -352,16 +376,16 @@ fn render_portal_at<T: Renderer>(
                 vge::render::render_one_top_level(
                     canvas,
                     term_renderer,
-                    &portal.vge.state,
+                    &content.vge.state,
                     el,
-                    portal.vge.top_of_live_screen(),
-                    portal.size_h as u16,
+                    content.vge.top_of_live_screen(),
+                    content.size_h as u16,
                     portal_scrollback,
                     pick_ctx,
                 );
                 canvas.restore();
             }
-            Layer::Portal(sub) => {
+            Layer::Portal(sub, sub_content) => {
                 let next_sel = portal_selection.and_then(|s| {
                     let first = s.remaining_path.first().map(|s| s.as_str())?;
                     if first != sub.id.as_str() {
@@ -391,6 +415,7 @@ fn render_portal_at<T: Renderer>(
                     canvas,
                     term_renderer,
                     sub,
+                    sub_content,
                     ox_px,
                     oy_px,
                     sub_top,

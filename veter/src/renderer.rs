@@ -1729,10 +1729,16 @@ impl TerminalRenderer {
     /// rendering passes `None` because portal cursors are drawn
     /// separately by `prt::render` (so the unfocused-style policy
     /// from §9.2 can apply).
+    /// `scroll_offset` is the scrollback offset to read `screen` at, in
+    /// rows above the live region. For the host grid that is the grid's
+    /// own offset; for a PRT portal it is the *view's* offset, since two
+    /// forked views share one buffer and scroll independently — the
+    /// buffer itself stays live and never moves.
     pub fn draw_screen_at<T: Renderer>(
         &mut self,
         canvas: &mut Canvas<T>,
         screen: &vt100::Screen,
+        scroll_offset: usize,
         ox_px: f32,
         oy_px: f32,
         focused_cursor: Option<(u16, u16)>,
@@ -1765,7 +1771,7 @@ impl TerminalRenderer {
         // Cell backgrounds.
         for row in 0..rows {
             for col in 0..cols {
-                let cell = match screen.cell(row, col) {
+                let cell = match screen.cell_at(scroll_offset, row, col) {
                     Some(c) => c,
                     None => continue,
                 };
@@ -1809,7 +1815,7 @@ impl TerminalRenderer {
 
         for row in 0..rows {
             for col in 0..cols {
-                let cell = match screen.cell(row, col) {
+                let cell = match screen.cell_at(scroll_offset, row, col) {
                     Some(c) => c,
                     None => continue,
                 };
@@ -2008,6 +2014,8 @@ impl TerminalRenderer {
         self.draw_screen_at(
             canvas,
             screen,
+            // The host grid is not a view — it owns its own offset.
+            screen.scrollback(),
             0.0,
             0.0,
             focused_cursor,

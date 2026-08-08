@@ -312,24 +312,92 @@ impl Grid {
         self.scrollback.iter()
     }
 
+    /// Offset from the live grid's first row to the bottom-most row
+    /// whose text contains `needle`, or `None` if no row does.
+    ///
+    /// A live row gives `0..rows`; a row still held in the scrollback
+    /// ring gives a negative offset, `-1` being the row immediately
+    /// above the live grid. Added to
+    /// [`top_of_live_screen`](Self::top_of_live_screen) it is the
+    /// matched row's absolute line index, which is the coordinate space
+    /// scrollback-anchored consumers pin themselves to.
+    ///
+    /// The live rows are searched first and win outright: an
+    /// application that reprints its token every frame must anchor to
+    /// the copy on screen, not to an older one that has scrolled away.
+    ///
+    /// Read-only, and deliberately independent of `scrollback_offset`
+    /// — where the *user* has scrolled to is a property of the view and
+    /// must not change which row a marker names.
+    ///
+    /// Matching does not cross row boundaries, so a needle long enough
+    /// to soft-wrap can never be found; callers keep their markers
+    /// short.
+    pub fn last_row_offset_containing(&self, needle: &str) -> Option<i64> {
+        if needle.is_empty() {
+            return None;
+        }
+        let mut buf = String::new();
+        let mut contains = |row: &crate::row::Row| {
+            buf.clear();
+            // Full width rather than `self.size.cols`: a scrollback row
+            // predating a width change keeps the width it was written
+            // at, and `write_contents` stops at the row's own end.
+            row.write_contents(&mut buf, 0, u16::MAX, false);
+            buf.contains(needle)
+        };
+        // Counts down through the live rows to 0, then straight on into
+        // the negatives — the ring's last row is the one above row 0.
+        let mut offset = i64::try_from(self.rows.len()).unwrap_or(i64::MAX);
+        for row in self.rows.iter().rev() {
+            offset -= 1;
+            if contains(row) {
+                return Some(offset);
+            }
+        }
+        for row in self.scrollback.iter().rev() {
+            offset -= 1;
+            if contains(row) {
+                return Some(offset);
+            }
+        }
+        None
+    }
+
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
+        self.visible_rows_at(self.scrollback_offset)
+    }
+
+    /// [`visible_rows`](Self::visible_rows), but reading the grid as if
+    /// the scroll offset were `offset` rather than the grid's own.
+    ///
+    /// This is what lets two PRT views share one buffer at different
+    /// scroll positions: the offset is a property of the *view*, not of
+    /// the grid, so the read path takes it as an argument. A shared
+    /// buffer leaves its own `scrollback_offset` at 0 (always live) and
+    /// every view reads through here.
+    ///
+    /// `offset` is clamped to the ring's fill, so an out-of-range value
+    /// reads the oldest available rows rather than underflowing the
+    /// `skip` below.
+    pub fn visible_rows_at(
+        &self,
+        offset: usize,
+    ) -> impl Iterator<Item = &crate::row::Row> {
         let scrollback_len = self.scrollback.len();
+        let offset = offset.min(scrollback_len);
         let rows_len = self.rows.len();
         self.scrollback
             .iter()
-            .skip(scrollback_len - self.scrollback_offset)
-            // when scrollback_offset > rows_len (e.g. rows = 3,
+            .skip(scrollback_len - offset)
+            // when offset > rows_len (e.g. rows = 3,
             // scrollback_len = 10, offset = 9) the skip(10 - 9)
             // will take 9 rows instead of 3. we need to set
             // the upper bound to rows_len (e.g. 3)
             .take(rows_len)
-            // same for rows_len - scrollback_offset (e.g. 3 - 9).
+            // same for rows_len - offset (e.g. 3 - 9).
             // it'll panic with overflow. we have to saturate the subtraction.
-            .chain(
-                self.rows
-                    .iter()
-                    .take(rows_len.saturating_sub(self.scrollback_offset)),
-            )
+            .chain(self.rows.iter().take(rows_len.saturating_sub(offset)))
     }
 
     pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
@@ -344,6 +412,15 @@ impl Grid {
 
     pub fn visible_row(&self, row: u16) -> Option<&crate::row::Row> {
         self.visible_rows().nth(usize::from(row))
+    }
+
+    /// [`visible_row`](Self::visible_row) at an explicit view offset.
+    pub fn visible_row_at(
+        &self,
+        offset: usize,
+        row: u16,
+    ) -> Option<&crate::row::Row> {
+        self.visible_rows_at(offset).nth(usize::from(row))
     }
 
     pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row> {
@@ -365,6 +442,16 @@ impl Grid {
 
     pub fn visible_cell(&self, pos: Pos) -> Option<&crate::Cell> {
         self.visible_row(pos.row).and_then(|r| r.get(pos.col))
+    }
+
+    /// [`visible_cell`](Self::visible_cell) at an explicit view offset.
+    pub fn visible_cell_at(
+        &self,
+        offset: usize,
+        pos: Pos,
+    ) -> Option<&crate::Cell> {
+        self.visible_row_at(offset, pos.row)
+            .and_then(|r| r.get(pos.col))
     }
 
     pub fn drawing_cell(&self, pos: Pos) -> Option<&crate::Cell> {

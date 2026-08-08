@@ -60,11 +60,21 @@ impl Default for Limits {
 pub trait ScreenAnchor {
     /// Cursor row, 0-based, within the live screen.
     fn cursor_row(&self) -> u16;
-    /// The bottom-most live-screen row whose text contains `needle`,
-    /// 0-based. Searched from the bottom because the marker names the
-    /// *most recent* occurrence — an application that reprints its
-    /// token each frame must anchor to the latest one.
-    fn last_row_containing(&self, needle: &str) -> Option<u16>;
+    /// Offset from the top of the live screen to the bottom-most row
+    /// whose text contains `needle`. Searched from the bottom because
+    /// the marker names the *most recent* occurrence — an application
+    /// that reprints its token each frame must anchor to the latest
+    /// one.
+    ///
+    /// Negative reaches into scrollback (`-1` is the row just above the
+    /// live screen), which is what lets a marker that has already
+    /// scrolled off the screen still resolve to the row it named. A
+    /// long message reserving several regions scrolls its own earlier
+    /// markers away before the client that anchors to them ever runs;
+    /// without scrollback the first of them would resolve to nothing
+    /// and fall back to the viewport, landing on top of the text at the
+    /// top of the screen.
+    fn last_row_offset_containing(&self, needle: &str) -> Option<i64>;
 }
 
 impl<CB: vt100::Callbacks> ScreenAnchor for vt100::Parser<CB> {
@@ -72,18 +82,8 @@ impl<CB: vt100::Callbacks> ScreenAnchor for vt100::Parser<CB> {
         self.screen().cursor_position().0
     }
 
-    fn last_row_containing(&self, needle: &str) -> Option<u16> {
-        if needle.is_empty() {
-            return None;
-        }
-        let (_, cols) = self.screen().size();
-        let mut found = None;
-        for (row, text) in self.screen().rows(0, cols).enumerate() {
-            if text.contains(needle) {
-                found = Some(row as u16);
-            }
-        }
-        found
+    fn last_row_offset_containing(&self, needle: &str) -> Option<i64> {
+        self.screen().last_row_offset_containing(needle)
     }
 }
 
@@ -1503,6 +1503,14 @@ impl VgeEngine {
     /// lands where a default-anchored one would, which is visibly
     /// wrong-but-sane instead of silently off by an unpredictable
     /// amount.
+    ///
+    /// The marker base may be negative — a marker row that has scrolled
+    /// into scrollback still names its own line, and the whole point of
+    /// resolving to an absolute line is that the answer does not depend
+    /// on the row being on screen at the time. Anchoring above the live
+    /// screen needs nothing else: an element there is one the viewport
+    /// has already scrolled past, exactly as if it had been placed
+    /// earlier and left behind.
     fn anchor_from_origin(
         &self,
         origin: Point,
@@ -1513,7 +1521,7 @@ impl VgeEngine {
             (OriginAnchor::Viewport, _) | (_, None) => 0,
             (OriginAnchor::Cursor, Some(s)) => i64::from(s.cursor_row()),
             (OriginAnchor::Marker(needle), Some(s)) => {
-                s.last_row_containing(needle).map_or(0, i64::from)
+                s.last_row_offset_containing(needle).unwrap_or(0)
             }
         };
         let floor = origin.y.floor();

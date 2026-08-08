@@ -14,8 +14,8 @@
 use prt_protocol::apc::{ApcStream, TerminalEvent};
 use prt_protocol::codec::Reader;
 use prt_protocol::command::{
-    self, AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, UpdateOriginBody,
-    WritePortalBody,
+    self, AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody,
+    UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
@@ -27,8 +27,8 @@ use prt_protocol::envelope::{
 use prt_protocol::frame::*;
 
 use super::portal::{
-    Portal, PortalAnchor, PortalCallbacks, PortalSet, PolledStateCache, RawCallbackEvent,
-    RowDamage,
+    Portal, PortalAnchor, PortalCallbacks, PortalContent, PortalSet, PolledStateCache,
+    RawCallbackEvent, RowDamage,
 };
 
 /// Host-side caps published in the probe response (§2.1, §12).
@@ -174,8 +174,11 @@ impl PrtState {
                 FocusKind::Host => return chain,
                 FocusKind::Portal(id) => {
                     chain.push(id.as_str());
-                    match cur.current().portals.get(id.as_str()) {
-                        Some(p) => cur = &p.children.state,
+                    // Descent follows the *buffer*: sub-portals belong
+                    // to the content, so two views of one buffer see
+                    // the same children.
+                    match cur.current().content(id.as_str()) {
+                        Some(c) => cur = &c.children.state,
                         None => return chain,
                     }
                 }
@@ -508,9 +511,11 @@ impl PrtEngine {
         set: &mut PortalSet,
         out: &mut Vec<crate::vge::GpuImageId>,
     ) {
-        for portal in set.portals.values_mut() {
-            out.extend(portal.vge.take_pending_image_deletes());
-            out.extend(portal.children.take_all_pending_image_deletes());
+        // Per buffer, not per view: a forked buffer would otherwise
+        // surrender the same handles twice.
+        for content in set.contents_mut() {
+            out.extend(content.vge.take_pending_image_deletes());
+            out.extend(content.children.take_all_pending_image_deletes());
         }
     }
 
@@ -522,12 +527,12 @@ impl PrtEngine {
     pub fn take_subtree_for_destroy(&mut self) -> Vec<crate::vge::GpuImageId> {
         let mut deletes: Vec<crate::vge::GpuImageId> =
             std::mem::take(&mut self.pending_image_deletes);
-        for portal in self.state.main.portals.values_mut() {
-            deletes.extend(portal.drain_for_destroy());
+        for content in self.state.main.contents_mut() {
+            deletes.extend(content.drain_for_destroy());
         }
         if let Some(alt) = &mut self.state.alt {
-            for portal in alt.portals.values_mut() {
-                deletes.extend(portal.drain_for_destroy());
+            for content in alt.contents_mut() {
+                deletes.extend(content.drain_for_destroy());
             }
         }
         deletes
@@ -644,14 +649,14 @@ impl PrtEngine {
             return true;
         }
         let inner_bytes = {
-            let Some(portal) = self.state.current_mut().portals.get_mut(head) else {
+            let Some(content) = self.state.current_mut().content_mut(head) else {
                 return false;
             };
-            if !portal.children.emit_scroll_delta_for_path(&path[1..], delta) {
+            if !content.children.emit_scroll_delta_for_path(&path[1..], delta) {
                 return false;
             }
-            portal.children.flush_pending_events();
-            portal.children.take_responses()
+            content.children.flush_pending_events();
+            content.children.take_responses()
         };
         if !inner_bytes.is_empty() {
             self.emit_event(EVT_RAW_REPLY, raw_reply_body(head, &inner_bytes));
@@ -681,14 +686,14 @@ impl PrtEngine {
             return true;
         }
         let inner_bytes = {
-            let Some(portal) = self.state.current_mut().portals.get_mut(head) else {
+            let Some(content) = self.state.current_mut().content_mut(head) else {
                 return false;
             };
-            if !portal.children.emit_scroll_set_for_path(&path[1..], offset) {
+            if !content.children.emit_scroll_set_for_path(&path[1..], offset) {
                 return false;
             }
-            portal.children.flush_pending_events();
-            portal.children.take_responses()
+            content.children.flush_pending_events();
+            content.children.take_responses()
         };
         if !inner_bytes.is_empty() {
             self.emit_event(EVT_RAW_REPLY, raw_reply_body(head, &inner_bytes));
@@ -730,13 +735,13 @@ impl PrtEngine {
             .collect();
         for id in portal_ids {
             let bundle = {
-                let Some(portal) = self.state.current_mut().portals.get_mut(&id) else {
+                let Some(content) = self.state.current_mut().content_mut(&id) else {
                     continue;
                 };
-                portal.vft.drive();
-                portal.children.drive_and_flush_vft();
-                let mut b = portal.vft.take_responses();
-                b.extend_from_slice(&portal.children.take_responses());
+                content.vft.drive();
+                content.children.drive_and_flush_vft();
+                let mut b = content.vft.take_responses();
+                b.extend_from_slice(&content.children.take_responses());
                 b
             };
             if !bundle.is_empty() {
@@ -790,12 +795,14 @@ impl PrtEngine {
             // dropped.
         } else if !now_alt && self.state.on_alt() {
             if let Some(mut dropped) = self.state.leave_alt_screen() {
-                for (id, mut portal) in dropped.portals.drain() {
+                for mut content in dropped.drain_contents() {
                     self.pending_image_deletes
-                        .extend(portal.drain_for_destroy());
+                        .extend(content.drain_for_destroy());
+                }
+                for id in dropped.portals.keys() {
                     self.emit_event(
                         EVT_PORTAL_EVICTED,
-                        portal_evicted_body(&id, EVICT_ALT_SWAP),
+                        portal_evicted_body(id, EVICT_ALT_SWAP),
                     );
                 }
             }
@@ -823,12 +830,11 @@ impl PrtEngine {
         {
             return;
         }
-        let drained: Vec<(String, Portal)> =
-            self.state.current_mut().portals.drain().collect();
-        let ids: Vec<String> = drained.iter().map(|(id, _)| id.clone()).collect();
-        for (_, mut portal) in drained {
+        let ids: Vec<String> =
+            self.state.current_mut().portals.drain().map(|(id, _)| id).collect();
+        for mut content in self.state.current_mut().drain_contents() {
             self.pending_image_deletes
-                .extend(portal.drain_for_destroy());
+                .extend(content.drain_for_destroy());
         }
         for id in &ids {
             self.emit_event(
@@ -860,9 +866,11 @@ impl PrtEngine {
             })
             .collect();
         for id in to_drop {
-            if let Some(mut portal) = self.state.current_mut().portals.remove(&id) {
+            // Only the last view of a buffer tears it down; dropping one
+            // view of a forked pair leaves the survivor working.
+            if let Some(mut content) = self.state.current_mut().remove_view(&id) {
                 self.pending_image_deletes
-                    .extend(portal.drain_for_destroy());
+                    .extend(content.drain_for_destroy());
             }
             self.emit_event(
                 EVT_PORTAL_EVICTED,
@@ -889,9 +897,11 @@ impl PrtEngine {
             })
             .collect();
         for id in to_drop {
-            if let Some(mut portal) = self.state.current_mut().portals.remove(&id) {
+            // Only the last view of a buffer tears it down; dropping one
+            // view of a forked pair leaves the survivor working.
+            if let Some(mut content) = self.state.current_mut().remove_view(&id) {
                 self.pending_image_deletes
-                    .extend(portal.drain_for_destroy());
+                    .extend(content.drain_for_destroy());
             }
             self.emit_event(
                 EVT_PORTAL_EVICTED,
@@ -923,9 +933,11 @@ impl PrtEngine {
             })
             .collect();
         for id in to_evict {
-            if let Some(mut portal) = self.state.current_mut().portals.remove(&id) {
+            // Only the last view of a buffer tears it down; dropping one
+            // view of a forked pair leaves the survivor working.
+            if let Some(mut content) = self.state.current_mut().remove_view(&id) {
                 self.pending_image_deletes
-                    .extend(portal.drain_for_destroy());
+                    .extend(content.drain_for_destroy());
             }
             self.emit_event(
                 EVT_PORTAL_EVICTED,
@@ -1059,6 +1071,7 @@ impl PrtEngine {
             Command::SetPortalScrollback { id, lines } => {
                 self.cmd_set_portal_scrollback(&id, lines)
             }
+            Command::ForkPortal(b) => self.cmd_fork_portal(b),
         }
     }
 
@@ -1167,16 +1180,14 @@ impl PrtEngine {
 
         let set = self.state.current_mut();
         let creation_seq = set.next_seq();
-        let portal = Portal {
-            id: b.id.clone(),
+        // A plain CreatePortal makes a buffer and the single view onto
+        // it. `ForkPortal` (§6.9) is the path that adds a second view to
+        // an existing buffer instead of allocating a new one.
+        let content = PortalContent {
             size_w: b.size_w,
             size_h: b.size_h,
-            origin_x: b.origin_x,
-            anchor,
-            is_visible: b.is_visible,
-            draw_order: b.draw_order,
-            creation_seq,
             scrollback_lines: scrollback as u32,
+            views: 1,
             vt,
             children: child_engine,
             vge: portal_vge,
@@ -1189,17 +1200,94 @@ impl PrtEngine {
             last_damage_eval: None,
             pending_cursor_queries: 0,
         };
+        let content_id = set.insert_content(content);
+        let portal = Portal {
+            id: b.id.clone(),
+            content: content_id,
+            origin_x: b.origin_x,
+            anchor,
+            is_visible: b.is_visible,
+            draw_order: b.draw_order,
+            creation_seq,
+            view_offset: 0,
+        };
         set.portals.insert(b.id, portal);
         Ok(Vec::new())
     }
 
-    fn cmd_delete_portal(&mut self, id: &str) -> Result<Vec<u8>, (u16, &'static str)> {
-        let mut portal = match self.state.current_mut().portals.remove(id) {
-            Some(p) => p,
-            None => return Err((ERR_UNKNOWN_PORTAL, "id not found")),
+    /// §6.9 — add a second view onto `src_id`'s buffer.
+    ///
+    /// No new grid, no new engines, no nesting-depth cost: the buffer
+    /// and its whole sub-portal subtree already exist and are simply
+    /// referenced once more. What the new view gets of its own is a
+    /// position, a draw order, visibility and a scroll offset.
+    ///
+    /// Forking is symmetric on purpose. The result is two peers with no
+    /// notion of which came first, so writes through either reach the
+    /// same buffer and deleting either leaves the other fully working
+    /// (`cmd_delete_portal`).
+    fn cmd_fork_portal(
+        &mut self,
+        b: ForkPortalBody,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        // Validate before mutating: failures leave the table untouched.
+        let content_id = {
+            let set = self.state.current();
+            if set.portals.contains_key(&b.new_id) {
+                return Err((ERR_DUPLICATE_ID, "id in use"));
+            }
+            if (set.portals.len() as u32) >= self.limits.max_portals {
+                return Err((ERR_TOO_MANY_PORTALS, "portal budget exhausted"));
+            }
+            let Some(src) = set.portals.get(&b.src_id) else {
+                return Err((ERR_UNKNOWN_PORTAL, "src id not found"));
+            };
+            src.content
         };
-        let deletes = portal.drain_for_destroy();
-        self.pending_image_deletes.extend(deletes);
+
+        let anchor = match b.anchor_mode {
+            AnchorMode::Live => PortalAnchor::Live {
+                origin_y: b.origin_y,
+            },
+            AnchorMode::Scrollback => PortalAnchor::Scrollback {
+                anchor_line: self.top_of_live_screen + i64::from(b.origin_y),
+            },
+        };
+
+        let set = self.state.current_mut();
+        let creation_seq = set.next_seq();
+        if let Some(content) = set.contents.get_mut(&content_id) {
+            content.views += 1;
+        }
+        set.portals.insert(
+            b.new_id.clone(),
+            Portal {
+                id: b.new_id,
+                content: content_id,
+                origin_x: b.origin_x,
+                anchor,
+                is_visible: b.is_visible,
+                draw_order: b.draw_order,
+                creation_seq,
+                // A fresh view starts at the live region regardless of
+                // where its peer is scrolled — the offset is per-view.
+                view_offset: 0,
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    fn cmd_delete_portal(&mut self, id: &str) -> Result<Vec<u8>, (u16, &'static str)> {
+        if !self.state.current().portals.contains_key(id) {
+            return Err((ERR_UNKNOWN_PORTAL, "id not found"));
+        }
+        // §6.2 — the buffer (and its sub-portal subtree) comes back only
+        // when this was its last view. Deleting one view of a forked
+        // pair drops the window, not the shell behind it.
+        if let Some(mut content) = self.state.current_mut().remove_view(id) {
+            let deletes = content.drain_for_destroy();
+            self.pending_image_deletes.extend(deletes);
+        }
         Ok(Vec::new())
     }
 
@@ -1216,11 +1304,13 @@ impl PrtEngine {
         {
             return Err((ERR_SIZE_OUT_OF_RANGE, "size exceeds cap"));
         }
+        // Geometry belongs to the buffer, not the view: there is one
+        // grid, so forked views necessarily share its dimensions and
+        // `UpdateSize` through either of them resizes both.
         let portal = self
             .state
             .current_mut()
-            .portals
-            .get_mut(id)
+            .content_mut(id)
             .ok_or((ERR_UNKNOWN_PORTAL, "id not found"))?;
         let changed = portal.size_w != new_w || portal.size_h != new_h;
         // A vertical resize moves the portal's live screen relative to
@@ -1308,11 +1398,10 @@ impl PrtEngine {
     }
 
     fn cmd_clear_all(&mut self) -> Result<Vec<u8>, (u16, &'static str)> {
-        let drained: Vec<(String, Portal)> =
-            self.state.current_mut().portals.drain().collect();
-        for (_, mut portal) in drained {
+        self.state.current_mut().portals.clear();
+        for mut content in self.state.current_mut().drain_contents() {
             self.pending_image_deletes
-                .extend(portal.drain_for_destroy());
+                .extend(content.drain_for_destroy());
         }
         Ok(Vec::new())
     }
@@ -1336,7 +1425,7 @@ impl PrtEngine {
     /// Suppressed on the alt screen for the same reason the event is
     /// (§8.10: full-screen TUIs run there and repaint constantly).
     fn portal_activity(
-        portal: &mut Portal,
+        portal: &mut PortalContent,
         committed_line: bool,
         min_interval: std::time::Duration,
     ) -> bool {
@@ -1396,11 +1485,14 @@ impl PrtEngine {
         // Read before the borrow scope below takes `self.state` mutably.
         let damage_min_interval = self.damage_min_interval;
         let (raw_events, old_cache, new_cache, reverse_bytes, activity) = {
+            // The whole write path acts on the buffer: bytes, engines,
+            // damage and cursor queries all belong to the content, so a
+            // write through either view of a forked pair lands once, in
+            // the one grid both of them show.
             let portal = self
                 .state
                 .current_mut()
-                .portals
-                .get_mut(&b.id)
+                .content_mut(&b.id)
                 .expect("contains_key checked above");
 
             // 1. Route through the portal's PRT ApcStream. Sub-portal
@@ -1728,21 +1820,23 @@ impl PrtEngine {
         id: &str,
         lines: u32,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
-        let portal = self
+        let (view, content) = self
             .state
             .current_mut()
-            .portals
-            .get_mut(id)
+            .split_mut(id)
             .ok_or((ERR_UNKNOWN_PORTAL, "id not found"))?;
-        portal.vt.screen_mut().set_scrollback(lines as usize);
-        let applied = portal.vt.screen().scrollback() as u32;
-        // Probe the actual history depth: ask vt100 to scroll past the
-        // end, read back the clamped value, then restore. Identical
-        // technique to `vge::state::measure_history` so we don't need
-        // to add a new vt100 accessor.
-        portal.vt.screen_mut().set_scrollback(usize::MAX);
-        let history_depth = portal.vt.screen().scrollback() as u32;
-        portal.vt.screen_mut().set_scrollback(applied as usize);
+        // The offset belongs to *this view*, not to the buffer — which
+        // is exactly what lets two forked views sit at different scroll
+        // positions over one shell. The buffer's own grid stays live and
+        // the render path reads it through `cell_at(view_offset, ..)`.
+        //
+        // History depth comes straight off the ring fill. The old code
+        // probed for it by scrolling to `usize::MAX` and reading the
+        // clamped value back, which is no longer possible (nothing may
+        // move the shared grid) and was never necessary.
+        let history_depth = content.vt.screen().scrollback_fill() as u32;
+        let applied = lines.min(history_depth);
+        view.view_offset = applied;
 
         let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&applied.to_le_bytes());
@@ -1952,7 +2046,7 @@ mod tests {
         dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
         // The depth-1 child engine answers a nested client's probe with
         // slot 1 (green) — matching its portal VGE's `host.accent`.
-        let child = &mut engine.state.current_mut().portals.get_mut("p").unwrap().children;
+        let child = &mut engine.state.current_mut().content_mut("p").unwrap().children;
         let parsed = dispatch_one(child, CMD_PROBE, 1, &[]);
         let (_, accent) = probe_vge_features_and_accent(&parsed.body);
         assert_eq!(accent, Some([0, 255, 0, 255]));
@@ -1966,16 +2060,16 @@ mod tests {
         // Depth-1 portal: its VGE engine resolves `host.accent` to slot 1.
         dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
         assert_eq!(
-            portal_accent_rgb(&engine.state.current().portals["p"].vge),
+            portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),
             (0.0, 1.0, 0.0),
         );
 
         // Depth-2 portal: created inside p's child engine (which inherited
         // the palette) resolves `host.accent` to slot 2.
-        let child = &mut engine.state.current_mut().portals.get_mut("p").unwrap().children;
+        let child = &mut engine.state.current_mut().content_mut("p").unwrap().children;
         dispatch_one(child, CMD_CREATE_PORTAL, 1, &make_create_body("q", 40, 12));
         assert_eq!(
-            portal_accent_rgb(&child.state.current().portals["q"].vge),
+            portal_accent_rgb(&child.state.current().content("q").unwrap().vge),
             (0.0, 0.0, 1.0),
         );
     }
@@ -1988,11 +2082,14 @@ mod tests {
         assert_eq!(parsed.frame_type, RSP_OK);
         assert_eq!(parsed.request_id, 1);
         assert!(engine.state.current().portals.contains_key("p"));
-        let portal = &engine.state.current().portals["p"];
-        assert_eq!(portal.size_w, 80);
-        assert_eq!(portal.size_h, 24);
-        assert_eq!(portal.creation_seq, 0);
-        assert!(matches!(portal.anchor, PortalAnchor::Live { origin_y: 0 }));
+        let view = &engine.state.current().portals["p"];
+        assert_eq!(view.creation_seq, 0);
+        assert!(matches!(view.anchor, PortalAnchor::Live { origin_y: 0 }));
+        let content = engine.state.current().content("p").unwrap();
+        assert_eq!(content.size_w, 80);
+        assert_eq!(content.size_h, 24);
+        // A plain create makes exactly one view of one buffer.
+        assert_eq!(content.views, 1);
     }
 
     #[test]
@@ -2139,7 +2236,7 @@ mod tests {
         let body = encode::update_size_body("p", 100, 30);
         let parsed = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 2, &body);
         assert_eq!(parsed.frame_type, RSP_OK);
-        let portal = &engine.state.current().portals["p"];
+        let portal = engine.state.current().content("p").unwrap();
         assert_eq!(portal.size_w, 100);
         assert_eq!(portal.size_h, 30);
         assert_eq!(portal.vt.screen().size(), (30, 100));
@@ -2171,7 +2268,7 @@ mod tests {
             data: b"line\r\n".repeat(15),
         });
         let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 2, &body);
-        let portal = &engine.state.current().portals["p"];
+        let portal = engine.state.current().content("p").unwrap();
         let top_before = portal.vge.top_of_live_screen();
         assert_eq!(portal.vt.screen().cursor_position().0, 9);
 
@@ -2179,13 +2276,13 @@ mod tests {
         // scrollback.
         let body = encode::update_size_body("p", 20, 6);
         let _ = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 3, &body);
-        let portal = &engine.state.current().portals["p"];
+        let portal = engine.state.current().content("p").unwrap();
         assert_eq!(portal.vge.top_of_live_screen(), top_before + 4);
 
         // Grow back: the rows are pulled out again.
         let body = encode::update_size_body("p", 20, 10);
         let _ = dispatch_one(&mut engine, CMD_UPDATE_SIZE, 4, &body);
-        let portal = &engine.state.current().portals["p"];
+        let portal = engine.state.current().content("p").unwrap();
         assert_eq!(portal.vge.top_of_live_screen(), top_before);
     }
 
@@ -2608,6 +2705,230 @@ mod tests {
         frames.iter().find(|f| f.frame_type == code)
     }
 
+    // ---- §6.9 forked views ------------------------------------------
+
+    fn make_fork_body(src: &str, new: &str) -> Vec<u8> {
+        encode::fork_portal_body(&ForkPortalBody {
+            src_id: src.to_string(),
+            new_id: new.to_string(),
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+        })
+    }
+
+    /// Read row `row` of `id`'s buffer as this *view* sees it — i.e. at
+    /// the view's own scroll offset, which is the whole point.
+    fn view_row(engine: &PrtEngine, id: &str, row: u16) -> String {
+        let set = engine.state.current();
+        let view = &set.portals[id];
+        let content = set.content(id).unwrap();
+        let (_, cols) = content.vt.screen().size();
+        (0..cols)
+            .filter_map(|c| {
+                content
+                    .vt
+                    .screen()
+                    .cell_at(view.view_offset as usize, row, c)
+            })
+            .map(vt100::Cell::contents)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn fork_shares_one_buffer_between_two_views() {
+        let mut engine = PrtEngine::new();
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 20, 4));
+        let parsed = dispatch_one(&mut engine, CMD_FORK_PORTAL, 2, &make_fork_body("p", "p2"));
+        assert_eq!(parsed.frame_type, RSP_OK);
+
+        // Two views, one buffer, refcount 2.
+        let set = engine.state.current();
+        assert_eq!(set.portals.len(), 2);
+        assert_eq!(set.contents.len(), 1);
+        assert_eq!(set.portals["p"].content, set.portals["p2"].content);
+        assert_eq!(set.content("p").unwrap().views, 2);
+
+        // A write through *either* view lands in the one buffer, so both
+        // show it. This is what makes the peers equal rather than one
+        // being a copy of the other.
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p2".into(),
+            data: b"hello".to_vec(),
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+        assert_eq!(view_row(&engine, "p", 0), "hello");
+        assert_eq!(view_row(&engine, "p2", 0), "hello");
+    }
+
+    #[test]
+    fn forked_views_scroll_independently() {
+        let mut engine = PrtEngine::new();
+        // Needs a real scrollback ring — `make_create_body` asks for none.
+        let create = encode::create_portal_body(&CreatePortalBody {
+            id: "p".into(),
+            size_w: 20,
+            size_h: 3,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 100,
+        });
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &create);
+        dispatch_one(&mut engine, CMD_FORK_PORTAL, 2, &make_fork_body("p", "p2"));
+
+        // Push 10 lines through so there is history to scroll into.
+        let mut data = Vec::new();
+        for i in 0..10 {
+            data.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data,
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+
+        // Scroll only p2 back.
+        let body = encode::set_portal_scrollback_body("p2", 4);
+        let parsed = dispatch_one(&mut engine, CMD_SET_PORTAL_SCROLLBACK, 4, &body);
+        assert_eq!(parsed.frame_type, RSP_OK);
+        let mut r = Reader::new(&parsed.body);
+        assert_eq!(r.u32().unwrap(), 4, "applied offset");
+        assert!(r.u32().unwrap() >= 4, "history depth");
+
+        // p stays live, p2 shows older text — one grid, two positions.
+        assert_eq!(engine.state.current().portals["p"].view_offset, 0);
+        assert_eq!(engine.state.current().portals["p2"].view_offset, 4);
+        assert_ne!(view_row(&engine, "p", 0), view_row(&engine, "p2", 0));
+
+        // And the buffer itself never moved: it is always live, which is
+        // what keeps the two views from fighting over one offset.
+        assert_eq!(
+            engine.state.current().content("p").unwrap().vt.screen().scrollback(),
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_one_view_leaves_its_peer_working() {
+        let mut engine = PrtEngine::new();
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 20, 4));
+        dispatch_one(&mut engine, CMD_FORK_PORTAL, 2, &make_fork_body("p", "p2"));
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"before".to_vec(),
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+
+        // Drop the view that was created *first* — neither peer is
+        // privileged, so this must be survivable in either direction.
+        let parsed =
+            dispatch_one(&mut engine, CMD_DELETE_PORTAL, 4, &encode::delete_portal_body("p"));
+        assert_eq!(parsed.frame_type, RSP_OK);
+
+        let set = engine.state.current();
+        assert!(!set.portals.contains_key("p"));
+        assert_eq!(set.contents.len(), 1, "buffer outlives the dropped view");
+        assert_eq!(set.content("p2").unwrap().views, 1);
+        // Content is intact, and the survivor still accepts writes.
+        assert_eq!(view_row(&engine, "p2", 0), "before");
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p2".into(),
+            data: b"\r\nafter".to_vec(),
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 5, &body);
+        assert_eq!(view_row(&engine, "p2", 1), "after");
+    }
+
+    #[test]
+    fn deleting_the_last_view_tears_the_buffer_down() {
+        let mut engine = PrtEngine::new();
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 20, 4));
+        dispatch_one(&mut engine, CMD_FORK_PORTAL, 2, &make_fork_body("p", "p2"));
+        let _ = dispatch_one(&mut engine, CMD_DELETE_PORTAL, 3, &encode::delete_portal_body("p"));
+        assert_eq!(engine.state.current().contents.len(), 1);
+        let _ = dispatch_one(&mut engine, CMD_DELETE_PORTAL, 4, &encode::delete_portal_body("p2"));
+        assert!(engine.state.current().portals.is_empty());
+        assert!(
+            engine.state.current().contents.is_empty(),
+            "last view out frees the buffer"
+        );
+    }
+
+    #[test]
+    fn fork_rejects_unknown_source_and_duplicate_id() {
+        let mut engine = PrtEngine::new();
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 20, 4));
+
+        let parsed =
+            dispatch_one(&mut engine, CMD_FORK_PORTAL, 2, &make_fork_body("nope", "p2"));
+        assert_eq!(parsed.frame_type, RSP_ERR);
+        let mut r = Reader::new(&parsed.body);
+        assert_eq!(r.u16().unwrap(), ERR_UNKNOWN_PORTAL);
+
+        let parsed = dispatch_one(&mut engine, CMD_FORK_PORTAL, 3, &make_fork_body("p", "p"));
+        assert_eq!(parsed.frame_type, RSP_ERR);
+        let mut r = Reader::new(&parsed.body);
+        assert_eq!(r.u16().unwrap(), ERR_DUPLICATE_ID);
+
+        // Both failures were atomic: still one view, one buffer, and the
+        // refcount was not bumped by the rejected fork.
+        let set = engine.state.current();
+        assert_eq!(set.portals.len(), 1);
+        assert_eq!(set.contents.len(), 1);
+        assert_eq!(set.content("p").unwrap().views, 1);
+    }
+
+    #[test]
+    fn snapshot_round_trip_keeps_views_sharing_one_buffer() {
+        let mut a = PrtEngine::new();
+        dispatch_one(&mut a, CMD_CREATE_PORTAL, 1, &make_create_body("p", 20, 4));
+        dispatch_one(&mut a, CMD_FORK_PORTAL, 2, &make_fork_body("p", "p2"));
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"shared".to_vec(),
+        });
+        let _ = dispatch_one(&mut a, CMD_WRITE_PORTAL, 3, &body);
+        let _ = dispatch_one(
+            &mut a,
+            CMD_SET_PORTAL_SCROLLBACK,
+            4,
+            &encode::set_portal_scrollback_body("p2", 0),
+        );
+
+        let bytes = a.binary_snapshot();
+        let mut b = PrtEngine::new();
+        b.restore_from_binary_snapshot(&bytes).unwrap();
+
+        // The sharing graph survived: serializing each view's buffer
+        // inline would have produced two grids that diverge on the next
+        // write.
+        let set = b.state.current();
+        assert_eq!(set.portals.len(), 2);
+        assert_eq!(set.contents.len(), 1, "one buffer, not two");
+        assert_eq!(set.portals["p"].content, set.portals["p2"].content);
+        assert_eq!(set.content("p").unwrap().views, 2, "refcount recomputed");
+        assert_eq!(view_row(&b, "p", 0), "shared");
+        assert_eq!(view_row(&b, "p2", 0), "shared");
+
+        // Still one buffer after the round trip, so a write through one
+        // view is still visible through the other.
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p2".into(),
+            data: b"\r\nagain".to_vec(),
+        });
+        let _ = dispatch_one(&mut b, CMD_WRITE_PORTAL, 5, &body);
+        assert_eq!(view_row(&b, "p", 1), "again");
+    }
+
     fn event_count(frames: &[ParsedFrame], code: u8) -> usize {
         frames.iter().filter(|f| f.frame_type == code).count()
     }
@@ -2621,7 +2942,7 @@ mod tests {
         assert_eq!(frames[0].frame_type, RSP_OK);
         assert_eq!(frames.len(), 1, "no events for plain text");
 
-        let portal = &engine.state.current().portals["p"];
+        let portal = engine.state.current().content("p").unwrap();
         let cell = portal.vt.screen().cell(0, 0).unwrap();
         assert_eq!(cell.contents(), "h");
         let cell = portal.vt.screen().cell(0, 4).unwrap();
@@ -3064,7 +3385,7 @@ mod tests {
         assert_eq!(inner_rid, 42);
 
         // Sub-portal must live in outer.children.
-        let outer = &engine.state.current().portals["outer"];
+        let outer = engine.state.current().content("outer").unwrap();
         assert!(outer.children.state.current().portals.contains_key("inner"));
     }
 
@@ -3372,7 +3693,7 @@ mod tests {
         });
         let _ = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
 
-        let outer = &engine.state.current().portals["outer"];
+        let outer = engine.state.current().content("outer").unwrap();
         assert!(outer.children.state.current().portals.contains_key("inner"));
 
         // Now feed RIS into the outer portal — sub-portals should die.
@@ -3383,7 +3704,7 @@ mod tests {
         let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 3, &body);
 
         // Outer's children scope is wiped.
-        let outer = &engine.state.current().portals["outer"];
+        let outer = engine.state.current().content("outer").unwrap();
         assert!(outer.children.state.current().portals.is_empty());
 
         // Outer Ok + RawReply containing the inner-engine's t2c
@@ -3531,8 +3852,7 @@ mod tests {
         engine
             .state
             .current_mut()
-            .portals
-            .get_mut("A")
+            .content_mut("A")
             .unwrap()
             .children
             .state
@@ -4019,10 +4339,11 @@ mod tests {
         let bytes2 = b.binary_snapshot();
         assert_eq!(bytes1, bytes2);
 
-        let portal = &b.state.current().portals["p1"];
+        let view = &b.state.current().portals["p1"];
+        assert!(matches!(view.anchor, PortalAnchor::Live { origin_y: 0 }));
+        let portal = b.state.current().content("p1").unwrap();
         assert_eq!(portal.size_w, 24);
         assert_eq!(portal.size_h, 8);
-        assert!(matches!(portal.anchor, PortalAnchor::Live { origin_y: 0 }));
         // vt100 state survived — first row contains "hello".
         let row0: String = (0..5)
             .filter_map(|c| portal.vt.screen().cell(0, c))
@@ -4059,7 +4380,7 @@ mod tests {
 
         // Sanity: the outer portal has one child.
         assert!(
-            a.state.current().portals["outer"]
+            a.state.current().content("outer").unwrap()
                 .children
                 .state
                 .current()
@@ -4074,9 +4395,9 @@ mod tests {
         assert_eq!(bytes1, bytes2);
 
         // Nested structure survived.
-        let outer = &b.state.current().portals["outer"];
+        let outer = b.state.current().content("outer").unwrap();
         assert!(outer.children.state.current().portals.contains_key("inner"));
-        let inner = &outer.children.state.current().portals["inner"];
+        let inner = outer.children.state.current().content("inner").unwrap();
         assert_eq!(inner.size_w, 10);
         assert_eq!(inner.size_h, 4);
     }

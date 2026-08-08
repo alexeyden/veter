@@ -5,6 +5,8 @@
 //! prefix key is **Ctrl+Space**. After pressing it once:
 //!
 //!   v  split the focused pane vertically (new pane to the right)
+//!   V  split into a second *view* of the focused pane: one shell,
+//!      two independently scrollable halves (PRT §6.9)
 //!   h  split horizontally (new pane below)
 //!   x  close the focused pane
 //!   r  rename the focused pane (modal edit window)
@@ -42,8 +44,8 @@ use nix::unistd::{chdir, execvp, tcgetpgrp, Pid};
 use prt_protocol::apc::ApcStream as PrtApcStream;
 use prt_protocol::codec::Reader as PrtReader;
 use prt_protocol::command::{
-    AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, UpdateOriginBody,
-    WritePortalBody,
+    AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, ForkPortalBody,
+    UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
@@ -864,6 +866,19 @@ struct PaneScroll {
     csi_buf: Vec<u8>,
 }
 
+/// Where a pane's keystrokes go, and who owns the child process.
+///
+/// A mirror pane (PRT §6.9 `ForkPortal`) is a second *view* of another
+/// pane's buffer: it has no shell of its own, so input, `TIOCSWINSZ`
+/// and pty reads all route through the peer that owns the PTY. Which
+/// peer that is carries no meaning beyond bookkeeping — the protocol
+/// treats the views as equal, and `close_pane` hands the PTY to a
+/// survivor when the current owner goes away.
+enum PaneIo {
+    Owned(PanePty),
+    Peer(String),
+}
+
 struct Pane {
     /// Stable default label, equal to the portal id (`p1`, `p2`, …).
     /// Never mutated after construction; renames live in `manual_title`
@@ -880,7 +895,7 @@ struct Pane {
     /// case the program only sets the icon name (rare, but mutt and a
     /// couple of others do it).
     osc_icon: Option<String>,
-    pty: PanePty,
+    io: PaneIo,
     /// Most recent host-cell rect this pane was laid out in. Used to
     /// detect "actually changed" and skip redundant PRT updates.
     last_rect: Option<PaneRect>,
@@ -914,14 +929,31 @@ struct Pane {
 }
 
 impl Pane {
-    /// Effective display title, highest precedence first.
-    fn effective_title(&self) -> &str {
-        self.manual_title
-            .as_deref()
-            .or(self.osc_title.as_deref())
-            .or(self.osc_icon.as_deref())
-            .unwrap_or(&self.title)
+    /// The pane that owns this one's PTY: itself, or its peer.
+    fn pty_owner(&self) -> &str {
+        match &self.io {
+            PaneIo::Owned(_) => &self.title,
+            PaneIo::Peer(owner) => owner,
+        }
     }
+
+    /// This pane's own PTY, if it has one. `None` for a mirror view —
+    /// callers that need the shell should go through
+    /// [`State::pty_mut`] so the lookup follows the peer link.
+    fn own_pty_mut(&mut self) -> Option<&mut PanePty> {
+        match &mut self.io {
+            PaneIo::Owned(p) => Some(p),
+            PaneIo::Peer(_) => None,
+        }
+    }
+
+    fn own_pty(&self) -> Option<&PanePty> {
+        match &self.io {
+            PaneIo::Owned(p) => Some(p),
+            PaneIo::Peer(_) => None,
+        }
+    }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -976,6 +1008,10 @@ const MODAL_IDS: ModalIds<'static> = ModalIds {
     thumb: MODAL_THUMB_ID,
 };
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
+/// Cap on the window title we hand the host, in characters. A pane's
+/// OSC title is whatever the inner program said; the host clamps too,
+/// but there's no point putting a kilobyte on the wire.
+const WINDOW_TITLE_MAX: usize = 256;
 /// Floor on the per-tab label width when the bar is crowded. Labels
 /// shrink uniformly to reclaim space but never below this many columns
 /// (one narrow glyph + `…`); past that the bar scrolls instead. A label
@@ -998,6 +1034,24 @@ const SEPARATORS_ELEMENT_ID: &str = "vmux-separators";
 /// had to be cut. `max` is expected to be at least [`TABBAR_MIN_LABEL`].
 fn elide_tab_label(label: &str, max: usize) -> String {
     vge_ui::measure::elide(label, max)
+}
+
+/// OSC 2 (set window title) for `title`, the sequence every terminal
+/// already understands — vmux tells the host what the window should say
+/// exactly the way a shell would.
+///
+/// Control characters are dropped rather than escaped: the payload runs
+/// until its terminator, so a BEL or ESC inside a pane's OSC title would
+/// cut the sequence short (or start a new one) on the host's parser.
+/// BEL-terminated because that is what the programs setting these titles
+/// emit; both forms are accepted everywhere.
+fn window_title_osc(title: &str) -> Vec<u8> {
+    let clean: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(WINDOW_TITLE_MAX)
+        .collect();
+    format!("\x1b]2;{clean}\x07").into_bytes()
 }
 
 /// Largest uniform label-column cap that still lets every tab fit on
@@ -1614,6 +1668,7 @@ fn help_modal() -> &'static ScrollModal {
             "Pane".into(),
             "  v        split focused pane vertically".into(),
             "  h        split focused pane horizontally".into(),
+            "  V / H    second view of this pane (shared shell)".into(),
             "  ←↑↓→    move focus to the pane in that direction".into(),
             "  x        close focused pane".into(),
             "  r        rename focused pane".into(),
@@ -1791,6 +1846,8 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "move-pane", aliases: &[], args: "[TAB#] [PANE#]", summary: "move a pane to another tab" },
     CommandSpec { name: "split-v", aliases: &[], args: "", summary: "split focused pane vertically" },
     CommandSpec { name: "split-h", aliases: &[], args: "", summary: "split focused pane horizontally" },
+    CommandSpec { name: "mirror-v", aliases: &["mirror"], args: "", summary: "second view of this pane, side by side" },
+    CommandSpec { name: "mirror-h", aliases: &[], args: "", summary: "second view of this pane, stacked" },
     CommandSpec { name: "zoom", aliases: &[], args: "", summary: "toggle zoom on the focused pane" },
     CommandSpec { name: "swap-prev", aliases: &["swap-pane-prev"], args: "", summary: "swap focused pane with the previous one" },
     CommandSpec { name: "swap-next", aliases: &["swap-pane-next"], args: "", summary: "swap focused pane with the next one" },
@@ -1961,6 +2018,8 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
             Ok(out)
         }
         "split-h" => state.split(SplitDir::Horizontal),
+        "mirror-v" | "mirror" => state.split_mirror(SplitDir::Vertical),
+        "mirror-h" => state.split_mirror(SplitDir::Horizontal),
         "new-tab" => {
             let mut out = state.new_tab()?;
             if !args.is_empty() {
@@ -2130,6 +2189,148 @@ struct ResizeDrag {
     bounds: PaneRect,
 }
 
+/// Pane-to-PTY plumbing for mirror views (PRT §6.9).
+///
+/// `Pane.title` is the pane id and never changes, so it doubles as the
+/// key in every lookup here.
+impl State {
+    /// Resolve `id` to the pane that owns its PTY — itself for an
+    /// ordinary pane, its peer for a mirror view.
+    fn pty_owner(&self, id: &str) -> Option<String> {
+        Some(self.panes.get(id)?.pty_owner().to_string())
+    }
+
+    /// The PTY behind `id`, following the peer link for a mirror view.
+    fn pty_mut(&mut self, id: &str) -> Option<&mut PanePty> {
+        let owner = self.pty_owner(id)?;
+        self.panes.get_mut(&owner)?.own_pty_mut()
+    }
+
+    /// Every pane sharing `id`'s buffer, `id` included. These are the
+    /// views the host holds against one `PortalContent`.
+    fn peer_group(&self, id: &str) -> Vec<String> {
+        let Some(owner) = self.pty_owner(id) else {
+            return Vec::new();
+        };
+        self.panes
+            .iter()
+            .filter(|(_, p)| p.pty_owner() == owner)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Effective display title for a pane, highest precedence first.
+    ///
+    /// The name describes the *shell*, not the window onto it: OSC 0/1/2
+    /// come from the inner program and a rename names what's running. So
+    /// both views of a mirrored pair (§6.9) show the same title, resolved
+    /// through the peer that owns the PTY.
+    ///
+    /// The id fallback stays per-view, so two unnamed halves read as
+    /// `p1` / `p2` and remain separately addressable — and the halves are
+    /// still told apart by the scroll indicator, which *is* per-view.
+    fn effective_title_for(&self, id: &str) -> String {
+        let Some(pane) = self.panes.get(id) else {
+            return id.to_string();
+        };
+        let named = self.panes.get(pane.pty_owner()).unwrap_or(pane);
+        named
+            .manual_title
+            .as_deref()
+            .or(named.osc_title.as_deref())
+            .or(named.osc_icon.as_deref())
+            .unwrap_or(&pane.title)
+            .to_string()
+    }
+
+    /// True when `id` is a mirror view rather than a pane with a shell.
+    fn is_mirror(&self, id: &str) -> bool {
+        self.panes
+            .get(id)
+            .is_some_and(|p| matches!(p.io, PaneIo::Peer(_)))
+    }
+
+    /// Move `leaving`'s PTY to one of its peers, if it owns one and any
+    /// peer remains. No-op for an ordinary pane, which is the case that
+    /// must keep behaving exactly as before: its shell dies with it.
+    ///
+    /// Which peer inherits is arbitrary — that is what "the views are
+    /// equal" means. The remaining peers are repointed at the new owner
+    /// so the group stays flat.
+    fn handover_pty(&mut self, leaving: &str) {
+        if !matches!(
+            self.panes.get(leaving).map(|p| &p.io),
+            Some(PaneIo::Owned(_))
+        ) {
+            return;
+        }
+        // Snapshot the group first: once `leaving` stops being the
+        // owner, the other peers still point at it and would no longer
+        // resolve into the heir's group.
+        let group = self.peer_group(leaving);
+        let Some(heir) = group.iter().find(|id| *id != leaving).cloned() else {
+            return;
+        };
+        let Some(pty) = self
+            .panes
+            .get_mut(leaving)
+            .and_then(|p| match std::mem::replace(&mut p.io, PaneIo::Peer(heir.clone())) {
+                PaneIo::Owned(pty) => Some(pty),
+                PaneIo::Peer(_) => None,
+            })
+        else {
+            return;
+        };
+        if let Some(p) = self.panes.get_mut(&heir) {
+            p.io = PaneIo::Owned(pty);
+        }
+        for id in group {
+            if id == heir {
+                continue;
+            }
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.io = PaneIo::Peer(heir.clone());
+            }
+        }
+    }
+
+    /// The grid size one buffer must take when several views show it:
+    /// the smallest visible view wins.
+    ///
+    /// This is Konsole's `Session::updateTerminalSize` rule. Views that
+    /// aren't in `rects` are on another tab and excluded — otherwise a
+    /// mirror left on a background tab would hold the live pane down to
+    /// its size. `own_*` is the caller's own rect, used when the pane
+    /// has no peers (the overwhelmingly common case, and the path that
+    /// must stay allocation-free-ish and behave exactly as before).
+    fn peer_group_grid(
+        &self,
+        id: &str,
+        rects: &HashMap<String, PaneRect>,
+        own_cols: u32,
+        own_rows: u32,
+    ) -> (u32, u32) {
+        let group = self.peer_group(id);
+        if group.len() < 2 {
+            return (own_cols, own_rows);
+        }
+        let mut cols = own_cols;
+        let mut rows = own_rows;
+        for peer in group {
+            let Some(rect) = rects.get(&peer) else {
+                continue;
+            };
+            let (r, c) = inner_grid_for(*rect);
+            cols = cols.min(c);
+            rows = rows.min(r);
+        }
+        // A degenerate rect must never collapse the shell to nothing;
+        // Konsole floors this at 2 for the same reason (a view that
+        // hasn't been laid out yet reports a garbage size).
+        (cols.max(2), rows.max(2))
+    }
+}
+
 struct State {
     panes: HashMap<String, Pane>,
     tabs: Vec<Tab>,
@@ -2177,6 +2378,10 @@ struct State {
     /// `Some` while the user is dragging a split divider with the mouse.
     /// All mouse events route to the drag until the button releases.
     resize_drag: Option<ResizeDrag>,
+    /// Active tab's title as last announced to the host via OSC 2, so a
+    /// relayout that leaves the label alone (a resize, a split) doesn't
+    /// re-announce it. Empty before the first announcement.
+    window_title: String,
 }
 
 impl State {
@@ -2212,6 +2417,7 @@ impl State {
             next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
             session_name: None,
             resize_drag: None,
+            window_title: String::new(),
         };
         let (rows, cols) = inner_grid_for(s.full_bounds());
         let cell_px = s.cell_px();
@@ -2224,7 +2430,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
-                pty,
+                io: PaneIo::Owned(pty),
                 last_rect: None,
                 // Pre-record the inner size so the first `relayout_and_render`
                 // doesn't redundantly TIOCSWINSZ — that would fire SIGWINCH at
@@ -2293,6 +2499,48 @@ impl State {
         id
     }
 
+    /// Split the focused pane into a second *view* of the same shell —
+    /// PRT §6.9, and the thing Konsole's old split-view did.
+    ///
+    /// No new PTY: the pair share one buffer, so both show the same
+    /// output and both accept input, but each scrolls on its own. That
+    /// is the point — read a long transcript in one half while typing in
+    /// the other. Closing either leaves the other working.
+    fn split_mirror(&mut self, dir: SplitDir) -> Result<Vec<u8>> {
+        self.tabs[self.active_tab].zoomed = None;
+        let target = self.focus().to_string();
+        // Mirror the pane that owns the shell, so peers form one flat
+        // group rather than a chain of views pointing at each other.
+        let Some(owner) = self.pty_owner(&target) else {
+            return Ok(Vec::new());
+        };
+        let new_id = self.allocate_pane_id();
+        if !self.layout_mut().split_leaf(&target, dir, &new_id) {
+            return Ok(Vec::new());
+        }
+        self.panes.insert(
+            new_id.clone(),
+            Pane {
+                title: new_id.clone(),
+                manual_title: None,
+                osc_title: None,
+                osc_icon: None,
+                io: PaneIo::Peer(owner),
+                last_rect: None,
+                // Left as None so the first relayout emits ForkPortal;
+                // unlike a real pane there's no PTY to avoid SIGWINCHing,
+                // which is what the pre-recorded sizes are for.
+                last_inner: None,
+                last_winsize: None,
+                inner_mouse_protocol: 0,
+                scroll: None,
+                activity: false,
+            },
+        );
+        self.set_focus(new_id);
+        self.relayout_and_render()
+    }
+
     fn split(&mut self, dir: SplitDir) -> Result<Vec<u8>> {
         // Splitting while zoomed is meaningless — the user wouldn't see
         // the new sibling. Exit zoom first; the relayout below covers it.
@@ -2321,7 +2569,8 @@ impl State {
         let cwd = self
             .panes
             .get(&target)
-            .and_then(|p| pane_cwd(p.pty.raw_fd(), p.pty.child));
+            .and_then(Pane::own_pty)
+            .and_then(|p| pane_cwd(p.raw_fd(), p.child));
         let pty = PanePty::spawn(&new_id, rows as u16, cols as u16, cell_px, cwd.as_deref())?;
         self.panes.insert(
             new_id.clone(),
@@ -2330,7 +2579,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
-                pty,
+                io: PaneIo::Owned(pty),
                 last_rect: None,
                 last_inner: Some((cols, rows)),
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
@@ -2396,6 +2645,13 @@ impl State {
         // anyway, and we don't want a stale ack to resurrect state on
         // a freshly-allocated pane id (unlikely but cheap to defend).
         self.pending_scrolls.retain(|_, pid| pid != target);
+        // If this pane holds the shell for a mirror group, hand the PTY
+        // to a survivor before dropping it. The two views are equal on
+        // the wire, so closing either must be survivable — and dropping
+        // `PanePty` here would SIGHUP a shell the other view is still
+        // showing. Host-side the buffer is refcounted and outlives this
+        // `DeletePortal` on its own (§6.2).
+        self.handover_pty(target);
         let mut tab_idx: Option<usize> = None;
         for (i, tab) in self.tabs.iter().enumerate() {
             let mut leaves = Vec::new();
@@ -2635,7 +2891,8 @@ impl State {
         let cwd = self
             .panes
             .get(self.focus())
-            .and_then(|p| pane_cwd(p.pty.raw_fd(), p.pty.child));
+            .and_then(Pane::own_pty)
+            .and_then(|p| pane_cwd(p.raw_fd(), p.child));
         let pane_id = self.allocate_pane_id();
         let tab_title = self.allocate_tab_id();
         let new_tab = Tab {
@@ -2661,7 +2918,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
-                pty,
+                io: PaneIo::Owned(pty),
                 last_rect: None,
                 last_inner: Some((cols, rows)),
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
@@ -2776,11 +3033,7 @@ impl State {
             let mut leaves = Vec::new();
             tab.layout.collect_leaves(&mut leaves);
             for pane_id in leaves {
-                let label = self
-                    .panes
-                    .get(&pane_id)
-                    .map(|p| p.effective_title().to_string())
-                    .unwrap_or_else(|| pane_id.clone());
+                let label = self.effective_title_for(&pane_id);
                 let hint = format!("{tab_label} · {pane_id}");
                 let filter_key = format!("{label} {hint}").to_lowercase();
                 items.push(
@@ -2809,11 +3062,7 @@ impl State {
 
     /// Open the rename modal pre-filled with `pane_id`'s effective title.
     fn open_rename_pane(&mut self, pane_id: String) -> Vec<u8> {
-        let buffer = self
-            .panes
-            .get(&pane_id)
-            .map(|p| p.effective_title().to_string())
-            .unwrap_or_default();
+        let buffer = self.effective_title_for(&pane_id);
         self.mode = Mode::Rename {
             target: RenameTarget::Pane(pane_id),
             editor: LineEditor::new(buffer),
@@ -2835,10 +3084,19 @@ impl State {
     /// re-render its chrome plus the tab bar (the pane title can bubble up
     /// as the tab's auto-title).
     fn set_pane_title(&mut self, pane_id: &str, name: Option<String>) -> Vec<u8> {
-        if let Some(p) = self.panes.get_mut(pane_id) {
+        // One shell, one name: renaming either half of a mirrored pair
+        // renames what's running, so the two can't drift apart — and a
+        // rename typed into the mirror isn't silently dropped.
+        let group = self.peer_group(pane_id);
+        if let Some(owner) = self.pty_owner(pane_id)
+            && let Some(p) = self.panes.get_mut(&owner)
+        {
             p.manual_title = name.filter(|s| !s.is_empty());
         }
-        let mut out = self.render_one_chrome(pane_id);
+        let mut out = Vec::new();
+        for id in &group {
+            out.extend(self.render_one_chrome(id));
+        }
         out.extend(self.render_tabbar());
         out
     }
@@ -3042,18 +3300,39 @@ impl State {
             // Compute display title BEFORE borrowing pane mutably so we
             // don't fight the borrow checker over the `self.mode` read
             // inside `display_title_for`.
-            let pane_title_raw = self
-                .panes
-                .get(pane_id)
-                .map(|p| p.effective_title().to_string())
-                .unwrap_or_default();
+            let pane_title_raw = self.effective_title_for(pane_id);
             let display_title = self.display_title_for(pane_id, &pane_title_raw);
             let show_title = !single_pane || display_title != pane_title_raw;
             let scroll_ind = self.scroll_indicator_for(pane_id);
+            // Konsole's rule (`Session::updateTerminalSize`): one buffer
+            // behind N views must fit the smallest of them, and hidden
+            // views don't count — a mirror parked on a background tab
+            // must not shrink the pane you're working in.
+            let (cols, rows) = self.peer_group_grid(pane_id, &rects, cols, rows);
+            let mirror_of = match &self.panes[pane_id].io {
+                PaneIo::Peer(owner) => Some(owner.clone()),
+                PaneIo::Owned(_) => None,
+            };
             let pane = self.panes.get_mut(pane_id).expect("layout/panes mismatch");
 
             let create_portal = pane.last_rect.is_none();
-            if create_portal {
+            if create_portal && let Some(owner) = mirror_of {
+                // §6.9 — a second view of `owner`'s buffer. No size and
+                // no scrollback: there is one grid and it already exists.
+                prt_cmds.push((
+                    PrtCommand::ForkPortal(ForkPortalBody {
+                        src_id: owner,
+                        new_id: pane_id.clone(),
+                        origin_x: inner_x,
+                        origin_y: inner_y,
+                        anchor_mode: AnchorMode::Live,
+                        is_visible: true,
+                        draw_order: PORTAL_DRAW_ORDER,
+                        flags: 0,
+                    }),
+                    0,
+                ));
+            } else if create_portal {
                 prt_cmds.push((
                     PrtCommand::CreatePortal(CreatePortalBody {
                         id: pane_id.clone(),
@@ -3165,8 +3444,10 @@ impl State {
             // dimensions without touching the grid, and the inner
             // program needs that pushed too.
             let winsize = (cols, rows, cell_px.0, cell_px.1);
-            if pane.last_winsize != Some(winsize) {
-                pane.pty.resize(rows as u16, cols as u16, cell_px);
+            if pane.last_winsize != Some(winsize)
+                && let Some(pty) = pane.own_pty_mut()
+            {
+                pty.resize(rows as u16, cols as u16, cell_px);
             }
             pane.last_rect = Some(rect);
             pane.last_inner = Some((cols, rows));
@@ -3296,6 +3577,10 @@ impl State {
         if !vge_cmds.is_empty() {
             out.extend(build_vge_envelope(&vge_cmds));
         }
+        // The tab bar was just rebuilt above, so the window title the
+        // host shows may be stale — a tab switch, a rename or a focus
+        // move all land here.
+        out.extend(self.window_title_update());
         Ok(out)
     }
 
@@ -3566,12 +3851,9 @@ impl State {
         if !self.visible_panes.contains(pane_id) {
             return Vec::new();
         }
-        let (rect, title_raw) = match self.panes.get(pane_id) {
-            Some(pane) => match pane.last_rect {
-                Some(rect) => (rect, pane.effective_title().to_string()),
-                None => return Vec::new(),
-            },
-            None => return Vec::new(),
+        let title_raw = self.effective_title_for(pane_id);
+        let Some(rect) = self.panes.get(pane_id).and_then(|p| p.last_rect) else {
+            return Vec::new();
         };
         let display_title = self.display_title_for(pane_id, &title_raw);
         let scroll_ind = self.scroll_indicator_for(pane_id);
@@ -3634,11 +3916,14 @@ impl State {
             // Only use the pane's title when it's been customised
             // (manual rename or OSC). The default `pN` label would
             // bubble up as e.g. "p3" which is meaningless on a tab.
-            if pane.manual_title.is_some()
-                || pane.osc_title.is_some()
-                || pane.osc_icon.is_some()
+            // Read through the peer link, so focusing the mirror half
+            // of a pair bubbles the same name up as focusing the other.
+            let named = self.panes.get(pane.pty_owner()).unwrap_or(pane);
+            if named.manual_title.is_some()
+                || named.osc_title.is_some()
+                || named.osc_icon.is_some()
             {
-                return pane.effective_title().to_string();
+                return self.effective_title_for(&tab.focus);
             }
         }
         tab.title.clone()
@@ -3689,6 +3974,40 @@ impl State {
             .collect()
     }
 
+    /// Announce the active tab's title to the host as OSC 2, so the
+    /// window title follows the active tab the way Konsole's does.
+    /// Empty when it hasn't changed since the last announcement.
+    ///
+    /// Called wherever the tab bar is (re)built, which is exactly the
+    /// set of events that can change the label: focus moves, renames,
+    /// an inner program's OSC title, tab switches, tab close. The host
+    /// dresses it up (`"<title> — Veter"`); what vmux sends is the tab
+    /// label verbatim.
+    fn window_title_update(&mut self) -> Vec<u8> {
+        let title = self.window_title_for_tab(self.active_tab);
+        if title == self.window_title {
+            return Vec::new();
+        }
+        self.window_title = title;
+        window_title_osc(&self.window_title)
+    }
+
+    /// What tab `idx` should put in the window title: its effective
+    /// label, except when that is only the numeric default — "1" names
+    /// nothing outside the tab bar, and an empty title leaves the host
+    /// showing the bare application name, which is what a terminal
+    /// whose child never set a title shows anyway.
+    fn window_title_for_tab(&self, idx: usize) -> String {
+        let Some(tab) = self.tabs.get(idx) else {
+            return String::new();
+        };
+        let title = self.tab_effective_title(idx);
+        if tab.manual_title.is_none() && title == tab.title {
+            return String::new();
+        }
+        title
+    }
+
     /// Re-emit just the tab bar element. Used when an OSC title or a
     /// rename changes the active pane's effective title without
     /// otherwise affecting layout.
@@ -3717,7 +4036,9 @@ impl State {
         }
         cmds.push((VgeCommand::CreateElement(body), 0));
         self.tabbar_created = true;
-        build_vge_envelope(&cmds)
+        let mut out = build_vge_envelope(&cmds);
+        out.extend(self.window_title_update());
+        out
     }
 }
 
@@ -4410,12 +4731,24 @@ fn main() -> Result<()> {
         let read_panes = pending < OUT_HIGH_WATER;
         // Snapshot the pane fd ordering so we can map back to ids after
         // poll returns. (HashMap iteration is unstable; we capture once.)
-        let pane_ids: Vec<String> = state.panes.keys().cloned().collect();
+        // Only PTY owners: a mirror view has no shell of its own, so
+        // there is no fd to poll and nothing to read out of it. Its
+        // content arrives through its peer's `WritePortal`, because the
+        // host holds one buffer behind both views.
+        let pane_ids: Vec<String> = state
+            .panes
+            .iter()
+            .filter(|(_, p)| p.own_pty().is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
         let pane_base = fds.len();
         let pane_borroweds: Vec<BorrowedFd<'_>> = pane_ids
             .iter()
             .map(|id| {
-                let raw = state.panes[id].pty.raw_fd();
+                let raw = state.panes[id]
+                    .own_pty()
+                    .expect("pane_ids holds only PTY owners")
+                    .raw_fd();
                 unsafe { BorrowedFd::borrow_raw(raw) }
             })
             .collect();
@@ -4430,7 +4763,10 @@ fn main() -> Result<()> {
             if read_panes {
                 ev |= PollFlags::POLLIN;
             }
-            if state.panes[id].pty.wants_write() {
+            if state.panes[id]
+                .own_pty()
+                .is_some_and(PanePty::wants_write)
+            {
                 ev |= PollFlags::POLLOUT;
             }
             fds.push(PollFd::new(pane_borroweds[i], ev));
@@ -4503,13 +4839,16 @@ fn main() -> Result<()> {
             // a download chunk at network speed no longer stalls the loop,
             // so keystrokes and prefix commands stay responsive.
             if revents.contains(PollFlags::POLLOUT) {
-                if let Some(p) = state.panes.get_mut(pid) {
-                    p.pty.drain_out();
+                if let Some(p) = state.panes.get_mut(pid).and_then(Pane::own_pty_mut) {
+                    p.drain_out();
                 }
             }
 
             if read_panes && revents.contains(PollFlags::POLLIN) {
-                let raw = state.panes[pid].pty.raw_fd();
+                let raw = state.panes[pid]
+                    .own_pty()
+                    .expect("pane_ids holds only PTY owners")
+                    .raw_fd();
                 let n = match nix::unistd::read(raw, &mut rd_buf) {
                     Ok(n) => n,
                     Err(nix::errno::Errno::EINTR) => continue,
@@ -4716,9 +5055,9 @@ fn handle_stdin_chunk(
                 let id = br.string().unwrap_or("").to_string();
                 let data = br.bytes().unwrap_or(&[]).to_vec();
                 if !id.is_empty() {
-                    if let Some(p) = state.panes.get_mut(&id) {
+                    if let Some(p) = state.pty_mut(&id) {
                         dlog(&format!("rawreply>{id}"), &data);
-                        p.pty.enqueue(&data);
+                        p.enqueue(&data);
                     }
                 }
             } else if ft == EVT_TITLE_CHANGE || ft == EVT_ICON_NAME_CHANGE {
@@ -4737,6 +5076,10 @@ fn handle_stdin_chunk(
                         let new_value = if title.is_empty() { None } else { Some(title) };
                         if *slot != new_value {
                             *slot = new_value;
+                            // Every view of this shell shows the new
+                            // title, so all of them need repainting —
+                            // the event only names the one written to.
+                            titles_dirty.extend(state.peer_group(&id));
                             titles_dirty.insert(id);
                         }
                     }
@@ -5115,8 +5458,8 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         portal_row + 1,
         final_byte as char,
     );
-    if let Some(p) = state.panes.get_mut(&pane_id) {
-        p.pty.enqueue(payload.as_bytes());
+    if let Some(p) = state.pty_mut(&pane_id) {
+        p.enqueue(payload.as_bytes());
     }
     Ok(())
 }
@@ -5272,10 +5615,13 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     .position(|c| *c == prefix_byte())
                     .map(|p| idx + p)
                     .unwrap_or(bytes.len());
-                if let Some(pane) = state.panes.get_mut(&focus_id) {
+                // Typing in a mirror view reaches the shared shell:
+                // `pty_mut` follows the peer link, so both views are
+                // equally usable for input.
+                if let Some(pty) = state.pty_mut(&focus_id) {
                     dlog(&format!("key>{focus_id}"), &bytes[idx..stop]);
                     trace_vmux_to_pane(&focus_id, &bytes[idx..stop]);
-                    pane.pty.enqueue(&bytes[idx..stop]);
+                    pty.enqueue(&bytes[idx..stop]);
                 }
                 idx = stop;
             }
@@ -5353,6 +5699,10 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         // pane controls (lowercase)
         b'v' => state.split(SplitDir::Vertical),
         b'h' => state.split(SplitDir::Horizontal),
+        // Shifted twins of the split keys: same geometry, but the new
+        // pane is a second view of the same shell rather than a new one.
+        b'V' => state.split_mirror(SplitDir::Vertical),
+        b'H' => state.split_mirror(SplitDir::Horizontal),
         b'x' => state.close_focused(),
         b'z' => state.toggle_zoom(),
         b's' => state.enter_resize(),
@@ -5414,8 +5764,8 @@ fn handle_prefix_command(state: &mut State, b: u8) -> Result<Vec<u8>> {
         _ if b == prefix_byte() => {
             // Double-tap: forward a literal prefix byte to the focused pane.
             let focus_id = state.focus().to_string();
-            if let Some(pane) = state.panes.get_mut(&focus_id) {
-                pane.pty.enqueue(&[prefix_byte()]);
+            if let Some(pty) = state.pty_mut(&focus_id) {
+                pty.enqueue(&[prefix_byte()]);
             }
             Ok(Vec::new())
         }
@@ -6099,6 +6449,19 @@ mod tests {
         let num_widths = vec![3.0; 50];
         let cap = tabbar_label_cap(&labels, &num_widths, 80.0);
         assert_eq!(cap, TABBAR_MIN_LABEL);
+    }
+
+    #[test]
+    fn window_title_osc_is_bel_terminated_and_clean() {
+        assert_eq!(window_title_osc("claude"), b"\x1b]2;claude\x07".to_vec());
+        // A pane title carrying a BEL or ESC would truncate the
+        // sequence on the host's parser; those bytes are dropped.
+        assert_eq!(
+            window_title_osc("a\x07b\x1b]2;evil"),
+            b"\x1b]2;ab]2;evil\x07".to_vec()
+        );
+        let long = window_title_osc(&"x".repeat(WINDOW_TITLE_MAX * 2));
+        assert_eq!(long.len(), WINDOW_TITLE_MAX + 5);
     }
 
     #[test]

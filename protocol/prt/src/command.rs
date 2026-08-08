@@ -81,6 +81,33 @@ pub struct CreatePortalBody {
     pub scrollback_lines: u32,
 }
 
+/// §6.9 — add a second view onto an existing portal's buffer.
+///
+/// The new view shows the same cells as `src_id` and shares its
+/// scrollback, sub-portals and every per-portal engine; it has its own
+/// position, draw order, visibility and scroll offset. Writing to
+/// either view reaches the one buffer, so both are equal: there is no
+/// original and no copy, and deleting either leaves the other working.
+///
+/// No `size_w` / `size_h` / `scrollback_lines`: there is one grid, so
+/// the new view necessarily inherits its dimensions and history.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct ForkPortalBody {
+    /// Existing view whose buffer the new view will show.
+    pub src_id: String,
+    /// Id for the new view; must be unused in this scope.
+    pub new_id: String,
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub anchor_mode: AnchorMode,
+    pub is_visible: bool,
+    pub draw_order: i32,
+    /// Reserved; spec mandates it be `0`. Decoder enforces this.
+    pub flags: u8,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -122,6 +149,8 @@ pub enum Command {
     /// (no offset); larger values move the visible region back into the
     /// portal's scrollback ring up to the per-portal cap.
     SetPortalScrollback { id: String, lines: u32 },
+    /// §6.9 — a second view onto an existing portal's buffer.
+    ForkPortal(ForkPortalBody),
 }
 
 fn read_id(r: &mut Reader<'_>) -> DecodeResult<String> {
@@ -190,6 +219,37 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 draw_order,
                 flags,
                 scrollback_lines,
+            }))
+        }
+        CMD_FORK_PORTAL => {
+            let src_id = read_id(&mut r)?;
+            let new_id = read_id(&mut r)?;
+            let origin_x = r.i32()?;
+            let origin_y = r.i32()?;
+            let anchor_mode = AnchorMode::from_u8(r.u8()?)?;
+            let is_visible = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ERR_BAD_PAYLOAD),
+            };
+            let draw_order = r.i32()?;
+            let flags = r.u8()?;
+            // §6.9 — `flags` is reserved; non-zero is rejected.
+            if flags != 0 {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            if !r.at_end() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            Ok(Command::ForkPortal(ForkPortalBody {
+                src_id,
+                new_id,
+                origin_x,
+                origin_y,
+                anchor_mode,
+                is_visible,
+                draw_order,
+                flags,
             }))
         }
         CMD_DELETE_PORTAL => {

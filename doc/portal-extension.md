@@ -252,6 +252,7 @@ be tolerated by skipping unknown trailing bytes.
 | 0x0A | SetFocus           | §9.1         |
 | 0x0B | SetCursorStyle     | §9.2         |
 | 0x0C | SetPortalScrollback| §9.3         |
+| 0x0D | ForkPortal         | §6.9         |
 
 All other frame_type values in the command range (0x01..0x7F) are
 reserved and MUST be rejected with `err_unknown_command`. Frame types
@@ -547,6 +548,15 @@ sub-portals (and their sub-portals…) are torn down with their parent.
 The PTY-side concerns of the inner program are *not* the host's
 problem — the client owns those FDs and is responsible for hangup.
 
+`DeletePortal` removes a *view*. When the portal has been forked
+(§6.9) the buffer behind it — its grid, scrollback, sub-portal subtree
+and per-portal engines — survives as long as any other view of it
+remains, and the recursive teardown above happens only when the last
+one goes. Deleting either member of a forked pair therefore leaves the
+other fully working: there is no original and no copy. Clients holding
+a PTY open against a forked portal must not close it while a peer view
+survives.
+
 ### 6.3 UpdateSize (0x04)
 
 Body:
@@ -628,6 +638,58 @@ followed by `CreatePortal`.
 
 ## 7. Portal byte stream
 
+### 6.9 ForkPortal (0x0D)
+
+Body:
+
+```
+string  src_id             ; existing portal whose buffer to show
+string  new_id             ; id for the new view; unique in this scope
+i32     origin_x           ; cells from the host's left edge
+i32     origin_y           ; cells; interpretation depends on anchor_mode
+u8      anchor_mode        ; 0 = Live, 1 = Scrollback
+u8      is_visible         ; 0 or 1
+i32     draw_order
+u8      flags              ; reserved; must be 0 (rejected with err_bad_payload)
+```
+
+Creates a second **view** onto `src_id`'s buffer. Both views show the
+same cells and share one scrollback ring, one sub-portal subtree and
+one set of per-portal engines. What the new view gets of its own is a
+position, an anchor, a draw order, visibility, and — the point of the
+command — its own scroll offset (§9.3).
+
+There is no `size_w` / `size_h` / `scrollback_lines`: there is one
+grid, so a view necessarily inherits its dimensions and history. For
+the same reason `UpdateSize` (§6.3) through *either* view resizes the
+one grid and both views with it. A client laying two views out at
+different pixel sizes must pick the size itself; sizing the buffer to
+the smallest visible view is the conventional choice.
+
+The views are **equal**. Nothing records which came first: `WritePortal`
+(§7.1) through either reaches the same buffer, events attribute to
+whichever view was written to (§8), and `DeletePortal` on either leaves
+the other working (§6.2). A client can therefore forget which of a pair
+it forked from.
+
+Behavior:
+
+- Unknown `src_id` → `err_unknown_portal`.
+- `new_id` already in use in this scope → `err_duplicate_id`.
+- Over `max_portals` **views** in this scope → `err_too_many_portals`.
+  Forking costs a view, not a buffer, so it does not consume
+  scrollback budget.
+- Forking does **not** add nesting depth: the buffer and its subtree
+  already exist, so `max_nesting_depth` is not consulted and
+  `err_max_nesting_depth` cannot arise here.
+- `src_id` resolves in the current scope only (§5.5, §6.8). There is no
+  way to fork a portal into a different scope — a view and its buffer
+  always live in the same portal table.
+- The new view starts at the live region (offset 0) regardless of where
+  `src_id` is scrolled.
+
+Response: empty Ok.
+
 ### 7.1 WritePortal (0x09)
 
 Body:
@@ -636,6 +698,11 @@ Body:
 string id
 bytes  data           ; raw bytes destined for the portal's inner vt100
 ```
+
+`id` names a view; the bytes reach the buffer behind it. When a portal
+has been forked (§6.9) a client MUST write to exactly **one** of the
+peer views — the buffer is shared, so writing the same bytes to both
+delivers them twice.
 
 The host appends `data` to the portal's input queue and parses
 synchronously: a single `WritePortal` call drains entirely into the
@@ -703,6 +770,21 @@ is hidden. The host has no portal-level rate-limit knob in v1.
 All events carry a `string id` first, identifying the source portal.
 Event bodies are described below.
 
+**Attribution under forking (§6.9).** A buffer with two views could
+name either in an event; the rule is that an event is attributed to the
+view whose command caused it. Everything driven by bytes — `RawReply`,
+`Bell`, `TitleChange`, `IconNameChange`, `WorkingDirChange`,
+`ClipboardOp`, `CursorVisibilityChange`, `BufferModeChange`,
+`MouseModeChange`, `PortalActivity` — carries the `id` of the
+`WritePortal` that produced it, and `ResizeNotify` carries the `id` of
+the `UpdateSize`. Since a client writes to exactly one peer (§7.1),
+each event fires exactly once against an id that client already knows.
+
+The three genuinely per-view events are unaffected, because they are
+properties of a view rather than of a buffer: `PortalEvicted` (§8.7)
+fires for the view whose anchor scrolled away, and `PortalScrollDelta`
+/ `PortalScrollSet` (§8.11, §8.12) name the view the user scrolled.
+
 ### 8.1 Bell (0x81)
 
 ```
@@ -727,6 +809,15 @@ payload). OSC 1 fires `IconNameChange` only. OSC 2 fires
 The host applies no length limit beyond the host's own input parser
 limits. The client is responsible for clamping if it puts the title
 in a tab UI.
+
+A portal title never retitles the host's own window: the host has one
+window and any number of portals, and only the client knows which of
+them the user is looking at — or whether a rename has superseded the
+inner program's OSC title. A client that wants the window to follow
+its active pane re-announces the chosen title on its own output as
+ordinary `OSC 2`, which the host applies the same way it applies a
+title from a non-portal child. (`vmux` does this with the active tab's
+label, so the window title reads like Konsole's: `"<tab> — Veter"`.)
 
 Suppressed if the relevant feature bit is not advertised.
 
@@ -1009,7 +1100,13 @@ u32    lines       ; offset, in rows, from the top of the live screen
                    ; into scrollback. 0 = live region (no offset).
 ```
 
-Drives the portal's vt100 scrollback offset. While `lines > 0` the host
+Drives the offset of the named **view**. Two views of one buffer (§6.9)
+hold separate offsets, which is what lets a client show a scrolled-back
+transcript in one half of a split while the other tracks the live
+region. The buffer itself always sits live; nothing a view does to its
+own offset is observable by its peers.
+
+While `lines > 0` the host
 renders that portion of the portal's history instead of the live
 region; new bytes still flow into the inner vt100 normally and accrue
 in scrollback. The value is silently capped at the portal's current
@@ -1173,6 +1270,7 @@ The host advertises hard caps via the probe response. Over-limit ops
 fail atomically. A non-exhaustive list:
 
 - `max_portals`: per host screen buffer (main and alt are independent).
+  Counts **views** (§6.9), so a forked pair costs two.
 - `max_portal_cells_w` / `max_portal_cells_h`: per portal grid.
 - `max_scrollback_lines`: per portal scrollback ring.
 - `max_write_bytes`: per `WritePortal` body (clients chunk bigger
@@ -1186,7 +1284,9 @@ numbers can be tuned without breaking the protocol.
 
 Memory cost is dominated by per-portal scrollback rings, so clients
 that allocate many portals should request a smaller
-`scrollback_lines` per portal at create time.
+`scrollback_lines` per portal at create time. Additional *views* of an
+existing portal (§6.9) are nearly free by comparison — they add no grid
+and no ring.
 
 ## 13. Cookbook
 
@@ -1223,7 +1323,9 @@ Reverse channel and notifications:
   PTY master, just like keyboard input. From the shell's stdin
   perspective, "user keystrokes" and "DSR replies my own queries
   triggered" are the same byte stream.
-- Any `TitleChange` event → update the client's tab/status UI.
+- Any `TitleChange` event → update the client's tab/status UI, and —
+  if the pane is the active one — re-announce the resulting label as
+  `OSC 2` so the host's window title follows it (§8.2).
 - Any `MouseModeChange` event → update the client's per-pane mouse
   state; if the union over panes changed, write the matching DECSET
   sequence to the host's own input source so the host starts (or
@@ -1360,6 +1462,41 @@ generated at the host can flow down the input path described above.
 The cascade requires no new wire ops — every layer is just an
 ordinary PRT client that happens to also be an inner program of
 the layer above.
+
+### 13.6 Split view: two panes, one shell
+
+A multiplexer wants Konsole's old split-view: the user reads back
+through a long transcript in one half while still typing in the other,
+with both halves showing the same shell.
+
+```
+ForkPortal   src_id="p1", new_id="p1.b", origin=(80,0), anchor=Live
+UpdateSize   id="p1", new_w=80, new_h=50        ; both views, one grid
+SetPortalScrollback id="p1.b", lines=200        ; only the right half moves
+```
+
+The client keeps writing pty output to `p1` alone (§7.1) and routes
+keystrokes from whichever half has focus to the same pty — input never
+travels over PRT (§11), so which view is focused is a client-side
+question. `p1.b` stays parked 200 lines back while `p1` follows the
+live region.
+
+Closing either half is a plain `DeletePortal`; the buffer survives
+until the second one goes (§6.2), so the client does not have to track
+which half it forked from. It does have to move its pty ownership to
+the surviving half, since that FD is the client's own.
+
+One consequence of the attribution rule (§8) is worth spelling out: a
+client that labels panes must treat anything the *inner program* says
+about itself as a property of the buffer, not of the view. `TitleChange`
+arrives naming only the view that was written to, so a client storing
+the title per view would leave every other view of that shell showing a
+stale name — or, if it only ever writes through one peer, never
+updating at all. Resolve such state through the shared buffer and
+repaint all its views. The same goes for `IconNameChange`,
+`WorkingDirChange` and `MouseModeChange`. Genuinely per-view state —
+scroll offset, focus, and any indicator derived from them — is what
+tells the halves apart.
 
 ## 14. Open issues / future work
 
