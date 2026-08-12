@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::args::Cli;
 use crate::dist::{DistBundle, Manifest};
@@ -63,40 +63,115 @@ pub fn perform(master: &Master, bundle: &DistBundle) -> Result<()> {
         "installing veter-tools (sha256 {}) to remote ~/.local/bin/",
         &bundle.manifest.sha256[..16.min(bundle.manifest.sha256.len())]
     );
-    upload_and_extract(master, &bundle.tarball)?;
+    upload_and_extract(master, bundle)?;
     write_remote_manifest(master, &bundle.manifest)?;
     log::info!("install complete");
     Ok(())
 }
 
-/// Streams the tarball into a temp dir on the remote, then copies
-/// the executables into `~/.local/bin`. We don't extract directly
-/// into `~/.local/bin` because the tarball's top-level entry is
-/// `veter-tools-<version>/` and we only want the binaries (not the
-/// README) at the destination.
-fn upload_and_extract(master: &Master, tarball: &std::path::Path) -> Result<()> {
-    let remote_cmd = r#"set -e
+/// What to install when the staged manifest predates the `tools`
+/// field. This list used to be hardcoded in the remote command, where
+/// it silently drifted behind the Makefile's `DIST_TOOLS` — `vfm`,
+/// `vdraw` and `vproto` shipped in the tarball for releases without
+/// ever being copied out of it. It survives only so an old bundle
+/// installs something rather than nothing; the manifest is the source
+/// of truth for everything current.
+const LEGACY_TOOLS: &[&str] = &["vplay", "vmux", "vcat", "vsend", "vrecv", "vsd"];
+
+/// What to copy out of the bundle into `~/.local/bin`: exactly the
+/// binaries the manifest lists.
+fn install_names(manifest: &Manifest) -> Vec<String> {
+    if manifest.tools.is_empty() {
+        LEGACY_TOOLS.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        manifest.tools.clone()
+    }
+}
+
+/// Names get spliced into a remote shell command, so they're held to
+/// a charset that needs no quoting to be safe. The manifest is our
+/// own file, but it's still a file on disk — anything outside this
+/// charset means a corrupt (or hostile) manifest, which is worth
+/// failing the install over rather than quoting around.
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The shell script that runs on the remote: extract the tarball
+/// streamed to its stdin into a temp dir, then copy `names` out of it
+/// into `~/.local/bin`. We don't extract straight into `~/.local/bin`
+/// because the tarball's top-level entry is `veter-tools-<version>/`
+/// and we only want the listed entries (not the README) at the
+/// destination.
+fn remote_install_script(names: &[String]) -> Result<String> {
+    if let Some(bad) = names.iter().find(|n| !is_safe_name(n)) {
+        bail!("manifest lists an unusable tool name {bad:?}");
+    }
+    let list = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        r#"set -e
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tar -xJpf - -C "$tmp"
 mkdir -p "$HOME/.local/bin"
-for t in vplay vmux vcat vsend vrecv vsd; do
+for t in {list}; do
   src=$(ls "$tmp"/veter-tools-*/"$t" 2>/dev/null | head -n1)
   if [ -n "$src" ] && [ -f "$src" ]; then
     install -m 0755 "$src" "$HOME/.local/bin/$t"
     echo "installed $t"
+  else
+    echo "missing $t"
   fi
-done"#;
-    let file = std::fs::File::open(tarball)
-        .with_context(|| format!("opening {}", tarball.display()))?;
-    master.run_with_stdin(remote_cmd, file)
+done"#
+    ))
+}
+
+/// Streams the tarball into a temp dir on the remote, then copies
+/// the executables into `~/.local/bin`.
+fn upload_and_extract(master: &Master, bundle: &DistBundle) -> Result<()> {
+    let names = install_names(&bundle.manifest);
+    let remote_cmd = remote_install_script(&names)?;
+    let file = std::fs::File::open(&bundle.tarball)
+        .with_context(|| format!("opening {}", bundle.tarball.display()))?;
+    let stdout = master.run_with_stdin(&remote_cmd, file)?;
+    warn_about_missing(&stdout);
+    Ok(())
+}
+
+/// The remote loop prints one `installed <name>` / `missing <name>`
+/// line per expected entry. A `missing` line means the manifest and
+/// the tarball disagree; the loop can't fail on that by itself (a
+/// name it never finds simply doesn't get copied), which is how the
+/// hardcoded list stayed wrong for so long without anyone noticing.
+fn warn_about_missing(stdout: &str) {
+    let missing: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("missing "))
+        .collect();
+    if !missing.is_empty() {
+        log::warn!(
+            "manifest lists {} not present in the tarball; not installed",
+            missing.join(", ")
+        );
+    }
 }
 
 fn write_remote_manifest(master: &Master, manifest: &Manifest) -> Result<()> {
     let mut json = serde_json::to_string(manifest).context("serializing manifest")?;
     json.push('\n');
     let cmd = r#"mkdir -p "$HOME/.local/share/veter-tools" && cat > "$HOME/.local/share/veter-tools/manifest.json""#;
-    master.run_with_stdin(cmd, json.as_bytes())
+    master.run_with_stdin(cmd, json.as_bytes())?;
+    Ok(())
 }
 
 /// `uname -m` ↔ rust target-triple compatibility. The triple's first
@@ -255,6 +330,67 @@ mod tests {
             decide(Some(&b), &p, &mk_cli()),
             Action::Skip(SkipReason::HomeNotWritable)
         ));
+    }
+
+    fn mk_manifest(tools: &[&str]) -> Manifest {
+        Manifest {
+            version: "0.1.7".into(),
+            arch: "x86_64-unknown-linux-musl".into(),
+            sha256: "abc".into(),
+            tools: tools.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn install_names_come_from_the_manifest() {
+        let m = mk_manifest(&["vmux", "vcat", "vfm", "vdraw", "vproto"]);
+        assert_eq!(
+            install_names(&m),
+            vec!["vmux", "vcat", "vfm", "vdraw", "vproto"]
+        );
+    }
+
+    #[test]
+    fn install_names_fall_back_for_a_manifest_without_tools() {
+        let m = mk_manifest(&[]);
+        assert_eq!(install_names(&m), LEGACY_TOOLS.to_vec());
+    }
+
+    /// vplace drives the local terminal, so it is not in the bundle
+    /// and must not be installed even if a stale manifest names it.
+    #[test]
+    fn scripts_are_not_part_of_the_bundle() {
+        let m = mk_manifest(&["vmux", "vfm"]);
+        assert!(!install_names(&m).contains(&"vplace".to_string()));
+    }
+
+    #[test]
+    fn script_lists_every_name() {
+        let names = install_names(&mk_manifest(&["vmux", "vfm"]));
+        let script = remote_install_script(&names).unwrap();
+        assert!(script.contains("for t in 'vmux' 'vfm'; do"));
+    }
+
+    #[test]
+    fn script_refuses_an_unusable_name() {
+        let names = vec!["vmux".to_string(), "a b".to_string()];
+        assert!(remote_install_script(&names).is_err());
+    }
+
+    #[test]
+    fn safe_name_check() {
+        assert!(is_safe_name("vfm"));
+        assert!(is_safe_name("vplace"));
+        assert!(is_safe_name("v-tool_2.0"));
+        assert!(!is_safe_name(""));
+        assert!(!is_safe_name("."));
+        assert!(!is_safe_name(".."));
+        assert!(!is_safe_name("-rf"));
+        assert!(!is_safe_name("a b"));
+        assert!(!is_safe_name("a'b"));
+        assert!(!is_safe_name("a/b"));
+        assert!(!is_safe_name("a$b"));
+        assert!(!is_safe_name("a;rm -rf ~"));
     }
 
     #[test]

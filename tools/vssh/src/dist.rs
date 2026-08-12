@@ -18,6 +18,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// What the Makefile staged, as read back from `manifest*.json`.
+///
+/// `tools` is the authoritative list of what the tarball carries and
+/// therefore what gets copied into the remote's `~/.local/bin` — see
+/// `install::install_names`. It mirrors the Makefile's `DIST_TOOLS`,
+/// which is the point: the set of tools is defined in exactly one
+/// place. It defaults to empty so a manifest staged before the field
+/// existed still parses. The Makefile's `SCRIPTS` (`vplace`) are
+/// local-only and deliberately absent from the bundle.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     pub version: String,

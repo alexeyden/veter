@@ -335,13 +335,12 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    $$(INSTALL) -m 0755 $$(DIST_BINDIR_$(1))/$$$$t \
 	        $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/$$$$t; \
 	done
-	@# Scripts are architecture-independent but useless without the
-	@# binary they drive, so they ride along rather than being a
-	@# separate install step on the remote.
-	@for s in $$(SCRIPTS); do \
-	    $$(INSTALL) -m 0755 $$(SCRIPT_SRCDIR)/$$$$s \
-	        $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/$$$$s; \
-	done
+	@# The vplace script deliberately does not ride along. It drives
+	@# the terminal the user is looking at, so it belongs on the
+	@# machine running veter, not on a host reached through it. The
+	@# deb and install-remote ship the binaries only, for the same
+	@# reason; vssh installs whatever the manifest lists, which is
+	@# why the manifest tracks DIST_TOOLS and not SCRIPTS.
 	@printf '%s\n' \
 	    'veter-tools $$(DIST_VERSION) — $(1)' \
 	    '' \
@@ -357,7 +356,6 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    '  vdraw   block-diagram editor (VGE; .excalidraw)' \
 	    '  vfm     file browser with picture previews (VGE; ffmpeg for video thumbs)' \
 	    '  vproto  speak VGE/PRT/SES from a script (JSON in, JSON out)' \
-	    '  vplace  place an image in a pane from outside it (script; needs python3)' \
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
 	    '  vsd  persistent session daemon (doc/session-manager.md)' \

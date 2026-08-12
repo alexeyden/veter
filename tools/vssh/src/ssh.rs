@@ -88,8 +88,10 @@ impl Master {
     }
 
     /// Run a remote command with `reader` piped to its stdin.
-    /// Captures stderr for the error path; logs stdout at debug.
-    pub fn run_with_stdin<R: Read>(&self, cmd: &str, mut reader: R) -> Result<()> {
+    /// Captures stderr for the error path; logs stdout at debug and
+    /// returns it, since a remote script can succeed and still have
+    /// something to report (see `install::warn_about_missing`).
+    pub fn run_with_stdin<R: Read>(&self, cmd: &str, mut reader: R) -> Result<String> {
         let cp_opt = format!("ControlPath={}", self.control_path);
         log::debug!("master.run_with_stdin: {cmd}");
         let mut child = Command::new("ssh")
@@ -115,10 +117,11 @@ impl Master {
                 stderr.trim()
             );
         }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        for line in stdout.lines() {
             log::debug!("remote: {line}");
         }
-        Ok(())
+        Ok(stdout)
     }
 
     /// Consume the Master without running `Drop`. Returns the
