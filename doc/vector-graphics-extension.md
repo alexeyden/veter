@@ -855,15 +855,27 @@ point     origin           ; relative to element.origin
 u8        align            ; 0 = Left, 1 = Center, 2 = Right
 Style     fill_style
 u8        font_style       ; bitmask
+f32       font_scale       ; multiplier on the terminal's font size
 string    text             ; UTF-8, single-line
 ```
 
 `font_style` bits: 0x01 Bold, 0x02 Italic, 0x04 Underline, 0x08
 Strikethrough. Multiple bits may be combined.
 
-The text is rendered in the terminal's primary font at the same size used
-for the cell grid. Multi-line text is not supported; embedded `\n` is
-treated as a literal character (typically rendered as a tofu glyph).
+The text is rendered in the terminal's primary font. `font_scale`
+multiplies the size that font is drawn at for the cell grid: `1.0` is
+exactly cell size, `2.0` is twice as tall. It must be finite, greater
+than zero, and no larger than `64.0` — otherwise `err_bad_payload`. It
+scales the glyphs, the baseline drop, and the underline/strikethrough
+rules together, and composes with the element's transform (§9.11), so
+text at `font_scale = 2` inside an element scaled 3× is drawn 6×.
+
+The scale does **not** change the cell grid, the element origin, or any
+other coordinate: every point in this command stays in cell units
+(§5.1). Only the glyphs get bigger.
+
+Multi-line text is not supported; embedded `\n` is treated as a literal
+character (typically rendered as a tofu glyph).
 
 `align` controls horizontal anchoring relative to `origin`:
 
@@ -873,7 +885,9 @@ treated as a literal character (typically rendered as a tofu glyph).
 
 Vertical alignment: the text baseline sits at `origin.y` (interpreted in
 cell-height units, then converted to the font's pixel baseline using the
-ascent of the primary font).
+scaled ascent of the primary font). So `origin.y` pins the *top* of the
+run's line box wherever the size is, and a run grows downward as
+`font_scale` rises.
 
 ### 7.5 DrawImage (0x21)
 
@@ -1738,7 +1752,10 @@ Consequences worth knowing when writing a client:
 - **Shaping is the terminal's.** A run is measured with the terminal's
   own font metrics (§7.4), which is why a client cannot predict where a
   character boundary falls; `libs/vge-ui`'s `unicode-width` estimate is
-  an approximation for layout, not a mapping the terminal shares.
+  an approximation for layout, not a mapping the terminal shares. A
+  `font_scale` other than 1.0 scales that estimate along with the
+  glyphs — the run is that many times wider and taller — but does not
+  make it any more exact.
 - **It does not compete with a mouse-driven client.** VGE delivers no
   mouse events (§9.10), and a client that has enabled VT100 mouse
   reporting keeps receiving every event it did before. A terminal

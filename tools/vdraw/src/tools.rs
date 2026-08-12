@@ -121,6 +121,58 @@ impl LineType {
 /// Stroke widths in doc px, matching Excalidraw's thin/bold/extra-bold.
 pub const THICKNESSES: [f32; 3] = [1.0, 2.0, 4.0];
 
+/// Text size, as a multiple of the terminal's own font size (VGE §7.4).
+///
+/// Three presets rather than a free number: the sizes have to read as
+/// distinct at a glance in a diagram, and the document stores doc px
+/// anyway (`Element::font_size`), so anything finer would round-trip
+/// through a scale the editor can't show you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontSize {
+    Small,
+    Normal,
+    Big,
+}
+
+/// Options order, left to right.
+pub const FONT_SIZES: [FontSize; 3] = [FontSize::Small, FontSize::Normal, FontSize::Big];
+
+impl FontSize {
+    /// The §7.4 multiplier. `Normal` is exactly 1.0 — one grid row, what
+    /// every vdraw text was before sizes existed — so an old document
+    /// opens looking the way it always did.
+    pub fn scale(self) -> f32 {
+        match self {
+            FontSize::Small => 0.75,
+            FontSize::Normal => 1.0,
+            FontSize::Big => 1.75,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FontSize::Small => "S",
+            FontSize::Normal => "M",
+            FontSize::Big => "L",
+        }
+    }
+
+    /// The preset closest to an arbitrary multiplier. A file from the
+    /// real editor carries whatever `fontSize` it likes, so the options
+    /// row has to highlight *something* — this picks the nearest rather
+    /// than pretending the element is unstyled.
+    pub fn nearest(scale: f32) -> Self {
+        FONT_SIZES
+            .into_iter()
+            .min_by(|a, b| {
+                (a.scale() - scale)
+                    .abs()
+                    .total_cmp(&(b.scale() - scale).abs())
+            })
+            .unwrap_or(FontSize::Normal)
+    }
+}
+
 /// Background swatches, Excalidraw's default fill palette. The first
 /// entry is `"transparent"` — an outline-only shape, and the default.
 pub const FILLS: [&str; 5] = [
@@ -151,6 +203,11 @@ pub struct ToolState {
     pub color: &'static str,
     pub fill: &'static str,
     pub line_type: LineType,
+    /// Size the next text is placed at. Not baked into `new_element`
+    /// like the other options: the document records a font size in doc
+    /// px, which only the camera's cell height can convert to, so the
+    /// caller stamps it (`Element::set_font_scale`).
+    pub font_size: FontSize,
 }
 
 impl Default for ToolState {
@@ -161,6 +218,7 @@ impl Default for ToolState {
             color: COLORS[0],
             fill: FILLS[0],
             line_type: LineType::Solid,
+            font_size: FontSize::Normal,
         }
     }
 }
@@ -247,6 +305,7 @@ mod tests {
             color: COLORS[3],
             fill: FILLS[2],
             line_type: LineType::Dashed,
+            font_size: FontSize::Normal,
         };
         let e = st.new_element("e1", 10.0, 20.0, 100.0, 50.0).expect("element");
         assert_eq!(e.kind, "rectangle");
@@ -327,6 +386,41 @@ mod tests {
         assert_eq!(e.points[0], [0.0, 0.0]);
         assert_eq!(e.points[1], [60.0, 40.0]);
         assert_eq!((e.x, e.y), (10.0, 20.0));
+    }
+
+    #[test]
+    fn normal_is_exactly_cell_size() {
+        // The whole back-compat story rests on this: a document with no
+        // sizes, and every text drawn before the presets existed, must
+        // keep landing on one grid row.
+        assert_eq!(FontSize::Normal.scale(), 1.0);
+        assert_eq!(ToolState::default().font_size, FontSize::Normal);
+    }
+
+    #[test]
+    fn presets_are_ordered_and_distinct() {
+        let scales: Vec<f32> = FONT_SIZES.iter().map(|f| f.scale()).collect();
+        assert!(scales[0] < scales[1] && scales[1] < scales[2]);
+        // Each step has to be visible at a glance, or three buttons is
+        // two buttons too many.
+        assert!(scales[1] / scales[0] >= 1.2);
+        assert!(scales[2] / scales[1] >= 1.2);
+    }
+
+    #[test]
+    fn every_preset_is_its_own_nearest() {
+        for fs in FONT_SIZES {
+            assert_eq!(FontSize::nearest(fs.scale()), fs);
+        }
+    }
+
+    #[test]
+    fn nearest_snaps_a_foreign_font_size() {
+        // What a file from the real editor lands on: anything, and the
+        // options row still has to highlight one button.
+        assert_eq!(FontSize::nearest(0.1), FontSize::Small);
+        assert_eq!(FontSize::nearest(0.95), FontSize::Normal);
+        assert_eq!(FontSize::nearest(6.0), FontSize::Big);
     }
 
     #[test]

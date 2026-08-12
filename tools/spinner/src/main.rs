@@ -264,6 +264,7 @@ fn hint_body(cols: u16, rows: u16) -> CreateElementBody {
             align: Align::Center,
             fill: Style::Flat(rgb(0x9A_A0_B0)),
             font_style: FontStyle(0),
+            font_scale: 1.0,
             text: "one UpdateTransform per frame — q quits".into(),
         }],
         origin: hint_origin(cols, rows),

@@ -605,6 +605,7 @@ fn build_placeholder_commands(image_rect: Rect, total: u32) -> Vec<DrawCmd> {
             a: 1.0,
         }),
         font_style: FontStyle::default(),
+        font_scale: 1.0,
         text: progress_text(0, total, total_mb),
     };
     vec![track_cmd, fill_cmd, label_cmd]

@@ -19,7 +19,10 @@
 //! Phase 5 adds text: the T tool places a text element by click, and
 //! Enter on a selection edits its label. Editing is modal — it has to
 //! swallow the tool letters and `q`, or typing would switch tools and
-//! quit.
+//! quit. Text comes in three sizes (`tools::FontSize`), carried on the
+//! wire as VGE's `font_scale` (§7.4) and stored in the document as
+//! Excalidraw's `fontSize`; the two are the same fact in different
+//! units, converted through the camera's cell height.
 //!
 //! Phase 6 adds `.excalidraw` load/save (`vdraw [path]`, Ctrl-S) and
 //! snapshot-based undo/redo (`history.rs`, Ctrl-Z / Ctrl-Y). Undo takes
@@ -152,7 +155,7 @@ fn main() -> Result<()> {
 
     let mut cursor = (0u16, 0u16);
     let mut state = ToolState::default();
-    let mut bar = chrome::layout(cols, rows, &state, None);
+    let mut bar = chrome::layout(cols, rows, cam.cell_h, &state, None);
     send(&full_render(
         &document,
         &cam,
@@ -228,7 +231,21 @@ fn main() -> Result<()> {
                         document.elements[i].text.pop();
                     }
                     Event::Enter | Event::Escape => done = true,
-                    Event::MouseDown { .. } => done = true,
+                    // A style option applies to the text being typed and
+                    // leaves the caret alive: picking a size mid-word is
+                    // not a reason to commit, and the click that ends an
+                    // edit is swallowed, so otherwise it would take two.
+                    // A tool button is a real mode change and a click off
+                    // the palette is "click elsewhere to finish", so both
+                    // still end the edit.
+                    Event::MouseDown { col, row, .. } => match bar.hit(col, row) {
+                        Some(action) if !matches!(action, Action::Tool(_)) => {
+                            apply(&mut state, action);
+                            restyle(&mut document.elements[i], action, &cam);
+                            chrome_dirty = true;
+                        }
+                        _ => done = true,
+                    },
                     // Ctrl-C still quits, even mid-edit.
                     Event::Quit => return Ok(()),
                     _ => continue,
@@ -395,7 +412,7 @@ fn main() -> Result<()> {
                             // only taken when the option actually
                             // applies to this shape.
                             let mut probe = document.elements[i].clone();
-                            if restyle(&mut probe, action) {
+                            if restyle(&mut probe, action, &cam) {
                                 history.checkpoint(&document);
                                 document.elements[i] = probe;
                                 dirty_doc = true;
@@ -424,9 +441,14 @@ fn main() -> Result<()> {
                     } else if button == input::Button::Left && state.tool == Tool::Text {
                         // Text is placed by click and typed, not dragged.
                         let p = drag::snap_screen(col, row, &cam);
-                        if let Some(el) =
+                        if let Some(mut el) =
                             state.new_element(format!("el-{next_id}"), p.x, p.y, 0.0, 0.0)
                         {
+                            // The size is the one option `new_element`
+                            // can't bake in: the document stores doc px,
+                            // and only the camera knows the cell height
+                            // that converts to.
+                            el.set_font_scale(state.font_size.scale(), cam.cell_h);
                             history.checkpoint(&document);
                             dirty_doc = true;
                             next_id += 1;
@@ -706,6 +728,7 @@ fn main() -> Result<()> {
             bar = chrome::layout(
                 cols,
                 rows,
+                cam.cell_h,
                 &state,
                 selected.map(|i| &document.elements[i]),
             );
@@ -815,17 +838,22 @@ fn full_render(
 fn resize_text_box(e: &mut doc::Element, cam: &Camera) {
     // Record the font size a *web* renderer should use, for every
     // element that carries text — containers included, since their
-    // caption is split out into a real text element on save. Derived
-    // from the cell height so the saved document matches what vdraw
-    // drew; vdraw's own rendering ignores it (VGE text is cell-sized).
+    // caption is split out into a real text element on save. The
+    // multiplier vdraw draws with (§7.4) and the doc px it saves are
+    // the same number in different units, so this normalises rather
+    // than overwrites: an element with no size yet lands on 1.0, the
+    // cell-sized default every vdraw text had before sizes existed.
+    let scale = e.font_scale(cam.cell_h);
     if !e.text.is_empty() {
-        e.font_size = Some(cam.cell_h / doc::LINE_HEIGHT);
+        e.set_font_scale(scale, cam.cell_h);
     }
     if e.shape() != Some(doc::Shape::Text) {
         return;
     }
-    e.width = render::text_cells(&e.text) * cam.cell_w;
-    e.height = cam.cell_h;
+    // The box has to track the glyphs, or selection and hit-testing
+    // would still be outlining a one-row run.
+    e.width = render::text_cells(&e.text) * cam.cell_w * scale;
+    e.height = cam.cell_h * scale;
 }
 
 /// Re-send an element's origin and geometry, optionally with the text
@@ -843,7 +871,7 @@ fn push_element_update(
     };
     let mut commands = body.commands;
     if caret {
-        commands.push(render::caret_command(e, theme::selection_accent()));
+        commands.push(render::caret_command(e, cam, theme::selection_accent()));
     }
     frame.push((
         Command::UpdateOrigin {
@@ -883,7 +911,7 @@ fn preview_body(
 /// Returns whether anything changed: switching tools is not a restyle,
 /// and an option the shape can't express (a fill on an arrow, a line
 /// type on text) is a no-op rather than a silent lie in the document.
-fn restyle(e: &mut doc::Element, action: Action) -> bool {
+fn restyle(e: &mut doc::Element, action: Action, cam: &Camera) -> bool {
     match action {
         Action::Tool(_) => false,
         Action::Thickness(w) => {
@@ -908,6 +936,19 @@ fn restyle(e: &mut doc::Element, action: Action) -> bool {
                 true
             }
         },
+        Action::Font(fs) => match e.shape() {
+            // Only text is sized from the palette. A container's label
+            // follows the container, which has no size control of its
+            // own — see `chrome::layout`'s `show_font`.
+            Some(doc::Shape::Text) => {
+                e.set_font_scale(fs.scale(), cam.cell_h);
+                // The box is derived from the size, so it has to be
+                // recomputed here and not merely on the next keystroke.
+                resize_text_box(e, cam);
+                true
+            }
+            _ => false,
+        },
     }
 }
 
@@ -918,6 +959,7 @@ fn apply(state: &mut ToolState, action: Action) {
         Action::Color(c) => state.color = c,
         Action::Fill(c) => state.fill = c,
         Action::Line(lt) => state.line_type = lt,
+        Action::Font(fs) => state.font_size = fs,
     }
 }
 
@@ -951,7 +993,7 @@ fn status_text(
         return format!("vdraw  {n}");
     }
     if editing {
-        return "vdraw  [text]  typing — Enter or Esc commits".into();
+        return "vdraw  [text]  typing — Enter or Esc commits · palette restyles".into();
     }
     let p = cam.pointer_to_doc(cursor.0, cursor.1);
     let sel = match selected {
@@ -991,6 +1033,7 @@ fn status_element(cam: &Camera, cursor: (u16, u16), state: &ToolState, rows: u16
                 a: 1.0,
             }),
             font_style: FontStyle::default(),
+            font_scale: 1.0,
             text: status_text(cam, cursor, state, None, false, false, None),
         }],
         origin: status_origin(rows),

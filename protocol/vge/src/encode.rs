@@ -7,8 +7,8 @@
 use crate::codec::{Point, Writer};
 use crate::command::{
     Align, Color, Command, ConcreteStyle, CreateElementBody, DrawCmd, FLAG_BY_PREFIX, OriginAnchor,
-    Style, UpdateCommandBody,
-    UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange, UploadImageBody,
+    Style, UpdateCommandBody, UpdateCommandsBody, UpdateImageBody, UpdateTextBody, UpdateTextRange,
+    UploadImageBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
 use crate::frame::*;
@@ -242,6 +242,7 @@ pub fn write_draw_cmd(w: &mut Writer, cmd: &DrawCmd) {
             align,
             fill,
             font_style,
+            font_scale,
             text,
         } => {
             w.u8(OP_DRAW_TEXT);
@@ -253,6 +254,7 @@ pub fn write_draw_cmd(w: &mut Writer, cmd: &DrawCmd) {
             });
             write_style(w, fill);
             w.u8(font_style.0);
+            w.f32(*font_scale);
             w.str(text);
         }
         DrawCmd::FillPolygon { fill, points } => {
@@ -546,11 +548,34 @@ mod tests {
                 align: Align::Center,
                 fill: Style::Flat(red()),
                 font_style: FontStyle(0x05), // Bold + Underline
+                font_scale: 1.0,
                 text: "hello".into(),
             }],
             origin: Point { x: 10.0, y: 4.0 },
             is_visible: true,
             draw_order: 1,
+            parent: None,
+            size: None,
+            transform: None,
+            anchor: OriginAnchor::Viewport,
+        }));
+    }
+
+    #[test]
+    fn create_element_with_sized_text_roundtrip() {
+        roundtrip(Command::CreateElement(CreateElementBody {
+            id: "heading".into(),
+            commands: vec![DrawCmd::DrawText {
+                origin: Point { x: 0.0, y: 0.0 },
+                align: Align::Left,
+                fill: Style::Flat(red()),
+                font_style: FontStyle(0),
+                font_scale: 2.5,
+                text: "big".into(),
+            }],
+            origin: Point { x: 1.0, y: 1.0 },
+            is_visible: true,
+            draw_order: 0,
             parent: None,
             size: None,
             transform: None,

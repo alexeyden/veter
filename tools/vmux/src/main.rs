@@ -1410,6 +1410,7 @@ fn build_tabbar_commands(
             align: Align::Left,
             fill: Style::Flat(COLOR_ACTIVE_TEXT),
             font_style: FontStyle(0x01),
+            font_scale: 1.0,
             text: format!(" {label} "),
         });
     }
@@ -1424,6 +1425,7 @@ fn build_tabbar_commands(
             align: Align::Left,
             fill: accent_style(),
             font_style: FontStyle(0x00),
+            font_scale: 1.0,
             text: " ‹".to_string(),
         });
     }
@@ -1463,6 +1465,7 @@ fn build_tabbar_commands(
             align: Align::Left,
             fill: Style::Flat(COLOR_ACTIVE_TEXT),
             font_style: FontStyle(0x00),
+            font_scale: 1.0,
             text: num_text,
         });
 
@@ -1509,6 +1512,7 @@ fn build_tabbar_commands(
                 COLOR_DIM_TEXT
             }),
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
+            font_scale: 1.0,
             text: name_text,
         });
     }
@@ -1523,6 +1527,7 @@ fn build_tabbar_commands(
             align: Align::Left,
             fill: accent_style(),
             font_style: FontStyle(0x00),
+            font_scale: 1.0,
             text: "› ".to_string(),
         });
     }
@@ -1612,6 +1617,7 @@ fn build_chrome_commands(
             align: Align::Right,
             fill: Style::Flat(COLOR_TITLE_TEXT),
             font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
+            font_scale: 1.0,
             text: title.to_string(),
         });
     }

@@ -15,7 +15,7 @@ use vge_protocol::path::PathSegment;
 
 use crate::doc::{Element, Shape};
 use crate::tools::{
-    COLORS, FILLS, LINE_TYPES, LineType, THICKNESSES, TOOLS, Tool, ToolState,
+    COLORS, FILLS, FONT_SIZES, FontSize, LINE_TYPES, LineType, THICKNESSES, TOOLS, Tool, ToolState,
 };
 
 pub const CHROME_ID: &str = "vdraw.chrome.bar";
@@ -43,6 +43,8 @@ pub enum Action {
     /// Background colour; `"transparent"` means outline-only.
     Fill(&'static str),
     Line(LineType),
+    /// Text size preset (§7.4). Only text carries one.
+    Font(FontSize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +103,7 @@ impl Chrome {
 pub fn layout(
     cols: u16,
     rows: u16,
+    cell_h: f32,
     state: &ToolState,
     selected: Option<&Element>,
 ) -> Chrome {
@@ -148,6 +151,14 @@ pub fn layout(
             Some(s) => (s != Shape::Text, s.is_closed()),
             None => (state.tool.has_line_type(), state.tool.has_fill()),
         };
+        // Sizes belong to text and nothing else. A container's label
+        // takes the container's size (`render::finish`), but showing
+        // three more buttons on every box — most of which have no label
+        // — would be noise, so the group is text-only.
+        let show_font = match sel_shape {
+            Some(s) => s == Shape::Text,
+            None => state.tool == Tool::Text,
+        };
         // Which value each group highlights: the selection's, or the
         // tool defaults when nothing is selected.
         let is_thickness = |t: f32| match selected {
@@ -166,6 +177,12 @@ pub fn layout(
             Some(e) => lt.as_str() == e.stroke_style,
             None => lt == state.line_type,
         };
+        // A document may carry any `fontSize`, including one from the
+        // real editor, so the selection highlights the nearest preset.
+        let is_font = |fs: FontSize| match selected {
+            Some(e) => fs == FontSize::nearest(e.font_scale(cell_h)),
+            None => fs == state.font_size,
+        };
         let thick_w = OPT_W * THICKNESSES.len() as f32;
         let line_w = if show_line {
             OPT_W * LINE_TYPES.len() as f32
@@ -178,8 +195,13 @@ pub fn layout(
         } else {
             0.0
         };
-        let groups = 2.0 + f32::from(show_line) + f32::from(show_fill);
-        let total = thick_w + line_w + color_w + fill_w + GROUP_GAP * (groups - 1.0);
+        let font_w = if show_font {
+            OPT_W * FONT_SIZES.len() as f32
+        } else {
+            0.0
+        };
+        let groups = 2.0 + f32::from(show_line) + f32::from(show_fill) + f32::from(show_font);
+        let total = thick_w + line_w + color_w + fill_w + font_w + GROUP_GAP * (groups - 1.0);
         let mut x = ((cols - total) / 2.0).max(0.0).floor();
         panels.push(Rect {
             x,
@@ -245,6 +267,22 @@ pub fn layout(
                     active: is_fill(c),
                 });
                 x += SWATCH_W;
+            }
+        }
+        if show_font {
+            x += GROUP_GAP;
+            for fs in FONT_SIZES {
+                hotspots.push(Hotspot {
+                    rect: Rect {
+                        x,
+                        y: options_top,
+                        w: OPT_W,
+                        h: OPT_H,
+                    },
+                    action: Action::Font(fs),
+                    active: is_font(fs),
+                });
+                x += OPT_W;
             }
         }
     }
@@ -368,6 +406,24 @@ pub fn draw(chrome: &Chrome, cell_w: f32, cell_h: f32) -> Vec<DrawCmd> {
                 )],
             }),
             Action::Line(lt) => cmds.push(line_sample(lt, cx, cy, fg)),
+            Action::Font(fs) => {
+                // The sample letter is drawn at the size it selects, so
+                // the three buttons *are* the preview. Bigger than the
+                // button at L, hence the vertical centring on a scaled
+                // line box rather than on the cell.
+                let scale = fs.scale();
+                cmds.push(DrawCmd::DrawText {
+                    origin: Point {
+                        x: cx,
+                        y: cy - 0.5 * scale,
+                    },
+                    align: Align::Center,
+                    fill: fg,
+                    font_style: FontStyle(0x01),
+                    font_scale: scale,
+                    text: fs.label().into(),
+                });
+            }
             Action::Color(css) | Action::Fill(css) => {
                 let r = Rect {
                     x: cx - 0.9,
@@ -530,6 +586,7 @@ fn tool_icon(t: Tool, cx: f32, cy: f32, fg: Style, cell_w: f32, cell_h: f32) -> 
             align: Align::Center,
             fill: fg,
             font_style: FontStyle(0x01),
+            font_scale: 1.0,
             text: "T".into(),
         }],
     }
@@ -550,6 +607,10 @@ fn arc_node(rx: f32, ry: f32, dst: Point) -> vge_protocol::path::PathNode {
 mod tests {
     use super::*;
 
+    /// A representative cell height in doc px — only the font-size group
+    /// reads it, to turn an element's `fontSize` back into a multiplier.
+    const CELL_H: f32 = 20.0;
+
     fn state(tool: Tool) -> ToolState {
         ToolState {
             tool,
@@ -560,7 +621,7 @@ mod tests {
     #[test]
     fn every_tool_button_hits_its_own_tool() {
         let st = state(Tool::Box);
-        let ch = layout(120, 40, &st, None);
+        let ch = layout(120, 40, CELL_H, &st, None);
         for t in TOOLS {
             let h = ch
                 .hotspots
@@ -575,7 +636,7 @@ mod tests {
 
     #[test]
     fn select_tool_shows_no_options() {
-        let ch = layout(120, 40, &state(Tool::Select), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Select), None);
         assert!(
             ch.hotspots
                 .iter()
@@ -586,8 +647,8 @@ mod tests {
 
     #[test]
     fn palette_stays_put_when_the_options_row_appears() {
-        let without = layout(120, 40, &state(Tool::Select), None);
-        let with = layout(120, 40, &state(Tool::Box), None);
+        let without = layout(120, 40, CELL_H, &state(Tool::Select), None);
+        let with = layout(120, 40, CELL_H, &state(Tool::Box), None);
         let tool_row = |c: &Chrome| {
             c.hotspots
                 .iter()
@@ -605,16 +666,87 @@ mod tests {
 
     #[test]
     fn text_tool_hides_line_type_but_keeps_colour() {
-        let ch = layout(120, 40, &state(Tool::Text), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Text), None);
         assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Thickness(_))));
     }
 
+    fn font_buttons(ch: &Chrome) -> Vec<FontSize> {
+        ch.hotspots
+            .iter()
+            .filter_map(|h| match h.action {
+                Action::Font(fs) => Some(fs),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn font_sizes_appear_for_text_and_nothing_else() {
+        assert_eq!(
+            font_buttons(&layout(120, 40, CELL_H, &state(Tool::Text), None)),
+            FONT_SIZES.to_vec()
+        );
+        for t in [Tool::Box, Tool::Ellipse, Tool::Diamond, Tool::Line, Tool::Arrow] {
+            assert!(
+                font_buttons(&layout(120, 40, CELL_H, &state(t), None)).is_empty(),
+                "{} is not text",
+                t.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_selected_text_brings_its_sizes_with_it() {
+        // Reachable under Select, like every other option group.
+        let text = styled(Shape::Text);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Select), Some(&text));
+        assert_eq!(font_buttons(&ch), FONT_SIZES.to_vec());
+
+        // ...and a selected box still has none, even under the T tool.
+        let boxed = styled(Shape::Rectangle);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Text), Some(&boxed));
+        assert!(font_buttons(&ch).is_empty());
+    }
+
+    #[test]
+    fn the_highlighted_size_is_the_selection_not_the_tool_default() {
+        let mut text = styled(Shape::Text);
+        text.set_font_scale(FontSize::Big.scale(), CELL_H);
+        // Tool default is deliberately something else.
+        let ch = layout(120, 40, CELL_H, &state(Tool::Text), Some(&text));
+        let active: Vec<FontSize> = ch
+            .hotspots
+            .iter()
+            .filter(|h| h.active)
+            .filter_map(|h| match h.action {
+                Action::Font(fs) => Some(fs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(active, vec![FontSize::Big]);
+    }
+
+    #[test]
+    fn exactly_one_size_is_ever_highlighted() {
+        // Including for a `fontSize` that matches no preset — a file
+        // from the real editor.
+        let mut text = styled(Shape::Text);
+        text.font_size = Some(41.0);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Select), Some(&text));
+        let n = ch
+            .hotspots
+            .iter()
+            .filter(|h| h.active && matches!(h.action, Action::Font(_)))
+            .count();
+        assert_eq!(n, 1);
+    }
+
     #[test]
     fn fill_swatches_appear_only_for_closed_shapes() {
         for t in [Tool::Box, Tool::Ellipse, Tool::Diamond] {
-            let ch = layout(120, 40, &state(t), None);
+            let ch = layout(120, 40, CELL_H, &state(t), None);
             assert!(
                 ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))),
                 "{} should offer a fill",
@@ -622,7 +754,7 @@ mod tests {
             );
         }
         for t in [Tool::Line, Tool::Arrow, Tool::Text, Tool::Select] {
-            let ch = layout(120, 40, &state(t), None);
+            let ch = layout(120, 40, CELL_H, &state(t), None);
             assert!(
                 !ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))),
                 "{} has no interior to fill",
@@ -633,7 +765,7 @@ mod tests {
 
     #[test]
     fn stroke_and_fill_swatches_are_distinct_actions() {
-        let ch = layout(120, 40, &state(Tool::Box), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), None);
         // The same colour string can appear in both palettes; clicking
         // one must not change the other.
         let strokes: Vec<_> = ch
@@ -660,7 +792,7 @@ mod tests {
     #[test]
     fn the_widest_options_row_fits_in_eighty_columns() {
         for t in TOOLS {
-            let ch = layout(80, 40, &state(t), None);
+            let ch = layout(80, 40, CELL_H, &state(t), None);
             for h in &ch.hotspots {
                 assert!(
                     h.rect.x >= 0.0 && h.rect.x + h.rect.w <= 80.0,
@@ -704,7 +836,7 @@ mod tests {
 
     #[test]
     fn the_two_panels_are_visually_separated() {
-        let ch = layout(120, 40, &state(Tool::Box), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), None);
         assert_eq!(ch.panels.len(), 2, "palette + options");
         let (palette, options) = (ch.panels[0], ch.panels[1]);
         assert!(
@@ -732,7 +864,7 @@ mod tests {
     #[test]
     fn a_selection_shows_options_even_under_the_select_tool() {
         let sel = styled(Shape::Rectangle);
-        let ch = layout(120, 40, &state(Tool::Select), Some(&sel));
+        let ch = layout(120, 40, CELL_H, &state(Tool::Select), Some(&sel));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
@@ -751,8 +883,9 @@ mod tests {
             fill: FILLS[0],
             thickness: THICKNESSES[0],
             line_type: LineType::Solid,
+            font_size: FontSize::Normal,
         };
-        let ch = layout(120, 40, &st, Some(&sel));
+        let ch = layout(120, 40, CELL_H, &st, Some(&sel));
         let active = |f: fn(&Action) -> bool| {
             ch.hotspots
                 .iter()
@@ -777,18 +910,18 @@ mod tests {
     #[test]
     fn option_groups_follow_the_selected_shape() {
         let arrow = styled(Shape::Arrow);
-        let ch = layout(120, 40, &state(Tool::Box), Some(&arrow));
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), Some(&arrow));
         assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Fill(_))));
 
         let text = styled(Shape::Text);
-        let ch = layout(120, 40, &state(Tool::Box), Some(&text));
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), Some(&text));
         assert!(!ch.hotspots.iter().any(|h| matches!(h.action, Action::Line(_))));
         assert!(ch.hotspots.iter().any(|h| matches!(h.action, Action::Color(_))));
     }
 
     #[test]
     fn hotspots_never_overlap() {
-        let ch = layout(120, 40, &state(Tool::Box), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), None);
         for (i, a) in ch.hotspots.iter().enumerate() {
             for b in &ch.hotspots[i + 1..] {
                 let disjoint = a.rect.x + a.rect.w <= b.rect.x
@@ -803,7 +936,7 @@ mod tests {
     #[test]
     fn exactly_one_control_per_group_is_active() {
         let st = state(Tool::Box);
-        let ch = layout(120, 40, &st, None);
+        let ch = layout(120, 40, CELL_H, &st, None);
         let count = |f: fn(&Action) -> bool| {
             ch.hotspots.iter().filter(|h| f(&h.action) && h.active).count()
         };
@@ -815,7 +948,7 @@ mod tests {
 
     #[test]
     fn chrome_sits_above_the_status_line() {
-        let ch = layout(120, 40, &state(Tool::Box), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), None);
         for h in &ch.hotspots {
             assert!(
                 h.rect.y + h.rect.h <= 39.0,
@@ -827,7 +960,7 @@ mod tests {
 
     #[test]
     fn covers_includes_panel_padding_between_groups() {
-        let ch = layout(120, 40, &state(Tool::Box), None);
+        let ch = layout(120, 40, CELL_H, &state(Tool::Box), None);
         let p = ch.panels.last().expect("options panel");
         // A gap cell between two option groups is not a hotspot but
         // must still count as chrome, so dragging there doesn't pan.

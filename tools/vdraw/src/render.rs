@@ -172,9 +172,13 @@ pub fn text_cells(text: &str) -> f32 {
     text.width() as f32
 }
 
-/// A text caret, one cell tall, sitting after the last character.
-pub fn caret_command(e: &Element, accent: Style) -> DrawCmd {
-    let n = text_cells(&e.text);
+/// A text caret sitting after the last character.
+///
+/// One cell tall and one run wide at cell size — both scaled by the
+/// element's `font_scale`, since the glyphs it trails are (§7.4).
+pub fn caret_command(e: &Element, cam: &Camera, accent: Style) -> DrawCmd {
+    let scale = e.font_scale(cam.cell_h);
+    let n = text_cells(&e.text) * scale;
     let x = match e.shape() {
         // Container labels are centre-aligned about the origin.
         Some(Shape::Text) => n,
@@ -185,8 +189,8 @@ pub fn caret_command(e: &Element, accent: Style) -> DrawCmd {
         rects: vec![Rect {
             x,
             y: 0.0,
-            w: 0.12,
-            h: 1.0,
+            w: 0.12 * scale,
+            h: scale,
         }],
     }
 }
@@ -293,6 +297,7 @@ pub fn element_body(e: &Element, order: i32, cam: &Camera) -> Option<CreateEleme
             align: align_of(&e.text_align),
             fill: stroke.clone()?,
             font_style: FontStyle::default(),
+            font_scale: e.font_scale(cam.cell_h),
             text: e.text.clone(),
         }],
     };
@@ -305,7 +310,9 @@ pub fn element_body(e: &Element, order: i32, cam: &Camera) -> Option<CreateEleme
 /// keeps its caption.
 fn finish(e: &Element, mut cmds: Vec<DrawCmd>, order: i32, cam: &Camera) -> CreateElementBody {
     // Drawn inside the same element so the shape and its text move as
-    // one. Text is cell-sized, so it is centred rather than laid out.
+    // one. A label is a single run, so it is centred rather than laid
+    // out — but it takes the container's own size, since `for_export`
+    // splits it into a real text element carrying that `fontSize`.
     if e.shape() != Some(Shape::Text) && !e.text.is_empty() {
         if let Some(st) = paint(&e.stroke_color, e.opacity) {
             cmds.push(DrawCmd::DrawText {
@@ -313,6 +320,7 @@ fn finish(e: &Element, mut cmds: Vec<DrawCmd>, order: i32, cam: &Camera) -> Crea
                 align: Align::Center,
                 fill: st,
                 font_style: FontStyle::default(),
+                font_scale: e.font_scale(cam.cell_h),
                 text: e.text.clone(),
             });
         }
@@ -781,6 +789,45 @@ mod tests {
         assert_eq!((short.x, short.y), (10.0, 2.0));
     }
 
+    /// The one command whose `font_scale` a viewer actually sees.
+    fn text_scale_of(e: &Element, cam: &Camera) -> f32 {
+        let body = element_body(e, 1, cam).expect("body");
+        body.commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::DrawText { font_scale, .. } => Some(*font_scale),
+                _ => None,
+            })
+            .expect("a DrawText")
+    }
+
+    #[test]
+    fn a_sized_text_reaches_the_wire_as_that_multiplier() {
+        let cam = Camera::new(8.0, 17.0);
+        let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        e.text = "heading".into();
+        e.set_font_scale(1.75, cam.cell_h);
+        assert!((text_scale_of(&e, &cam) - 1.75).abs() < 1e-5);
+
+        // No size recorded — every pre-presets document — stays at one
+        // grid row rather than picking up a default from somewhere.
+        let mut plain = Element::new("p", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        plain.text = "body".into();
+        assert_eq!(text_scale_of(&plain, &cam), 1.0);
+    }
+
+    #[test]
+    fn a_container_label_takes_the_container_size() {
+        // `for_export` splits the label into a text element carrying
+        // the container's `fontSize`, so what vdraw draws and what the
+        // web editor draws have to be the same size.
+        let cam = Camera::new(8.0, 17.0);
+        let mut b = Element::new("b", Shape::Rectangle, 0.0, 0.0, 160.0, 68.0);
+        b.text = "label".into();
+        b.set_font_scale(0.75, cam.cell_h);
+        assert!((text_scale_of(&b, &cam) - 0.75).abs() < 1e-5);
+    }
+
     #[test]
     fn shapes_still_anchor_at_their_centre() {
         let cam = Camera::new(8.0, 17.0);
@@ -791,9 +838,10 @@ mod tests {
 
     #[test]
     fn caret_follows_the_display_width() {
+        let cam = Camera::new(8.0, 17.0);
         let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
         e.text = "hello".into();
-        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, ACCENT) else {
+        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, &cam, ACCENT) else {
             panic!("expected caret rect");
         };
         assert_eq!(rects[0].x, 5.0, "one cell per narrow character");
@@ -801,7 +849,7 @@ mod tests {
         // Wide glyphs take two cells each, so a character count would
         // park the caret in the middle of the last one.
         e.text = "日本".into();
-        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, ACCENT) else {
+        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, &cam, ACCENT) else {
             panic!("expected caret rect");
         };
         assert_eq!(rects[0].x, 4.0);
@@ -809,10 +857,26 @@ mod tests {
         // Container labels are centred, so the caret sits at half-width.
         let mut b = Element::new("b", Shape::Rectangle, 0.0, 0.0, 100.0, 40.0);
         b.text = "hello".into();
-        let DrawCmd::FillRectangles { rects, .. } = caret_command(&b, ACCENT) else {
+        let DrawCmd::FillRectangles { rects, .. } = caret_command(&b, &cam, ACCENT) else {
             panic!("expected caret rect");
         };
         assert_eq!(rects[0].x, 2.5);
+    }
+
+    #[test]
+    fn caret_grows_with_the_text_it_trails() {
+        let cam = Camera::new(8.0, 17.0);
+        let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        e.text = "hello".into();
+        e.set_font_scale(2.0, cam.cell_h);
+        let DrawCmd::FillRectangles { rects, .. } = caret_command(&e, &cam, ACCENT) else {
+            panic!("expected caret rect");
+        };
+        // Five characters at 2× are ten cells of advance, and the bar
+        // itself is two rows tall — otherwise it would mark the wrong
+        // spot on a run whose glyphs it no longer matches.
+        assert_eq!(rects[0].x, 10.0);
+        assert_eq!(rects[0].h, 2.0);
     }
 
     #[test]

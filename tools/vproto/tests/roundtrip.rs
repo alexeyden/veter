@@ -155,6 +155,60 @@ fn commands_the_old_cli_could_not_emit() {
     }}));
 }
 
+/// A `DrawText` with an explicit size (§7.4) as a script would write it.
+fn text_element(font_scale: Option<f32>) -> Value {
+    let mut text = json!({
+        "origin": {"x": 0.0, "y": 0.0},
+        "align": "Left",
+        "fill": {"Flat": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0}},
+        "font_style": 0,
+        "text": "heading",
+    });
+    if let Some(s) = font_scale {
+        text["font_scale"] = json!(s);
+    }
+    json!({"CreateElement": {
+        "id": "t.el",
+        "commands": [{"DrawText": text}],
+        "origin": {"x": 0.0, "y": 0.0},
+        "is_visible": true,
+        "draw_order": 0,
+        "parent": null,
+        "size": null,
+        "transform": null,
+        "anchor": "Viewport",
+    }})
+}
+
+#[test]
+fn draw_text_font_scale_survives_the_round_trip() {
+    vge_roundtrip(text_element(Some(2.5)));
+    vge_roundtrip(text_element(Some(0.5)));
+    vge_roundtrip(text_element(Some(1.0)));
+}
+
+#[test]
+fn draw_text_without_font_scale_defaults_to_cell_size() {
+    // A script that never mentions a size must still produce a valid
+    // command — the field is on the wire either way, so the JSON
+    // default is what keeps existing scripts working.
+    let bytes = emit("vge", &json!([text_element(None)]));
+    let f = frames(&bytes);
+    let decoded = vge_protocol::command::parse(f[0].0, &f[0].2).expect("host parser");
+    let back = serde_json::to_value(&decoded).unwrap();
+    let drawn = &back["CreateElement"]["commands"][0]["DrawText"];
+    assert_eq!(drawn["font_scale"], 1.0);
+}
+
+#[test]
+fn draw_text_rejects_a_nonsense_font_scale() {
+    // Encoding succeeds (it is just an f32); the host parser is what
+    // refuses it, which is the boundary that matters.
+    let bytes = emit("vge", &json!([text_element(Some(0.0))]));
+    let f = frames(&bytes);
+    assert!(vge_protocol::command::parse(f[0].0, &f[0].2).is_err());
+}
+
 #[test]
 fn prt_commands_round_trip() {
     prt_roundtrip(json!({"DeletePortal": {"id": "pane1"}}));

@@ -141,6 +141,21 @@ impl FontStyle {
     }
 }
 
+/// The multiplier that means "the terminal's own font size" — the one
+/// the cell grid is drawn at (§7.4).
+pub const DEFAULT_FONT_SCALE: f32 = 1.0;
+
+/// Largest multiplier a terminal must accept (§7.4). A cap keeps one
+/// bad float from asking the glyph rasteriser for a thousand-pixel em.
+pub const MAX_FONT_SCALE: f32 = 64.0;
+
+/// Serde/JSON default for `DrawText::font_scale`, so a document written
+/// before the field existed still deserialises.
+#[cfg(feature = "serde")]
+fn default_font_scale() -> f32 {
+    DEFAULT_FONT_SCALE
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -154,6 +169,11 @@ pub enum DrawCmd {
         align: Align,
         fill: Style,
         font_style: FontStyle,
+        /// Multiplier on the terminal's own font size (§7.4);
+        /// [`DEFAULT_FONT_SCALE`] is the size the cell grid is drawn at.
+        /// Always on the wire — omit it in JSON and it reads as 1.0.
+        #[cfg_attr(feature = "serde", serde(default = "default_font_scale"))]
+        font_scale: f32,
         text: String,
     },
     FillPolygon {
@@ -532,6 +552,17 @@ fn validate_line_width(w: f32) -> DecodeResult<f32> {
     Ok(w)
 }
 
+/// A font multiplier must be a real, positive number no larger than
+/// [`MAX_FONT_SCALE`] (§7.4). Zero would make the run invisible but
+/// still pickable, and a wild value is a rasteriser hazard, so both
+/// are `err_bad_payload` rather than something to clamp silently.
+fn validate_font_scale(s: f32) -> DecodeResult<f32> {
+    if !s.is_finite() || s <= 0.0 || s > MAX_FONT_SCALE {
+        return Err(DecodeError::bad_payload());
+    }
+    Ok(s)
+}
+
 pub fn read_draw_cmd(r: &mut Reader<'_>) -> DecodeResult<DrawCmd> {
     let op = r.u8()?;
     match op {
@@ -555,12 +586,14 @@ pub fn read_draw_cmd(r: &mut Reader<'_>) -> DecodeResult<DrawCmd> {
             };
             let fill = read_style(r)?;
             let font_style = FontStyle(r.u8()?);
+            let font_scale = validate_font_scale(r.f32()?)?;
             let text = r.string()?.to_owned();
             Ok(DrawCmd::DrawText {
                 origin,
                 align,
                 fill,
                 font_style,
+                font_scale,
                 text,
             })
         }
@@ -1380,5 +1413,49 @@ mod tests {
         let mut r = Reader::new(&w.buf);
         let cmd = read_draw_cmd(&mut r).unwrap();
         assert!(matches!(cmd, DrawCmd::OutlineFillPath { .. }));
+    }
+
+    /// A `DrawText` body with the given multiplier, ready for
+    /// `read_draw_cmd`.
+    fn sized_text_bytes(scale: f32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(OP_DRAW_TEXT);
+        w.f32(0.0);
+        w.f32(0.0); // origin
+        w.u8(0); // Left
+        w.buf.extend_from_slice(&flat_white());
+        w.u8(0); // font_style
+        w.f32(scale);
+        w.str("hi");
+        w.buf
+    }
+
+    #[test]
+    fn draw_text_carries_font_scale() {
+        let bytes = sized_text_bytes(1.75);
+        let mut r = Reader::new(&bytes);
+        match read_draw_cmd(&mut r).unwrap() {
+            DrawCmd::DrawText {
+                font_scale, text, ..
+            } => {
+                assert_eq!(font_scale, 1.75);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected DrawText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn draw_text_rejects_unusable_font_scale() {
+        // Zero and negative would put the run on screen with no glyphs
+        // to click; NaN and an absurd multiplier are rasteriser hazards.
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, MAX_FONT_SCALE * 2.0] {
+            let bytes = sized_text_bytes(bad);
+            let mut r = Reader::new(&bytes);
+            assert!(
+                read_draw_cmd(&mut r).is_err(),
+                "font_scale {bad} must be rejected"
+            );
+        }
     }
 }

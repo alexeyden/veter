@@ -52,6 +52,31 @@ pub const LINE_HEIGHT: f32 = 1.25;
 /// Used when a text element has no cell-derived size to work from.
 pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
+/// Bounds on the VGE multiplier a document may ask for (§7.4 caps it at
+/// 64). A hand-edited or foreign `fontSize` shouldn't be able to fill
+/// the screen with one glyph, or vanish.
+const MIN_FONT_SCALE: f32 = 0.25;
+const MAX_FONT_SCALE: f32 = 8.0;
+
+/// doc-px font size → the VGE font multiplier (§7.4) that draws it.
+///
+/// One grid row is `LINE_HEIGHT` times the font size — which is where
+/// [`DEFAULT_FONT_SIZE`]'s 16 comes from: a 20px cell divided by 1.25.
+/// So a text drawn at multiplier 1.0 occupies exactly one row, and the
+/// saved document says the same thing in the units a web renderer
+/// understands.
+pub fn font_scale_from_px(font_size_px: f32, cell_h: f32) -> f32 {
+    if !font_size_px.is_finite() || font_size_px <= 0.0 || cell_h <= 0.0 {
+        return 1.0;
+    }
+    (font_size_px * LINE_HEIGHT / cell_h).clamp(MIN_FONT_SCALE, MAX_FONT_SCALE)
+}
+
+/// The inverse: the `fontSize` to record for a given multiplier.
+pub fn font_px_from_scale(scale: f32, cell_h: f32) -> f32 {
+    scale * cell_h / LINE_HEIGHT
+}
+
 impl Document {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -326,9 +351,26 @@ impl Element {
         }
     }
 
+    /// The VGE font multiplier (§7.4) this element's text is drawn at.
+    /// An element with no `fontSize` — anything vdraw wrote before sizes
+    /// existed — reads as cell-sized, which is what it looked like.
+    pub fn font_scale(&self, cell_h: f32) -> f32 {
+        match self.font_size {
+            Some(px) => font_scale_from_px(px, cell_h),
+            None => 1.0,
+        }
+    }
+
+    /// Record a multiplier as the doc-px `fontSize` that expresses it.
+    /// The document never stores the multiplier itself: `fontSize` is
+    /// the field the schema has, and a web renderer reads it directly.
+    pub fn set_font_scale(&mut self, scale: f32, cell_h: f32) {
+        self.font_size = Some(font_px_from_scale(scale, cell_h));
+    }
+
     /// Fill in the metadata Excalidraw needs to actually paint a string.
-    /// vdraw's own renderer ignores all of it — VGE text is locked to
-    /// the cell size (§7.4) — so this exists purely for interop.
+    /// Everything here beyond `fontSize` is interop only — vdraw draws
+    /// with the terminal's own font, at `font_scale` (§7.4).
     pub fn apply_text_metrics(&mut self, font_size: f32) {
         self.font_size = Some(font_size);
         // 3 = Cascadia, the monospace family. Closest to what vdraw
@@ -416,6 +458,87 @@ mod tests {
         b.font_size = Some(13.6);
         d.elements = vec![t, b];
         d
+    }
+
+    #[test]
+    fn a_cell_sized_run_is_the_default_font_size() {
+        // The two constants are the same fact: a 20px cell row is
+        // `LINE_HEIGHT` times a 16px font. If they ever disagree, a
+        // document saved at multiplier 1.0 would come back a different
+        // size in the web editor than it looked in vdraw.
+        assert_eq!(font_px_from_scale(1.0, 20.0), DEFAULT_FONT_SIZE);
+        assert_eq!(font_scale_from_px(DEFAULT_FONT_SIZE, 20.0), 1.0);
+    }
+
+    #[test]
+    fn font_scale_round_trips_through_doc_px() {
+        for cell_h in [17.0, 20.0, 33.0] {
+            for scale in [0.75, 1.0, 1.75] {
+                let px = font_px_from_scale(scale, cell_h);
+                assert!(
+                    (font_scale_from_px(px, cell_h) - scale).abs() < 1e-5,
+                    "{scale} at cell {cell_h} came back as {}",
+                    font_scale_from_px(px, cell_h)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_with_no_font_size_reads_as_cell_sized() {
+        // Every document vdraw wrote before sizes existed, and every
+        // shape that isn't text.
+        let e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(e.font_size, None);
+        assert_eq!(e.font_scale(20.0), 1.0);
+    }
+
+    #[test]
+    fn a_nonsense_font_size_falls_back_rather_than_exploding() {
+        // A hand-edited or foreign file must not be able to ask the
+        // terminal for a multiplier §7.4 would reject outright.
+        let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        for bad in [0.0, -12.0, f32::NAN] {
+            e.font_size = Some(bad);
+            assert_eq!(e.font_scale(20.0), 1.0, "fontSize {bad}");
+        }
+        e.font_size = Some(100_000.0);
+        assert!(e.font_scale(20.0) <= MAX_FONT_SCALE);
+    }
+
+    #[test]
+    fn set_font_scale_is_what_font_scale_reads_back() {
+        let mut e = Element::new("t", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        e.set_font_scale(1.75, 17.0);
+        assert!((e.font_scale(17.0) - 1.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_size_survives_a_save_and_load() {
+        // The size is only ever stored as `fontSize`, so this is the
+        // path that decides whether a big heading is still big when the
+        // file is reopened.
+        let cell_h = 17.0;
+        let mut d = Document::default();
+        let mut t = Element::new("t1", Shape::Text, 0.0, 0.0, 0.0, 0.0);
+        t.text = "heading".into();
+        t.set_font_scale(1.75, cell_h);
+        let mut b = Element::new("b1", Shape::Rectangle, 0.0, 0.0, 160.0, 68.0);
+        b.text = "label".into();
+        b.set_font_scale(0.75, cell_h);
+        d.elements = vec![t, b];
+
+        let json = serde_json::to_string(&d.with_split_labels()).unwrap();
+        let mut back: Document = serde_json::from_str(&json).unwrap();
+        back.fold_bound_labels();
+
+        let text = back.elements.iter().find(|e| e.id == "t1").expect("text");
+        assert!((text.font_scale(cell_h) - 1.75).abs() < 1e-5);
+        // The container's label was split out and folded back; its size
+        // has to come home with it, or a reopened diagram restyles
+        // itself.
+        let boxed = back.elements.iter().find(|e| e.id == "b1").expect("box");
+        assert!((boxed.font_scale(cell_h) - 0.75).abs() < 1e-5);
     }
 
     /// Excalidraw builds its font as `${fontSize}px ${family}`; without

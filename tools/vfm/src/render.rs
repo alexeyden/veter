@@ -560,6 +560,7 @@ fn text(x: f32, y: f32, align: Align, fill: Color, bold: bool, s: String) -> Dra
         align,
         fill: Style::Flat(fill),
         font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
+        font_scale: 1.0,
         text: s,
     }
 }

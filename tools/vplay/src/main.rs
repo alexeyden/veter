@@ -295,6 +295,7 @@ fn create_status(cols: u16, rows: u16) -> Command {
         align,
         fill: flat(c.0, c.1, c.2, 1.0),
         font_style: FontStyle::default(),
+        font_scale: 1.0,
         text: String::new(),
     };
     Command::CreateElement(CreateElementBody {
@@ -519,6 +520,7 @@ fn create_progress(cols: u16, media_rows: u16) -> Command {
                 align: Align::Center,
                 fill: flat(0.86, 0.90, 0.96, 1.0),
                 font_style: FontStyle::default(),
+                font_scale: 1.0,
                 text: String::new(),
             },
         ],

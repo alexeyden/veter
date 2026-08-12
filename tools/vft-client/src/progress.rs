@@ -262,6 +262,7 @@ impl VgeProgress {
             align: Align::Center,
             fill: Style::Flat(TEXT_RGBA),
             font_style: FontStyle::default(),
+            font_scale: 1.0,
             text: self.render_text(0, 0, 0.0),
         };
         let create = Command::CreateElement(CreateElementBody {
@@ -300,6 +301,7 @@ impl VgeProgress {
             align: Align::Center,
             fill: Style::Flat(TEXT_RGBA),
             font_style: FontStyle::default(),
+            font_scale: 1.0,
             text: self.render_text(current, total, rate_bps),
         };
         let upd_fg = Command::UpdateCommand(UpdateCommandBody {

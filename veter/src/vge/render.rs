@@ -495,6 +495,7 @@ fn render_cmd<T: Renderer>(
             align,
             fill,
             font_style,
+            font_scale,
             text,
         } => {
             if text.is_empty() {
@@ -504,6 +505,12 @@ fn render_cmd<T: Renderer>(
                 Some(c) => flat_to_femto(c),
                 None => MAGENTA,
             };
+            // A requested font size (§7.4) composes with the element's
+            // on-screen scale and from here on is indistinguishable from
+            // it: shaping, the baseline drop, the rules and the pick box
+            // are all already expressed in terms of one scale factor, so
+            // text sized 2× behaves exactly like text zoomed 2×.
+            let scale = scale * font_scale;
             let baseline_x = ox + origin.x * cell_w;
             // Baseline drop scales with the glyphs so the text stays pinned
             // to its origin under zoom.
@@ -898,6 +905,10 @@ mod tests {
     }
 
     fn draw_text_at(x: f32, y: f32, text: &str) -> DrawCmd {
+        draw_sized_text_at(x, y, text, 1.0)
+    }
+
+    fn draw_sized_text_at(x: f32, y: f32, text: &str, font_scale: f32) -> DrawCmd {
         DrawCmd::DrawText {
             origin: Point { x, y },
             align: Align::Left,
@@ -908,6 +919,7 @@ mod tests {
                 a: 1.0,
             }),
             font_style: FontStyle(0),
+            font_scale,
             text: text.into(),
         }
     }
@@ -1043,6 +1055,35 @@ mod tests {
 
         // A row above the run is a miss.
         assert!(tr.pick.hit(1.0 * cw + 1.0, 1.0 * ch).is_none());
+    }
+
+    #[test]
+    fn font_scale_grows_the_run_downward_from_its_origin_row() {
+        let (mut canvas, mut tr) = harness();
+        let (cw, ch) = (tr.cell_width, tr.cell_height);
+        // Width of the same run at cell size, to compare against.
+        let w1 = tr
+            .layout_vge_text("hello", 0.0, Align::Left, FontStyle(0), 1.0)
+            .total_width;
+
+        let mut state = VgeState::new();
+        state.elements_mut().insert(
+            "e".into(),
+            element(vec![draw_sized_text_at(1.0, 2.0, "hello", 2.0)]),
+        );
+        render(&mut canvas, &mut tr, &state);
+        assert_eq!(tr.pick.len(), 1);
+
+        // Twice as tall: a point a cell and a half below the origin row
+        // is inside a line box that at cell size would have ended one
+        // cell down.
+        assert!(tr.pick.hit(1.0 * cw + 1.0, 3.5 * ch).is_some());
+        // Twice as wide, and no wider.
+        assert!(tr.pick.hit(1.0 * cw + w1 * 1.5, 2.0 * ch + 1.0).is_some());
+        assert!(tr.pick.hit(1.0 * cw + w1 * 2.5, 2.0 * ch + 1.0).is_none());
+        // The top edge stays put — `origin.y` pins the line box whatever
+        // the size, so the run grows downward rather than around itself.
+        assert!(tr.pick.hit(1.0 * cw + 1.0, 2.0 * ch - 1.0).is_none());
     }
 
     #[test]

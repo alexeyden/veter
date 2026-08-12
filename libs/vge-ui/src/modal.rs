@@ -72,6 +72,7 @@ fn open_chrome(box_w: f32, box_h: f32, title: &str, rx: f32, ry: f32) -> Vec<Dra
             align: Align::Center,
             fill: Style::Flat(COLOR_MODAL_TEXT),
             font_style: FontStyle(0x01),
+            font_scale: 1.0,
             text: title.into(),
         },
     ]
@@ -131,6 +132,7 @@ pub fn prompt_element(
         align: Align::Center,
         fill: Style::Flat(COLOR_MODAL_TEXT),
         font_style: FontStyle(0x00),
+        font_scale: 1.0,
         text: line.into(),
     });
 
@@ -217,6 +219,7 @@ pub fn picker_element<P>(
         align: Align::Left,
         fill: Style::Flat(COLOR_MODAL_TEXT),
         font_style: FontStyle(0x00),
+        font_scale: 1.0,
         text: input_line,
     });
     // Caret bar — "> " is 2 cells, then as many as the typed text takes.
@@ -251,6 +254,7 @@ pub fn picker_element<P>(
                 COLOR_MODAL_TEXT
             }),
             font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
+            font_scale: 1.0,
             text: it.label.clone(),
         });
         if !it.hint.is_empty() {
@@ -262,6 +266,7 @@ pub fn picker_element<P>(
                 align: Align::Right,
                 fill: Style::Flat(COLOR_DIM_TEXT),
                 font_style: FontStyle(0x00),
+                font_scale: 1.0,
                 text: it.hint.clone(),
             });
         }
@@ -449,6 +454,7 @@ impl ScrollModal {
                     align: Align::Center,
                     fill: Style::Flat(COLOR_MODAL_TEXT),
                     font_style: FontStyle(0x01),
+                    font_scale: 1.0,
                     text: title,
                 },
                 DrawCmd::DrawLinePath {
@@ -504,6 +510,7 @@ impl ScrollModal {
                 align: Align::Left,
                 fill: Style::Flat(COLOR_MODAL_TEXT),
                 font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
+                font_scale: 1.0,
                 text: line.clone(),
             });
         }
