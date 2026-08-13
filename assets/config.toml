@@ -33,21 +33,27 @@
 # or one of the generic aliases. `fallback` lists families tried in order for
 # a character the primary lacks, ahead of any generic lookup.
 #
-# The fallback list matters most for icon glyphs (powerline separators, Nerd
-# Font symbols), which live in the Private Use Area. Nothing about a PUA
-# codepoint says which symbol it is, so a font mapping one is not evidence it
-# draws the intended glyph: Adwaita Sans, the GNOME UI font, spends 745 PUA
-# codepoints on its own stylistic alternates — U+E0A0, the powerline branch,
-# is its `divide.case`. Naming a symbol font here settles it outright.
+# The fallback list matters most for icon glyphs (Nerd Font symbols), which
+# live in the Private Use Area. Nothing about a PUA codepoint says which
+# symbol it is, so a font mapping one is not evidence it draws the intended
+# glyph: Adwaita Sans, the GNOME UI font, spends 745 PUA codepoints on its own
+# stylistic alternates — U+E0A0, the powerline branch, is its `divide.case`.
 #
-# For a PUA character no listed family covers, veter asks Fontconfig which
+# So for a PUA character no listed family covers, veter asks Fontconfig which
 # font actually owns the codepoint (an ordered charset match, the same way
 # Konsole resolves it) rather than taking the first family that claims it.
-# So the defaults below are a fast path, not a requirement — missing families
-# are skipped silently.
+# That is usually the better answer, which is why the list is empty by
+# default: Fontconfig tends to name a patched monospace font, already
+# proportioned like the primary, while a standalone symbol face advances a
+# full em per glyph and has to be scaled down to fit the cell. Name one here
+# only to pin a particular face; missing families are skipped silently.
+#
+# Powerline separators (U+E0B0..U+E0B7) don't go through any of this — they
+# are drawn as cell-sized primitives, like the box and block elements, so
+# they tile seamlessly whatever is installed, including nothing.
 [font]
 # family = "monospace"
-# fallback = ["Symbols Nerd Font Mono", "Symbols Nerd Font"]
+# fallback = ["Symbols Nerd Font Mono"]
 
 # ---------------------------------------------------------------------------
 # Search chrome colors

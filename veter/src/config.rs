@@ -6,11 +6,13 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Five things are configurable:
+//! Six things are configurable:
 //!
 //!  * `[accent]` — the shared accent palette the host publishes into the
 //!    reserved `host.*` VGE style namespace (see VGE §7.3). vmux and
 //!    other clients render their chrome from it via `host.accent`.
+//!  * `[font]` — the primary family and the fallback families tried for
+//!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
 //!    highlights).
 //!  * `[keys]` — the host-intercepted key chords (search, scroll,
@@ -187,15 +189,15 @@ pub struct FontConfig {
     /// what the default leaves it to.
     pub family: String,
     /// Families tried, in order, for a character the primary lacks —
-    /// before any generic lookup.
+    /// before the Fontconfig lookup that would otherwise pick one.
     ///
-    /// This exists because a font mapping a Private Use Area codepoint
-    /// tells you nothing about *which* symbol it draws there: the range
-    /// has no agreed meaning, so fonts legitimately use it for their own
-    /// internal glyphs. Adwaita Sans, for one, maps 745 PUA codepoints to
-    /// stylistic alternates — U+E0A0 (the powerline branch) is its
-    /// `divide.case`, and U+E0B0 (the powerline separator) its `y.subs`.
-    /// Naming a symbol font here settles it outright.
+    /// Empty by default, and worth leaving that way unless a particular
+    /// face is wanted: Fontconfig's charset match tends to land on a
+    /// patched monospace font, whose cell proportions are close enough
+    /// to the primary's to need no correction, whereas a standalone
+    /// symbol face advances a full em per glyph — at a 19.2px cell,
+    /// Symbols Nerd Font Mono advances 32px — and has to be scaled down
+    /// to fit, which leaves its icons noticeably short.
     pub fallback: Vec<String>,
 }
 
@@ -203,13 +205,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "monospace".into(),
-            // The Nerd Fonts project ships these as fallback-only faces
-            // holding just the icon ranges, which is exactly this slot.
-            // Absent families are skipped, so naming them costs nothing.
-            fallback: vec![
-                "Symbols Nerd Font Mono".into(),
-                "Symbols Nerd Font".into(),
-            ],
+            fallback: Vec::new(),
         }
     }
 }
@@ -831,18 +827,17 @@ mod tests {
         // fallbacks — that is what fixes icon glyphs out of the box.
         let bare: Config = toml::from_str("").unwrap();
         assert_eq!(bare.font.family, "monospace");
-        assert_eq!(bare.font.fallback[0], "Symbols Nerd Font Mono");
+        assert!(bare.font.fallback.is_empty());
 
         // Naming one key leaves the other at its default.
         let partial: Config = toml::from_str("[font]\nfamily = \"Iosevka\"\n").unwrap();
         assert_eq!(partial.font.family, "Iosevka");
-        assert_eq!(partial.font.fallback, bare.font.fallback);
+        assert!(partial.font.fallback.is_empty());
 
-        // An empty list is honoured, not treated as unset: it means
-        // "skip straight to the Fontconfig lookup".
-        let none: Config = toml::from_str("[font]\nfallback = []\n").unwrap();
-        assert!(none.font.fallback.is_empty());
-        assert_eq!(none.font.family, "monospace");
+        let pinned: Config =
+            toml::from_str("[font]\nfallback = [\"Symbols Nerd Font\"]\n").unwrap();
+        assert_eq!(pinned.font.fallback, ["Symbols Nerd Font"]);
+        assert_eq!(pinned.font.family, "monospace");
     }
 
     #[test]

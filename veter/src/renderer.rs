@@ -260,6 +260,93 @@ fn color_key(c: Color) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
 }
 
+/// Draw a Powerline separator (U+E0B0..U+E0B7) as a cell-sized
+/// primitive rather than a font glyph, for the same reason as the box
+/// and block elements: these are tiling shapes whose whole job is to
+/// butt seamlessly against the neighbouring cell's background, and a
+/// glyph only does that if the font it came from happens to share the
+/// primary font's cell box.
+///
+/// It rarely does. The separators live in the Private Use Area, so they
+/// arrive from whatever fallback face `resolve_fallback` lands on, and
+/// that face is drawn at the primary's pixel size, not its cell: at
+/// 32px, Noto Sans Mono spans 43.6px ascent-to-descent while Symbols
+/// Nerd Font Mono spans 32.0 — a separator 27% short of the cell, with
+/// the notch that leaves. (Konsole gets away with a font glyph because
+/// its default Liberation Mono spans 36.2px, close enough to the patched
+/// fonts' 37.2 to hide the seam.) Drawn here they fit exactly, whatever
+/// is installed — including nothing.
+///
+/// Returns `true` if `ch` was a separator and the cell was filled.
+fn try_draw_powerline<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    ch: char,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fg: Color,
+) -> bool {
+    let code = ch as u32;
+    if !(0xE0B0..=0xE0B7).contains(&code) {
+        return false;
+    }
+    // The thin variants are strokes of the same outline. Scale the pen
+    // with the cell so it stays visible at small sizes and doesn't turn
+    // into a slab at large ones.
+    // `max` before `clamp`: at a tiny cell the upper bound can fall
+    // under the lower one, and `clamp` panics on an inverted range.
+    let pen = (w * 0.14).clamp(1.0, (h * 0.12).max(1.0));
+    let (right, thin) = match code {
+        0xE0B0 => (true, false),
+        0xE0B1 => (true, true),
+        0xE0B2 => (false, false),
+        0xE0B3 => (false, true),
+        0xE0B4 => (true, false),
+        0xE0B5 => (true, true),
+        0xE0B6 => (false, false),
+        _ => (false, true),
+    };
+    let round = code >= 0xE0B4;
+
+    // Inset a stroked outline by half the pen, or it is clipped in half
+    // by the cell edge.
+    let (x0, x1) = if thin {
+        let i = pen * 0.5;
+        if right { (x + i, x + w - i) } else { (x + w - i, x + i) }
+    } else if right {
+        (x, x + w)
+    } else {
+        (x + w, x)
+    };
+    let (y0, y1) = if thin {
+        (y + pen * 0.5, y + h - pen * 0.5)
+    } else {
+        (y, y + h)
+    };
+
+    let mut p = Path::new();
+    p.move_to(x0, y0);
+    if round {
+        // A semicircle bulging toward `x1`. The 4/3 control offset is
+        // the standard cubic approximation of a half-ellipse.
+        let bulge = (x1 - x0) * 4.0 / 3.0;
+        p.bezier_to(x0 + bulge, y0, x0 + bulge, y1, x0, y1);
+    } else {
+        p.line_to(x1, (y0 + y1) * 0.5);
+        p.line_to(x0, y1);
+    }
+    if thin {
+        let mut paint = Paint::color(fg);
+        paint.set_line_width(pen);
+        canvas.stroke_path(&p, &paint);
+    } else {
+        p.close();
+        canvas.fill_path(&p, &Paint::color(fg));
+    }
+    true
+}
+
 /// Draw a Unicode block element (U+2580..U+259F) directly with cell-sized
 /// rectangles instead of using the font glyph. Most monospace fonts ship
 /// block glyphs that fall short of the cell box (especially the cell
@@ -824,6 +911,55 @@ impl GlyphCache {
 struct FallbackFont {
     data: Vec<u8>,
     index: usize,
+    /// Rasterisation scales that fit this face to the primary's cell,
+    /// kept apart so a double-width character can be fitted to the two
+    /// cells it occupies (see `cell_fit`). Both are 1.0 for a face
+    /// already proportioned like the primary, and well under it for a
+    /// symbol font whose glyphs are a full em wide.
+    width_fit: f32,
+    height_fit: f32,
+}
+
+/// The primary font's cell, which fallback faces are fitted to.
+#[derive(Debug, Clone, Copy)]
+struct CellMetrics {
+    width: f32,
+    height: f32,
+    /// Pixel size the primary is rasterised at.
+    size: f32,
+}
+
+/// How much to shrink (or grow) a fallback face so one of its glyphs
+/// lands inside one cell instead of sprawling across its neighbours.
+///
+/// A fallback is rasterised at the primary's pixel size, which says
+/// nothing about how big its glyphs come out: at 32px Symbols Nerd Font
+/// Mono advances 32.0px per glyph — "Mono" there means one advance for
+/// every glyph, an em wide, not one that matches a terminal — against a
+/// 19.2px cell. Its icons overhang the next two columns. The patched
+/// full fonts are already close (CaskaydiaCove advances 18.75px), so
+/// they come out near 1.0 and are left alone.
+///
+/// Fitting is uniform, so icons keep their shape. Cell-filling glyphs
+/// need the opposite treatment — exact, non-uniform, cell geometry —
+/// which is why the separators are drawn as primitives instead.
+fn cell_fit(data: &[u8], index: usize, cell: CellMetrics) -> (f32, f32) {
+    let Some(font_ref) = FontRef::from_index(data, index) else {
+        return (1.0, 1.0);
+    };
+    let m = font_ref.metrics(&[]).scale(cell.size);
+    let line = m.ascent + m.descent;
+    let width = if m.average_width > 0.0 {
+        (cell.width / m.average_width).clamp(0.1, 4.0)
+    } else {
+        1.0
+    };
+    let height = if line > 0.0 {
+        (cell.height / line).clamp(0.1, 4.0)
+    } else {
+        1.0
+    };
+    (width, height)
 }
 
 /// Which faces the grid is drawn with. Mirrors the binary's `[font]`
@@ -882,14 +1018,22 @@ fn fontconfig_family_for(ch: char) -> Option<String> {
 /// a family name collides across weights, and Parley's blob address
 /// can be recycled once the blob is dropped, which would silently point
 /// a cached glyph id at a different font's tables.
-fn register_fallback(fallback_fonts: &mut Vec<FallbackFont>, data: &[u8], index: usize) -> u16 {
+fn register_fallback(
+    fallback_fonts: &mut Vec<FallbackFont>,
+    data: &[u8],
+    index: usize,
+    cell: CellMetrics,
+) -> u16 {
     let idx = fallback_fonts
         .iter()
         .position(|fb| fb.index == index && fb.data == data)
         .unwrap_or_else(|| {
+            let (width_fit, height_fit) = cell_fit(data, index, cell);
             fallback_fonts.push(FallbackFont {
                 data: data.to_vec(),
                 index,
+                width_fit,
+                height_fit,
             });
             fallback_fonts.len() - 1
         });
@@ -902,6 +1046,7 @@ fn glyph_in_family(
     fallback_fonts: &mut Vec<FallbackFont>,
     name: &str,
     ch: char,
+    cell: CellMetrics,
 ) -> Option<ResolvedGlyph> {
     let family = font_cx.collection.family_by_name(name)?;
     let info = family.default_font()?;
@@ -914,7 +1059,7 @@ fn glyph_in_family(
     }
     Some(ResolvedGlyph {
         glyph_id,
-        font_id: register_fallback(fallback_fonts, data, index),
+        font_id: register_fallback(fallback_fonts, data, index, cell),
     })
 }
 
@@ -927,7 +1072,7 @@ fn resolve_fallback(
     fallback_families: &[String],
     pua_families: &mut Vec<String>,
     ch: char,
-    font_size: f32,
+    cell: CellMetrics,
 ) -> Option<ResolvedGlyph> {
     if let Some(&cached) = char_font_map.get(&ch) {
         return cached;
@@ -935,7 +1080,7 @@ fn resolve_fallback(
 
     // Configured families first, in order. Absent families just miss.
     for name in fallback_families {
-        if let Some(g) = glyph_in_family(font_cx, fallback_fonts, name, ch) {
+        if let Some(g) = glyph_in_family(font_cx, fallback_fonts, name, ch, cell) {
             char_font_map.insert(ch, Some(g));
             return Some(g);
         }
@@ -953,13 +1098,13 @@ fn resolve_fallback(
     if is_private_use(ch) {
         for i in 0..pua_families.len() {
             let name = pua_families[i].clone();
-            if let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch) {
+            if let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch, cell) {
                 char_font_map.insert(ch, Some(g));
                 return Some(g);
             }
         }
         if let Some(name) = fontconfig_family_for(ch)
-            && let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch)
+            && let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch, cell)
         {
             pua_families.push(name);
             char_font_map.insert(ch, Some(g));
@@ -975,7 +1120,7 @@ fn resolve_fallback(
     let mut builder = layout_cx.ranged_builder(font_cx, &s, 1.0, false);
     builder.push_default(StyleProperty::Brush(Color::white()));
     builder.push_default(FontStack::from("system-ui"));
-    builder.push_default(StyleProperty::FontSize(font_size));
+    builder.push_default(StyleProperty::FontSize(cell.size));
     let mut layout: Layout<Color> = builder.build(&s);
     layout.break_all_lines(None);
     layout.align(None, Alignment::Start, AlignmentOptions::default());
@@ -994,7 +1139,7 @@ fn resolve_fallback(
                 if glyph_id != 0 {
                     let resolved = ResolvedGlyph {
                         glyph_id,
-                        font_id: register_fallback(fallback_fonts, data_ref, index),
+                        font_id: register_fallback(fallback_fonts, data_ref, index, cell),
                     };
                     char_font_map.insert(ch, Some(resolved));
                     return Some(resolved);
@@ -1458,6 +1603,7 @@ impl TerminalRenderer {
         if gid != 0 {
             return Some((gid, 0));
         }
+        let cell = self.cell_metrics();
         let resolved = resolve_fallback(
             &mut self.font_cx,
             &mut self.layout_cx,
@@ -1466,9 +1612,30 @@ impl TerminalRenderer {
             &self.fallback_families,
             &mut self.pua_families,
             ch,
-            self.font_size,
+            cell,
         )?;
         Some((resolved.glyph_id, resolved.font_id))
+    }
+
+    /// The primary's cell, as fallback faces are fitted to it.
+    fn cell_metrics(&self) -> CellMetrics {
+        CellMetrics {
+            width: self.cell_width,
+            height: self.cell_height,
+            size: self.font_size,
+        }
+    }
+
+    /// Rasterisation size for `font_id` in the grid: a fallback face is
+    /// shrunk to fit the cell, the primary is already the cell.
+    /// `span` is the character's column count, so a double-width glyph
+    /// is fitted to the two cells it actually occupies.
+    fn grid_raster_size(&self, font_id: u16, span: f32) -> f32 {
+        if font_id == 0 {
+            return self.font_size;
+        }
+        let fb = &self.fallback_fonts[(font_id - 1) as usize];
+        self.font_size * (fb.width_fit * span).min(fb.height_fit)
     }
 
     fn font_ref_for(&self, font_id: u16) -> FontRef<'_> {
@@ -1707,6 +1874,7 @@ impl TerminalRenderer {
         layout.align(None, Alignment::Start, AlignmentOptions::default());
 
         let total_width = layout.width();
+        let cell = self.cell_metrics();
 
         // Walk runs, registering fonts and collecting per-glyph info.
         // Cluster boundaries come off the same runs, so the stop list
@@ -1721,7 +1889,12 @@ impl TerminalRenderer {
                     let data_ref = font.data.as_ref();
                     let font_index = font.index as usize;
                     let font_id =
-                        register_fallback(&mut self.fallback_fonts, data_ref, font_index);
+                        register_fallback(
+                            &mut self.fallback_fonts,
+                            data_ref,
+                            font_index,
+                            cell,
+                        );
 
                     let mut cluster_x = run_layout.offset();
                     for cluster in run.clusters() {
@@ -1938,6 +2111,7 @@ impl TerminalRenderer {
         let mut alpha_batches: HashMap<u32, HashMap<usize, Vec<Quad>>> = HashMap::new();
         let mut color_batches: HashMap<usize, Vec<Quad>> = HashMap::new();
 
+        let cell_metrics = self.cell_metrics();
         for row in 0..rows {
             for col in 0..cols {
                 let cell = match screen.cell_at(scroll_offset, row, col) {
@@ -1970,6 +2144,10 @@ impl TerminalRenderer {
                     try_draw_block_element(
                         canvas, ch, cx, cy, self.cell_width, self.cell_height, fg,
                     )
+                } else if (0xE0B0..=0xE0B7).contains(&code) {
+                    try_draw_powerline(
+                        canvas, ch, cx, cy, self.cell_width, self.cell_height, fg,
+                    )
                 } else {
                     false
                 };
@@ -1990,7 +2168,7 @@ impl TerminalRenderer {
                             &self.fallback_families,
                             &mut self.pua_families,
                             ch,
-                            self.font_size,
+                            cell_metrics,
                         ) {
                             Some(rg) => (rg.glyph_id, rg.font_id),
                             None => continue,
@@ -2001,6 +2179,11 @@ impl TerminalRenderer {
                 let x = cx;
                 let y = cy + self.ascent;
 
+                // A fallback face is rasterised small enough to stay
+                // inside the cells this character occupies; the primary
+                // defines them, so it is drawn as-is.
+                let span = if cell.is_wide() { 2.0 } else { 1.0 };
+                let raster_size = self.grid_raster_size(font_id, span);
                 let rendered = if font_id == 0 {
                     let fr = FontRef::from_index(&self.font_data, self.font_index).unwrap();
                     self.glyph_cache.get_or_render(
@@ -2008,7 +2191,7 @@ impl TerminalRenderer {
                         &mut self.scale_cx,
                         fr,
                         glyph_id,
-                        self.font_size,
+                        raster_size,
                         0,
                     )
                 } else {
@@ -2019,7 +2202,7 @@ impl TerminalRenderer {
                         &mut self.scale_cx,
                         fr,
                         glyph_id,
-                        self.font_size,
+                        raster_size,
                         font_id,
                     )
                 };
@@ -2452,15 +2635,80 @@ mod font_fallback_tests {
         let a = vec![1u8, 2, 3];
         let b = vec![4u8, 5, 6];
 
-        assert_eq!(register_fallback(&mut fonts, &a, 0), 1);
-        assert_eq!(register_fallback(&mut fonts, &a, 0), 1, "same bytes reuse the id");
-        assert_eq!(register_fallback(&mut fonts, &b, 0), 2, "different bytes, new id");
+        let cell = CellMetrics { width: 9.0, height: 20.0, size: 16.0 };
+        assert_eq!(register_fallback(&mut fonts, &a, 0, cell), 1);
         assert_eq!(
-            register_fallback(&mut fonts, &a, 1),
+            register_fallback(&mut fonts, &a, 0, cell),
+            1,
+            "same bytes reuse the id"
+        );
+        assert_eq!(
+            register_fallback(&mut fonts, &b, 0, cell),
+            2,
+            "different bytes, new id"
+        );
+        assert_eq!(
+            register_fallback(&mut fonts, &a, 1, cell),
             3,
             "same bytes at another face index is another font"
         );
         assert_eq!(fonts.len(), 3);
+    }
+
+    /// Separators are primitives, so they never reach font selection —
+    /// that is what makes them tile against the neighbouring cell's
+    /// background whatever (if anything) is installed.
+    #[test]
+    fn powerline_separators_are_drawn_as_primitives() {
+        let mut canvas = Canvas::new(femtovg::renderer::Void).unwrap();
+        canvas.set_size(200, 100, 1.0);
+        let fg = Color::white();
+        for code in 0xE0B0..=0xE0B7u32 {
+            let ch = char::from_u32(code).unwrap();
+            assert!(
+                try_draw_powerline(&mut canvas, ch, 0.0, 0.0, 9.0, 20.0, fg),
+                "U+{code:04X} must be drawn as a primitive"
+            );
+        }
+        // Its neighbours are ordinary glyphs: U+E0AF ends the block
+        // below, U+E0B8 starts the slanted set, and U+E0A0 is the branch
+        // icon, which is not a tiling shape.
+        // A one-pixel cell must not panic the pen calculation.
+        assert!(try_draw_powerline(&mut canvas, '\u{e0b1}', 0.0, 0.0, 1.0, 1.0, fg));
+
+        for code in [0xE0AFu32, 0xE0B8, 0xE0A0] {
+            let ch = char::from_u32(code).unwrap();
+            assert!(
+                !try_draw_powerline(&mut canvas, ch, 0.0, 0.0, 9.0, 20.0, fg),
+                "U+{code:04X} must fall through to the font"
+            );
+        }
+    }
+
+    /// A fallback face is rasterised at the primary's pixel size, which
+    /// says nothing about how wide its glyphs come out.
+    #[test]
+    fn cell_fit_scales_a_face_into_the_cell() {
+        let mut cx = FontContext::new();
+        let cell = CellMetrics { width: 19.2, height: 43.6, size: 32.0 };
+        let Some(fam) = cx.collection.family_by_name("Symbols Nerd Font Mono") else {
+            eprintln!("skipped: Symbols Nerd Font Mono not installed");
+            return;
+        };
+        let info = fam.default_font().unwrap();
+        let index = info.index() as usize;
+        let blob = info.load(Some(&mut cx.source_cache)).unwrap();
+        let (width_fit, height_fit) = cell_fit(blob.as_ref(), index, cell);
+
+        // It advances a full em (32px at this size) into a 19.2px cell,
+        // so its glyphs have to come down to ~0.6 to stay in one column.
+        assert!(
+            (0.5..0.7).contains(&width_fit),
+            "width_fit was {width_fit}, expected the em to be scaled into the cell"
+        );
+        // Vertically it is short of the cell, so it would be grown —
+        // which is why the narrower of the two constraints wins.
+        assert!(height_fit > 1.0, "height_fit was {height_fit}");
     }
 
     /// The regression this whole chain exists for: a powerline glyph
@@ -2477,7 +2725,8 @@ mod font_fallback_tests {
         let mut map: HashMap<char, Option<ResolvedGlyph>> = HashMap::new();
         let mut pua: Vec<String> = Vec::new();
 
-        if glyph_in_family(&mut font_cx, &mut fonts, SYMBOLS, '\u{e0a0}').is_none() {
+        let cell = CellMetrics { width: 19.2, height: 43.6, size: 32.0 };
+        if glyph_in_family(&mut font_cx, &mut fonts, SYMBOLS, '\u{e0a0}', cell).is_none() {
             eprintln!("skipped: {SYMBOLS} not installed");
             return;
         }
@@ -2492,7 +2741,7 @@ mod font_fallback_tests {
             &configured,
             &mut pua,
             '\u{e0a0}',
-            14.0,
+            cell,
         )
         .expect("powerline branch must resolve");
 
@@ -2509,3 +2758,4 @@ mod font_fallback_tests {
         assert!(pua.is_empty());
     }
 }
+
