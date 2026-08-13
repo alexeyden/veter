@@ -1904,6 +1904,68 @@ fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
     bits
 }
 
+/// Spell one mouse report in the encoding the host program negotiated.
+/// `col`/`row` are 1-indexed host cells. `None` means "send nothing":
+/// reporting is off, or this event is not reportable in this mode, or
+/// the cell is not representable in this encoding.
+///
+/// Emitting SGR unconditionally would be wrong even though every
+/// modern program negotiates it: a program receives `ESC [ < …` only
+/// if it enabled DECSET 1006, and ncurses enables 1006 only when its
+/// terminfo entry carries `XM`. Older entries don't, so ncurses
+/// matches `kmous=\E[M` and the unrecognised report reaches the
+/// application as literal keystrokes.
+///
+/// `vmux::encode_mouse_report` is the same rule one layer down, for a
+/// portal's inner program (`doc/portal-extension.md` §11). It keys off
+/// the §8.9 encoding *codes* rather than these vt100 enums — and it
+/// also spells urxvt (1015), which vt100 does not model — so the two
+/// stay separate; keep them in step.
+fn encode_mouse_report(
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+    button: u32,
+    col: u32,
+    row: u32,
+    press: bool,
+) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+    if mode == Mode::None {
+        return None;
+    }
+    // X10 (DECSET 9) reports presses only, whatever the encoding.
+    if !press && mode == Mode::Press {
+        return None;
+    }
+    // SGR is the only encoding that spells a release as its own final
+    // byte; the legacy ones report button 3, keeping the modifier and
+    // motion bits.
+    if encoding == Enc::Sgr {
+        let final_byte = if press { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{button};{col};{row}{final_byte}").into_bytes());
+    }
+    let button = if press { button } else { (button & !0b11) | 3 };
+    let (cb, cx, cy) = (button + 32, col + 32, row + 32);
+    let mut out = b"\x1b[M".to_vec();
+    if encoding == Enc::Utf8 {
+        // 1005: the same values as code points, so a cell past 223
+        // still fits (up to 2015).
+        for v in [cb, cx, cy] {
+            let ch = char::from_u32(v)?;
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        return Some(out);
+    }
+    // Legacy: one byte each, so anything past column/row 223 is
+    // unreportable. Drop it rather than name the wrong cell — xterm
+    // does the same.
+    for v in [cb, cx, cy] {
+        out.push(u8::try_from(v).ok()?);
+    }
+    Some(out)
+}
+
 impl App {
     fn new(
         proxy: EventLoopProxy<()>,
@@ -2987,26 +3049,29 @@ impl App {
         Some((col, row))
     }
 
-    /// Forward a button press/release to the inner program via SGR
-    /// mouse encoding (`\e[<b;c;r{M,m}`). Returns true if the event
-    /// was forwarded (caller skips local handling); false if mouse
-    /// mode isn't on or the encoding isn't SGR. Mirrors the gating
-    /// the wheel handler already does.
+    /// Forward a button press/release to the inner program in whatever
+    /// mouse encoding it negotiated (`encode_mouse_report`). Returns
+    /// true if the event belongs to that program (caller skips local
+    /// handling); false only when mouse reporting is off entirely.
+    ///
+    /// True with nothing written is deliberate: once a program owns the
+    /// mouse, an event it declined to hear about (an X10 release, a
+    /// cell its encoding cannot name) must not fall through and start
+    /// a local selection — that would make clicks past column 223
+    /// behave differently from clicks before it.
     fn try_forward_mouse_button(&self, button: u32, press: bool) -> bool {
         let (mode, encoding) = self.host_mouse_proto();
-        if mode == vt100::MouseProtocolMode::None
-            || !matches!(encoding, vt100::MouseProtocolEncoding::Sgr)
-        {
+        if mode == vt100::MouseProtocolMode::None {
             return false;
         }
         let Some((col, row)) = self.cursor_to_host_cell() else {
             return false;
         };
         let code = button | encode_mouse_modifier_bits(self.modifiers);
-        let suffix = if press { 'M' } else { 'm' };
-        let payload = format!("\x1b[<{code};{col};{row}{suffix}");
-        if let Some(pty) = &self.pty {
-            let _ = pty.write_all(payload.as_bytes());
+        if let Some(payload) = encode_mouse_report(mode, encoding, code, col, row, press)
+            && let Some(pty) = &self.pty
+        {
+            let _ = pty.write_all(&payload);
         }
         true
     }
@@ -3018,9 +3083,6 @@ impl App {
     /// crossing. Returns true if forwarded.
     fn try_forward_mouse_motion(&mut self) -> bool {
         let (mode, encoding) = self.host_mouse_proto();
-        if !matches!(encoding, vt100::MouseProtocolEncoding::Sgr) {
-            return false;
-        }
         let held = self.mouse_buttons_held;
         let report = match mode {
             vt100::MouseProtocolMode::ButtonMotion => held != 0,
@@ -3046,11 +3108,13 @@ impl App {
         } else {
             3 // AnyMotion with nothing pressed: button-released code
         };
-        // Bit 5 (0x20) is the SGR motion flag.
+        // Bit 5 (0x20) is the motion flag in every encoding.
         let code = button | 0x20 | encode_mouse_modifier_bits(self.modifiers);
-        let payload = format!("\x1b[<{code};{col};{row}M");
+        let Some(payload) = encode_mouse_report(mode, encoding, code, col, row, true) else {
+            return false;
+        };
         if let Some(pty) = &self.pty {
-            let _ = pty.write_all(payload.as_bytes());
+            let _ = pty.write_all(&payload);
         }
         true
     }
@@ -5001,8 +5065,7 @@ impl ApplicationHandler for App {
                         vt100::MouseProtocolMode::None,
                         vt100::MouseProtocolEncoding::Default,
                     ));
-                let forward = mode != vt100::MouseProtocolMode::None
-                    && matches!(encoding, vt100::MouseProtocolEncoding::Sgr);
+                let forward = mode != vt100::MouseProtocolMode::None;
 
                 if forward {
                     // Convert pointer position + delta into wheel ticks
@@ -5034,11 +5097,15 @@ impl ApplicationHandler for App {
                             })
                             .unwrap_or((1, 1));
                         let button = if ticks > 0 { 64 } else { 65 };
-                        let mut payload = Vec::with_capacity(16 * ticks.unsigned_abs() as usize);
+                        // The wheel is a press-only button, so one
+                        // report per tick and never a release.
+                        let tick =
+                            encode_mouse_report(mode, encoding, button, col, row, true)
+                                .unwrap_or_default();
+                        let mut payload =
+                            Vec::with_capacity(tick.len() * ticks.unsigned_abs() as usize);
                         for _ in 0..ticks.unsigned_abs() {
-                            payload.extend_from_slice(
-                                format!("\x1b[<{button};{col};{row}M").as_bytes(),
-                            );
+                            payload.extend_from_slice(&tick);
                         }
                         if let Some(pty) = &self.pty {
                             let _ = pty.write_all(&payload);
@@ -5363,6 +5430,73 @@ fn trace_keyboard_send(bytes: &[u8]) {
     }
     line.push_str("|\n");
     let _ = file.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod mouse_report_tests {
+    use super::*;
+    use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+
+    /// A report must be spelled in the encoding the host program
+    /// negotiated. Emitting SGR to a program that never enabled 1006
+    /// (its terminfo lacks `XM`, so ncurses matches `kmous=\E[M`)
+    /// delivers `ESC [ < …` to it as literal keystrokes.
+    #[test]
+    fn report_follows_negotiated_encoding() {
+        // SGR (1006): unchanged, and the only one with an `m` release.
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, 48, 10, true).unwrap(),
+            b"\x1b[<0;48;10M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, 48, 10, false).unwrap(),
+            b"\x1b[<0;48;10m".to_vec()
+        );
+
+        // Legacy: `ESC [ M` with each value offset by 32, and a release
+        // spelled as button 3 rather than a final `m`.
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 48, 10, true).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 48 + 32, 10 + 32]
+        );
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 48, 10, false).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 3, 48 + 32, 10 + 32]
+        );
+        // Modifier and motion bits survive the release rewrite.
+        assert_eq!(
+            encode_mouse_report(Mode::ButtonMotion, Enc::Default, 4 | 32, 5, 6, false).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 4 + 32 + 3, 5 + 32, 6 + 32]
+        );
+
+        // Reporting off: nothing, whatever the encoding says.
+        assert!(encode_mouse_report(Mode::None, Enc::Sgr, 0, 1, 1, true).is_none());
+        // X10 (DECSET 9) has no release report at all.
+        assert!(encode_mouse_report(Mode::Press, Enc::Default, 0, 48, 10, false).is_none());
+        assert!(encode_mouse_report(Mode::Press, Enc::Sgr, 0, 48, 10, false).is_none());
+
+        // Legacy cannot spell a cell past 223; drop rather than lie.
+        assert!(encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 224, 10, true).is_none());
+        // UTF-8 (1005) can, as a multi-byte code point.
+        let utf8 =
+            encode_mouse_report(Mode::PressRelease, Enc::Utf8, 0, 224, 10, true).unwrap();
+        assert_eq!(&utf8[..3], b"\x1b[M");
+        assert_eq!(
+            String::from_utf8(utf8[3..].to_vec()).unwrap(),
+            format!(
+                "{}{}{}",
+                ' ',
+                char::from_u32(224 + 32).unwrap(),
+                char::from_u32(10 + 32).unwrap()
+            )
+        );
+
+        // The wheel is a press-only button in every encoding.
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 64, 1, 1, true).unwrap(),
+            vec![0x1b, b'[', b'M', 64 + 32, 33, 33]
+        );
+    }
 }
 
 #[cfg(test)]

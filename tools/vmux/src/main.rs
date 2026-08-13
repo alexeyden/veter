@@ -916,6 +916,13 @@ struct Pane {
     /// dispatcher to decide whether wheel events drive vmux's
     /// per-pane scrollback or get forwarded to the inner program.
     inner_mouse_protocol: u8,
+    /// Mouse *encoding* from the same event (§8.9): 0 legacy, 1 UTF-8
+    /// (1005), 2 SGR (1006), 3 urxvt (1015). §11 requires forwarded
+    /// reports to be encoded the way the inner program asked, so this
+    /// is not cosmetic: a program whose terminfo lacks `XM` never
+    /// enables 1006, and ncurses then matches `kmous=\E[M` only — an
+    /// SGR report reaches it as the literal keystrokes `ESC [ < …`.
+    inner_mouse_encoding: u8,
     /// `Some` while this pane is navigating its scrollback. Independent
     /// per-pane so two panes can sit at different offsets at the same
     /// time and tab switches don't clobber state.
@@ -2446,6 +2453,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
+                inner_mouse_encoding: 0,
                 scroll: None,
                 activity: false,
             },
@@ -2539,6 +2547,7 @@ impl State {
                 last_inner: None,
                 last_winsize: None,
                 inner_mouse_protocol: 0,
+                inner_mouse_encoding: 0,
                 scroll: None,
                 activity: false,
             },
@@ -2590,6 +2599,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
+                inner_mouse_encoding: 0,
                 scroll: None,
                 activity: false,
             },
@@ -2929,6 +2939,7 @@ impl State {
                 last_inner: Some((cols, rows)),
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
+                inner_mouse_encoding: 0,
                 scroll: None,
                 activity: false,
             },
@@ -5106,14 +5117,17 @@ fn handle_stdin_chunk(
                     }
                 }
             } else if ft == EVT_MOUSE_MODE_CHANGE {
-                // §8.9: id, protocol, encoding, focus_events. We only
-                // need protocol — encoding/focus is handled per-event
-                // when we re-encode forwarded mouse bytes.
+                // §8.9: id, protocol, encoding, focus_events. Protocol
+                // decides *whether* a report is forwarded; encoding
+                // decides how it is spelled (§11). Focus events are
+                // still unused.
                 let mut br = PrtReader::new(body);
                 let id = br.string().unwrap_or("").to_string();
                 let protocol = br.u8().unwrap_or(0);
+                let encoding = br.u8().unwrap_or(0);
                 if let Some(p) = state.panes.get_mut(&id) {
                     p.inner_mouse_protocol = protocol;
+                    p.inner_mouse_encoding = encoding;
                 }
             } else if ft == EVT_PORTAL_SCROLL_DELTA {
                 // §8.11: string id, i32 delta. The host is asking us to
@@ -5456,18 +5470,88 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     {
         return Ok(());
     }
-    let final_byte = if ev.press { b'M' } else { b'm' };
-    let payload = format!(
-        "\x1b[<{};{};{}{}",
+    let (proto, encoding) = state
+        .panes
+        .get(&pane_id)
+        .map(|p| (p.inner_mouse_protocol, p.inner_mouse_encoding))
+        .unwrap_or((0, 0));
+    let Some(payload) = encode_mouse_report(
+        encoding,
+        proto,
         ev.button,
-        portal_col + 1,
-        portal_row + 1,
-        final_byte as char,
-    );
+        portal_col as u32 + 1,
+        portal_row as u32 + 1,
+        ev.press,
+    ) else {
+        return Ok(());
+    };
     if let Some(p) = state.pty_mut(&pane_id) {
-        p.enqueue(payload.as_bytes());
+        p.enqueue(&payload);
     }
     Ok(())
+}
+
+/// Spell one mouse report the way the inner program asked for it
+/// (§8.9 `encoding`, §11) — `col`/`row` are 1-indexed and
+/// portal-relative. `None` means "send nothing": the event is either
+/// not reportable in this mode or not representable in this encoding.
+///
+/// Always emitting SGR is wrong even though every modern program
+/// negotiates it. A program only receives `ESC [ < …` correctly if it
+/// enabled DECSET 1006, and ncurses enables 1006 only when its
+/// terminfo entry carries `XM` — older entries (and `screen` /
+/// `tmux` ones) do not, so ncurses matches `kmous=\E[M` instead and
+/// hands the unparsed report to the application as keystrokes. In
+/// htop that types `<`, which opens its "Sort by" panel.
+fn encode_mouse_report(
+    encoding: u8,
+    protocol: u8,
+    button: u32,
+    col: u32,
+    row: u32,
+    press: bool,
+) -> Option<Vec<u8>> {
+    // X10 (DECSET 9) reports presses only, whatever the encoding.
+    if !press && protocol <= 1 {
+        return None;
+    }
+    // SGR is the only encoding that spells a release as its own final
+    // byte; every legacy one reports button 3, keeping the modifier
+    // and motion bits.
+    if encoding == 2 {
+        let final_byte = if press { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{button};{col};{row}{final_byte}").into_bytes());
+    }
+    let button = if press { button } else { (button & !0b11) | 3 };
+    encode_legacy(encoding, button, col, row)
+}
+
+/// The three legacy encodings, which all carry the same
+/// `(button, col, row)` triple and differ only in how they spell it.
+fn encode_legacy(encoding: u8, button: u32, col: u32, row: u32) -> Option<Vec<u8>> {
+    if encoding == 3 {
+        // urxvt (1015): decimal parameters, CSI-terminated by `M`.
+        return Some(format!("\x1b[{};{};{}M", button + 32, col, row).into_bytes());
+    }
+    let (cb, cx, cy) = (button + 32, col + 32, row + 32);
+    let mut out = b"\x1b[M".to_vec();
+    if encoding == 1 {
+        // UTF-8 (1005): the same values as code points, so a coordinate
+        // past 223 still fits (up to 2015).
+        for v in [cb, cx, cy] {
+            let ch = char::from_u32(v)?;
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        return Some(out);
+    }
+    // Legacy (0): one byte each, so anything past column/row 223 is
+    // unreportable. Drop it rather than send a wrong cell — xterm
+    // does the same.
+    for v in [cb, cx, cy] {
+        out.push(u8::try_from(v).ok()?);
+    }
+    Some(out)
 }
 
 /// Resolve a left click on row 0 (the tab bar) and switch tabs to
@@ -6853,5 +6937,65 @@ mod tests {
         // Pressing '2' selects the second tab and commits immediately.
         assert_eq!(feed_picker(&mut p, b"2"), "commit");
         assert_eq!(p.current(), Some(1));
+    }
+
+    /// §11: a forwarded report must be spelled in the encoding the
+    /// inner program negotiated. Regression test for htop over ssh to
+    /// a host whose terminfo lacks `XM`: it enables 1000 without 1006,
+    /// so an SGR report reached it as the keystrokes `ESC [ < …` and
+    /// the literal `<` opened htop's "Sort by" panel.
+    #[test]
+    fn mouse_report_follows_inner_encoding() {
+        // SGR (1006): unchanged, and the only one with an `m` release.
+        assert_eq!(
+            encode_mouse_report(2, 2, 0, 48, 10, true).unwrap(),
+            b"\x1b[<0;48;10M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_report(2, 2, 0, 48, 10, false).unwrap(),
+            b"\x1b[<0;48;10m".to_vec()
+        );
+
+        // Legacy (0): `ESC [ M` with each value offset by 32, and a
+        // release spelled as button 3 rather than a final `m`.
+        assert_eq!(
+            encode_mouse_report(0, 2, 0, 48, 10, true).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 48 + 32, 10 + 32]
+        );
+        assert_eq!(
+            encode_mouse_report(0, 2, 0, 48, 10, false).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 3, 48 + 32, 10 + 32]
+        );
+        // Modifier and motion bits survive the release rewrite.
+        assert_eq!(
+            encode_mouse_report(0, 3, 4 | 32, 5, 6, false).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 4 + 32 + 3, 5 + 32, 6 + 32]
+        );
+
+        // X10 (DECSET 9) has no release report at all.
+        assert!(encode_mouse_report(0, 1, 0, 48, 10, false).is_none());
+        assert!(encode_mouse_report(2, 1, 0, 48, 10, false).is_none());
+
+        // Legacy cannot spell a cell past 223; drop rather than lie.
+        assert!(encode_mouse_report(0, 2, 0, 224, 10, true).is_none());
+        // UTF-8 (1005) can, as a multi-byte code point.
+        let utf8 = encode_mouse_report(1, 2, 0, 224, 10, true).unwrap();
+        assert_eq!(&utf8[..3], b"\x1b[M");
+        assert_eq!(
+            String::from_utf8(utf8[3..].to_vec()).unwrap(),
+            format!("{}{}{}", ' ', char::from_u32(224 + 32).unwrap(), char::from_u32(10 + 32).unwrap())
+        );
+
+        // urxvt (1015): decimal parameters, always `M`.
+        assert_eq!(
+            encode_mouse_report(3, 2, 0, 48, 10, true).unwrap(),
+            b"\x1b[32;48;10M".to_vec()
+        );
+
+        // The wheel is a press-only button in every encoding.
+        assert_eq!(
+            encode_mouse_report(0, 2, 64, 1, 1, true).unwrap(),
+            vec![0x1b, b'[', b'M', 64 + 32, 33, 33]
+        );
     }
 }
