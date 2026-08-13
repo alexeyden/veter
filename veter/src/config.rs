@@ -178,6 +178,42 @@ impl Default for WindowConfig {
     }
 }
 
+/// `[font]` — which faces the grid is drawn with.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FontConfig {
+    /// Primary family. Anything Fontconfig resolves works, including the
+    /// generic aliases (`monospace`, `monospace:style=Regular`), which is
+    /// what the default leaves it to.
+    pub family: String,
+    /// Families tried, in order, for a character the primary lacks —
+    /// before any generic lookup.
+    ///
+    /// This exists because a font mapping a Private Use Area codepoint
+    /// tells you nothing about *which* symbol it draws there: the range
+    /// has no agreed meaning, so fonts legitimately use it for their own
+    /// internal glyphs. Adwaita Sans, for one, maps 745 PUA codepoints to
+    /// stylistic alternates — U+E0A0 (the powerline branch) is its
+    /// `divide.case`, and U+E0B0 (the powerline separator) its `y.subs`.
+    /// Naming a symbol font here settles it outright.
+    pub fallback: Vec<String>,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            family: "monospace".into(),
+            // The Nerd Fonts project ships these as fallback-only faces
+            // holding just the icon ranges, which is exactly this slot.
+            // Absent families are skipped, so naming them costs nothing.
+            fallback: vec![
+                "Symbols Nerd Font Mono".into(),
+                "Symbols Nerd Font".into(),
+            ],
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key chords
 // ---------------------------------------------------------------------------
@@ -666,6 +702,7 @@ fn shell_quote(s: &str) -> String {
 #[serde(default)]
 pub struct Config {
     pub accent: AccentConfig,
+    pub font: FontConfig,
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
     pub window: WindowConfig,
@@ -786,6 +823,26 @@ mod tests {
         assert_eq!(Rgba::parse("ffffff").unwrap(), Rgba::rgb(255, 255, 255));
         assert!(Rgba::parse("#xyz").is_err());
         assert!(Rgba::parse("#12345").is_err());
+    }
+
+    #[test]
+    fn font_section_is_optional_and_partial() {
+        // A config predating the section keeps the built-in symbol
+        // fallbacks — that is what fixes icon glyphs out of the box.
+        let bare: Config = toml::from_str("").unwrap();
+        assert_eq!(bare.font.family, "monospace");
+        assert_eq!(bare.font.fallback[0], "Symbols Nerd Font Mono");
+
+        // Naming one key leaves the other at its default.
+        let partial: Config = toml::from_str("[font]\nfamily = \"Iosevka\"\n").unwrap();
+        assert_eq!(partial.font.family, "Iosevka");
+        assert_eq!(partial.font.fallback, bare.font.fallback);
+
+        // An empty list is honoured, not treated as unset: it means
+        // "skip straight to the Fontconfig lookup".
+        let none: Config = toml::from_str("[font]\nfallback = []\n").unwrap();
+        assert!(none.font.fallback.is_empty());
+        assert_eq!(none.font.family, "monospace");
     }
 
     #[test]

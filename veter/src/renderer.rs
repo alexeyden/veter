@@ -824,7 +824,17 @@ impl GlyphCache {
 struct FallbackFont {
     data: Vec<u8>,
     index: usize,
-    source_ptr: usize, // pointer identity from Parley's font cache
+}
+
+/// Which faces the grid is drawn with. Mirrors the binary's `[font]`
+/// config section, which owns the defaults — `renderer` is in the
+/// library half and cannot see `config`.
+#[derive(Debug, Clone, Default)]
+pub struct FontSpec {
+    /// Primary family, resolved by Fontconfig. Empty means `monospace`.
+    pub family: String,
+    /// Families tried in order for a character the primary lacks.
+    pub fallback: Vec<String>,
 }
 
 /// Resolved glyph: which font and glyph ID to use for a character.
@@ -836,11 +846,86 @@ struct ResolvedGlyph {
 
 /// Resolve a character to a fallback font. Uses Parley for font discovery.
 /// Kept as a free function so the caller can pass disjoint struct fields.
+/// A Private Use Area codepoint (BMP block plus the two supplementary
+/// planes). Coverage of one of these is not evidence of intent: the
+/// range has no agreed meaning, so a font may map it to anything of its
+/// own — Adwaita Sans, the GNOME UI font, spends 745 PUA codepoints on
+/// stylistic alternates, and lands `divide.case` on U+E0A0 where a
+/// powerline branch belongs. Hence the arbitration below.
+fn is_private_use(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0xE000..=0xF8FF | 0xF_0000..=0xF_FFFD | 0x10_0000..=0x10_FFFD
+    )
+}
+
+/// Ask Fontconfig which font actually owns `ch` — an ordered charset
+/// match across everything installed, which is how Konsole and every
+/// other Qt/GTK terminal resolves a missing glyph. `None` if `fc-match`
+/// isn't there to ask.
+fn fontconfig_family_for(ch: char) -> Option<String> {
+    let out = std::process::Command::new("fc-match")
+        .arg("-f")
+        .arg("%{family[0]}")
+        .arg(format!(":charset={:x}", ch as u32))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Intern `data` and return its `font_id` (1-based; 0 is the primary).
+/// Identity is the font bytes themselves. Anything cheaper is a trap:
+/// a family name collides across weights, and Parley's blob address
+/// can be recycled once the blob is dropped, which would silently point
+/// a cached glyph id at a different font's tables.
+fn register_fallback(fallback_fonts: &mut Vec<FallbackFont>, data: &[u8], index: usize) -> u16 {
+    let idx = fallback_fonts
+        .iter()
+        .position(|fb| fb.index == index && fb.data == data)
+        .unwrap_or_else(|| {
+            fallback_fonts.push(FallbackFont {
+                data: data.to_vec(),
+                index,
+            });
+            fallback_fonts.len() - 1
+        });
+    (idx + 1) as u16
+}
+
+/// Resolve `ch` against a named family, if it is installed and maps it.
+fn glyph_in_family(
+    font_cx: &mut FontContext,
+    fallback_fonts: &mut Vec<FallbackFont>,
+    name: &str,
+    ch: char,
+) -> Option<ResolvedGlyph> {
+    let family = font_cx.collection.family_by_name(name)?;
+    let info = family.default_font()?;
+    let index = info.index() as usize;
+    let blob = info.load(Some(&mut font_cx.source_cache))?;
+    let data = blob.as_ref();
+    let glyph_id = FontRef::from_index(data, index)?.charmap().map(ch);
+    if glyph_id == 0 {
+        return None;
+    }
+    Some(ResolvedGlyph {
+        glyph_id,
+        font_id: register_fallback(fallback_fonts, data, index),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_fallback(
     font_cx: &mut FontContext,
     layout_cx: &mut LayoutContext<Color>,
     fallback_fonts: &mut Vec<FallbackFont>,
     char_font_map: &mut HashMap<char, Option<ResolvedGlyph>>,
+    fallback_families: &[String],
+    pua_families: &mut Vec<String>,
     ch: char,
     font_size: f32,
 ) -> Option<ResolvedGlyph> {
@@ -848,6 +933,44 @@ fn resolve_fallback(
         return cached;
     }
 
+    // Configured families first, in order. Absent families just miss.
+    for name in fallback_families {
+        if let Some(g) = glyph_in_family(font_cx, fallback_fonts, name, ch) {
+            char_font_map.insert(ch, Some(g));
+            return Some(g);
+        }
+    }
+
+    // For the PUA, let Fontconfig arbitrate rather than accepting the
+    // first family that claims the codepoint. One query serves a whole
+    // icon set: the family it names is remembered, so the rest of a
+    // status line resolves without spawning anything.
+    //
+    // Kept apart from the configured list on purpose — a family found
+    // for one icon must not become the fallback for unrelated
+    // characters, or which font draws U+25B6 would depend on whether an
+    // icon happened to be rendered earlier in the session.
+    if is_private_use(ch) {
+        for i in 0..pua_families.len() {
+            let name = pua_families[i].clone();
+            if let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch) {
+                char_font_map.insert(ch, Some(g));
+                return Some(g);
+            }
+        }
+        if let Some(name) = fontconfig_family_for(ch)
+            && let Some(g) = glyph_in_family(font_cx, fallback_fonts, &name, ch)
+        {
+            pua_families.push(name);
+            char_font_map.insert(ch, Some(g));
+            return Some(g);
+        }
+    }
+
+    // Generic lookup, and what everything above is refining. A PUA
+    // character reaches here only when Fontconfig had no answer (or is
+    // absent) — better the old guess than a blank cell, since a system
+    // font may legitimately be the one carrying those icons.
     let s = String::from(ch);
     let mut builder = layout_cx.ranged_builder(font_cx, &s, 1.0, false);
     builder.push_default(StyleProperty::Brush(Color::white()));
@@ -869,23 +992,9 @@ fn resolve_fallback(
                 let glyph_id = font_ref.charmap().map(ch);
 
                 if glyph_id != 0 {
-                    let source_ptr = data_ref.as_ptr() as usize;
-                    let fb_idx = fallback_fonts
-                        .iter()
-                        .position(|fb| fb.source_ptr == source_ptr && fb.index == index)
-                        .unwrap_or_else(|| {
-                            let idx = fallback_fonts.len();
-                            fallback_fonts.push(FallbackFont {
-                                data: data_ref.to_vec(),
-                                index,
-                                source_ptr,
-                            });
-                            idx
-                        });
-
                     let resolved = ResolvedGlyph {
                         glyph_id,
-                        font_id: (fb_idx + 1) as u16,
+                        font_id: register_fallback(fallback_fonts, data_ref, index),
                     };
                     char_font_map.insert(ch, Some(resolved));
                     return Some(resolved);
@@ -1118,6 +1227,12 @@ pub struct TerminalRenderer {
     font_cx: FontContext,
     layout_cx: LayoutContext<Color>,
     fallback_fonts: Vec<FallbackFont>,
+    /// Families consulted for a character the primary font lacks:
+    /// the configured `[font] fallback` list.
+    fallback_families: Vec<String>,
+    /// Families Fontconfig named for a PUA codepoint earlier in this
+    /// session, so one icon set costs one query. PUA lookups only.
+    pua_families: Vec<String>,
     char_font_map: HashMap<char, Option<ResolvedGlyph>>,
 
     // Rendering
@@ -1154,13 +1269,22 @@ pub struct TerminalRenderer {
 }
 
 impl TerminalRenderer {
-    pub fn new<T: Renderer>(_canvas: &mut Canvas<T>, font_size: f32) -> Self {
+    pub fn new<T: Renderer>(
+        _canvas: &mut Canvas<T>,
+        font_size: f32,
+        font: FontSpec,
+    ) -> Self {
         let mut font_cx = FontContext::new();
         let mut layout_cx = LayoutContext::new();
 
         let sample = "X";
         let mut builder = layout_cx.ranged_builder(&mut font_cx, sample, 1.0, false);
-        builder.push_default(FontStack::from("monospace"));
+        let requested = if font.family.trim().is_empty() {
+            "monospace"
+        } else {
+            font.family.trim()
+        };
+        builder.push_default(FontStack::from(requested));
         builder.push_default(StyleProperty::FontSize(font_size));
         let mut layout: Layout<Color> = builder.build(sample);
         layout.break_all_lines(None);
@@ -1206,8 +1330,8 @@ impl TerminalRenderer {
         }
 
         eprintln!(
-            "Font: family={:?} cell={}x{}, ascent={}, size={}",
-            font_family, cell_width, cell_height, ascent, font_size
+            "Font: requested={:?} family={:?} cell={}x{}, ascent={}, size={}",
+            requested, font_family, cell_width, cell_height, ascent, font_size
         );
 
         Self {
@@ -1217,6 +1341,8 @@ impl TerminalRenderer {
             font_cx,
             layout_cx,
             fallback_fonts: Vec::new(),
+            fallback_families: font.fallback,
+            pua_families: Vec::new(),
             char_font_map: HashMap::new(),
             font_size,
             cell_width,
@@ -1337,6 +1463,8 @@ impl TerminalRenderer {
             &mut self.layout_cx,
             &mut self.fallback_fonts,
             &mut self.char_font_map,
+            &self.fallback_families,
+            &mut self.pua_families,
             ch,
             self.font_size,
         )?;
@@ -1592,24 +1720,8 @@ impl TerminalRenderer {
                     let font = run.font();
                     let data_ref = font.data.as_ref();
                     let font_index = font.index as usize;
-                    let source_ptr = data_ref.as_ptr() as usize;
-
-                    let font_id = match self
-                        .fallback_fonts
-                        .iter()
-                        .position(|fb| fb.source_ptr == source_ptr && fb.index == font_index)
-                    {
-                        Some(i) => (i + 1) as u16,
-                        None => {
-                            let i = self.fallback_fonts.len();
-                            self.fallback_fonts.push(FallbackFont {
-                                data: data_ref.to_vec(),
-                                index: font_index,
-                                source_ptr,
-                            });
-                            (i + 1) as u16
-                        }
-                    };
+                    let font_id =
+                        register_fallback(&mut self.fallback_fonts, data_ref, font_index);
 
                     let mut cluster_x = run_layout.offset();
                     for cluster in run.clusters() {
@@ -1875,6 +1987,8 @@ impl TerminalRenderer {
                             &mut self.layout_cx,
                             &mut self.fallback_fonts,
                             &mut self.char_font_map,
+                            &self.fallback_families,
+                            &mut self.pua_families,
                             ch,
                             self.font_size,
                         ) {
@@ -2166,7 +2280,7 @@ mod text_layout_tests {
     fn harness() -> (Canvas<Void>, TerminalRenderer) {
         let mut canvas = Canvas::new(Void).unwrap();
         canvas.set_size(800, 600, 1.0);
-        let tr = TerminalRenderer::new(&mut canvas, 14.0);
+        let tr = TerminalRenderer::new(&mut canvas, 14.0, FontSpec::default());
         (canvas, tr)
     }
 
@@ -2307,5 +2421,91 @@ mod text_layout_tests {
         let l = layout(&mut tr, "", 12.0, Align::Left);
         assert_eq!(l.total_width, 0.0);
         assert_eq!(l.byte_offset_at(1000.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod font_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn private_use_blocks_are_recognised() {
+        // BMP block and both supplementary planes.
+        assert!(is_private_use('\u{e000}'));
+        assert!(is_private_use('\u{e0a0}')); // powerline branch
+        assert!(is_private_use('\u{f8ff}'));
+        assert!(is_private_use('\u{f0000}'));
+        assert!(is_private_use('\u{100000}'));
+        // Neighbours outside it, and ordinary text.
+        assert!(!is_private_use('\u{d7ff}')); // last codepoint before the surrogates
+        assert!(!is_private_use('\u{f900}'));
+        assert!(!is_private_use('\u{25b6}'));
+        assert!(!is_private_use('A'));
+    }
+
+    /// Font identity is the bytes. Keying on the blob address instead
+    /// would let a recycled allocation alias two different fonts, and a
+    /// cached glyph id would then index the wrong tables.
+    #[test]
+    fn register_fallback_interns_by_content() {
+        let mut fonts = Vec::new();
+        let a = vec![1u8, 2, 3];
+        let b = vec![4u8, 5, 6];
+
+        assert_eq!(register_fallback(&mut fonts, &a, 0), 1);
+        assert_eq!(register_fallback(&mut fonts, &a, 0), 1, "same bytes reuse the id");
+        assert_eq!(register_fallback(&mut fonts, &b, 0), 2, "different bytes, new id");
+        assert_eq!(
+            register_fallback(&mut fonts, &a, 1),
+            3,
+            "same bytes at another face index is another font"
+        );
+        assert_eq!(fonts.len(), 3);
+    }
+
+    /// The regression this whole chain exists for: a powerline glyph
+    /// must come from a font that actually draws powerline glyphs, not
+    /// from whichever family happens to map the codepoint. Skipped
+    /// where the symbol font isn't installed, since the answer then
+    /// legitimately depends on what is.
+    #[test]
+    fn pua_resolves_through_the_configured_symbol_font() {
+        const SYMBOLS: &str = "Symbols Nerd Font Mono";
+        let mut font_cx = FontContext::new();
+        let mut layout_cx: LayoutContext<Color> = LayoutContext::new();
+        let mut fonts: Vec<FallbackFont> = Vec::new();
+        let mut map: HashMap<char, Option<ResolvedGlyph>> = HashMap::new();
+        let mut pua: Vec<String> = Vec::new();
+
+        if glyph_in_family(&mut font_cx, &mut fonts, SYMBOLS, '\u{e0a0}').is_none() {
+            eprintln!("skipped: {SYMBOLS} not installed");
+            return;
+        }
+        fonts.clear();
+
+        let configured = vec![SYMBOLS.to_string()];
+        let resolved = resolve_fallback(
+            &mut font_cx,
+            &mut layout_cx,
+            &mut fonts,
+            &mut map,
+            &configured,
+            &mut pua,
+            '\u{e0a0}',
+            14.0,
+        )
+        .expect("powerline branch must resolve");
+
+        let fb = &fonts[(resolved.font_id - 1) as usize];
+        let family = FontRef::from_index(&fb.data, fb.index)
+            .and_then(|f| {
+                f.localized_strings()
+                    .find_by_id(StringId::Family, None)
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        assert_eq!(family, SYMBOLS);
+        // The configured list answered, so nothing was spawned.
+        assert!(pua.is_empty());
     }
 }

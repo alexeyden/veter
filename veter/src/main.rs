@@ -4560,7 +4560,14 @@ impl ApplicationHandler for App {
 
         // Initialize terminal renderer and measure cell dimensions
         let font_size = 16.0 * window.scale_factor() as f32;
-        let mut term_renderer = renderer::TerminalRenderer::new(&mut canvas, font_size);
+        let mut term_renderer = renderer::TerminalRenderer::new(
+            &mut canvas,
+            font_size,
+            renderer::FontSpec {
+                family: self.config.font.family.clone(),
+                fallback: self.config.font.fallback.clone(),
+            },
+        );
         // Apply configured search-chrome colors (the panel's accent
         // tint falls back to accent slot 0 when unset).
         term_renderer.set_search_colors(

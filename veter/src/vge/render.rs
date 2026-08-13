@@ -929,7 +929,7 @@ mod tests {
     fn harness() -> (Canvas<Void>, TerminalRenderer) {
         let mut canvas = Canvas::new(Void).unwrap();
         canvas.set_size(800, 600, 1.0);
-        let tr = TerminalRenderer::new(&mut canvas, 14.0);
+        let tr = TerminalRenderer::new(&mut canvas, 14.0, crate::renderer::FontSpec::default());
         (canvas, tr)
     }
 
