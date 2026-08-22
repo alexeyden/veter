@@ -142,9 +142,9 @@ fn apply(app_output: &[u8], envelope: &[u8]) -> (VgeEngine, vt100::Parser) {
     engine.after_vt100_process(&mut parser);
     // The application's own output first -- this is what puts the marker
     // on the grid and reserves the rows.
-    drive_terminal_stage(&mut engine, &mut parser, app_output);
+    drive_terminal_stage(&mut engine, &mut parser, app_output, None);
     // Then our out-of-band write.
-    drive_terminal_stage(&mut engine, &mut parser, envelope);
+    drive_terminal_stage(&mut engine, &mut parser, envelope, None);
     (engine, parser)
 }
 
@@ -225,11 +225,11 @@ fn placement_survives_scrolling_into_scrollback() {
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
-    drive_terminal_stage(&mut engine, &mut parser, &app);
-    drive_terminal_stage(&mut engine, &mut parser, &envelope);
+    drive_terminal_stage(&mut engine, &mut parser, &app, None);
+    drive_terminal_stage(&mut engine, &mut parser, &envelope, None);
 
     let before = engine.state.elements()["vplace.IMAGE-s"].anchor_line;
-    drive_terminal_stage(&mut engine, &mut parser, &b"filler\r\n".repeat(40));
+    drive_terminal_stage(&mut engine, &mut parser, &b"filler\r\n".repeat(40), None);
     let after = engine.state.elements()["vplace.IMAGE-s"].anchor_line;
     assert_eq!(before, after, "anchor must not move when content scrolls");
     assert!(
@@ -275,11 +275,11 @@ fn two_reserved_regions_in_one_message_both_land_on_their_markers() {
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
-    drive_terminal_stage(&mut engine, &mut parser, &app);
+    drive_terminal_stage(&mut engine, &mut parser, &app, None);
     // Both envelopes after the whole message, which is when the hook
     // runs: it reads the finished turn and places each marker in turn.
     for env in &envelopes {
-        drive_terminal_stage(&mut engine, &mut parser, env);
+        drive_terminal_stage(&mut engine, &mut parser, env, None);
     }
 
     let top = engine.top_of_live_screen();
@@ -417,8 +417,8 @@ fn clear_sweeps_only_this_tools_namespace() {
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
-    drive_terminal_stage(&mut engine, &mut parser, &app);
-    drive_terminal_stage(&mut engine, &mut parser, &place);
+    drive_terminal_stage(&mut engine, &mut parser, &app, None);
+    drive_terminal_stage(&mut engine, &mut parser, &place, None);
 
     let foreign = vge_protocol::encode::build_envelope(&[(
         vge_protocol::command::Command::CreateElement(
@@ -436,10 +436,10 @@ fn clear_sweeps_only_this_tools_namespace() {
         ),
         vge_protocol::frame::REQ_ID_NO_RESPONSE,
     )]);
-    drive_terminal_stage(&mut engine, &mut parser, &foreign);
+    drive_terminal_stage(&mut engine, &mut parser, &foreign, None);
     assert!(engine.state.elements().contains_key("vplace.IMAGE-c"));
 
-    drive_terminal_stage(&mut engine, &mut parser, &clear);
+    drive_terminal_stage(&mut engine, &mut parser, &clear, None);
     assert!(
         !engine.state.elements().contains_key("vplace.IMAGE-c"),
         "--clear must remove this tool's elements"

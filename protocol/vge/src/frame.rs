@@ -26,12 +26,14 @@ pub const CMD_DROP_IMAGE: u8 = 0x0D;
 // 0x0E retired — was ClearAll, now DeleteElement with an empty prefix (§6.2).
 pub const CMD_UPDATE_SIZE: u8 = 0x0F;
 pub const CMD_UPDATE_TRANSFORM: u8 = 0x10;
+pub const CMD_QUERY_HIT: u8 = 0x11;
 
 // §4 response codes
 pub const RSP_OK: u8 = 0x01;
 pub const RSP_ERR: u8 = 0x02;
 pub const RSP_PROBE: u8 = 0x03;
 pub const RSP_CHUNK_ACK: u8 = 0x04;
+pub const RSP_HIT: u8 = 0x05;
 
 /// Sentinel `request_id` value that asks the host to apply the
 /// command but not emit a response frame. Used for "state push"
@@ -61,6 +63,7 @@ pub const ERR_IMAGE_DECODE: u16 = 0x0032;
 pub const ERR_DUPLICATE_IMAGE_ID: u16 = 0x0033;
 pub const ERR_TOO_MANY_IMAGES: u16 = 0x0034;
 pub const ERR_MAX_NESTING_DEPTH: u16 = 0x0040;
+pub const ERR_NO_HIT_TESTING: u16 = 0x0050;
 pub const ERR_INTERNAL: u16 = 0x00FF;
 
 // §7.1 draw command opcodes

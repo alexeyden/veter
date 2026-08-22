@@ -214,6 +214,7 @@ fn map_mouse_encoding(e: MouseProtocolEncoding) -> u8 {
         MouseProtocolEncoding::Sgr => 2,
         // urxvt (1015) is not represented in vt100; if/when it lands,
         // the mapping returns 3 here.
+        MouseProtocolEncoding::SgrPixels => 4, // DECSET 1016
     }
 }
 

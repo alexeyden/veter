@@ -221,6 +221,7 @@ later sections.
 | 0x0D | DropImage          | §8.2         |
 | 0x0F | UpdateSize         | §9.5         |
 | 0x10 | UpdateTransform    | §9.12        |
+| 0x11 | QueryHit           | §15          |
 
 `0x0E` is **retired**. It was `ClearAll`, whose job is now done by
 `DeleteElement` with an empty prefix (§6.2, §6.7).
@@ -239,6 +240,7 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x02 | Err            | `u16 error_code, string message`                         |
 | 0x03 | ProbeResponse  | as in §2.1                                               |
 | 0x04 | ChunkAck       | `string image_id, u32 bytes_received` (§8.2)             |
+| 0x05 | HitResponse    | as in §15                                                |
 
 `error_code` values:
 
@@ -260,6 +262,7 @@ matches §1.2 (frame_type, request_id, body_length, body).
 | 0x0033 | err_duplicate_image_id  | image ID already in use (UploadImage)            |
 | 0x0034 | err_too_many_images     | Image budget exhausted                           |
 | 0x0040 | err_max_nesting_depth   | parenting would exceed advertised cap            |
+| 0x0050 | err_no_hit_testing      | this terminal is not the one rendering (§15)     |
 | 0x00FF | err_internal            | Terminal-side failure                            |
 
 After an `Err` response, the terminal's state is unchanged: failed commands
@@ -1479,6 +1482,13 @@ keeps the protocol stateless on input and lets the client own all
 interaction policy (scroll acceleration, kinetic scrolling, focus,
 etc.).
 
+That still leaves the client re-deriving geometry the terminal already
+resolved, and — for text — geometry it cannot derive at all, since it
+has neither the font nor the shaping. `QueryHit` (§15) closes that gap
+without moving input into the protocol: the client keeps receiving
+every event on its own tty and asks, when it wants to, what the
+terminal painted at a point.
+
 ### 9.11 Element transforms
 
 Every element carries an optional affine transform, default identity.
@@ -1786,3 +1796,103 @@ Retention (§8.0) does not enter into it. The copy is taken from the
 image as it stands when the user asks; a later `DropImage`, or an Auto
 image falling to zero references, affects nothing already on the
 clipboard.
+
+## 15. QueryHit (0x11)
+
+```
+point  point            ; f32 x, y — viewport-relative cells (§5.1)
+```
+
+Reports what the terminal painted under a point. Answered with a
+`HitResponse` (0x05):
+
+```
+u8      flags           ; bit0 = hit. On a miss the body ends here.
+string  element_id      ; empty for an anonymous element (§6.1)
+u32     command_index   ; which draw command within that element (§6.3)
+f32     local_x, local_y ; the point in the element's coordinate space (§9.3)
+u8      kind            ; 1 = text, 2 = image
+u32     byte_offset     ; kind == text: the character under the point,
+u32     byte_len        ; as a byte range into the run's text
+```
+
+### 15.1 Why the terminal answers this
+
+Everything else in this protocol is one-way: the client says what to
+draw and the terminal draws it. Hit-testing is the one question the
+client cannot answer for itself, because where an element lands is the
+product of scrollback anchoring (§5.2), the element's transform
+(§9.11), the ancestor chain of clip rects (§9.2) and — inside a portal
+— that portal's origin, and because a `DrawText` has no extent on the
+wire at all. The client knows the transform it chose; it does not know
+the font, the shaping, or which character its user just clicked.
+
+`QueryHit` is a **query, not an event**. Mouse input keeps arriving on
+the client's own tty exactly as before (§9.10), the client keeps
+deciding what a click means, and no VGE frame is ever sent
+unsolicited. Adding a mouse-event channel instead would have put input
+on two paths at once — the raw report on the tty and a frame relayed
+through whatever multiplexer sits between — with no ordering between
+them, and would have made the terminal arbitrate which of two clients
+owns a point. Neither is worth the one primitive that was missing.
+
+### 15.2 Coordinates
+
+The point is in the **sender's own** viewport-relative cell
+coordinates — the same space element origins live in (§5.1) — and may
+be fractional. A client with pixel-resolution mouse reports (DECSET
+1016) divides by the probe's `cell_pixel_width` / `cell_pixel_height`
+to get here; a client with cell-only reports has nothing finer than
+the cell to offer and should use the cell's centre.
+
+Inside a portal, the origin is the portal's own top-left, not the
+host's. An inner program has no idea where its portal was placed and
+does not need one: the terminal knows, and applies it.
+
+`local_x` / `local_y` come back in the hit element's coordinate space
+(§9.3), directly comparable with the origin the client sent for it.
+
+### 15.3 Scope
+
+A query is answered only against elements in the scope it arrived in.
+An inner program never learns the ids of the multiplexer's chrome
+drawn over it, or of any other portal's content — the same scoping
+every other command follows (§10).
+
+### 15.4 What is hit-testable
+
+Only `DrawText` and `DrawImage`. Shapes are transparent to the
+pointer, so a client painting a full-screen background does not
+swallow every point on the screen; a client that wants a shape to be
+hittable knows its own geometry and can test for it directly, which is
+exactly what it cannot do for text.
+
+The topmost drawable wins, "topmost" meaning last painted (§10).
+
+### 15.5 The answer describes the last painted frame
+
+The terminal answers from the frame it most recently drew, not from
+the element state as it stands after the commands in this same
+envelope. A client that moves something and asks about the new
+position in one breath gets the old geometry; a client that queries in
+response to input — which is the case this exists for — is asking
+about the frame its user was looking at, which is the right one.
+
+Two consequences a client should expect:
+
+- **An element deleted since that frame reads as a miss.** The
+  terminal will not name an id the client no longer believes in.
+- **A hit is not a lease.** The element can be gone by the time the
+  response is read; nothing is pinned.
+
+### 15.6 When the terminal cannot answer
+
+A terminal that is holding the state but not painting it — a session
+daemon whose renderer is a separate process (`doc/session-manager.md`)
+— answers `err_no_hit_testing` (0x0050). It is an error rather than a
+miss because a miss is a fact about the screen, and this is the
+absence of one.
+
+Clients MUST cope. A hit test is an improvement on geometry the client
+can approximate itself, never the only way it can work: fall back to
+testing against the origins and sizes it sent.

@@ -14,7 +14,8 @@ use vge_protocol::command::{
 };
 use vge_protocol::codec::Point as ProtoPoint;
 use vge_protocol::envelope::{
-    append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ChunkAckBody, ProbeBody,
+    append_frame, err_body, wrap_t2c_envelope as wrap_envelope, ChunkAckBody, Hit, HitBody,
+    HitKind, ProbeBody,
 };
 use vge_protocol::frame::*;
 
@@ -46,6 +47,68 @@ impl Default for Limits {
             supported_image_encodings: 0b11, // bit0 Raw, bit1 WebP
             max_nesting_depth: 16,
         }
+    }
+}
+
+/// A hit as the renderer resolves it, before the engine turns the
+/// element's creation sequence back into the id its client knows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawHit {
+    pub creation_seq: u64,
+    pub command_index: u32,
+    /// The point in the drawable's own coordinate space (§9.3).
+    pub local_x: f32,
+    pub local_y: f32,
+    /// `Some((byte_offset, byte_len))` when the drawable is a text run
+    /// and the point is over one of its characters.
+    pub text: Option<(u32, u32)>,
+}
+
+/// Resolves a point to whatever the renderer last painted there.
+///
+/// The engine knows which elements exist but not where they landed:
+/// that is the product of scrollback anchoring (§5.2), the element's
+/// transform (§9.11), the ancestor chain of clip rects (§9.2) and —
+/// inside a portal — the portal's own origin, all settled by the
+/// render pass and by nothing else (`veter::vge::pick`). Re-deriving
+/// them here would be the second geometry walk that design exists to
+/// avoid, and for text it would additionally have to re-shape the run.
+/// So `QueryHit` (§15) asks the renderer.
+///
+/// `scope` names the portal path *below* this tester, innermost last.
+/// An engine always calls with `&[]`; each PRT recursion level wraps
+/// the tester it was given, so the path assembles itself on the way
+/// back out and no engine has to know where it sits in the tree.
+///
+/// A host that is not the one painting — `vsd`, whose renderer is a
+/// separate process — supplies none, and `QueryHit` answers
+/// `err_no_hit_testing` rather than a misleading miss.
+pub trait HitTester {
+    fn hit_test(&self, scope: &[&str], x_cells: f32, y_cells: f32) -> Option<RawHit>;
+}
+
+/// One level of portal nesting, wrapped around the tester the level
+/// above supplied. It prefixes its portal's id, so an engine deeper in
+/// the tree keeps calling with `&[]` and the full path assembles
+/// itself on the way back out — no engine stores where it sits, and
+/// nothing has to be fixed up when a snapshot restores a subtree.
+pub struct ScopedHitTester<'a> {
+    parent: &'a dyn HitTester,
+    id: &'a str,
+}
+
+impl<'a> ScopedHitTester<'a> {
+    pub fn new(parent: &'a dyn HitTester, id: &'a str) -> Self {
+        Self { parent, id }
+    }
+}
+
+impl HitTester for ScopedHitTester<'_> {
+    fn hit_test(&self, scope: &[&str], x_cells: f32, y_cells: f32) -> Option<RawHit> {
+        let mut path = Vec::with_capacity(scope.len() + 1);
+        path.push(self.id);
+        path.extend_from_slice(scope);
+        self.parent.hit_test(&path, x_cells, y_cells)
     }
 }
 
@@ -176,8 +239,10 @@ pub struct UploadedImage {
 #[derive(Debug, Clone)]
 pub struct Element {
     /// Some(name) for client-named elements, None for anonymous (§6.1).
-    /// Currently unread by the renderer but useful for debugging.
-    #[allow(dead_code)]
+    /// The renderer never needs it — it walks the storage map — but
+    /// `QueryHit` (§15) does: an element is addressed internally by
+    /// creation sequence, and this is what turns that back into the
+    /// name its client gave it.
     pub id: Option<String>,
     pub commands: Vec<DrawCmd>,
     /// Storage key of the parent element, if any. None = top-level
@@ -726,7 +791,7 @@ impl VgeEngine {
             // No live screen here: this entry point exists for callers
             // that have none (client-side helpers and tests), so §9.4's
             // cursor and marker anchors fall back to viewport-relative.
-            self.handle_envelope_payload(&payload, None);
+            self.handle_envelope_payload(&payload, None, None);
         }
         for ev in out.events {
             self.handle_terminal_event(ev);
@@ -744,8 +809,13 @@ impl VgeEngine {
     }
 
     /// Apply one payload extracted by [`Self::feed_segments`].
-    pub fn apply_payload(&mut self, payload: &[u8], screen: Option<&dyn ScreenAnchor>) {
-        self.handle_envelope_payload(payload, screen);
+    pub fn apply_payload(
+        &mut self,
+        payload: &[u8],
+        screen: Option<&dyn ScreenAnchor>,
+        hit: Option<&dyn HitTester>,
+    ) {
+        self.handle_envelope_payload(payload, screen, hit);
     }
 
     /// Apply one terminal event extracted by [`Self::feed_segments`].
@@ -904,7 +974,12 @@ impl VgeEngine {
         }
     }
 
-    fn handle_envelope_payload(&mut self, payload: &[u8], screen: Option<&dyn ScreenAnchor>) {
+    fn handle_envelope_payload(
+        &mut self,
+        payload: &[u8],
+        screen: Option<&dyn ScreenAnchor>,
+        hit: Option<&dyn HitTester>,
+    ) {
         let mut frames_buf: Vec<u8> = Vec::new();
 
         let mut r = Reader::new(payload);
@@ -954,7 +1029,7 @@ impl VgeEngine {
                 Err(_) => break,
             };
 
-            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf, screen);
+            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf, screen, hit);
         }
 
         if !frames_buf.is_empty() {
@@ -969,6 +1044,7 @@ impl VgeEngine {
         body: &[u8],
         out_frames: &mut Vec<u8>,
         screen: Option<&dyn ScreenAnchor>,
+        hit: Option<&dyn HitTester>,
     ) {
         // `REQ_ID_NO_RESPONSE` (see vge-protocol §4) is the sender's
         // explicit "apply but don't ack" sentinel — used by
@@ -983,7 +1059,7 @@ impl VgeEngine {
                 }
             }
             Ok(cmd) => {
-                let result = self.apply_command(cmd, screen);
+                let result = self.apply_command(cmd, screen, hit);
                 if quiet {
                     // State changes are already applied; skip the
                     // response frame entirely.
@@ -1001,6 +1077,10 @@ impl VgeEngine {
                             // carries `bytes_received == total_bytes`,
                             // signaling "done."
                             CMD_UPLOAD_IMAGE => RSP_CHUNK_ACK,
+                            // §15 — the hit report has its own
+                            // response code; a miss is still a
+                            // successful query, not an error.
+                            CMD_QUERY_HIT => RSP_HIT,
                             _ => RSP_OK,
                         };
                         append_frame(out_frames, frame_type, request_id, &rsp_body);
@@ -1022,6 +1102,7 @@ impl VgeEngine {
         &mut self,
         cmd: Command,
         screen: Option<&dyn ScreenAnchor>,
+        hit: Option<&dyn HitTester>,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         match cmd {
             Command::Probe => {
@@ -1077,7 +1158,60 @@ impl VgeEngine {
             Command::UpdateTransform { id, transform } => {
                 self.cmd_update_transform(&id, transform)
             }
+            Command::QueryHit { point } => self.cmd_query_hit(point, hit),
         }
+    }
+
+    /// §15 — report what the renderer last painted under `point`.
+    ///
+    /// The renderer resolves the geometry (see [`HitTester`]); this
+    /// side only translates its answer back into the client's own
+    /// vocabulary, since `creation_seq` is engine bookkeeping and
+    /// never crosses the wire. An element the renderer painted may
+    /// have been deleted in the commands that came after that frame,
+    /// which reads as a miss — the honest answer, since what the user
+    /// clicked is no longer there.
+    fn cmd_query_hit(
+        &mut self,
+        point: ProtoPoint,
+        hit: Option<&dyn HitTester>,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
+        let Some(tester) = hit else {
+            return Err((
+                ERR_NO_HIT_TESTING,
+                "this terminal is not the one rendering",
+            ));
+        };
+        let miss = || Ok(HitBody { hit: None }.encode());
+        let Some(raw) = tester.hit_test(&[], point.x, point.y) else {
+            return miss();
+        };
+        let Some(el) = self
+            .state
+            .elements()
+            .values()
+            .find(|e| e.creation_seq == raw.creation_seq)
+        else {
+            return miss();
+        };
+        Ok(HitBody {
+            hit: Some(Hit {
+                element_id: el.id.clone().unwrap_or_default(),
+                command_index: raw.command_index,
+                local: ProtoPoint {
+                    x: raw.local_x,
+                    y: raw.local_y,
+                },
+                kind: match raw.text {
+                    Some((byte_offset, byte_len)) => HitKind::Text {
+                        byte_offset,
+                        byte_len,
+                    },
+                    None => HitKind::Image,
+                },
+            }),
+        }
+        .encode())
     }
 
     fn cmd_update_size(
@@ -4121,6 +4255,148 @@ mod tests {
         append_command(&mut frames, CMD_DELETE_ELEMENT, 3, &del.buf);
         restored.process_pty_chunk(&build_envelope(&frames));
         assert!(!restored.state.shared.images.contains_key("logo"));
+    }
+
+    // ---- §15 QueryHit ------------------------------------------------
+
+    mod query_hit {
+        use super::*;
+        use vge_protocol::codec::{Point, Rect};
+        use vge_protocol::command::{
+            Color, Command, CreateElementBody, DrawCmd, OriginAnchor, Style,
+        };
+        use vge_protocol::encode::build_envelope as enc;
+        use vge_protocol::envelope::{HitBody, HitKind};
+
+        /// Stands in for the renderer. Also asserts the contract that
+        /// an engine names its own scope as empty and lets the PRT
+        /// wrappers prepend the portal path (`ScopedHitTester`).
+        struct Stub(Option<RawHit>);
+
+        impl HitTester for Stub {
+            fn hit_test(&self, scope: &[&str], x: f32, y: f32) -> Option<RawHit> {
+                assert!(scope.is_empty(), "the engine's own scope is the empty path");
+                assert!(x.is_finite() && y.is_finite());
+                self.0
+            }
+        }
+
+        fn element(id: &str) -> Command {
+            Command::CreateElement(CreateElementBody {
+                id: id.to_string(),
+                commands: vec![DrawCmd::FillRectangles {
+                    fill: Style::Flat(Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                    rects: vec![Rect { x: 0.0, y: 0.0, w: 4.0, h: 1.0 }],
+                }],
+                origin: Point { x: 0.0, y: 0.0 },
+                is_visible: true,
+                draw_order: 0,
+                parent: None,
+                size: None,
+                transform: None,
+                anchor: OriginAnchor::Viewport,
+            })
+        }
+
+        /// Drive one envelope the way the terminal stage does, and
+        /// return the `(frame_type, body)` of the last response.
+        fn ask(
+            engine: &mut VgeEngine,
+            tester: Option<&dyn HitTester>,
+            x: f32,
+            y: f32,
+        ) -> (u8, Vec<u8>) {
+            let env = enc(&[(Command::QueryHit { point: Point { x, y } }, 7)]);
+            for seg in engine.feed_segments(&env) {
+                if let Segment::Payload(p) = seg {
+                    engine.apply_payload(&p, None, tester);
+                }
+            }
+            let payload = unwrap_t2c_envelope(&engine.take_responses());
+            let mut r = Reader::new(&payload);
+            let _version = r.u8();
+            let _payload_len = r.u32();
+            let mut last = (0u8, Vec::new());
+            while r.remaining() >= 9 {
+                let ty = r.u8().unwrap();
+                let _rid = r.u32().unwrap();
+                let len = r.u32().unwrap() as usize;
+                last = (ty, r.take(len).unwrap().to_vec());
+            }
+            last
+        }
+
+        fn seq_of(engine: &VgeEngine, id: &str) -> u64 {
+            engine.state.elements()[id].creation_seq
+        }
+
+        /// A text hit comes back as the element's own id plus the byte
+        /// range of the character under the point — the part of the
+        /// answer a client cannot compute, since it has neither the
+        /// font nor the shaping.
+        #[test]
+        fn a_text_hit_names_the_element_and_the_character() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            for seg in e.feed_segments(&enc(&[(element("app.label"), 1)])) {
+                if let Segment::Payload(p) = seg {
+                    e.apply_payload(&p, None, None);
+                }
+            }
+            let _ = e.take_responses();
+
+            let stub = Stub(Some(RawHit {
+                creation_seq: seq_of(&e, "app.label"),
+                command_index: 0,
+                local_x: 2.5,
+                local_y: 0.5,
+                text: Some((3, 2)),
+            }));
+            let (ty, body) = ask(&mut e, Some(&stub), 4.0, 1.0);
+            assert_eq!(ty, RSP_HIT);
+            let hit = HitBody::decode(&body).unwrap().hit.expect("a hit");
+            assert_eq!(hit.element_id, "app.label");
+            assert_eq!(hit.command_index, 0);
+            assert_eq!(hit.kind, HitKind::Text { byte_offset: 3, byte_len: 2 });
+            assert_eq!((hit.local.x, hit.local.y), (2.5, 0.5));
+        }
+
+        /// Nothing under the point is a successful query, not an error.
+        #[test]
+        fn a_miss_is_an_ok_response_with_no_hit() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            let (ty, body) = ask(&mut e, Some(&Stub(None)), 4.0, 1.0);
+            assert_eq!(ty, RSP_HIT);
+            assert_eq!(HitBody::decode(&body).unwrap().hit, None);
+        }
+
+        /// The renderer painted an element the client has since
+        /// deleted. Reporting the stale id would name something the
+        /// client no longer believes in, so it reads as a miss.
+        #[test]
+        fn a_hit_on_a_since_deleted_element_reads_as_a_miss() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            let stub = Stub(Some(RawHit {
+                creation_seq: 999,
+                command_index: 0,
+                local_x: 0.0,
+                local_y: 0.0,
+                text: None,
+            }));
+            let (ty, body) = ask(&mut e, Some(&stub), 1.0, 1.0);
+            assert_eq!(ty, RSP_HIT);
+            assert_eq!(HitBody::decode(&body).unwrap().hit, None);
+        }
+
+        /// A host that is not the one painting cannot answer, and must
+        /// say so rather than report a miss a client would believe.
+        #[test]
+        fn no_renderer_is_an_error_not_a_miss() {
+            let mut e = VgeEngine::new((9, 20), 1.0);
+            let (ty, body) = ask(&mut e, None, 4.0, 1.0);
+            assert_eq!(ty, RSP_ERR);
+            let mut r = Reader::new(&body);
+            assert_eq!(r.u16().unwrap(), ERR_NO_HIT_TESTING);
+        }
     }
 
     // ---- §6.2 / §8.2 prefix forms ------------------------------------

@@ -228,6 +228,7 @@ pub(crate) fn encode_mouse_encoding(w: &mut Writer, e: crate::screen::MouseProto
         crate::screen::MouseProtocolEncoding::Default => 0u8,
         crate::screen::MouseProtocolEncoding::Utf8 => 1,
         crate::screen::MouseProtocolEncoding::Sgr => 2,
+        crate::screen::MouseProtocolEncoding::SgrPixels => 3,
     };
     w.u8(tag);
 }
@@ -239,6 +240,7 @@ pub(crate) fn decode_mouse_encoding(
         0 => crate::screen::MouseProtocolEncoding::Default,
         1 => crate::screen::MouseProtocolEncoding::Utf8,
         2 => crate::screen::MouseProtocolEncoding::Sgr,
+        3 => crate::screen::MouseProtocolEncoding::SgrPixels,
         _ => return Err(SnapshotError::bad_payload("unknown mouse encoding tag")),
     })
 }

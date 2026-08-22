@@ -162,8 +162,8 @@ pub fn run(stdin_fd: &OwnedFd, stdout_fd: &OwnedFd, timeout: Duration) -> Result
             }
         }
         if prt.is_none() {
-            for payload in prt_out.payloads {
-                if let Some(data) = parse_prt_probe_payload(&payload) {
+            for payload in prt_out.payloads() {
+                if let Some(data) = parse_prt_probe_payload(payload) {
                     prt = Some(data);
                     break;
                 }
@@ -407,8 +407,8 @@ mod tests {
 
         let mut apc = ApcStream::with_marker(*MARKER_T2C);
         let out = apc.feed(&env);
-        assert_eq!(out.payloads.len(), 1);
-        let parsed = parse_prt_probe_payload(&out.payloads[0]).unwrap();
+        assert_eq!(out.payloads().count(), 1);
+        let parsed = parse_prt_probe_payload(out.payloads().next().unwrap()).unwrap();
         assert_eq!(parsed.max_portals, 64);
         assert_eq!(parsed.max_write_bytes, 1 << 20);
         assert_eq!(parsed.features, 0xFF);

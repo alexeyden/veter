@@ -39,6 +39,7 @@ pub fn drive_terminal_stage<CB: vt100::Callbacks>(
     engine: &mut VgeEngine,
     parser: &mut vt100::Parser<CB>,
     input: &[u8],
+    hit: Option<&dyn state::HitTester>,
 ) {
     let mut text_pending = false;
     for seg in engine.feed_segments(input) {
@@ -58,7 +59,11 @@ pub fn drive_terminal_stage<CB: vt100::Callbacks>(
                 // marker-anchored origin resolves against (§9.4), and
                 // it is up to date here precisely because the sync
                 // above already ran.
-                engine.apply_payload(&payload, Some(parser as &dyn state::ScreenAnchor));
+                engine.apply_payload(
+                    &payload,
+                    Some(parser as &dyn state::ScreenAnchor),
+                    hit,
+                );
             }
             Segment::Event(ev) => {
                 if text_pending {
@@ -145,7 +150,7 @@ mod tests {
         let mut chunk = b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec();
         chunk.extend(create_element_envelope("mid", 0.0));
         chunk.extend_from_slice(b"g\r\nh\r\n");
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
 
         let anchor = engine.state.elements()["mid"].anchor_line;
 
@@ -175,13 +180,13 @@ mod tests {
         whole.extend_from_slice(b"g\r\n");
 
         let (mut one, mut one_parser) = engine_and_parser();
-        drive_terminal_stage(&mut one, &mut one_parser, &whole);
+        drive_terminal_stage(&mut one, &mut one_parser, &whole, None);
         let expected = one.state.elements()["split"].anchor_line;
 
         for cut in 1..whole.len() {
             let (mut e, mut p) = engine_and_parser();
-            drive_terminal_stage(&mut e, &mut p, &whole[..cut]);
-            drive_terminal_stage(&mut e, &mut p, &whole[cut..]);
+            drive_terminal_stage(&mut e, &mut p, &whole[..cut], None);
+            drive_terminal_stage(&mut e, &mut p, &whole[cut..], None);
             assert_eq!(
                 e.state.elements()["split"].anchor_line, expected,
                 "cut at {cut} moved the anchor"
@@ -200,7 +205,7 @@ mod tests {
         let mut chunk = create_element_envelope("before", 0.0);
         chunk.extend_from_slice(b"\x1b[2J");
         chunk.extend(create_element_envelope("after", 0.0));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
 
         assert!(
             !engine.state.elements().contains_key("before"),
@@ -246,7 +251,7 @@ mod tests {
         let (mut engine, mut parser) = engine_and_parser();
         let mut chunk = b"a\r\nb\r\n".to_vec(); // cursor lands on row 2
         chunk.extend(create_anchored("cur", 0.0, OriginAnchor::Cursor));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
 
         let top = engine.top_of_live_screen();
         assert_eq!(parser.screen().cursor_position().0, 2);
@@ -260,7 +265,7 @@ mod tests {
         let (mut engine, mut parser) = engine_and_parser();
         let mut chunk = b"a\r\nb\r\n".to_vec();
         chunk.extend(create_anchored("up", -2.0, OriginAnchor::Cursor));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         let top = engine.top_of_live_screen();
         assert_eq!(engine.state.elements()["up"].anchor_line, top);
     }
@@ -277,7 +282,7 @@ mod tests {
             0.0,
             OriginAnchor::Marker("<<tok>>".into()),
         ));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         let top = engine.top_of_live_screen();
         // Rows: 0 = "x", 1 = "<<tok>>", 2 = "y".
         assert_eq!(engine.state.elements()["m"].anchor_line, top + 1);
@@ -294,7 +299,7 @@ mod tests {
             0.0,
             OriginAnchor::Marker("<<tok>>".into()),
         ));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         let top = engine.top_of_live_screen();
         assert_eq!(engine.state.elements()["m"].anchor_line, top + 2);
     }
@@ -312,7 +317,7 @@ mod tests {
         // lines push it three rows past the top of the live screen.
         let mut chunk = b"<<tok>>\r\na\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec();
         chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
 
         let top = engine.top_of_live_screen();
         assert_eq!(top, 4, "six lines after the marker on a 4-row screen");
@@ -331,11 +336,11 @@ mod tests {
         let mut chunk = b"<<tok>>\r\n".to_vec();
         chunk.extend_from_slice(&b"x\r\n".repeat(6));
         chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         assert!(engine.state.elements().contains_key("m"));
 
         // Scroll far enough to push line 0 out of the 100-row ring.
-        drive_terminal_stage(&mut engine, &mut parser, &b"y\r\n".repeat(120));
+        drive_terminal_stage(&mut engine, &mut parser, &b"y\r\n".repeat(120), None);
         assert!(
             !engine.state.elements().contains_key("m"),
             "the element goes when the row it named falls out of scrollback"
@@ -352,7 +357,7 @@ mod tests {
             1.0,
             OriginAnchor::Marker("absent".into()),
         ));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         let top = engine.top_of_live_screen();
         assert_eq!(engine.state.elements()["m"].anchor_line, top + 1);
     }
@@ -366,7 +371,7 @@ mod tests {
         let (mut engine, mut parser) = engine_and_parser();
         let mut chunk = b"a\r\nb\r\nc\r\n".to_vec();
         chunk.extend(create_anchored("cur", 0.0, OriginAnchor::Cursor));
-        drive_terminal_stage(&mut engine, &mut parser, &chunk);
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
         let ordered = engine.state.elements()["cur"].anchor_line;
 
         let (mut naive, mut naive_parser) = engine_and_parser();

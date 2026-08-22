@@ -1163,6 +1163,18 @@ pub struct TextExtent {
     pub total_width: f32,
 }
 
+/// What a drawn VGE run leaves behind: where it landed, and where each
+/// character boundary falls inside it. The stops come from the layout
+/// the draw itself used, so the pick index can answer "which character
+/// is under this point" (§15) without a second measurement that could
+/// drift out of step with what was painted.
+pub struct TextRun {
+    pub extent: TextExtent,
+    /// `(byte offset, x offset from `extent.start_x`)`, ascending in
+    /// both, terminated by a `(text.len(), total_width)` sentinel.
+    pub stops: Vec<(usize, f32)>,
+}
+
 /// One glyph of a plain (unstyled) run. `x` is the offset from the
 /// run's `start_x`.
 struct PlainGlyph {
@@ -1207,6 +1219,13 @@ pub struct TextLayout {
 }
 
 impl TextLayout {
+    /// The run's character boundaries as `(byte offset, x offset from
+    /// `start_x`)`. Handed to the pick index so a hit test reads the
+    /// same measurements the draw used (§15).
+    pub fn stops(&self) -> &[(usize, f32)] {
+        &self.stops
+    }
+
     pub fn extent(&self) -> TextExtent {
         TextExtent {
             start_x: self.start_x,
@@ -1671,6 +1690,7 @@ impl TerminalRenderer {
         self.draw_vge_text_selected(
             canvas, x_px, y_px, text, color, align, font_style, scale, None,
         )
+        .extent
     }
 
     /// [`Self::draw_vge_text`] with a byte range drawn selected.
@@ -1693,11 +1713,14 @@ impl TerminalRenderer {
         font_style: vge::command::FontStyle,
         scale: f32,
         selected: Option<(usize, usize)>,
-    ) -> TextExtent {
+    ) -> TextRun {
         if text.is_empty() {
-            return TextExtent {
-                start_x: x_px,
-                total_width: 0.0,
+            return TextRun {
+                extent: TextExtent {
+                    start_x: x_px,
+                    total_width: 0.0,
+                },
+                stops: vec![(0, 0.0)],
             };
         }
 
@@ -1724,7 +1747,10 @@ impl TerminalRenderer {
             }
         }
 
-        extent
+        TextRun {
+            extent,
+            stops: layout.stops,
+        }
     }
 
     /// Glyphs plus any underline / strikethrough rules, in one colour.

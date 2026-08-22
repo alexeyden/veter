@@ -11,7 +11,7 @@
 // CursorVisibilityChange, MouseModeChange, RawReply, WorkingDirChange)
 // are appended to the response envelope after the WritePortal Ok frame.
 
-use prt_protocol::apc::{ApcStream, TerminalEvent};
+use prt_protocol::apc::{ApcStream, Item, TerminalEvent};
 use prt_protocol::codec::Reader;
 use prt_protocol::command::{
     self, AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody,
@@ -590,26 +590,65 @@ impl PrtEngine {
 
     /// Convenience wrapper around `process_pty_chunk_full` for callers
     /// that don't need the terminal-event surface — kept for API
-    /// symmetry with the VGE engine; `main.rs` uses the `_full` variant
-    /// because it needs to feed the events back into
-    /// `handle_terminal_events`.
+    /// symmetry with the VGE engine.
     #[allow(dead_code)]
     pub fn process_pty_chunk(&mut self, input: &[u8]) -> Vec<u8> {
         self.process_pty_chunk_full(input).passthrough
     }
 
+    /// [`Self::process_pty_chunk_full`] with the renderer's hit tester
+    /// available to the per-portal VGE engines, so a `QueryHit` (VGE
+    /// §15) from an inner program can be answered. The plain entry
+    /// point passes none, which is what a host that is not painting
+    /// (`vsd`) wants.
+    pub fn process_pty_chunk_with_hit(
+        &mut self,
+        input: &[u8],
+        hit: Option<&dyn crate::vge::state::HitTester>,
+    ) -> ChunkOutput {
+        self.feed_chunk(input, hit)
+    }
+
     /// Variant of `process_pty_chunk` that also surfaces the terminal
-    /// events observed in this chunk. The caller decides what to do
-    /// with them — the engine itself does not interpret them, since
-    /// most are scoped to a vt100 the engine doesn't own.
+    /// events observed in this chunk, for the reactions that belong to
+    /// a layer this engine doesn't own (VFT aborting its transfers on
+    /// RIS, the parent vt100 answering a cursor query). The portal-set
+    /// reactions are *not* the caller's to make: they are applied here,
+    /// interleaved with the commands, because a chunk's own ordering
+    /// decides what a command means.
+    ///
+    /// That interleaving is the whole reason `Output` is one ordered
+    /// list. A single read can carry an alt-screen switch followed by
+    /// a `CreatePortal` — which is exactly what a client that enters
+    /// the alt screen and lays out its panes in the same breath emits,
+    /// and what a network hop between it and us then coalesces into
+    /// one chunk. Dispatching every envelope first and reacting to the
+    /// switch afterwards filed that portal under the outgoing screen,
+    /// where the switch immediately suspended it: the client believed
+    /// in a portal the host had parked out of sight.
     pub fn process_pty_chunk_full(&mut self, input: &[u8]) -> ChunkOutput {
+        self.feed_chunk(input, None)
+    }
+
+    fn feed_chunk(
+        &mut self,
+        input: &[u8],
+        hit: Option<&dyn crate::vge::state::HitTester>,
+    ) -> ChunkOutput {
         let out = self.apc.feed(input);
-        for payload in out.payloads {
-            self.handle_envelope_payload(&payload);
+        let mut terminal_events = Vec::new();
+        for item in out.items {
+            match item {
+                Item::Payload(payload) => self.handle_envelope_payload(&payload, hit),
+                Item::Event(ev) => {
+                    self.handle_terminal_event(ev);
+                    terminal_events.push(ev);
+                }
+            }
         }
         ChunkOutput {
             passthrough: out.passthrough,
-            terminal_events: out.events,
+            terminal_events,
         }
     }
 
@@ -751,29 +790,52 @@ impl PrtEngine {
         self.flush_pending_events();
     }
 
-    /// React to a slice of `TerminalEvent`s observed by an apc stream
-    /// scoped to this engine: HardReset/SoftReset wipe this engine's
-    /// active portal set, EraseDisplay/EraseScrollback cull it, and
-    /// CursorPositionQuery is left to the caller (the parent vt100
-    /// owner answers it; the engine itself has no vt100 to query).
-    pub fn handle_terminal_events(&mut self, events: &[TerminalEvent]) {
-        for ev in events {
-            match ev {
-                TerminalEvent::HardReset => {
-                    self.scope_reset();
-                    // RIS rebuilds vt100's screen from scratch, line
-                    // origin included, so follow it back to 0 now
-                    // rather than waiting for the post-chunk refresh —
-                    // a later command in this same chunk must anchor
-                    // against the reset screen. (DECSTR doesn't move
-                    // the screen and so doesn't move the origin.)
-                    self.top_of_live_screen = 0;
-                }
-                TerminalEvent::SoftReset => self.scope_reset(),
-                TerminalEvent::EraseDisplay => self.cull_for_erase_display(),
-                TerminalEvent::EraseScrollback => self.cull_for_erase_scrollback(),
-                TerminalEvent::CursorPositionQuery => {}
+    /// React to one `TerminalEvent` observed by the apc stream scoped
+    /// to this engine, at the point in the stream it was seen:
+    /// HardReset/SoftReset wipe this engine's active portal set,
+    /// EraseDisplay/EraseScrollback cull it, the alt-screen swaps move
+    /// it aside and back (§5.4), and CursorPositionQuery is left to
+    /// the caller (the parent vt100 owner answers it; the engine
+    /// itself has no vt100 to query).
+    fn handle_terminal_event(&mut self, ev: TerminalEvent) {
+        match ev {
+            TerminalEvent::HardReset => {
+                self.scope_reset();
+                // RIS rebuilds vt100's screen from scratch, line
+                // origin included, so follow it back to 0 now
+                // rather than waiting for the post-chunk refresh —
+                // a later command in this same chunk must anchor
+                // against the reset screen. (DECSTR doesn't move
+                // the screen and so doesn't move the origin.)
+                self.top_of_live_screen = 0;
             }
+            TerminalEvent::SoftReset => self.scope_reset(),
+            TerminalEvent::EraseDisplay => self.cull_for_erase_display(),
+            TerminalEvent::EraseScrollback => self.cull_for_erase_scrollback(),
+            TerminalEvent::AltScreenEnter => self.enter_alt_scope(),
+            TerminalEvent::AltScreenLeave => self.leave_alt_scope(),
+            TerminalEvent::CursorPositionQuery => {}
+        }
+    }
+
+    /// §5.4 — suspend the main portal set behind a fresh alt one. No
+    /// eviction events: the main set is parked, not dropped.
+    fn enter_alt_scope(&mut self) {
+        self.state.enter_alt_screen();
+    }
+
+    /// §5.4 — drop the alt set, resume main, and tell each dropped
+    /// portal's client why it went away (§8.7 reason=2).
+    fn leave_alt_scope(&mut self) {
+        let Some(mut dropped) = self.state.leave_alt_screen() else {
+            return;
+        };
+        for mut content in dropped.drain_contents() {
+            self.pending_image_deletes.extend(content.drain_for_destroy());
+        }
+        let ids: Vec<String> = dropped.portals.keys().cloned().collect();
+        for id in ids {
+            self.emit_event(EVT_PORTAL_EVICTED, portal_evicted_body(&id, EVICT_ALT_SWAP));
         }
     }
 
@@ -787,25 +849,19 @@ impl PrtEngine {
         &mut self,
         parser: &mut vt100::Parser<CB>,
     ) {
-        // §5.4 — detect alt-screen transitions by polling vt100.
+        // §5.4 — reconcile against the vt100. The swap itself is
+        // normally handled where it was seen in the byte stream (the
+        // apc stream's AltScreenEnter/Leave), which is what keeps a
+        // command that follows it in the same chunk on the right
+        // screen. This is the backstop for the screen moving without
+        // us reading a sequence for it: a VSS snapshot restore, or RIS
+        // dropping the alt grid. Both paths are transition-guarded, so
+        // whichever runs first makes the other a no-op.
         let now_alt = parser.screen().alternate_screen();
         if now_alt && !self.state.on_alt() {
-            self.state.enter_alt_screen();
-            // No eviction events on entry: main set is suspended, not
-            // dropped.
+            self.enter_alt_scope();
         } else if !now_alt && self.state.on_alt() {
-            if let Some(mut dropped) = self.state.leave_alt_screen() {
-                for mut content in dropped.drain_contents() {
-                    self.pending_image_deletes
-                        .extend(content.drain_for_destroy());
-                }
-                for id in dropped.portals.keys() {
-                    self.emit_event(
-                        EVT_PORTAL_EVICTED,
-                        portal_evicted_body(id, EVICT_ALT_SWAP),
-                    );
-                }
-            }
+            self.leave_alt_scope();
             // Don't reset the line origin here: `set_size` resizes the
             // *main* grid too, so a resize while the alt screen was up
             // pushes/pulls main-grid rows and genuinely moves the main
@@ -951,7 +1007,11 @@ impl PrtEngine {
         self.pending_response_bytes.extend_from_slice(&env);
     }
 
-    fn handle_envelope_payload(&mut self, payload: &[u8]) {
+    fn handle_envelope_payload(
+        &mut self,
+        payload: &[u8],
+        hit: Option<&dyn crate::vge::state::HitTester>,
+    ) {
         let mut frames_buf: Vec<u8> = Vec::new();
 
         let mut r = Reader::new(payload);
@@ -1001,7 +1061,7 @@ impl PrtEngine {
                 Err(_) => break,
             };
 
-            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf);
+            self.dispatch_frame(frame_type, request_id, body, &mut frames_buf, hit);
         }
 
         if !frames_buf.is_empty() {
@@ -1015,6 +1075,7 @@ impl PrtEngine {
         request_id: u32,
         body: &[u8],
         out_frames: &mut Vec<u8>,
+        hit: Option<&dyn crate::vge::state::HitTester>,
     ) {
         // §1.2 — the sender's explicit "apply but don't ack" sentinel.
         // Errors are suppressed along with successes: a sender that
@@ -1027,7 +1088,7 @@ impl PrtEngine {
                     append_frame(out_frames, RSP_ERR, request_id, &err_body(code, ""));
                 }
             }
-            Ok(cmd) => match self.apply_command(cmd) {
+            Ok(cmd) => match self.apply_command(cmd, hit) {
                 Ok(rsp_body) => {
                     if !quiet {
                         let rsp_type =
@@ -1049,7 +1110,11 @@ impl PrtEngine {
         }
     }
 
-    fn apply_command(&mut self, cmd: Command) -> Result<Vec<u8>, (u16, &'static str)> {
+    fn apply_command(
+        &mut self,
+        cmd: Command,
+        hit: Option<&dyn crate::vge::state::HitTester>,
+    ) -> Result<Vec<u8>, (u16, &'static str)> {
         match cmd {
             Command::Probe => self.cmd_probe(),
             Command::CreatePortal(b) => self.cmd_create_portal(b),
@@ -1065,7 +1130,7 @@ impl PrtEngine {
                 self.cmd_update_draw_order(&id, draw_order)
             }
             Command::ClearAll => self.cmd_clear_all(),
-            Command::WritePortal(b) => self.cmd_write_portal(b),
+            Command::WritePortal(b) => self.cmd_write_portal(b, hit),
             Command::SetFocus { target } => self.cmd_set_focus(target),
             Command::SetCursorStyle { unfocused } => self.cmd_set_cursor_style(unfocused),
             Command::SetPortalScrollback { id, lines } => {
@@ -1468,6 +1533,7 @@ impl PrtEngine {
     fn cmd_write_portal(
         &mut self,
         b: WritePortalBody,
+        hit: Option<&dyn crate::vge::state::HitTester>,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         // Atomicity (§7.1): validate before consuming any bytes. The
         // failure paths must leave the inner vt100 untouched.
@@ -1484,6 +1550,12 @@ impl PrtEngine {
         // takes `&mut self` and would otherwise alias.
         // Read before the borrow scope below takes `self.state` mutably.
         let damage_min_interval = self.damage_min_interval;
+        // One more level of portal nesting for anything inside this
+        // write: an inner `QueryHit` resolves against the pick index
+        // entry drawn under this portal's id (VGE §15).
+        let scoped = hit.map(|h| crate::vge::state::ScopedHitTester::new(h, &b.id));
+        let inner_hit =
+            scoped.as_ref().map(|s| s as &dyn crate::vge::state::HitTester);
         let (raw_events, old_cache, new_cache, reverse_bytes, activity) = {
             // The whole write path acts on the buffer: bytes, engines,
             // damage and cursor queries all belong to the content, so a
@@ -1501,7 +1573,7 @@ impl PrtEngine {
             //    (CursorPositionQuery, RIS/DECSTR/2J/3J inside portal)
             //    are surfaced for us to act on against THIS portal's
             //    vt100 and its sub-portal scope.
-            let chunk = portal.children.process_pty_chunk_full(&b.data);
+            let chunk = portal.children.process_pty_chunk_with_hit(&b.data, inner_hit);
             for ev in &chunk.terminal_events {
                 if matches!(ev, TerminalEvent::CursorPositionQuery) {
                     portal.pending_cursor_queries =
@@ -1509,12 +1581,14 @@ impl PrtEngine {
                 }
             }
 
-            // §5.7 / §5.8 — RIS / DECSTR / 2J / 3J observed inside this
-            // portal's byte stream are scoped to this portal: they
-            // wipe / cull `portal.children`'s sub-portal table. The
-            // bytes themselves still flow to portal.vt below, which
-            // also resets / erases its own grid.
-            portal.children.handle_terminal_events(&chunk.terminal_events);
+            // §5.7 / §5.8 / §5.4 — RIS / DECSTR / 2J / 3J and the
+            // alt-screen swaps observed inside this portal's byte
+            // stream are scoped to this portal: `process_pty_chunk_full`
+            // already applied them to `portal.children`'s sub-portal
+            // table, in stream order with the sub-portal commands
+            // around them. The bytes themselves still flow to
+            // portal.vt below, which resets / erases / swaps its own
+            // grid on the same sequences.
 
             // §10 (vft-in-portal) — RIS / DECSTR inside the portal
             // also abort every transfer in this portal's VFT engine.
@@ -1620,6 +1694,7 @@ impl PrtEngine {
                 &mut portal.vge,
                 &mut portal.vt,
                 &ses_passthrough,
+                inner_hit,
             );
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
             let committed_line = portal.vt.screen().scroll_committed() != scroll_before
@@ -1921,8 +1996,8 @@ mod tests {
         let mut s = ApcStream::with_marker(*MARKER_T2C);
         let out = s.feed(resp_bytes);
         assert!(out.passthrough.is_empty(), "spurious passthrough bytes");
-        assert_eq!(out.payloads.len(), 1, "expected exactly one envelope");
-        let payload = &out.payloads[0];
+        assert_eq!(out.payloads().count(), 1, "expected exactly one envelope");
+        let payload = out.payloads().next().unwrap();
 
         let mut r = Reader::new(payload);
         let version = r.u8().unwrap();
@@ -2610,8 +2685,8 @@ mod tests {
 
         let mut s = ApcStream::with_marker(*MARKER_T2C);
         let out = s.feed(&resp);
-        assert_eq!(out.payloads.len(), 1, "one envelope back");
-        let payload = &out.payloads[0];
+        assert_eq!(out.payloads().count(), 1, "one envelope back");
+        let payload = out.payloads().next().unwrap();
 
         let mut r = Reader::new(payload);
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
@@ -2636,7 +2711,7 @@ mod tests {
         let mut s = ApcStream::with_marker(*MARKER_T2C);
         let out = s.feed(resp_bytes);
         let mut all = Vec::new();
-        for payload in &out.payloads {
+        for payload in out.payloads() {
             let mut r = Reader::new(payload);
             assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
             let _payload_len = r.u32().unwrap();
@@ -3374,8 +3449,8 @@ mod tests {
         // Decode the embedded inner-engine response envelope.
         let mut s = ApcStream::with_marker(*MARKER_T2C);
         let out = s.feed(inner_t2c);
-        assert_eq!(out.payloads.len(), 1);
-        let payload = &out.payloads[0];
+        assert_eq!(out.payloads().count(), 1);
+        let payload = out.payloads().next().unwrap();
         let mut r = Reader::new(payload);
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
         let _len = r.u32().unwrap();
@@ -3488,12 +3563,11 @@ mod tests {
                 &make_create_body(id, 10, 10),
             );
         }
-        // Feed RIS through the top-level engine. process_pty_chunk
-        // does NOT auto-react in v1 — the parent loop calls
-        // handle_terminal_events on the events itself.
+        // Feed RIS through the top-level engine: the scope reaction
+        // rides along inside `process_pty_chunk_full`, where the
+        // stream position of the reset is still known.
         let chunk = engine.process_pty_chunk_full(b"\x1bc");
         assert!(chunk.terminal_events.contains(&TerminalEvent::HardReset));
-        engine.handle_terminal_events(&chunk.terminal_events);
         engine.flush_pending_events();
 
         assert!(engine.state.current().portals.is_empty());
@@ -3520,7 +3594,6 @@ mod tests {
         );
         let chunk = engine.process_pty_chunk_full(b"\x1b[!p");
         assert!(chunk.terminal_events.contains(&TerminalEvent::SoftReset));
-        engine.handle_terminal_events(&chunk.terminal_events);
         assert!(engine.state.current().portals.is_empty());
     }
 
@@ -3542,8 +3615,7 @@ mod tests {
             0,
             &make_create_body_full("sb_live", 10, 10, AnchorMode::Scrollback, 0),
         );
-        let chunk = engine.process_pty_chunk_full(b"\x1b[2J");
-        engine.handle_terminal_events(&chunk.terminal_events);
+        let _ = engine.process_pty_chunk_full(b"\x1b[2J");
         engine.flush_pending_events();
 
         assert!(engine.state.current().portals.is_empty());
@@ -3579,8 +3651,7 @@ mod tests {
             &make_create_body_full("live", 10, 10, AnchorMode::Live, 0),
         );
 
-        let chunk = engine.process_pty_chunk_full(b"\x1b[3J");
-        engine.handle_terminal_events(&chunk.terminal_events);
+        let _ = engine.process_pty_chunk_full(b"\x1b[3J");
 
         assert!(!engine.state.current().portals.contains_key("old"));
         assert!(engine.state.current().portals.contains_key("live"));
@@ -3717,8 +3788,7 @@ mod tests {
 
         let mut s = ApcStream::with_marker(*MARKER_T2C);
         let out = s.feed(inner_t2c);
-        assert!(!out.payloads.is_empty());
-        let payload = &out.payloads[0];
+        let payload = out.payloads().next().expect("at least one envelope");
         let mut r = Reader::new(payload);
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
         let _ = r.u32().unwrap();
@@ -4032,13 +4102,13 @@ mod tests {
             "inner_wire should be a clean envelope, got {} bytes of passthrough",
             out.passthrough.len()
         );
-        assert_eq!(out.payloads.len(), 1, "exactly one inner envelope");
+        assert_eq!(out.payloads().count(), 1, "exactly one inner envelope");
 
         // The inner envelope's payload may carry multiple frames (the
         // RSP_OK that acknowledges the inner WritePortal, plus the
         // RawReply for "inner"). Walk all frames looking for the
         // RawReply.
-        let inner_payload = &out.payloads[0];
+        let inner_payload = out.payloads().next().unwrap();
         let mut r = Reader::new(inner_payload);
         let _version = r.u8().unwrap();
         let _payload_len = r.u32().unwrap();
@@ -4620,5 +4690,155 @@ mod tests {
         let mut r2 = Reader::new(&inner_ev.body);
         assert_eq!(r2.string().unwrap(), "inner");
         assert_eq!(r2.i32().unwrap(), 5);
+    }
+
+    /// §5.4 — a portal command and the alt-screen swap that scopes it
+    /// can arrive in the same read, and then only their order in the
+    /// stream says which screen the portal belongs to.
+    ///
+    /// Regression: a nested `vmux` over ssh came up with its first tab
+    /// dead. vmux writes `ESC[?1049h` and its opening `CreatePortal`
+    /// back to back; locally those are two PTY reads, but a network
+    /// hop coalesces them into one chunk. The engine used to dispatch
+    /// every envelope in a chunk first and poll the vt100 for the
+    /// swap afterwards, so the portal was filed on the main set and
+    /// then parked there when the swap suspended it — invisible, and
+    /// deaf to every later `WritePortal`, while a portal created any
+    /// time after that first chunk worked fine.
+    #[test]
+    fn alt_screen_enter_coalesced_with_create_keeps_the_portal_live() {
+        let mut engine = PrtEngine::new();
+        let mut parser: vt100::Parser = vt100::Parser::new(24, 80, 100);
+
+        let mut frames = Vec::new();
+        append_frame(&mut frames, CMD_CREATE_PORTAL, 1, &make_create_body("p1", 40, 10));
+        let mut chunk = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H".to_vec();
+        chunk.extend_from_slice(&wrap_c2t_envelope(&frames));
+
+        let out = engine.process_pty_chunk_full(&chunk);
+        parser.process(&out.passthrough);
+        engine.after_vt100_process(&mut parser);
+
+        assert!(parser.screen().alternate_screen());
+        assert!(engine.state.on_alt());
+        assert!(
+            engine.state.current().portals.contains_key("p1"),
+            "portal created after the swap must live on the alt set"
+        );
+        // …and it is the alt set it lives on: leaving the alt screen
+        // takes it away again.
+        let out = engine.process_pty_chunk_full(b"\x1b[?1049l");
+        parser.process(&out.passthrough);
+        engine.after_vt100_process(&mut parser);
+        assert!(!engine.state.current().portals.contains_key("p1"));
+    }
+
+    /// The mirror case: a portal created after the swap *back* to the
+    /// main screen belongs to the main set, and must survive the
+    /// alt-set eviction that same chunk triggers.
+    #[test]
+    fn alt_screen_leave_coalesced_with_create_keeps_the_portal_live() {
+        let mut engine = PrtEngine::new();
+        let mut parser: vt100::Parser = vt100::Parser::new(24, 80, 100);
+
+        let out = engine.process_pty_chunk_full(b"\x1b[?1049h");
+        parser.process(&out.passthrough);
+        engine.after_vt100_process(&mut parser);
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("on_alt", 40, 10),
+        );
+
+        let mut frames = Vec::new();
+        append_frame(&mut frames, CMD_CREATE_PORTAL, 2, &make_create_body("p1", 40, 10));
+        let mut chunk = b"\x1b[?1049l".to_vec();
+        chunk.extend_from_slice(&wrap_c2t_envelope(&frames));
+
+        let out = engine.process_pty_chunk_full(&chunk);
+        parser.process(&out.passthrough);
+        engine.after_vt100_process(&mut parser);
+
+        assert!(!parser.screen().alternate_screen());
+        assert!(!engine.state.on_alt());
+        assert!(engine.state.current().portals.contains_key("p1"));
+        assert!(!engine.state.current().portals.contains_key("on_alt"));
+    }
+
+    /// The nested shape of the same bug, which is where it actually
+    /// bit: a `vmux` inside a `vmux` over ssh. The inner client's
+    /// startup burst — alt-screen enter, then its first
+    /// `CreatePortal` — reaches the host as the payload of one
+    /// `WritePortal`, so the sub-portal engine sees both in a single
+    /// chunk. The sub-portal has to survive it and stay writable.
+    #[test]
+    fn sub_portal_created_after_alt_enter_in_one_write_stays_writable() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("pane", 80, 24));
+
+        let mut inner_frames = Vec::new();
+        append_frame(&mut inner_frames, CMD_CREATE_PORTAL, 1, &make_create_body("p1", 40, 10));
+        let mut burst = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H".to_vec();
+        burst.extend_from_slice(&wrap_c2t_envelope(&inner_frames));
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "pane".into(),
+            data: burst,
+        });
+        assert_eq!(
+            dispatch_one(&mut engine, CMD_WRITE_PORTAL, 2, &body).frame_type,
+            RSP_OK
+        );
+
+        let pane = engine.state.current().content("pane").unwrap();
+        assert!(pane.vt.screen().alternate_screen());
+        assert!(
+            pane.children.state.current().portals.contains_key("p1"),
+            "sub-portal created after the swap must live on the pane's alt set"
+        );
+
+        // The client's next write to it must land, not bounce off a
+        // portal the host parked on the suspended set.
+        let mut inner_frames = Vec::new();
+        append_frame(
+            &mut inner_frames,
+            CMD_WRITE_PORTAL,
+            2,
+            &encode::write_portal_body(&WritePortalBody {
+                id: "p1".into(),
+                data: b"hello".to_vec(),
+            }),
+        );
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "pane".into(),
+            data: wrap_c2t_envelope(&inner_frames),
+        });
+        let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 3, &body);
+        let pane = engine.state.current().content("pane").unwrap();
+        let inner = pane.children.state.current().content("p1").unwrap();
+        assert_eq!(inner.vt.screen().contents(), "hello");
+    }
+
+    /// The same ordering rule for the scope *wipes*: a portal created
+    /// after an erase-display in the same chunk describes the screen
+    /// that erase left behind, so it must not be culled by it.
+    #[test]
+    fn erase_display_does_not_cull_a_portal_created_after_it() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("before", 10, 10),
+        );
+
+        let mut frames = Vec::new();
+        append_frame(&mut frames, CMD_CREATE_PORTAL, 2, &make_create_body("after", 10, 10));
+        let mut chunk = b"\x1b[2J".to_vec();
+        chunk.extend_from_slice(&wrap_c2t_envelope(&frames));
+        let _ = engine.process_pty_chunk_full(&chunk);
+
+        assert!(!engine.state.current().portals.contains_key("before"));
+        assert!(engine.state.current().portals.contains_key("after"));
     }
 }

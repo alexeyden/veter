@@ -212,7 +212,7 @@ bit 2  emit_icon_events        // OSC 1   → IconNameChange event
 bit 3  emit_cwd_events         // OSC 7   → WorkingDirChange event
 bit 4  emit_clipboard_events   // OSC 52  → ClipboardOp event
 bit 5  emit_bell_events        // BEL     → Bell event
-bit 6  emit_mouse_mode_events  // DECSET 9/1000/1002/1003/1005/1006/1015
+bit 6  emit_mouse_mode_events  // DECSET 9/1000/1002/1003/1005/1006/1015/1016
                                //         → MouseModeChange event
 bit 7  emit_activity_events    // meaningful scroll → PortalActivity event
 ```
@@ -399,11 +399,25 @@ rendering is masked.
 
 ### 5.4 Host alternate screen
 
-When the host switches to its alternate screen (DECSET 1047 / 1049),
+When the host switches to its alternate screen (DECSET 47 / 1049),
 the current portal set is suspended and replaced with an empty set.
 On return to the main screen the alt portal set is dropped and the
 main set restored. Each host screen has its own portal table; they
 do not share state.
+
+The swap takes effect **at its position in the byte stream**, not at
+the end of whatever read carried it: commands that precede it belong
+to the outgoing set, commands that follow it to the incoming one. A
+client that enters the alternate screen and creates its portals in the
+same breath — which is what a full-screen multiplexer does at startup
+— emits both in one burst, and a network hop between it and the host
+may well deliver them as a single chunk. A host that dispatched a
+chunk's commands before reacting to a swap inside it would file those
+portals under the screen it was leaving, where the swap then parks
+them: invisible to the user, and unreachable by every later
+`WritePortal`, while the client has an `RSP_OK` saying they exist.
+The same ordering rule applies at every level, since a portal's byte
+stream is the `WritePortal` payload rather than the host PTY.
 
 A portal's *own* alt-screen state — set by the inner program writing
 `ESC [ ? 1049 h` into that portal — is per-portal and orthogonal
@@ -488,6 +502,11 @@ screen.
 
 Partial erases (`ESC [ J` / `ESC [ 0 J` / `ESC [ 1 J`) are
 cursor-relative and do not trigger this cleanup.
+
+Like the alt-screen swap (§5.4), and for the same reason, an erase
+applies where it sits in the byte stream: a portal a client creates
+*after* clearing the screen describes the screen the erase left
+behind, and is not dropped by it.
 
 `ESC [ 2 J` / `ESC [ 3 J` received *inside* a portal are scoped to
 that portal — they wipe the portal's own grid and drop the portal's
@@ -906,7 +925,8 @@ string id
 u8     protocol       ; 0 off, 1 X10 (DECSET 9), 2 normal (1000),
                       ; 3 button (1002), 4 any-event (1003)
 u8     encoding       ; 0 default (legacy), 1 UTF-8 (1005),
-                      ; 2 SGR (1006), 3 urxvt (1015)
+                      ; 2 SGR (1006), 3 urxvt (1015),
+                      ; 4 SGR-Pixels (1016)
 u8     focus_events   ; 0 off, 1 on (DECSET 1004)
 ```
 
@@ -1245,11 +1265,42 @@ wheel routes to portal vs. host scrollback, selection model), and
 makes mouse mode mismatches between portal and host trivially
 diagnosable client-side.
 
+An inner program in **SGR-Pixels** (encoding 4, DECSET 1016) is asking
+for a position finer than the cell grid, so the translation is in
+pixels rather than cells: the client subtracts the portal's origin
+multiplied by the cell size it passed to that portal's `TIOCSWINSZ`,
+which is the same cell size the inner program derives from
+`ws_xpixel / ws_col`. Both coordinate spaces therefore agree on which
+cell a pixel belongs to, so a client that hit-tests in cells keeps
+doing so — it divides the incoming pixel by the cell size to recover
+the cell, and forwards pixels only to the portals that asked for them.
+A client with no cell size available can do neither and should stay on
+cell coordinates; a pixel-mode program then sees cell resolution,
+which is degraded but well-formed.
+
 The client also has to enable mouse reporting on **its own** input
 source (the host's PTY, or — for a nested multiplexer — its parent
 portal's PTY). It does so by writing the appropriate DECSET sequence
 upstream whenever the union of its descendants' mouse modes
 changes. `MouseModeChange` events make that union cheap to track.
+
+The encoding is part of that union, not just the protocol mode: pixel
+resolution is only obtainable by asking upstream for it, so a client
+enables ?1016 on its own input source once any descendant selects
+encoding 4, and drops back to cells when the last one does. Pixel
+reports cost one event per pixel of pointer travel rather than one per
+cell crossing, which is why this is a union and not a default. A
+client forwarding a pixel-resolution stream to a cell-coordinate
+portal SHOULD suppress motion reports that repeat the coordinates it
+last sent that portal: the host deduplicates against its own, finer,
+reports and cannot do it on the client's behalf.
+
+Dropping ?1016 upstream MUST be followed by re-asserting whichever
+encoding the client wants back. A terminal holds one encoding
+selection rather than a stack, so `?1016l` leaves the *legacy*
+`ESC [ M` form in force, not the ?1006 that preceded it — and a client
+that keeps parsing SGR then sees no reports at all, while their
+payload bytes fall through to whatever is reading its input.
 
 Selection of inner-portal text is similarly client-side. The client
 hit-tests against its own portal layout and renders any selection

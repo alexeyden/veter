@@ -49,6 +49,18 @@ pub enum TerminalEvent {
     /// Engine drops Scrollback portals whose `anchor_line` is above
     /// `top_of_live_screen`.
     EraseScrollback,
+    /// `ESC [ ? 1049 h` / `ESC [ ? 47 h` — the screen swapped to the
+    /// alternate grid (§5.4), so the portal scope swaps with it.
+    ///
+    /// Observed here rather than polled off the vt100 afterwards
+    /// because the swap's *position in the stream* is what decides
+    /// which scope a portal command belongs to: a `CreatePortal` that
+    /// follows the swap in the same chunk belongs to the alt set.
+    AltScreenEnter,
+    /// `ESC [ ? 1049 l` / `ESC [ ? 47 l` — back to the main grid
+    /// (§5.4). The alt set is dropped and the suspended main set
+    /// resumes.
+    AltScreenLeave,
 }
 
 /// Cap on CSI body length we'll buffer for matching. Long sequences past
@@ -115,19 +127,65 @@ pub struct ApcStream {
     overflows: u32,
 }
 
+/// One thing the stream produced, in the order the bytes carried it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    /// A fully-received, un-stuffed PRT payload (one per envelope).
+    Payload(Vec<u8>),
+    /// A VT sequence observed at this point in the stream.
+    Event(TerminalEvent),
+}
+
 #[derive(Default)]
 pub struct Output {
     /// Bytes that should go to the next layer verbatim.
     pub passthrough: Vec<u8>,
-    /// Fully-received, un-stuffed PRT payloads (one per envelope).
-    pub payloads: Vec<Vec<u8>>,
-    /// Side-channel events observed in the stream.
-    pub events: Vec<TerminalEvent>,
+    /// Envelopes and observed events, interleaved in stream order.
+    ///
+    /// The order is load-bearing, which is why this is one list and
+    /// not two: an event like `AltScreenEnter` changes the scope a
+    /// portal command lands in (§5.4), so an engine that dispatched
+    /// every payload first and reacted to the events afterwards would
+    /// file a command under the wrong screen.
+    pub items: Vec<Item>,
 }
 
 impl Output {
     fn push_pass(&mut self, b: u8) {
         self.passthrough.push(b);
+    }
+
+    fn push_payload(&mut self, body: Vec<u8>) {
+        self.items.push(Item::Payload(body));
+    }
+
+    fn push_event(&mut self, ev: TerminalEvent) {
+        self.items.push(Item::Event(ev));
+    }
+
+    /// The payloads alone, in stream order — for callers with no
+    /// screen state of their own to keep in step (probes, clients).
+    pub fn payloads(&self) -> impl Iterator<Item = &[u8]> {
+        self.items.iter().filter_map(|i| match i {
+            Item::Payload(p) => Some(p.as_slice()),
+            Item::Event(_) => None,
+        })
+    }
+
+    /// Owned variant of [`Self::payloads`].
+    pub fn into_payloads(self) -> impl Iterator<Item = Vec<u8>> {
+        self.items.into_iter().filter_map(|i| match i {
+            Item::Payload(p) => Some(p),
+            Item::Event(_) => None,
+        })
+    }
+
+    /// The observed events alone, in stream order.
+    pub fn events(&self) -> impl Iterator<Item = TerminalEvent> + '_ {
+        self.items.iter().filter_map(|i| match i {
+            Item::Event(ev) => Some(*ev),
+            Item::Payload(_) => None,
+        })
     }
 }
 
@@ -224,7 +282,7 @@ impl ApcStream {
                 b'c' => {
                     out.push_pass(ESC);
                     out.push_pass(b'c');
-                    out.events.push(TerminalEvent::HardReset);
+                    out.push_event(TerminalEvent::HardReset);
                     State::Idle
                 }
                 ESC => {
@@ -319,7 +377,7 @@ impl ApcStream {
                         State::ApcPrt { body }
                     }
                     ST_CLOSE => {
-                        out.payloads.push(body);
+                        out.push_payload(body);
                         State::Idle
                     }
                     ESC_MARK_TILDE => {
@@ -362,17 +420,20 @@ impl ApcStream {
                 out.push_pass(b);
                 if (0x40..=0x7E).contains(&b) {
                     if buf.as_slice() == b"!" && b == b'p' {
-                        out.events.push(TerminalEvent::SoftReset);
+                        out.push_event(TerminalEvent::SoftReset);
                     }
                     // DSR cursor-position query is `ESC [ 6 n`.
                     if buf.as_slice() == b"6" && b == b'n' {
-                        out.events.push(TerminalEvent::CursorPositionQuery);
+                        out.push_event(TerminalEvent::CursorPositionQuery);
                     }
                     if b == b'J' && buf.as_slice() == b"2" {
-                        out.events.push(TerminalEvent::EraseDisplay);
+                        out.push_event(TerminalEvent::EraseDisplay);
                     }
                     if b == b'J' && buf.as_slice() == b"3" {
-                        out.events.push(TerminalEvent::EraseScrollback);
+                        out.push_event(TerminalEvent::EraseScrollback);
+                    }
+                    if let Some(ev) = alt_screen_event(&buf, b) {
+                        out.push_event(ev);
                     }
                     State::Idle
                 } else {
@@ -388,10 +449,50 @@ impl ApcStream {
     }
 }
 
+/// Classify a completed CSI as an alt-screen swap, given its
+/// parameter bytes and final byte.
+///
+/// Only the two mode numbers the screen model actually implements
+/// count: DECSET/DECRST `1049` (save-cursor + switch, what every
+/// full-screen program uses) and the bare `47`. `1047` is deliberately
+/// absent — the vt100 in this tree ignores it, and an observer that
+/// disagreed with the screen it is shadowing would swap the portal
+/// scope under a screen that never moved.
+fn alt_screen_event(params: &[u8], final_byte: u8) -> Option<TerminalEvent> {
+    if final_byte != b'h' && final_byte != b'l' {
+        return None;
+    }
+    // DEC private modes only: `ESC [ ? … h`.
+    let params = params.strip_prefix(b"?")?;
+    // A DECSET may carry several modes at once (`?1049;1002h`).
+    let hit = params
+        .split(|&c| c == b';')
+        .any(|p| p == b"1049" || p == b"47");
+    if !hit {
+        return None;
+    }
+    Some(if final_byte == b'h' {
+        TerminalEvent::AltScreenEnter
+    } else {
+        TerminalEvent::AltScreenLeave
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::frame::MARKER_T2C;
+
+    /// The two category views the tests assert on. `Output` keeps one
+    /// ordered list so the engine can apply payloads and events in
+    /// sequence; a test that only cares about one kind takes it here.
+    fn payloads(out: &Output) -> Vec<Vec<u8>> {
+        out.payloads().map(<[u8]>::to_vec).collect()
+    }
+
+    fn events(out: &Output) -> Vec<TerminalEvent> {
+        out.events().collect()
+    }
 
     fn envelope(body: &[u8]) -> Vec<u8> {
         let mut v = vec![ESC, APC_OPEN, b'P', b'R', b'T'];
@@ -407,8 +508,8 @@ mod tests {
         let body = b"hello";
         let out = s.feed(&envelope(body));
         assert!(out.passthrough.is_empty());
-        assert_eq!(out.payloads.len(), 1);
-        assert_eq!(&out.payloads[0], body);
+        assert_eq!(payloads(&out).len(), 1);
+        assert_eq!(&payloads(&out)[0], body);
     }
 
     #[test]
@@ -416,8 +517,8 @@ mod tests {
         let mut s = ApcStream::new();
         let body = &[0x00, 0x1B, 0xFF, 0x1B];
         let out = s.feed(&envelope(body));
-        assert_eq!(out.payloads.len(), 1);
-        assert_eq!(&out.payloads[0], body);
+        assert_eq!(payloads(&out).len(), 1);
+        assert_eq!(&payloads(&out)[0], body);
     }
 
     #[test]
@@ -433,8 +534,8 @@ mod tests {
         assert!(!env.contains(&XON), "wire envelope leaked a literal XON");
         assert!(!env.contains(&XOFF), "wire envelope leaked a literal XOFF");
         let out = s.feed(&env);
-        assert_eq!(out.payloads.len(), 1);
-        assert_eq!(&out.payloads[0], body);
+        assert_eq!(payloads(&out).len(), 1);
+        assert_eq!(&payloads(&out)[0], body);
     }
 
     #[test]
@@ -442,7 +543,7 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(b"hello world");
         assert_eq!(out.passthrough, b"hello world");
-        assert!(out.payloads.is_empty());
+        assert!(payloads(&out).is_empty());
     }
 
     #[test]
@@ -454,15 +555,15 @@ mod tests {
             for chunk in &[&env[..split], &env[split..]] {
                 let o = s.feed(chunk);
                 out.passthrough.extend(o.passthrough);
-                out.payloads.extend(o.payloads);
+                out.items.extend(o.items);
             }
             assert!(
                 out.passthrough.is_empty(),
                 "split {split}: leaked {:?}",
                 out.passthrough
             );
-            assert_eq!(out.payloads.len(), 1, "split {split}: missing payload");
-            assert_eq!(&out.payloads[0], b"abcdef", "split {split}");
+            assert_eq!(payloads(&out).len(), 1, "split {split}: missing payload");
+            assert_eq!(&payloads(&out)[0], b"abcdef", "split {split}");
         }
     }
 
@@ -477,7 +578,7 @@ mod tests {
         ];
         let out = s.feed(&env);
         assert_eq!(out.passthrough, env);
-        assert!(out.payloads.is_empty());
+        assert!(payloads(&out).is_empty());
     }
 
     #[test]
@@ -487,7 +588,7 @@ mod tests {
         let env = vec![ESC, APC_OPEN, b'G', b'a', b'b', b'c', ESC, ST_CLOSE];
         let out = s.feed(&env);
         assert_eq!(out.passthrough, env);
-        assert!(out.payloads.is_empty());
+        assert!(payloads(&out).is_empty());
     }
 
     #[test]
@@ -507,7 +608,7 @@ mod tests {
         assert!(s.flush_pending_esc().is_empty());
         // After flush, parser is back to Idle and accepts a fresh envelope.
         let out = s.feed(&envelope(b"x"));
-        assert_eq!(out.payloads, vec![b"x".to_vec()]);
+        assert_eq!(payloads(&out), vec![b"x".to_vec()]);
     }
 
     #[test]
@@ -516,10 +617,10 @@ mod tests {
         let mut s = ApcStream::new();
         let env = envelope(b"abc");
         let out = s.feed(&env[..env.len() - 1]); // everything but ST_CLOSE
-        assert!(out.payloads.is_empty());
+        assert!(payloads(&out).is_empty());
         assert!(s.flush_pending_esc().is_empty());
         let out = s.feed(&env[env.len() - 1..]);
-        assert_eq!(out.payloads, vec![b"abc".to_vec()]);
+        assert_eq!(payloads(&out), vec![b"abc".to_vec()]);
     }
 
     #[test]
@@ -528,9 +629,9 @@ mod tests {
         let mut buf = envelope(b"one");
         buf.extend(envelope(b"two"));
         let out = s.feed(&buf);
-        assert_eq!(out.payloads.len(), 2);
-        assert_eq!(&out.payloads[0], b"one");
-        assert_eq!(&out.payloads[1], b"two");
+        assert_eq!(payloads(&out).len(), 2);
+        assert_eq!(&payloads(&out)[0], b"one");
+        assert_eq!(&payloads(&out)[1], b"two");
     }
 
     #[test]
@@ -548,8 +649,8 @@ mod tests {
         all.extend_from_slice(&c2t);
 
         let out = s.feed(&all);
-        assert_eq!(out.payloads.len(), 1);
-        assert_eq!(&out.payloads[0], b"resp");
+        assert_eq!(payloads(&out).len(), 1);
+        assert_eq!(&payloads(&out)[0], b"resp");
         assert_eq!(out.passthrough, c2t);
     }
 
@@ -558,8 +659,8 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(&[ESC, b'c']);
         assert_eq!(out.passthrough, vec![ESC, b'c']);
-        assert_eq!(out.events, vec![TerminalEvent::HardReset]);
-        assert!(out.payloads.is_empty());
+        assert_eq!(events(&out), vec![TerminalEvent::HardReset]);
+        assert!(payloads(&out).is_empty());
     }
 
     #[test]
@@ -567,8 +668,8 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(b"\x1b[!p");
         assert_eq!(out.passthrough, b"\x1b[!p");
-        assert_eq!(out.events, vec![TerminalEvent::SoftReset]);
-        assert!(out.payloads.is_empty());
+        assert_eq!(events(&out), vec![TerminalEvent::SoftReset]);
+        assert!(payloads(&out).is_empty());
     }
 
     #[test]
@@ -576,7 +677,7 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(b"\x1b[6n");
         assert_eq!(out.passthrough, b"\x1b[6n");
-        assert_eq!(out.events, vec![TerminalEvent::CursorPositionQuery]);
+        assert_eq!(events(&out), vec![TerminalEvent::CursorPositionQuery]);
     }
 
     #[test]
@@ -584,14 +685,14 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(b"\x1b[2J");
         assert_eq!(out.passthrough, b"\x1b[2J");
-        assert_eq!(out.events, vec![TerminalEvent::EraseDisplay]);
+        assert_eq!(events(&out), vec![TerminalEvent::EraseDisplay]);
     }
 
     #[test]
     fn ed_3_emits_erase_scrollback_event() {
         let mut s = ApcStream::new();
         let out = s.feed(b"\x1b[3J");
-        assert_eq!(out.events, vec![TerminalEvent::EraseScrollback]);
+        assert_eq!(events(&out), vec![TerminalEvent::EraseScrollback]);
     }
 
     #[test]
@@ -602,7 +703,7 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(b"\x1b[H\x1b[2J\x1b[3J");
         assert_eq!(
-            out.events,
+            events(&out),
             vec![
                 TerminalEvent::EraseDisplay,
                 TerminalEvent::EraseScrollback,
@@ -610,13 +711,70 @@ mod tests {
         );
     }
 
+    /// §5.4 — the alt-screen swap has to be reported *where it
+    /// happens*, because it decides which portal scope the commands
+    /// around it belong to.
+    #[test]
+    fn alt_screen_swaps_are_observed_in_stream_order() {
+        let mut s = ApcStream::new();
+        let mut input = b"\x1b[?1049h".to_vec();
+        input.extend(envelope(b"cmd"));
+        input.extend_from_slice(b"\x1b[?1049l");
+        let out = s.feed(&input);
+        assert_eq!(out.passthrough, b"\x1b[?1049h\x1b[?1049l");
+        assert_eq!(
+            out.items,
+            vec![
+                Item::Event(TerminalEvent::AltScreenEnter),
+                Item::Payload(b"cmd".to_vec()),
+                Item::Event(TerminalEvent::AltScreenLeave),
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_screen_swap_spellings() {
+        let mut s = ApcStream::new();
+        // The bare `47` form, and a DECSET carrying several modes.
+        assert_eq!(events(&s.feed(b"\x1b[?47h")), vec![TerminalEvent::AltScreenEnter]);
+        assert_eq!(events(&s.feed(b"\x1b[?47l")), vec![TerminalEvent::AltScreenLeave]);
+        assert_eq!(
+            events(&s.feed(b"\x1b[?1049;1002h")),
+            vec![TerminalEvent::AltScreenEnter]
+        );
+        // Other private modes are not swaps…
+        assert!(events(&s.feed(b"\x1b[?1002h")).is_empty());
+        assert!(events(&s.feed(b"\x1b[?25l")).is_empty());
+        // …nor is `1047`, which the screen model this shadows ignores:
+        // reporting a swap the screen never makes would move the
+        // portal scope out from under it.
+        assert!(events(&s.feed(b"\x1b[?1047h")).is_empty());
+        // Non-private `h`/`l` (ANSI modes) are a different namespace.
+        assert!(events(&s.feed(b"\x1b[4h")).is_empty());
+        // And the sequence still reaches the screen either way.
+        assert_eq!(s.feed(b"\x1b[?1049h").passthrough, b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn alt_screen_swap_split_across_chunks() {
+        let mut s = ApcStream::new();
+        let mut all = Output::default();
+        for chunk in [&b"\x1b[?10"[..], &b"49h"[..]] {
+            let o = s.feed(chunk);
+            all.passthrough.extend(o.passthrough);
+            all.items.extend(o.items);
+        }
+        assert_eq!(all.passthrough, b"\x1b[?1049h");
+        assert_eq!(events(&all), vec![TerminalEvent::AltScreenEnter]);
+    }
+
     #[test]
     fn ed_partial_does_not_emit_erase_display() {
         // ESC[J / ESC[0J / ESC[1J are partial erases (cursor-relative).
         let mut s = ApcStream::new();
-        assert!(s.feed(b"\x1b[J").events.is_empty());
-        assert!(s.feed(b"\x1b[0J").events.is_empty());
-        assert!(s.feed(b"\x1b[1J").events.is_empty());
+        assert!(s.feed(b"\x1b[J").events().next().is_none());
+        assert!(s.feed(b"\x1b[0J").events().next().is_none());
+        assert!(s.feed(b"\x1b[1J").events().next().is_none());
     }
 
     #[test]
@@ -626,10 +784,10 @@ mod tests {
         for chunk in &[&b"\x1b"[..], &b"c"[..]] {
             let o = s.feed(chunk);
             all.passthrough.extend(o.passthrough);
-            all.events.extend(o.events);
+            all.items.extend(o.items);
         }
         assert_eq!(all.passthrough, b"\x1bc");
-        assert_eq!(all.events, vec![TerminalEvent::HardReset]);
+        assert_eq!(events(&all), vec![TerminalEvent::HardReset]);
     }
 
     /// Deterministic xorshift. These crates carry no `rand`
@@ -672,7 +830,7 @@ mod tests {
                     "leaked passthrough (len {len}, round {round})"
                 );
                 assert_eq!(
-                    out.payloads,
+                    payloads(&out),
                     vec![body],
                     "round-trip failed (len {len}, round {round})"
                 );
@@ -691,7 +849,7 @@ mod tests {
         let mut input = envelope(&vec![b'x'; 65]);
         input.extend(envelope(b"after"));
         let out = s.feed(&input);
-        assert_eq!(out.payloads, vec![b"after".to_vec()], "resync failed");
+        assert_eq!(payloads(&out), vec![b"after".to_vec()], "resync failed");
         assert!(out.passthrough.is_empty(), "dropped body leaked as text");
         assert_eq!(s.take_overflows(), 1);
         assert_eq!(s.take_overflows(), 0, "counter should clear on read");
@@ -703,7 +861,7 @@ mod tests {
         let mut s = ApcStream::new().with_max_payload(64);
         let body = vec![b'y'; 64];
         let out = s.feed(&envelope(&body));
-        assert_eq!(out.payloads, vec![body]);
+        assert_eq!(payloads(&out), vec![body]);
         assert_eq!(s.take_overflows(), 0);
     }
 
@@ -718,7 +876,7 @@ mod tests {
         let mut input = envelope(&hostile);
         input.extend(envelope(b"ok"));
         let out = s.feed(&input);
-        assert_eq!(out.payloads, vec![b"ok".to_vec()]);
+        assert_eq!(payloads(&out), vec![b"ok".to_vec()]);
         assert!(out.passthrough.is_empty());
         assert_eq!(s.take_overflows(), 1);
     }
@@ -732,8 +890,8 @@ mod tests {
             let mut payloads = Vec::new();
             for part in [&input[..cut], &input[cut..]] {
                 let out = s.feed(part);
-                payloads.extend(out.payloads);
                 assert!(out.passthrough.is_empty(), "cut {cut}: leaked text");
+                payloads.extend(out.into_payloads());
             }
             assert_eq!(payloads, vec![b"tail".to_vec()], "cut {cut}");
             assert_eq!(s.take_overflows(), 1, "cut {cut}");

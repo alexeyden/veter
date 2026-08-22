@@ -17,7 +17,7 @@ pub mod encode;
 pub mod envelope;
 pub mod frame;
 
-pub use apc::{ApcStream, Output, TerminalEvent};
+pub use apc::{ApcStream, Item, Output, TerminalEvent};
 pub use codec::{Reader, Writer};
 pub use command::{
     AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, UpdateOriginBody,

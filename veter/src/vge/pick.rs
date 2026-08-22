@@ -121,7 +121,15 @@ pub enum PickKind {
     /// (§9.11), which set the rasterisation size and so has to be fed
     /// back in to reproduce the same shaping when mapping a pointer
     /// position to a character.
-    Text { byte_len: u32, scale: f32 },
+    Text {
+        byte_len: u32,
+        scale: f32,
+        /// Index into [`PickList::stops`] of the character boundaries
+        /// the draw measured. Interned rather than inlined so a
+        /// [`PickItem`] stays `Copy` and fixed-size, the same trade the
+        /// portal paths make.
+        stops: u32,
+    },
     /// A `DrawImage` target rect.
     Image,
 }
@@ -328,6 +336,16 @@ pub struct PickList {
     /// Portal paths, interned so an item stays a fixed-size POD.
     /// Index 0 is the host scope (empty path) and is never removed.
     paths: Vec<Vec<String>>,
+    /// Where each interned scope's cell (0, 0) sits in device pixels.
+    /// Parallel to `paths`; index 0 is the host grid's own origin.
+    /// This is what turns a client's viewport-relative cell coordinate
+    /// (§5.1) — all a `QueryHit` can send, since a portal's inner
+    /// program has no idea where its portal was placed — into the
+    /// device space the items are indexed in.
+    path_origins: Vec<(f32, f32)>,
+    /// Character boundaries of each painted text run, in the same
+    /// order they were pushed. See [`PickKind::Text::stops`].
+    text_stops: Vec<Vec<(u32, f32)>>,
     items: Vec<PickItem>,
 }
 
@@ -335,6 +353,8 @@ impl PickList {
     pub fn new() -> Self {
         Self {
             paths: vec![Vec::new()],
+            path_origins: vec![(0.0, 0.0)],
+            text_stops: Vec::new(),
             items: Vec::new(),
         }
     }
@@ -343,12 +363,31 @@ impl PickList {
     /// host scope at index 0.
     pub fn clear(&mut self) {
         self.paths.truncate(1);
+        self.path_origins.truncate(1);
+        self.text_stops.clear();
         self.items.clear();
+    }
+
+    /// Record one run's character boundaries, returning the id to put
+    /// in its [`PickKind::Text`]. The stops arrive as byte offsets,
+    /// which are `usize` in the layout and narrowed here: a text run
+    /// is capped at `max_text_bytes` (§11), far below `u32::MAX`.
+    pub fn intern_stops(&mut self, stops: &[(usize, f32)]) -> u32 {
+        self.text_stops
+            .push(stops.iter().map(|(o, x)| (*o as u32, *x)).collect());
+        (self.text_stops.len() - 1) as u32
+    }
+
+    /// The character boundaries recorded for a text item.
+    pub fn stops(&self, id: u32) -> &[(u32, f32)] {
+        self.text_stops.get(id as usize).map_or(&[], |v| v.as_slice())
     }
 
     /// Intern a portal path, returning its id. Called once per portal
     /// per frame, so the linear scan is over a handful of entries.
-    pub fn intern_path(&mut self, path: &[String]) -> u16 {
+    /// `origin` is where that scope's cell (0, 0) lands in device
+    /// pixels.
+    pub fn intern_path(&mut self, path: &[String], origin: (f32, f32)) -> u16 {
         if let Some(i) = self.paths.iter().position(|p| p == path) {
             return i as u16;
         }
@@ -360,6 +399,7 @@ impl PickList {
             return 0;
         }
         self.paths.push(path.to_vec());
+        self.path_origins.push(origin);
         (self.paths.len() - 1) as u16
     }
 
@@ -405,6 +445,53 @@ impl PickList {
         })
     }
 
+    /// Answer a VGE `QueryHit` (§15) for one scope.
+    ///
+    /// `scope` is a portal path — empty for the host — and the point
+    /// is in that scope's own viewport-relative cells, which is the
+    /// only coordinate system the querying client has. The scope's
+    /// device origin was recorded when its path was interned, so this
+    /// is where the two meet.
+    ///
+    /// The answer describes the frame the renderer last painted. A
+    /// client that moved something and queries before the next frame
+    /// gets the old geometry; the spec says so, and the alternative —
+    /// re-resolving the whole layout on demand — is the parallel
+    /// geometry walk this index exists to avoid.
+    pub fn query(
+        &self,
+        scope: &[&str],
+        x_cells: f32,
+        y_cells: f32,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> Option<veter_host::vge::state::RawHit> {
+        let path_id = self
+            .paths
+            .iter()
+            .position(|p| p.len() == scope.len() && p.iter().zip(scope).all(|(a, b)| a == b))?
+            as u16;
+        let (ox, oy) = *self.path_origins.get(path_id as usize)?;
+        let hit = self.hit_matching(
+            ox + x_cells * cell_w,
+            oy + y_cells * cell_h,
+            |i| i.loc.path_id == path_id,
+        )?;
+        Some(veter_host::vge::state::RawHit {
+            creation_seq: hit.item.loc.creation_seq,
+            command_index: hit.item.loc.cmd_index,
+            local_x: hit.local_x,
+            local_y: hit.local_y,
+            text: match hit.item.kind {
+                PickKind::Text { stops, .. } => Some(char_range(
+                    self.stops(stops),
+                    hit.local_x - hit.item.local.x,
+                )),
+                PickKind::Image => None,
+            },
+        })
+    }
+
     /// The topmost item under a device-pixel point that also satisfies
     /// `want` — used to ask for "the topmost *image* here" without
     /// letting a text run painted over it shadow the answer.
@@ -430,6 +517,23 @@ impl PickList {
             }
         }
         None
+    }
+}
+
+/// The byte range of the character `rel` device pixels into a run,
+/// from the boundaries the draw measured. A point past the last
+/// character — which the clip and the item's box make rare but not
+/// impossible at the exact right edge — reports that boundary with a
+/// zero length, the same "caret, no character" the run's end means.
+fn char_range(stops: &[(u32, f32)], rel: f32) -> (u32, u32) {
+    if let Some(w) = stops.windows(2).find(|w| rel >= w[0].1 && rel < w[1].1) {
+        return (w[0].0, w[1].0 - w[0].0);
+    }
+    let last = stops.last().map_or(0, |(o, _)| *o);
+    if rel < stops.first().map_or(0.0, |(_, x)| *x) {
+        (stops.first().map_or(0, |(o, _)| *o), 0)
+    } else {
+        (last, 0)
     }
 }
 
@@ -546,7 +650,11 @@ mod tests {
         let r = PickRect::new(0.0, 0.0, 10.0, 10.0);
         list.push(item(r, Transform2D::identity(), PickRect::UNBOUNDED, 1));
         let mut text = item(r, Transform2D::identity(), PickRect::UNBOUNDED, 2);
-        text.kind = PickKind::Text { byte_len: 4, scale: 1.0 };
+        text.kind = PickKind::Text {
+            byte_len: 4,
+            scale: 1.0,
+            stops: list.intern_stops(&[(0, 0.0), (4, 10.0)]),
+        };
         list.push(text);
         assert_eq!(list.hit(5.0, 5.0).unwrap().item.loc.creation_seq, 2);
         let img = list
@@ -555,19 +663,87 @@ mod tests {
         assert_eq!(img.item.loc.creation_seq, 1);
     }
 
+    /// §15 — a query arrives in the querying scope's own cells and
+    /// has to land in the right item. The host grid starts at the
+    /// canvas origin; a portal's cells start wherever its path was
+    /// interned, which is the only thing that makes an inner
+    /// program's coordinates meaningful.
+    #[test]
+    fn query_resolves_cells_within_the_asking_scope() {
+        let (cw, ch) = (10.0, 20.0);
+        let mut list = PickList::new();
+        let pane = list.intern_path(&["p".to_string()], (100.0, 40.0));
+
+        // Host item covering cells (2,1)..(6,2).
+        list.push(item(
+            PickRect::new(20.0, 20.0, 40.0, 20.0),
+            Transform2D::identity(),
+            PickRect::UNBOUNDED,
+            1,
+        ));
+        // Pane item covering the pane's own cells (0,0)..(4,1).
+        let mut inner = item(
+            PickRect::new(100.0, 40.0, 40.0, 20.0),
+            Transform2D::identity(),
+            PickRect::UNBOUNDED,
+            2,
+        );
+        inner.loc.path_id = pane;
+        list.push(inner);
+
+        let host = list.query(&[], 2.5, 1.5, cw, ch).expect("host hit");
+        assert_eq!(host.creation_seq, 1);
+        // The pane's cell (0.5, 0.5) is nowhere near the host's, and
+        // each scope only ever answers with its own items.
+        let in_pane = list.query(&["p"], 0.5, 0.5, cw, ch).expect("pane hit");
+        assert_eq!(in_pane.creation_seq, 2);
+        assert!(list.query(&[], 0.5, 0.5, cw, ch).is_none());
+        assert!(list.query(&["p"], 2.5, 1.5, cw, ch).is_none());
+        // An unknown scope is not a scope with no items — it is a
+        // question about a portal that was not painted.
+        assert!(list.query(&["gone"], 0.5, 0.5, cw, ch).is_none());
+    }
+
+    /// The character under the point comes from the boundaries the
+    /// draw measured, so it is the one that was painted there.
+    #[test]
+    fn query_reports_the_character_under_the_point() {
+        let mut list = PickList::new();
+        let mut text = item(
+            PickRect::new(20.0, 0.0, 20.0, 20.0),
+            Transform2D::identity(),
+            PickRect::UNBOUNDED,
+            1,
+        );
+        // "ab" then a 4-byte char: boundaries at 0, 3 and 7 bytes.
+        text.kind = PickKind::Text {
+            byte_len: 7,
+            scale: 1.0,
+            stops: list.intern_stops(&[(0, 0.0), (3, 10.0), (7, 20.0)]),
+        };
+        list.push(text);
+
+        // 5px into the run: the first character, 3 bytes long.
+        let a = list.query(&[], 2.5, 0.5, 10.0, 20.0).expect("hit");
+        assert_eq!(a.text, Some((0, 3)));
+        // 15px in: the second, 4 bytes long.
+        let b = list.query(&[], 3.5, 0.5, 10.0, 20.0).expect("hit");
+        assert_eq!(b.text, Some((3, 4)));
+    }
+
     #[test]
     fn paths_intern_and_reuse() {
         let mut list = PickList::new();
         assert_eq!(list.path(0), &[] as &[String]);
-        let a = list.intern_path(&["pane1".to_string()]);
-        let b = list.intern_path(&["pane1".to_string(), "inner".to_string()]);
-        assert_eq!(list.intern_path(&["pane1".to_string()]), a);
+        let a = list.intern_path(&["pane1".to_string()], (10.0, 20.0));
+        let b = list.intern_path(&["pane1".to_string(), "inner".to_string()], (30.0, 40.0));
+        assert_eq!(list.intern_path(&["pane1".to_string()], (0.0, 0.0)), a);
         assert_ne!(a, b);
         assert_eq!(list.path(b), &["pane1".to_string(), "inner".to_string()]);
         list.clear();
         assert_eq!(list.path(0), &[] as &[String]);
         // Interning restarts after a clear.
-        assert_eq!(list.intern_path(&["other".to_string()]), 1);
+        assert_eq!(list.intern_path(&["other".to_string()], (0.0, 0.0)), 1);
     }
 
     fn selection(path: &[&str], seq: u64, anchor: usize, head: usize) -> VgeSelection {
@@ -626,7 +802,7 @@ mod tests {
     fn find_locates_the_selected_run_in_this_frame() {
         let mut list = PickList::new();
         let r = PickRect::new(0.0, 0.0, 10.0, 10.0);
-        let pane_id = list.intern_path(&["pane1".to_string()]);
+        let pane_id = list.intern_path(&["pane1".to_string()], (0.0, 0.0));
 
         // Same creation_seq in two different scopes — the path is what
         // tells them apart.
@@ -634,6 +810,7 @@ mod tests {
         host_text.kind = PickKind::Text {
             byte_len: 3,
             scale: 1.0,
+            stops: list.intern_stops(&[(0, 0.0), (3, 10.0)]),
         };
         let mut pane_text = host_text;
         pane_text.loc.path_id = pane_id;

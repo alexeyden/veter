@@ -47,6 +47,12 @@ pub enum MouseProtocolEncoding {
 
     /// SGR-like encoding.
     Sgr,
+
+    /// SGR framing with the position given in pixels rather than cells
+    /// (xterm's SGR-Pixels, DECSET 1016). Byte-identical to [`Self::Sgr`]
+    /// on the wire; only the meaning of the two coordinates differs, so
+    /// the emitter — not the parser — is what has to know.
+    SgrPixels,
     // Urxvt,
 }
 
@@ -1396,6 +1402,9 @@ impl Screen {
                 [1006] => {
                     self.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                [1016] => {
+                    self.set_mouse_encoding(MouseProtocolEncoding::SgrPixels);
+                }
                 [1049] => {
                     self.decsc();
                     self.alternate_grid.clear();
@@ -1436,6 +1445,9 @@ impl Screen {
                 }
                 [1006] => {
                     self.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
+                }
+                [1016] => {
+                    self.clear_mouse_encoding(MouseProtocolEncoding::SgrPixels);
                 }
                 [1049] => {
                     self.exit_alternate_grid();
@@ -2177,6 +2189,40 @@ mod binary_snapshot_tests {
         assert_eq!(bytes1, bytes2);
         assert!(p2.screen().bracketed_paste());
         assert!(p2.screen().application_keypad());
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_encoding_roundtrips() {
+        // ?1016 is SGR framing with pixel coordinates; it supersedes
+        // ?1006 the way any other encoding selection does, and `?1016l`
+        // drops back to the legacy encoding rather than to ?1006.
+        let mut p1 = Parser::new(4, 16, 0);
+        p1.process(b"\x1b[?1002h\x1b[?1006h\x1b[?1016h");
+        assert_eq!(
+            p1.screen().mouse_protocol_encoding(),
+            crate::MouseProtocolEncoding::SgrPixels
+        );
+        let bytes1 = p1.screen().binary_snapshot();
+        let p2 = restore_into_fresh(&bytes1, 4, 16, 0);
+        assert_eq!(
+            p2.screen().mouse_protocol_encoding(),
+            crate::MouseProtocolEncoding::SgrPixels
+        );
+        assert_eq!(bytes1, p2.screen().binary_snapshot());
+        // The re-emitted input modes name the mode the sender chose.
+        assert!(
+            p2.screen()
+                .input_mode_formatted()
+                .windows(8)
+                .any(|w| w == b"[?1016h")
+                || p2.screen().input_mode_formatted().ends_with(b"\x1b[?1016h")
+        );
+
+        p1.process(b"\x1b[?1016l");
+        assert_eq!(
+            p1.screen().mouse_protocol_encoding(),
+            crate::MouseProtocolEncoding::Default
+        );
     }
 
     #[test]

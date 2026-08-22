@@ -917,12 +917,19 @@ struct Pane {
     /// per-pane scrollback or get forwarded to the inner program.
     inner_mouse_protocol: u8,
     /// Mouse *encoding* from the same event (§8.9): 0 legacy, 1 UTF-8
-    /// (1005), 2 SGR (1006), 3 urxvt (1015). §11 requires forwarded
-    /// reports to be encoded the way the inner program asked, so this
-    /// is not cosmetic: a program whose terminfo lacks `XM` never
-    /// enables 1006, and ncurses then matches `kmous=\E[M` only — an
-    /// SGR report reaches it as the literal keystrokes `ESC [ < …`.
+    /// (1005), 2 SGR (1006), 3 urxvt (1015), 4 SGR-Pixels (1016).
+    /// §11 requires forwarded reports to be encoded the way the inner
+    /// program asked, so this is not cosmetic: a program whose
+    /// terminfo lacks `XM` never enables 1006, and ncurses then
+    /// matches `kmous=\E[M` only — an SGR report reaches it as the
+    /// literal keystrokes `ESC [ < …`.
     inner_mouse_encoding: u8,
+    /// Last coordinate pair forwarded to this pane as a motion event.
+    /// The host dedups against what *it* reports, which under ?1016 is
+    /// a pixel — so a pane still on cell coords would otherwise get
+    /// one duplicate report per pixel of travel. Keyed on the pair
+    /// actually sent, so each encoding gets its own resolution.
+    last_motion_sent: Option<(u32, u32)>,
     /// `Some` while this pane is navigating its scrollback. Independent
     /// per-pane so two panes can sit at different offsets at the same
     /// time and tab switches don't clobber state.
@@ -2356,6 +2363,13 @@ struct State {
     cell_pw: f32,
     cell_ph: f32,
     quit: bool,
+    /// True while ?1016 (SGR-Pixels) is enabled on vmux's own input
+    /// source. Tracks the union of the panes' `inner_mouse_encoding`
+    /// (§11: the client enables upstream what its descendants ask
+    /// for): pixel resolution is only obtainable by asking the host
+    /// for it, and only a program that wants it should pay the
+    /// per-pixel motion traffic.
+    pixel_mouse: bool,
     /// Set by SIGWINCH handler — main loop drains it.
     needs_resize_check: bool,
     /// True while a modal element exists in the host's VGE table.
@@ -2419,6 +2433,7 @@ impl State {
             cell_pw,
             cell_ph,
             quit: false,
+            pixel_mouse: false,
             needs_resize_check: false,
             modal_visible: false,
             last_focus_sent: None,
@@ -2454,6 +2469,7 @@ impl State {
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 inner_mouse_encoding: 0,
+                last_motion_sent: None,
                 scroll: None,
                 activity: false,
             },
@@ -2548,6 +2564,7 @@ impl State {
                 last_winsize: None,
                 inner_mouse_protocol: 0,
                 inner_mouse_encoding: 0,
+                last_motion_sent: None,
                 scroll: None,
                 activity: false,
             },
@@ -2600,6 +2617,7 @@ impl State {
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 inner_mouse_encoding: 0,
+                last_motion_sent: None,
                 scroll: None,
                 activity: false,
             },
@@ -2940,6 +2958,7 @@ impl State {
                 last_winsize: Some((cols, rows, cell_px.0, cell_px.1)),
                 inner_mouse_protocol: 0,
                 inner_mouse_encoding: 0,
+                last_motion_sent: None,
                 scroll: None,
                 activity: false,
             },
@@ -4135,7 +4154,7 @@ impl Drop for TtyGuard {
             // don't leak into the outer shell, then leave alt screen
             // and re-show the cursor.
             let _ = write_all_stdout(
-                b"\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b[?25h",
+                b"\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b[?25h",
             );
         }
         if let Some(saved) = self.saved.take() {
@@ -4452,7 +4471,7 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
             break;
         }
 
-        for payload in prt_apc.feed(&buf[..n]).payloads {
+        for payload in prt_apc.feed(&buf[..n]).into_payloads() {
             if let Some((themed, accent)) = parse_prt_probe(&payload) {
                 res.prt_ok = true;
                 res.host_themed_styles = themed;
@@ -4977,7 +4996,7 @@ fn await_cleanup_responses(
             Err(_) => return Ok(()),
         };
         let prt_out = prt_apc.feed(&buf[..n]);
-        for payload in &prt_out.payloads {
+        for payload in prt_out.payloads() {
             // Each envelope carries one or more frames; PRT response
             // codes are 0x01..=0x7F, events are 0x80..=0xFF (§4).
             let mut r = PrtReader::new(payload);
@@ -5053,8 +5072,8 @@ fn handle_stdin_chunk(
     // Pane ids whose effective title may have changed in this chunk.
     // Used after the loop to re-emit chrome and the tab bar in one go.
     let mut titles_dirty: HashSet<String> = HashSet::new();
-    for payload in prt_out.payloads {
-        let mut r = PrtReader::new(&payload);
+    for payload in prt_out.payloads() {
+        let mut r = PrtReader::new(payload);
         let _version = r.u8();
         let _payload_len = r.u32();
         while !r.at_end() {
@@ -5233,25 +5252,86 @@ fn handle_stdin_chunk(
 
     // Split mouse events out of the keystroke stream, dispatch each,
     // and forward only non-mouse bytes to the input state machine.
-    let (regular, mouse_events) = extract_mouse_events(&ses_out.passthrough);
+    let (regular, mouse_events) =
+        extract_mouse_events(&ses_out.passthrough, state.pixel_mouse, state.cell_px());
     for ev in mouse_events {
         handle_mouse_event(state, ev)?;
     }
     if !regular.is_empty() {
         process_user_input(state, &regular)?;
     }
+
+    // Last, because a `MouseModeChange` earlier in this same chunk may
+    // have changed whether any descendant wants pixel coordinates —
+    // but the mouse reports just parsed were generated by the host
+    // before it could have seen the request, so they are still in
+    // whichever space was in force on the way in. Reconciling after
+    // the fact keeps that reading honest; one round trip's worth of
+    // reports can still straddle the switch, which is why nothing
+    // downstream treats a coordinate as more than a position.
+    sync_pixel_mouse_reporting(state)?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Match ?1016 on vmux's own input source to what the panes want
+/// (§11: the client enables upstream whatever the union of its
+/// descendants asks for). Cells are the default because pixel mode
+/// costs a report per pixel of pointer travel rather than per cell
+/// crossing; nothing pays that until a pane asks for it.
+///
+/// vmux re-derives cells from pixels while this is on, so it needs a
+/// cell size to divide by. Without one it stays on cells and a pixel
+/// client gets cell-granularity reports — degraded, not broken.
+fn sync_pixel_mouse_reporting(state: &mut State) -> Result<()> {
+    let want = state.cell_pw >= 1.0
+        && state.cell_ph >= 1.0
+        && state
+            .panes
+            .values()
+            .any(|p| p.inner_mouse_encoding == 4); // §8.9: SGR-Pixels
+    if want == state.pixel_mouse {
+        return Ok(());
+    }
+    state.pixel_mouse = want;
+    write_all_stdout(pixel_mouse_transition(want))?;
+    Ok(())
+}
+
+/// The bytes that move vmux's own input source into or out of ?1016.
+///
+/// Turning it *off* has to re-assert ?1006. A terminal holds one
+/// encoding selection, not a stack (vt100's `clear_mouse_encoding`,
+/// and xterm's `extend_coords` before it): `?1016l` means "stop using
+/// the encoding I selected", and what is left is the legacy
+/// `ESC [ M` form — not the ?1006 that was in force beforehand.
+/// Without the re-assert the host starts spelling reports in an
+/// encoding `extract_mouse_events` does not recognise, so every click
+/// stops working *and* the report's payload bytes fall through to the
+/// focused pane as keystrokes.
+fn pixel_mouse_transition(want: bool) -> &'static [u8] {
+    if want {
+        b"\x1b[?1016h"
+    } else {
+        b"\x1b[?1016l\x1b[?1006h"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MouseEvent {
     /// xterm-style button code: bits 0..1 = button (0=left, 1=middle,
     /// 2=right, 3=release), bit 2 = shift, bit 3 = meta, bit 4 = ctrl,
     /// bit 5 = motion, bit 6 = wheel (64=up, 65=down).
     button: u32,
-    /// 1-indexed host cell coords as reported by SGR mouse encoding.
+    /// 1-indexed host cell coords. Every hit-test vmux runs — tab bar,
+    /// pane rects, divider drags — is in cells, so this is always
+    /// populated even when the host reported pixels.
     col: u32,
     row: u32,
+    /// 1-indexed host text-area pixel. Only meaningful when the host
+    /// is reporting in SGR-Pixels; otherwise it is the reported cell's
+    /// top-left corner, which is the best a cell report can say.
+    px: u32,
+    py: u32,
     /// `true` for press / motion events (`M`), `false` for release (`m`).
     press: bool,
 }
@@ -5259,7 +5339,16 @@ struct MouseEvent {
 /// Walk `bytes` and pull out SGR mouse sequences (`\e[<b;c;rM/m`).
 /// Returns the bytes that were NOT part of any mouse sequence (suitable
 /// for forwarding to the focused pane) plus the parsed events.
-fn extract_mouse_events(bytes: &[u8]) -> (Vec<u8>, Vec<MouseEvent>) {
+///
+/// SGR-Pixels (?1016) is the same framing with the two coordinates
+/// meaning pixels, so `pixels` — whether vmux currently has ?1016
+/// enabled on its own input source — decides how they are read, and
+/// `cell` converts between the two so every event carries both.
+fn extract_mouse_events(
+    bytes: &[u8],
+    pixels: bool,
+    cell: (u16, u16),
+) -> (Vec<u8>, Vec<MouseEvent>) {
     let mut out_bytes = Vec::with_capacity(bytes.len());
     let mut events = Vec::new();
     let mut i = 0;
@@ -5281,7 +5370,7 @@ fn extract_mouse_events(bytes: &[u8]) -> (Vec<u8>, Vec<MouseEvent>) {
             {
                 let press = bytes[end] == b'M';
                 let body = &bytes[start..end];
-                if let Some(ev) = parse_sgr_body(body, press) {
+                if let Some(ev) = parse_sgr_body(body, press, pixels, cell) {
                     events.push(ev);
                     i = end + 1;
                     continue;
@@ -5294,16 +5383,37 @@ fn extract_mouse_events(bytes: &[u8]) -> (Vec<u8>, Vec<MouseEvent>) {
     (out_bytes, events)
 }
 
-fn parse_sgr_body(body: &[u8], press: bool) -> Option<MouseEvent> {
+fn parse_sgr_body(
+    body: &[u8],
+    press: bool,
+    pixels: bool,
+    cell: (u16, u16),
+) -> Option<MouseEvent> {
     let s = std::str::from_utf8(body).ok()?;
     let mut parts = s.splitn(3, ';');
     let button: u32 = parts.next()?.parse().ok()?;
-    let col: u32 = parts.next()?.parse().ok()?;
-    let row: u32 = parts.next()?.parse().ok()?;
+    let x: u32 = parts.next()?.parse().ok()?;
+    let y: u32 = parts.next()?.parse().ok()?;
+    let (cw, ch) = (cell.0.max(1) as u32, cell.1.max(1) as u32);
+    // The host advertises `ws_xpixel` as `cols * cell_width`, so the
+    // cell size divides out exactly in both directions and the two
+    // forms stay consistent to the cell.
+    let (col, row, px, py) = if pixels {
+        (
+            x.saturating_sub(1) / cw + 1,
+            y.saturating_sub(1) / ch + 1,
+            x,
+            y,
+        )
+    } else {
+        (x, y, x.saturating_sub(1) * cw + 1, y.saturating_sub(1) * ch + 1)
+    };
     Some(MouseEvent {
         button,
         col,
         row,
+        px,
+        py,
         press,
     })
 }
@@ -5475,14 +5585,38 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         .get(&pane_id)
         .map(|p| (p.inner_mouse_protocol, p.inner_mouse_encoding))
         .unwrap_or((0, 0));
-    let Some(payload) = encode_mouse_report(
-        encoding,
-        proto,
-        ev.button,
-        portal_col as u32 + 1,
-        portal_row as u32 + 1,
-        ev.press,
-    ) else {
+    // A pixel report is translated by the portal's origin in pixels,
+    // exactly as a cell report is by its origin in cells. The pitch is
+    // the rounded cell size the pane's own `TIOCSWINSZ` carries
+    // (`pane_pixel_size`), so the inner program divides by the same
+    // number the host multiplied by.
+    let (cw, ch) = state.cell_px();
+    let (sent_x, sent_y) = if encoding == 4 {
+        (
+            ev.px
+                .saturating_sub(origin_x.max(0) as u32 * cw.max(1) as u32)
+                .max(1),
+            ev.py
+                .saturating_sub(origin_y.max(0) as u32 * ch.max(1) as u32)
+                .max(1),
+        )
+    } else {
+        (portal_col as u32 + 1, portal_row as u32 + 1)
+    };
+    // Dedup motion against what this pane was last sent: the host
+    // dedups against its own report, which under ?1016 is a pixel, so
+    // a cell-coordinate pane would otherwise see the same cell
+    // repeated for every pixel of travel across it.
+    if is_motion {
+        match state.panes.get_mut(&pane_id) {
+            Some(p) if p.last_motion_sent == Some((sent_x, sent_y)) => return Ok(()),
+            Some(p) => p.last_motion_sent = Some((sent_x, sent_y)),
+            None => return Ok(()),
+        }
+    }
+    let Some(payload) =
+        encode_mouse_report(encoding, proto, ev.button, sent_x, sent_y, ev.press)
+    else {
         return Ok(());
     };
     if let Some(p) = state.pty_mut(&pane_id) {
@@ -5492,9 +5626,11 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
 }
 
 /// Spell one mouse report the way the inner program asked for it
-/// (§8.9 `encoding`, §11) — `col`/`row` are 1-indexed and
-/// portal-relative. `None` means "send nothing": the event is either
-/// not reportable in this mode or not representable in this encoding.
+/// (§8.9 `encoding`, §11) — `x`/`y` are 1-indexed and
+/// portal-relative, in cells for every encoding but SGR-Pixels (4),
+/// where they are pixels. `None` means "send nothing": the event is
+/// either not reportable in this mode or not representable in this
+/// encoding.
 ///
 /// Always emitting SGR is wrong even though every modern program
 /// negotiates it. A program only receives `ESC [ < …` correctly if it
@@ -5507,23 +5643,25 @@ fn encode_mouse_report(
     encoding: u8,
     protocol: u8,
     button: u32,
-    col: u32,
-    row: u32,
+    x: u32,
+    y: u32,
     press: bool,
 ) -> Option<Vec<u8>> {
     // X10 (DECSET 9) reports presses only, whatever the encoding.
     if !press && protocol <= 1 {
         return None;
     }
-    // SGR is the only encoding that spells a release as its own final
-    // byte; every legacy one reports button 3, keeping the modifier
-    // and motion bits.
-    if encoding == 2 {
+    // SGR (2) and SGR-Pixels (4) share every byte of their framing —
+    // ?1016 is ?1006 with the coordinates read as pixels — and are the
+    // only encodings that spell a release as its own final byte; every
+    // legacy one reports button 3, keeping the modifier and motion
+    // bits.
+    if encoding == 2 || encoding == 4 {
         let final_byte = if press { 'M' } else { 'm' };
-        return Some(format!("\x1b[<{button};{col};{row}{final_byte}").into_bytes());
+        return Some(format!("\x1b[<{button};{x};{y}{final_byte}").into_bytes());
     }
     let button = if press { button } else { (button & !0b11) | 3 };
-    encode_legacy(encoding, button, col, row)
+    encode_legacy(encoding, button, x, y)
 }
 
 /// The three legacy encodings, which all carry the same
@@ -6939,6 +7077,61 @@ mod tests {
         assert_eq!(p.current(), Some(1));
     }
 
+    /// Regression: after vdraw (a ?1016 client) exited, vmux dropped
+    /// pixel mode and the mouse stopped working in the whole
+    /// multiplexer — `?1016l` had left the host on the legacy
+    /// encoding, whose reports vmux cannot parse and whose payload
+    /// bytes reached the pane as the keystrokes `?.@?.#?.` and
+    /// friends.
+    #[test]
+    fn leaving_pixel_mouse_restores_sgr_rather_than_legacy() {
+        assert_eq!(pixel_mouse_transition(true), b"\x1b[?1016h");
+        let off = pixel_mouse_transition(false);
+        assert_eq!(off, b"\x1b[?1016l\x1b[?1006h");
+        // The re-assert has to come after the disable, or it is the
+        // one that gets cleared.
+        let (disable, reassert) = (
+            off.windows(8).position(|w| w == b"\x1b[?1016l"),
+            off.windows(8).position(|w| w == b"\x1b[?1006h"),
+        );
+        assert!(disable < reassert, "?1006h must follow ?1016l");
+    }
+
+    /// SGR-Pixels reports carry pixels in the same framing, so vmux
+    /// reads them as pixels and derives the cell it hit-tests with —
+    /// and a cell report still yields a usable pixel (the cell's
+    /// corner) so downstream code never has to branch.
+    #[test]
+    fn pixel_reports_carry_both_coordinate_forms() {
+        // 10x20 cell. Pixel 25,45 is inside cell (3, 3).
+        let (rest, evs) = extract_mouse_events(b"\x1b[<0;25;45M", true, (10, 20));
+        assert!(rest.is_empty());
+        assert_eq!(
+            evs,
+            vec![MouseEvent { button: 0, col: 3, row: 3, px: 25, py: 45, press: true }]
+        );
+        // The cell's last pixel still resolves to that cell, and the
+        // next one moves on — the boundary the host is careful to keep
+        // exact when it maps the pointer into this space.
+        let (_, evs) = extract_mouse_events(b"\x1b[<0;30;40m", true, (10, 20));
+        assert_eq!(evs[0].col, 3);
+        assert_eq!(evs[0].row, 2);
+        let (_, evs) = extract_mouse_events(b"\x1b[<0;31;41M", true, (10, 20));
+        assert_eq!((evs[0].col, evs[0].row), (4, 3));
+
+        // Cell mode: the reported cell stands, and the pixel is its
+        // top-left corner.
+        let (_, evs) = extract_mouse_events(b"\x1b[<0;3;3M", false, (10, 20));
+        assert_eq!(
+            evs,
+            vec![MouseEvent { button: 0, col: 3, row: 3, px: 21, py: 41, press: true }]
+        );
+        // Non-mouse bytes are still passed through untouched.
+        let (rest, evs) = extract_mouse_events(b"ab\x1b[<0;25;45Mcd", true, (10, 20));
+        assert_eq!(rest, b"abcd".to_vec());
+        assert_eq!(evs.len(), 1);
+    }
+
     /// §11: a forwarded report must be spelled in the encoding the
     /// inner program negotiated. Regression test for htop over ssh to
     /// a host whose terminfo lacks `XM`: it enables 1000 without 1006,
@@ -6991,6 +7184,20 @@ mod tests {
             encode_mouse_report(3, 2, 0, 48, 10, true).unwrap(),
             b"\x1b[32;48;10M".to_vec()
         );
+
+        // SGR-Pixels (1016): 1006's framing, and the caller has
+        // already resolved the two numbers to portal-relative pixels.
+        assert_eq!(
+            encode_mouse_report(4, 2, 0, 471, 181, true).unwrap(),
+            b"\x1b[<0;471;181M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_report(4, 2, 0, 471, 181, false).unwrap(),
+            b"\x1b[<0;471;181m".to_vec()
+        );
+        // …and it is still an X10 program's business whether a release
+        // is reportable at all.
+        assert!(encode_mouse_report(4, 1, 0, 471, 181, false).is_none());
 
         // The wheel is a press-only button in every encoding.
         assert_eq!(

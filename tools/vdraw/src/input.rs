@@ -33,6 +33,26 @@ impl Button {
     }
 }
 
+/// Where the pointer is, in the two resolutions a mouse report can
+/// carry.
+///
+/// `col`/`row` are the 0-indexed cell — what chrome hit-testing wants,
+/// since the palette is laid out in cells. `x`/`y` are the same
+/// position in *fractional* cells, which is what the camera and the
+/// snap grid want.
+///
+/// Under SGR-Pixels (?1016) the fractional pair is exact. Under a
+/// cell-only encoding the report says which cell the pointer is in and
+/// nothing finer, so `x`/`y` are that cell's centre: the unbiased
+/// estimate, and the reason `drag::snap`'s grid sits on cell centres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pos {
+    pub col: u16,
+    pub row: u16,
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
     Quit,
@@ -49,40 +69,39 @@ pub enum Event {
     Undo,
     Redo,
     Save,
-    MouseDown {
-        button: Button,
-        col: u16,
-        row: u16,
-    },
-    MouseUp {
-        button: Button,
-        col: u16,
-        row: u16,
-    },
+    MouseDown { button: Button, at: Pos },
+    MouseUp { button: Button, at: Pos },
     /// Pointer motion. `held` is the dragged button, if any.
-    MouseMove {
-        col: u16,
-        row: u16,
-        held: Option<Button>,
-    },
-    WheelUp {
-        col: u16,
-        row: u16,
-    },
-    WheelDown {
-        col: u16,
-        row: u16,
-    },
+    MouseMove { at: Pos, held: Option<Button> },
+    WheelUp { at: Pos },
+    WheelDown { at: Pos },
 }
 
 #[derive(Default)]
 pub struct InputParser {
     buf: Vec<u8>,
+    /// Cell size in pixels once the caller has switched the terminal to
+    /// SGR-Pixels (?1016). `None` means reports still name cells.
+    cell: Option<(f32, f32)>,
 }
 
 impl InputParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read mouse reports as SGR-Pixels: the two coordinates are pixels
+    /// within the pane rather than cells, and `cell` — the probe's
+    /// `cell_pixel_*` — converts them to the fractional cell position
+    /// the camera works in.
+    ///
+    /// Call this only once ?1016 has actually been written to the
+    /// terminal, and write it only once the VGE probe has answered: a
+    /// terminal that ignored the request keeps sending cells, and
+    /// reading a cell number as a pixel puts the pointer a factor of
+    /// `cell` away from where it is.
+    pub fn set_pixel_mouse(&mut self, cell: (f32, f32)) {
+        self.cell = Some((cell.0.max(1.0), cell.1.max(1.0)));
     }
 
     /// Feed freshly-read bytes; returns the events that completed.
@@ -118,7 +137,7 @@ impl InputParser {
                         if i + 2 < b.len() && b[i + 2] == b'<' {
                             match find_mouse_end(&b[i..]) {
                                 Some(len) => {
-                                    if let Some(ev) = parse_sgr_mouse(&b[i..i + len]) {
+                                    if let Some(ev) = parse_sgr_mouse(&b[i..i + len], self.cell) {
                                         out.push(ev);
                                     }
                                     i += len;
@@ -268,38 +287,57 @@ fn find_mouse_end(s: &[u8]) -> Option<usize> {
     None
 }
 
-fn parse_sgr_mouse(s: &[u8]) -> Option<Event> {
-    // s = ESC [ < b ; col ; row (M|m)
+/// `cell` is `Some` when the terminal is reporting in SGR-Pixels; the
+/// framing is identical either way, only the meaning of the two
+/// numbers differs.
+fn parse_sgr_mouse(s: &[u8], cell: Option<(f32, f32)>) -> Option<Event> {
+    // s = ESC [ < b ; x ; y (M|m)
     let final_byte = *s.last()?;
     let text = std::str::from_utf8(&s[3..s.len() - 1]).ok()?;
     let mut parts = text.split(';');
     let b: u32 = parts.next()?.parse().ok()?;
-    let col: u32 = parts.next()?.parse().ok()?;
-    let row: u32 = parts.next()?.parse().ok()?;
-    // SGR is 1-indexed; the rest of the editor works in 0-indexed cells.
-    let col = col.saturating_sub(1) as u16;
-    let row = row.saturating_sub(1) as u16;
+    let px: u32 = parts.next()?.parse().ok()?;
+    let py: u32 = parts.next()?.parse().ok()?;
+    // Both encodings are 1-indexed; the rest of the editor works in
+    // 0-indexed cells.
+    let (x, y) = match cell {
+        Some((cw, ch)) => (
+            px.saturating_sub(1) as f32 / cw,
+            py.saturating_sub(1) as f32 / ch,
+        ),
+        // Cell coordinates say nothing about where inside the cell the
+        // pointer is; its centre is the unbiased guess (see [`Pos`]).
+        None => (
+            px.saturating_sub(1) as f32 + 0.5,
+            py.saturating_sub(1) as f32 + 0.5,
+        ),
+    };
+    let at = Pos {
+        col: x as u16,
+        row: y as u16,
+        x,
+        y,
+    };
 
     if b & 64 != 0 {
         // Wheel: 64 = up, 65 = down.
         return Some(if b & 1 == 0 {
-            Event::WheelUp { col, row }
+            Event::WheelUp { at }
         } else {
-            Event::WheelDown { col, row }
+            Event::WheelDown { at }
         });
     }
     if b & 32 != 0 {
         // Motion; the button bits carry the held button (3 = none).
         return Some(Event::MouseMove {
-            col,
-            row,
+            at,
             held: Button::from_bits(b),
         });
     }
     let button = Button::from_bits(b)?;
     Some(match final_byte {
-        b'M' => Event::MouseDown { button, col, row },
-        _ => Event::MouseUp { button, col, row },
+        b'M' => Event::MouseDown { button, at },
+        _ => Event::MouseUp { button, at },
     })
 }
 
@@ -400,6 +438,17 @@ mod tests {
         assert!(p.feed(b"\x1b[1~\x1b[2~\x1b[5~").is_empty());
     }
 
+    /// Cell coordinates land mid-cell, which is all a cell report can
+    /// honestly say about where inside it the pointer is.
+    fn cell(col: u16, row: u16) -> Pos {
+        Pos {
+            col,
+            row,
+            x: col as f32 + 0.5,
+            y: row as f32 + 0.5,
+        }
+    }
+
     #[test]
     fn sgr_mouse_buttons_and_wheel() {
         let mut p = InputParser::new();
@@ -408,20 +457,17 @@ mod tests {
             vec![
                 Event::MouseDown {
                     button: Button::Left,
-                    col: 9,
-                    row: 4
+                    at: cell(9, 4),
                 },
                 Event::MouseDown {
                     button: Button::Right,
-                    col: 9,
-                    row: 4
+                    at: cell(9, 4),
                 },
                 Event::MouseUp {
                     button: Button::Left,
-                    col: 10,
-                    row: 4
+                    at: cell(10, 4),
                 },
-                Event::WheelUp { col: 2, row: 2 },
+                Event::WheelUp { at: cell(2, 2) },
             ]
         );
     }
@@ -433,16 +479,42 @@ mod tests {
             p.feed(b"\x1b[<34;7;2M\x1b[<35;7;2M"),
             vec![
                 Event::MouseMove {
-                    col: 6,
-                    row: 1,
-                    held: Some(Button::Right)
+                    at: cell(6, 1),
+                    held: Some(Button::Right),
                 },
                 Event::MouseMove {
-                    col: 6,
-                    row: 1,
-                    held: None
+                    at: cell(6, 1),
+                    held: None,
                 },
             ]
         );
+    }
+
+    /// In pixel mode the same framing carries pixels: the cell is
+    /// derived, and the fractional position is the real one rather
+    /// than the cell's centre. This is the whole point of ?1016 for a
+    /// drawing tool — two clicks in one cell are two positions.
+    #[test]
+    fn pixel_mouse_resolves_within_the_cell() {
+        let mut p = InputParser::new();
+        p.set_pixel_mouse((10.0, 20.0));
+        // Pixel 26,45 (1-indexed) is 2.5 cells across, 2.2 down.
+        let evs = p.feed(b"\x1b[<0;26;45M");
+        let Event::MouseDown { at, .. } = evs[0] else {
+            panic!("expected a press, got {evs:?}");
+        };
+        assert_eq!((at.col, at.row), (2, 2));
+        assert!((at.x - 2.5).abs() < 1e-6, "{}", at.x);
+        assert!((at.y - 2.2).abs() < 1e-6, "{}", at.y);
+
+        // A pixel further left in the same cell is a different point
+        // but the same cell — the distinction a cell report cannot
+        // make.
+        let evs = p.feed(b"\x1b[<0;22;45M");
+        let Event::MouseDown { at: near, .. } = evs[0] else {
+            panic!("expected a press");
+        };
+        assert_eq!((near.col, near.row), (2, 2));
+        assert!(near.x < at.x);
     }
 }

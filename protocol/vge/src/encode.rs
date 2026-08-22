@@ -33,6 +33,7 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::UpdateImage(_) => CMD_UPDATE_IMAGE,
         Command::UpdateSize { .. } => CMD_UPDATE_SIZE,
         Command::UpdateTransform { .. } => CMD_UPDATE_TRANSFORM,
+        Command::QueryHit { .. } => CMD_QUERY_HIT,
     }
 }
 
@@ -82,6 +83,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
             w.str(id);
             w.transform(transform);
         }
+        Command::QueryHit { point } => write_point(&mut w, *point),
     }
     w.buf
 }

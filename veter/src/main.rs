@@ -864,10 +864,14 @@ struct App {
     /// `ButtonMotion` mode should be forwarded and which button code
     /// to report on a motion event.
     mouse_buttons_held: u8,
-    /// Last host-cell coords reported as a motion event, used to
-    /// dedup so the inner program receives at most one motion event
-    /// per cell. `None` means "no motion forwarded yet".
-    last_motion_cell: Option<(u32, u32)>,
+    /// Last coordinate pair reported as a motion event, used to dedup
+    /// so the inner program receives at most one motion event per
+    /// distinct position. Keyed on what was actually *sent*, which in
+    /// SGR-Pixels (?1016) is a pixel and in every other encoding a
+    /// cell — a program that asked for pixel resolution must not have
+    /// its motion collapsed to one report per cell crossing. `None`
+    /// means "no motion forwarded yet".
+    last_motion_report: Option<(u32, u32)>,
     /// Active scrollback search (Some while the search bar is open).
     /// Opened by `/` when the focused-leaf parser has scrollback > 0;
     /// closed by Esc (restores scrollback) or once the user is done.
@@ -1904,10 +1908,56 @@ fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
     bits
 }
 
+/// Answers a VGE `QueryHit` (§15) out of the pick index — the record
+/// the render pass leaves of where each `DrawText` / `DrawImage`
+/// actually landed.
+///
+/// Held as a plain borrow of the last frame's index rather than of the
+/// whole renderer: resolving a hit needs no re-shaping (the character
+/// boundaries were interned when the run was drawn) and no VGE state
+/// (the engine turns the creation sequence back into an id itself), so
+/// this can sit alongside the `&mut` borrows the byte pipeline holds.
+struct PickTester<'a> {
+    pick: &'a vge::pick::PickList,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+impl veter_host::vge::state::HitTester for PickTester<'_> {
+    fn hit_test(
+        &self,
+        scope: &[&str],
+        x_cells: f32,
+        y_cells: f32,
+    ) -> Option<veter_host::vge::state::RawHit> {
+        self.pick
+            .query(scope, x_cells, y_cells, self.cell_w, self.cell_h)
+    }
+}
+
+/// Where a mouse report says the pointer is. Which half of this the
+/// wire carries is the encoding's business: SGR-Pixels (?1016) spells
+/// `px`/`py`, every other encoding spells `col`/`row`. Both are
+/// carried together because the caller resolves the pointer once and
+/// cannot know which the host program negotiated.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct MousePos {
+    /// 1-indexed host grid cell.
+    col: u32,
+    row: u32,
+    /// 1-indexed pixel within the host text area — the same physical
+    /// pixels `ws_xpixel` / `ws_ypixel` count, so a client divides by
+    /// `ws_xpixel / ws_col` to recover the cell. Origin is the text
+    /// area's top-left, which for veter is also the window's: there is
+    /// no padding to subtract.
+    px: u32,
+    py: u32,
+}
+
 /// Spell one mouse report in the encoding the host program negotiated.
-/// `col`/`row` are 1-indexed host cells. `None` means "send nothing":
-/// reporting is off, or this event is not reportable in this mode, or
-/// the cell is not representable in this encoding.
+/// `None` means "send nothing": reporting is off, or this event is not
+/// reportable in this mode, or the position is not representable in
+/// this encoding.
 ///
 /// Emitting SGR unconditionally would be wrong even though every
 /// modern program negotiates it: a program receives `ESC [ < …` only
@@ -1920,13 +1970,14 @@ fn encode_mouse_modifier_bits(modifiers: ModifiersState) -> u32 {
 /// portal's inner program (`doc/portal-extension.md` §11). It keys off
 /// the §8.9 encoding *codes* rather than these vt100 enums — and it
 /// also spells urxvt (1015), which vt100 does not model — so the two
-/// stay separate; keep them in step.
+/// stay separate; keep them in step. It takes one coordinate pair
+/// rather than a `MousePos` because by then the client has already
+/// resolved which space the portal wants.
 fn encode_mouse_report(
     mode: vt100::MouseProtocolMode,
     encoding: vt100::MouseProtocolEncoding,
     button: u32,
-    col: u32,
-    row: u32,
+    pos: MousePos,
     press: bool,
 ) -> Option<Vec<u8>> {
     use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
@@ -1937,13 +1988,21 @@ fn encode_mouse_report(
     if !press && mode == Mode::Press {
         return None;
     }
-    // SGR is the only encoding that spells a release as its own final
-    // byte; the legacy ones report button 3, keeping the modifier and
-    // motion bits.
-    if encoding == Enc::Sgr {
+    // The two SGR encodings share every byte of their framing and
+    // differ only in what the two coordinates mean (?1016 is "1006
+    // but in pixels"), so they are one branch. Both are also the only
+    // encodings that spell a release as its own final byte; the legacy
+    // ones report button 3, keeping the modifier and motion bits.
+    if encoding == Enc::Sgr || encoding == Enc::SgrPixels {
+        let (x, y) = if encoding == Enc::SgrPixels {
+            (pos.px, pos.py)
+        } else {
+            (pos.col, pos.row)
+        };
         let final_byte = if press { 'M' } else { 'm' };
-        return Some(format!("\x1b[<{button};{col};{row}{final_byte}").into_bytes());
+        return Some(format!("\x1b[<{button};{x};{y}{final_byte}").into_bytes());
     }
+    let (col, row) = (pos.col, pos.row);
     let button = if press { button } else { (button & !0b11) | 3 };
     let (cb, cx, cy) = (button + 32, col + 32, row + 32);
     let mut out = b"\x1b[M".to_vec();
@@ -1999,7 +2058,7 @@ impl App {
             autoscroll_deadline: None,
             last_click: None,
             mouse_buttons_held: 0,
-            last_motion_cell: None,
+            last_motion_report: None,
             search: None,
             config,
             keys,
@@ -3037,16 +3096,37 @@ impl App {
             ))
     }
 
-    /// 1-indexed host-grid cell under the current cursor, in the form
-    /// SGR mouse encoding expects. None if state isn't initialized.
-    fn cursor_to_host_cell(&self) -> Option<(u32, u32)> {
+    /// The pointer's position in both forms a mouse report can take —
+    /// 1-indexed host cell and 1-indexed text-area pixel. None if
+    /// state isn't initialized.
+    ///
+    /// The pixel is *not* the raw window coordinate. A cell is a
+    /// fractional number of device pixels wide, but `ws_xpixel` is
+    /// advertised as `cols * round(cell_width)` so that cell size
+    /// divides out exactly (`pty::pixel_size`) — and dividing a
+    /// reported pixel by that cell size is precisely what a ?1016
+    /// client does to recover the cell. So the pointer is mapped into
+    /// the same rounded-cell space: whole cells at the advertised
+    /// pitch, plus the sub-cell offset scaled to fit. That keeps
+    /// `floor((px - 1) / round(cell_width)) + 1 == col` exact at every
+    /// boundary; reporting the true window pixel would put the two
+    /// coordinate systems a cell apart wherever the rounding drifts.
+    fn cursor_to_host_pos(&self) -> Option<MousePos> {
         let pos = self.cursor_pos?;
         let tr = self.term_renderer.as_ref()?;
-        let cw = tr.cell_width as f64;
-        let ch = tr.cell_height as f64;
-        let col = (pos.x / cw).floor().max(0.0) as u32 + 1;
-        let row = (pos.y / ch).floor().max(0.0) as u32 + 1;
-        Some((col, row))
+        let (x, y) = (pos.x.max(0.0), pos.y.max(0.0));
+        let axis = |v: f64, cell: f32| {
+            let cell = cell as f64;
+            let pitch = (cell.round()).max(1.0);
+            let n = (v / cell).floor();
+            // Sub-cell offset, rescaled from the true cell width to the
+            // advertised pitch and kept strictly inside the cell.
+            let frac = (((v - n * cell) / cell) * pitch).floor().clamp(0.0, pitch - 1.0);
+            (n as u32 + 1, (n * pitch + frac) as u32 + 1)
+        };
+        let (col, px) = axis(x, tr.cell_width);
+        let (row, py) = axis(y, tr.cell_height);
+        Some(MousePos { col, row, px, py })
     }
 
     /// Forward a button press/release to the inner program in whatever
@@ -3064,11 +3144,11 @@ impl App {
         if mode == vt100::MouseProtocolMode::None {
             return false;
         }
-        let Some((col, row)) = self.cursor_to_host_cell() else {
+        let Some(pos) = self.cursor_to_host_pos() else {
             return false;
         };
         let code = button | encode_mouse_modifier_bits(self.modifiers);
-        if let Some(payload) = encode_mouse_report(mode, encoding, code, col, row, press)
+        if let Some(payload) = encode_mouse_report(mode, encoding, code, pos, press)
             && let Some(pty) = &self.pty
         {
             let _ = pty.write_all(&payload);
@@ -3079,8 +3159,9 @@ impl App {
     /// Forward a pointer-motion event to the inner program when it
     /// has asked for one — `ButtonMotion` (1002) requires a held
     /// button, `AnyMotion` (1003) always reports. Deduplicates per
-    /// host cell so the inner program sees at most one event per cell
-    /// crossing. Returns true if forwarded.
+    /// reported position, so the inner program sees at most one event
+    /// per cell crossing — or per pixel, under ?1016. Returns true if
+    /// forwarded.
     fn try_forward_mouse_motion(&mut self) -> bool {
         let (mode, encoding) = self.host_mouse_proto();
         let held = self.mouse_buttons_held;
@@ -3092,13 +3173,21 @@ impl App {
         if !report {
             return false;
         }
-        let Some((col, row)) = self.cursor_to_host_cell() else {
+        let Some(pos) = self.cursor_to_host_pos() else {
             return false;
         };
-        if self.last_motion_cell == Some((col, row)) {
+        // Dedup against the coordinate this encoding actually sends,
+        // so ?1016 keeps its pixel resolution while every other
+        // encoding still sees one event per cell crossing.
+        let reported = if encoding == vt100::MouseProtocolEncoding::SgrPixels {
+            (pos.px, pos.py)
+        } else {
+            (pos.col, pos.row)
+        };
+        if self.last_motion_report == Some(reported) {
             return false;
         }
-        self.last_motion_cell = Some((col, row));
+        self.last_motion_report = Some(reported);
         let button = if held & 1 != 0 {
             0
         } else if held & 2 != 0 {
@@ -3110,7 +3199,7 @@ impl App {
         };
         // Bit 5 (0x20) is the motion flag in every encoding.
         let code = button | 0x20 | encode_mouse_modifier_bits(self.modifiers);
-        let Some(payload) = encode_mouse_report(mode, encoding, code, col, row, true) else {
+        let Some(payload) = encode_mouse_report(mode, encoding, code, pos, true) else {
             return false;
         };
         if let Some(pty) = &self.pty {
@@ -4323,6 +4412,18 @@ impl App {
             None => return PtyPass::DEAD,
         };
         let vss_backup = &mut self.vss_pre_attach_backup;
+        // §15 — the frame the renderer last painted is what a
+        // `QueryHit` is answered from. Borrowed immutably alongside the
+        // engines above (disjoint fields of `self`); nothing in this
+        // pass repaints, so the index cannot shift underneath a query.
+        let tester = self.term_renderer.as_ref().map(|tr| PickTester {
+            pick: &tr.pick,
+            cell_w: tr.cell_width,
+            cell_h: tr.cell_height,
+        });
+        let hit = tester
+            .as_ref()
+            .map(|t| t as &dyn veter_host::vge::state::HitTester);
         let pty = match &self.pty {
             Some(p) => p,
             None => return PtyPass::DEAD,
@@ -4362,11 +4463,11 @@ impl App {
                     // command-processing time — see
                     // `vge::drive_terminal_stage`. Nothing may be
                     // inserted between it and the parser.
-                    let prt_chunk = prt.process_pty_chunk_full(&data);
+                    let prt_chunk = prt.process_pty_chunk_with_hit(&data, hit);
                     let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
                     let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
                     let ses_passthrough = ses.process_pty_chunk(&vss_passthrough);
-                    vge::drive_terminal_stage(engine, parser, &ses_passthrough);
+                    vge::drive_terminal_stage(engine, parser, &ses_passthrough, hit);
                     // An over-cap envelope is dropped without a reply —
                     // there is no request_id left to answer, and a
                     // hostile stream should not get one. Say so, or the
@@ -4433,10 +4534,12 @@ impl App {
                             prt.sync_top_of_live_screen(parser);
                         }
                     }
-                    // PRT host-screen reactions: scope_reset / cull on
-                    // observed RIS/DECSTR/2J/3J, then alt-screen swap +
-                    // line origin refresh + scrollback eviction.
-                    prt.handle_terminal_events(&prt_chunk.terminal_events);
+                    // PRT's own host-screen reactions — scope_reset /
+                    // cull on RIS/DECSTR/2J/3J, alt-screen swap — ran
+                    // inside `process_pty_chunk_full`, interleaved with
+                    // the commands they scope. What is left for after
+                    // the vt100 has seen the chunk is the line origin
+                    // refresh and scrollback eviction.
                     // §5.6 — VFT has no apc-side observation of resets,
                     // so it relies on PRT's terminal event stream.
                     for ev in &prt_chunk.terminal_events {
@@ -5083,11 +5186,6 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .map(|t| t.cell_height)
                         .unwrap_or(20.0);
-                    let cell_w = self
-                        .term_renderer
-                        .as_ref()
-                        .map(|t| t.cell_width)
-                        .unwrap_or(9.0);
                     let ticks = match delta {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
@@ -5095,20 +5193,17 @@ impl ApplicationHandler for App {
                         }
                     };
                     if ticks != 0 {
-                        let (col, row) = self
-                            .cursor_pos
-                            .map(|p| {
-                                let c = (p.x / cell_w as f64).floor().max(0.0) as u32 + 1;
-                                let r = (p.y / cell_h as f64).floor().max(0.0) as u32 + 1;
-                                (c, r)
-                            })
-                            .unwrap_or((1, 1));
+                        let pos = self.cursor_to_host_pos().unwrap_or(MousePos {
+                            col: 1,
+                            row: 1,
+                            px: 1,
+                            py: 1,
+                        });
                         let button = if ticks > 0 { 64 } else { 65 };
                         // The wheel is a press-only button, so one
                         // report per tick and never a release.
-                        let tick =
-                            encode_mouse_report(mode, encoding, button, col, row, true)
-                                .unwrap_or_default();
+                        let tick = encode_mouse_report(mode, encoding, button, pos, true)
+                            .unwrap_or_default();
                         let mut payload =
                             Vec::with_capacity(tick.len() * ticks.unsigned_abs() as usize);
                         for _ in 0..ticks.unsigned_abs() {
@@ -5444,6 +5539,17 @@ mod mouse_report_tests {
     use super::*;
     use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
 
+    /// A cell/pixel pair for a pointer 48 cells across and 10 down,
+    /// as `cursor_to_host_pos` would resolve it on a 10x20 cell.
+    fn pos(col: u32, row: u32) -> MousePos {
+        MousePos {
+            col,
+            row,
+            px: (col - 1) * 10 + 1,
+            py: (row - 1) * 20 + 1,
+        }
+    }
+
     /// A report must be spelled in the encoding the host program
     /// negotiated. Emitting SGR to a program that never enabled 1006
     /// (its terminfo lacks `XM`, so ncurses matches `kmous=\E[M`)
@@ -5452,41 +5558,44 @@ mod mouse_report_tests {
     fn report_follows_negotiated_encoding() {
         // SGR (1006): unchanged, and the only one with an `m` release.
         assert_eq!(
-            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, 48, 10, true).unwrap(),
+            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, pos(48, 10), true).unwrap(),
             b"\x1b[<0;48;10M".to_vec()
         );
         assert_eq!(
-            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, 48, 10, false).unwrap(),
+            encode_mouse_report(Mode::PressRelease, Enc::Sgr, 0, pos(48, 10), false).unwrap(),
             b"\x1b[<0;48;10m".to_vec()
         );
 
         // Legacy: `ESC [ M` with each value offset by 32, and a release
         // spelled as button 3 rather than a final `m`.
         assert_eq!(
-            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 48, 10, true).unwrap(),
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, pos(48, 10), true).unwrap(),
             vec![0x1b, b'[', b'M', 32, 48 + 32, 10 + 32]
         );
         assert_eq!(
-            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 48, 10, false).unwrap(),
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, pos(48, 10), false).unwrap(),
             vec![0x1b, b'[', b'M', 32 + 3, 48 + 32, 10 + 32]
         );
         // Modifier and motion bits survive the release rewrite.
         assert_eq!(
-            encode_mouse_report(Mode::ButtonMotion, Enc::Default, 4 | 32, 5, 6, false).unwrap(),
+            encode_mouse_report(Mode::ButtonMotion, Enc::Default, 4 | 32, pos(5, 6), false)
+                .unwrap(),
             vec![0x1b, b'[', b'M', 32 + 4 + 32 + 3, 5 + 32, 6 + 32]
         );
 
         // Reporting off: nothing, whatever the encoding says.
-        assert!(encode_mouse_report(Mode::None, Enc::Sgr, 0, 1, 1, true).is_none());
+        assert!(encode_mouse_report(Mode::None, Enc::Sgr, 0, pos(1, 1), true).is_none());
         // X10 (DECSET 9) has no release report at all.
-        assert!(encode_mouse_report(Mode::Press, Enc::Default, 0, 48, 10, false).is_none());
-        assert!(encode_mouse_report(Mode::Press, Enc::Sgr, 0, 48, 10, false).is_none());
+        assert!(encode_mouse_report(Mode::Press, Enc::Default, 0, pos(48, 10), false).is_none());
+        assert!(encode_mouse_report(Mode::Press, Enc::Sgr, 0, pos(48, 10), false).is_none());
 
         // Legacy cannot spell a cell past 223; drop rather than lie.
-        assert!(encode_mouse_report(Mode::PressRelease, Enc::Default, 0, 224, 10, true).is_none());
+        assert!(
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 0, pos(224, 10), true).is_none()
+        );
         // UTF-8 (1005) can, as a multi-byte code point.
         let utf8 =
-            encode_mouse_report(Mode::PressRelease, Enc::Utf8, 0, 224, 10, true).unwrap();
+            encode_mouse_report(Mode::PressRelease, Enc::Utf8, 0, pos(224, 10), true).unwrap();
         assert_eq!(&utf8[..3], b"\x1b[M");
         assert_eq!(
             String::from_utf8(utf8[3..].to_vec()).unwrap(),
@@ -5500,9 +5609,35 @@ mod mouse_report_tests {
 
         // The wheel is a press-only button in every encoding.
         assert_eq!(
-            encode_mouse_report(Mode::PressRelease, Enc::Default, 64, 1, 1, true).unwrap(),
+            encode_mouse_report(Mode::PressRelease, Enc::Default, 64, pos(1, 1), true).unwrap(),
             vec![0x1b, b'[', b'M', 64 + 32, 33, 33]
         );
+    }
+
+    /// SGR-Pixels (?1016) is 1006's framing with the pointer's pixel
+    /// position in place of its cell, so the same event differs from
+    /// the SGR report in its two numbers and nothing else.
+    #[test]
+    fn sgr_pixels_reports_pixels_not_cells() {
+        let p = pos(48, 10); // px = 471, py = 181 on a 10x20 cell
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::SgrPixels, 0, p, true).unwrap(),
+            b"\x1b[<0;471;181M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_report(Mode::PressRelease, Enc::SgrPixels, 0, p, false).unwrap(),
+            b"\x1b[<0;471;181m".to_vec()
+        );
+        // Past column 223 the legacy encodings give up; pixels never
+        // have that ceiling, which is half the reason 1006 exists.
+        assert_eq!(
+            encode_mouse_report(Mode::ButtonMotion, Enc::SgrPixels, 0x20, pos(400, 1), true)
+                .unwrap(),
+            b"\x1b[<32;3991;1M".to_vec()
+        );
+        // Mode gating is the encoding's business as much as SGR's.
+        assert!(encode_mouse_report(Mode::None, Enc::SgrPixels, 0, p, true).is_none());
+        assert!(encode_mouse_report(Mode::Press, Enc::SgrPixels, 0, p, false).is_none());
     }
 }
 

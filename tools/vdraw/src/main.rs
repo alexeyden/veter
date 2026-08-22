@@ -78,7 +78,9 @@ use tools::{Tool, ToolState};
 #[derive(Debug, Clone, Copy)]
 enum Interaction {
     None,
-    Panning { from: (u16, u16) },
+    /// Fractional screen cells, so a pixel-resolution drag pans
+    /// smoothly rather than a cell at a time.
+    Panning { from: (f32, f32) },
     Drawing(Drag),
     Moving { index: usize, last: Point },
     Resizing { index: usize, handle: hit::Handle },
@@ -153,7 +155,7 @@ fn main() -> Result<()> {
     let mut history = history::History::new();
     let mut dirty_doc = false;
 
-    let mut cursor = (0u16, 0u16);
+    let mut cursor = input::Pos { col: 0, row: 0, x: 0.0, y: 0.0 };
     let mut state = ToolState::default();
     let mut bar = chrome::layout(cols, rows, cam.cell_h, &state, None);
     send(&full_render(
@@ -167,6 +169,16 @@ fn main() -> Result<()> {
     ))?;
 
     let mut parser = InputParser::new();
+    // SGR-Pixels (?1016), now that the probe has answered and the cell
+    // size is known. A drawing editor is exactly the case cell-accurate
+    // reports fail: two clicks inside one cell are two points, and only
+    // this encoding can tell them apart. Requested after the probe so a
+    // terminal that would have ignored it never gets the chance to send
+    // cells while the parser expects pixels; the parser flips in the
+    // same breath.
+    out.write_all(b"\x1b[?1016h")?;
+    out.flush()?;
+    parser.set_pixel_mouse((cam.cell_w, cam.cell_h));
     let mut buf = [0u8; 1024];
     // Cell-granular drag tracking: SGR reports whole cells, so a drag
     // delta is only ever an integral number of cells.
@@ -238,7 +250,7 @@ fn main() -> Result<()> {
                     // A tool button is a real mode change and a click off
                     // the palette is "click elsewhere to finish", so both
                     // still end the edit.
-                    Event::MouseDown { col, row, .. } => match bar.hit(col, row) {
+                    Event::MouseDown { at, .. } => match bar.hit(at.col, at.row) {
                         Some(action) if !matches!(action, Action::Tool(_)) => {
                             apply(&mut state, action);
                             restyle(&mut document.elements[i], action, &cam);
@@ -322,13 +334,13 @@ fn main() -> Result<()> {
                     status_dirty = true;
                 }
 
-                Event::WheelUp { col, row } => {
-                    cam.zoom_in_at(col as f32, row as f32);
+                Event::WheelUp { at } => {
+                    cam.zoom_in_at(at.x, at.y);
                     cam_dirty = true;
                     status_dirty = true;
                 }
-                Event::WheelDown { col, row } => {
-                    cam.zoom_out_at(col as f32, row as f32);
+                Event::WheelDown { at } => {
+                    cam.zoom_out_at(at.x, at.y);
                     cam_dirty = true;
                     status_dirty = true;
                 }
@@ -399,10 +411,10 @@ fn main() -> Result<()> {
                     }
                 }
 
-                Event::MouseDown { button, col, row } => {
+                Event::MouseDown { button, at } => {
                     // Chrome claims the click before the canvas sees it,
                     // so a press on the palette never starts a pan.
-                    if let Some(action) = bar.hit(col, row) {
+                    if let Some(action) = bar.hit(at.col, at.row) {
                         apply(&mut state, action);
                         // With something selected, a style option
                         // restyles it as well as becoming the default
@@ -427,20 +439,19 @@ fn main() -> Result<()> {
                         }
                         chrome_dirty = true;
                         status_dirty = true;
-                    } else if bar.covers(col, row) {
+                    } else if bar.covers(at.col, at.row) {
                         // Panel padding: swallow it.
                     } else if button == input::Button::Left && state.tool.creates_by_drag() {
                         // One checkpoint per gesture, taken on press —
                         // not per motion event, or undo would step back
                         // one pixel at a time.
                         history.checkpoint(&document);
-                        interaction = Interaction::Drawing(Drag::new(drag::snap_screen(
-                            col, row, &cam,
-                        )));
+                        interaction =
+                            Interaction::Drawing(Drag::new(drag::snap_screen(at, &cam)));
                         preview_dirty = true;
                     } else if button == input::Button::Left && state.tool == Tool::Text {
                         // Text is placed by click and typed, not dragged.
-                        let p = drag::snap_screen(col, row, &cam);
+                        let p = drag::snap_screen(at, &cam);
                         if let Some(mut el) =
                             state.new_element(format!("el-{next_id}"), p.x, p.y, 0.0, 0.0)
                         {
@@ -476,7 +487,7 @@ fn main() -> Result<()> {
                             status_dirty = true;
                         }
                     } else if button == input::Button::Left && state.tool == Tool::Select {
-                        let p = cam.pointer_to_doc(col, row);
+                        let p = cam.pointer_to_doc(at);
                         let tol = cam.cell_w.max(cam.cell_h) / cam.zoom * 0.6;
                         // A handle on the current selection wins over
                         // whatever element happens to sit under it.
@@ -497,24 +508,24 @@ fn main() -> Result<()> {
                             }
                             interaction = Interaction::Moving {
                                 index: i,
-                                last: drag::snap_screen(col, row, &cam),
+                                last: drag::snap_screen(at, &cam),
                             };
                         } else {
                             if selected.take().is_some() {
                                 selection_dirty = true;
                                 status_dirty = true;
                             }
-                            interaction = Interaction::Panning { from: (col, row) };
+                            interaction = Interaction::Panning { from: (at.x, at.y) };
                         }
                     } else {
                         // Right button always pans, as does any button
                         // when the active tool neither draws nor selects.
-                        interaction = Interaction::Panning { from: (col, row) };
+                        interaction = Interaction::Panning { from: (at.x, at.y) };
                     }
                 }
-                Event::MouseUp { col, row, .. } => {
+                Event::MouseUp { at, .. } => {
                     if let Interaction::Drawing(mut d) = interaction {
-                        d.current = drag::snap_screen(col, row, &cam);
+                        d.current = drag::snap_screen(at, &cam);
                         let (x, y, w, h) = d.extent();
                         if d.is_significant(&cam) {
                             if let Some(el) =
@@ -536,28 +547,27 @@ fn main() -> Result<()> {
                     }
                     interaction = Interaction::None;
                 }
-                Event::MouseMove { col, row, held } => {
+                Event::MouseMove { at, held } => {
                     if held.is_none() {
                         interaction = Interaction::None;
                     } else {
                         match &mut interaction {
                             Interaction::Drawing(d) => {
-                                let next = drag::snap_screen(col, row, &cam);
+                                let next = drag::snap_screen(at, &cam);
                                 if (next.x, next.y) != (d.current.x, d.current.y) {
                                     d.current = next;
                                     preview_dirty = true;
                                 }
                             }
                             Interaction::Panning { from } => {
-                                cam.pan_by(
-                                    col as f32 - from.0 as f32,
-                                    row as f32 - from.1 as f32,
-                                );
-                                *from = (col, row);
+                                // Pixel resolution makes this a smooth
+                                // pan rather than a cell-at-a-time one.
+                                cam.pan_by(at.x - from.0, at.y - from.1);
+                                *from = (at.x, at.y);
                                 cam_dirty = true;
                             }
                             Interaction::Moving { index, last } => {
-                                let next = drag::snap_screen(col, row, &cam);
+                                let next = drag::snap_screen(at, &cam);
                                 let (dx, dy) = (next.x - last.x, next.y - last.y);
                                 if dx != 0.0 || dy != 0.0 {
                                     *last = next;
@@ -578,7 +588,7 @@ fn main() -> Result<()> {
                                 }
                             }
                             Interaction::Resizing { index, handle } => {
-                                let to = drag::snap_screen(col, row, &cam);
+                                let to = drag::snap_screen(at, &cam);
                                 let i = *index;
                                 let h = *handle;
                                 hit::resize(
@@ -777,14 +787,14 @@ fn main() -> Result<()> {
     }
 }
 
-/// Screen cell a mouse event happened at, if it is a mouse event.
-fn pointer_pos(ev: &Event) -> Option<(u16, u16)> {
+/// Where a mouse event happened, if it is a mouse event.
+fn pointer_pos(ev: &Event) -> Option<input::Pos> {
     Some(match *ev {
-        Event::MouseDown { col, row, .. }
-        | Event::MouseUp { col, row, .. }
-        | Event::MouseMove { col, row, .. }
-        | Event::WheelUp { col, row }
-        | Event::WheelDown { col, row } => (col, row),
+        Event::MouseDown { at, .. }
+        | Event::MouseUp { at, .. }
+        | Event::MouseMove { at, .. }
+        | Event::WheelUp { at }
+        | Event::WheelDown { at } => at,
         _ => return None,
     })
 }
@@ -796,7 +806,7 @@ fn full_render(
     document: &doc::Document,
     cam: &Camera,
     bar: &chrome::Chrome,
-    cursor: (u16, u16),
+    cursor: input::Pos,
     state: &ToolState,
     rows: u16,
     background: Option<&Background>,
@@ -981,7 +991,7 @@ fn chrome_element(bar: &chrome::Chrome, cam: &Camera) -> Command {
 
 fn status_text(
     cam: &Camera,
-    cursor: (u16, u16),
+    cursor: input::Pos,
     state: &ToolState,
     selected: Option<&doc::Element>,
     editing: bool,
@@ -995,7 +1005,7 @@ fn status_text(
     if editing {
         return "vdraw  [text]  typing — Enter or Esc commits · palette restyles".into();
     }
-    let p = cam.pointer_to_doc(cursor.0, cursor.1);
+    let p = cam.pointer_to_doc(cursor);
     let sel = match selected {
         Some(e) => format!("  sel:{}", e.kind),
         None => String::new(),
@@ -1020,7 +1030,7 @@ fn status_origin(rows: u16) -> Point {
 
 /// Chrome is a top-level element — no `parent`, so the camera transform
 /// never reaches it and the readout stays put while the canvas moves.
-fn status_element(cam: &Camera, cursor: (u16, u16), state: &ToolState, rows: u16) -> Command {
+fn status_element(cam: &Camera, cursor: input::Pos, state: &ToolState, rows: u16) -> Command {
     Command::CreateElement(CreateElementBody {
         id: STATUS_ID.into(),
         commands: vec![DrawCmd::DrawText {
@@ -1107,7 +1117,7 @@ fn probe_host_accent(timeout: Duration) -> Option<Color> {
         if n == 0 {
             return None;
         }
-        if let Some(payload) = apc.feed(&buf[..n]).payloads.into_iter().next() {
+        if let Some(payload) = apc.feed(&buf[..n]).into_payloads().next() {
             return parse_prt_accent(&payload);
         }
     }
@@ -1187,7 +1197,7 @@ impl Drop for TermExit {
             ),
         ]);
         let _ = o.write_all(&env);
-        let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        let _ = o.write_all(b"\x1b[?1016l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
     }
 }
@@ -1218,7 +1228,7 @@ mod tests {
         append_frame(&mut frames, RSP_PROBE, 0, &body);
         let env = wrap_t2c_envelope(&frames);
         let mut apc = prt_protocol::ApcStream::with_marker(*MARKER_T2C);
-        let payload = apc.feed(&env).payloads.into_iter().next().expect("payload");
+        let payload = apc.feed(&env).into_payloads().next().expect("payload");
         parse_prt_accent(&payload)
     }
 

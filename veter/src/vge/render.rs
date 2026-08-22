@@ -515,7 +515,7 @@ fn render_cmd<T: Renderer>(
             // Baseline drop scales with the glyphs so the text stays pinned
             // to its origin under zoom.
             let baseline_y = oy + origin.y * cell_h + renderer.ascent() * scale;
-            let extent = renderer.draw_vge_text_selected(
+            let run = renderer.draw_vge_text_selected(
                 canvas,
                 baseline_x,
                 baseline_y,
@@ -538,11 +538,15 @@ fn render_cmd<T: Renderer>(
                 kind: PickKind::Text {
                     byte_len: text.len() as u32,
                     scale,
+                    // The boundaries this very draw measured, so a
+                    // §15 hit can name the character that was painted
+                    // rather than one a second measurement guessed.
+                    stops: renderer.pick.intern_stops(&run.stops),
                 },
                 local: PickRect::normalized(
-                    extent.start_x,
+                    run.extent.start_x,
                     baseline_y - renderer.ascent() * scale,
-                    extent.total_width,
+                    run.extent.total_width,
                     renderer.cell_height * scale,
                 ),
             });

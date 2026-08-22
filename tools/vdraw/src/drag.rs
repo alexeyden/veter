@@ -72,10 +72,10 @@ pub fn snap(p: Point, cam: &Camera) -> Point {
     }
 }
 
-/// Snap the doc-space point under a screen cell — the usual entry point
+/// Snap the doc-space point under the pointer — the usual entry point
 /// from a mouse event.
-pub fn snap_screen(col: u16, row: u16, cam: &Camera) -> Point {
-    snap(cam.pointer_to_doc(col, row), cam)
+pub fn snap_screen(at: crate::input::Pos, cam: &Camera) -> Point {
+    snap(cam.pointer_to_doc(at), cam)
 }
 
 #[cfg(test)]
@@ -98,15 +98,26 @@ mod tests {
         assert_eq!((p.y - c.cell_h / 2.0) % c.cell_h, 0.0);
     }
 
-    /// The whole point of the centre grid: the snapped point is exactly
-    /// where the pointer is estimated to be, not half a cell away.
+    fn cell_pos(col: u16, row: u16) -> crate::input::Pos {
+        crate::input::Pos {
+            col,
+            row,
+            x: col as f32 + 0.5,
+            y: row as f32 + 0.5,
+        }
+    }
+
+    /// The whole point of the centre grid: a cell-only report already
+    /// lands on a grid point, so snapping it moves nothing. (A pixel
+    /// report does not, and snapping then quantises — which is the
+    /// grid doing its job.)
     #[test]
     fn snapping_a_click_is_lossless() {
         let c = cam();
         for col in 0..12u16 {
             for row in 0..5u16 {
-                let p = c.pointer_to_doc(col, row);
-                let s = snap_screen(col, row, &c);
+                let p = c.pointer_to_doc(cell_pos(col, row));
+                let s = snap_screen(cell_pos(col, row), &c);
                 assert!(
                     (p.x - s.x).abs() < 1e-3 && (p.y - s.y).abs() < 1e-3,
                     "cell ({col},{row}) moved from ({}, {}) to ({}, {})",
@@ -130,9 +141,9 @@ mod tests {
     #[test]
     fn snap_screen_steps_one_cell_per_column() {
         let c = cam();
-        let mut prev = snap_screen(0, 3, &c).x;
+        let mut prev = snap_screen(cell_pos(0, 3), &c).x;
         for col in 1..20u16 {
-            let x = snap_screen(col, 3, &c).x;
+            let x = snap_screen(cell_pos(col, 3), &c).x;
             assert_eq!(x - prev, c.cell_w, "col {col} did not advance one cell");
             prev = x;
         }

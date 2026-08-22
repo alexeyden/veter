@@ -241,7 +241,10 @@ fn render_portal_at<T: Renderer>(
         .chain(std::iter::once(portal.id.clone()))
         .collect();
     let pick_ctx = vge::render::PickCtx {
-        path_id: term_renderer.pick.intern_path(&path),
+        // The portal's own cell (0, 0) in device pixels — the same
+        // translation `render_one_top_level` is called under below, and
+        // what a §15 `QueryHit` from inside this portal is relative to.
+        path_id: term_renderer.pick.intern_path(&path, (ox_px, oy_px)),
         on_alt: content.vge.state.on_alt(),
         clip: parent_clip.intersect(vge::pick::PickRect::new(ox_px, oy_px, w_px, h_px)),
         sel: vge_selection,

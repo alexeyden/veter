@@ -72,14 +72,14 @@ impl Camera {
         }
     }
 
-    /// Where the *pointer* is, given a mouse report of cell `(col, row)`.
+    /// Where the *pointer* is, in doc px.
     ///
-    /// A report only says which cell the cursor is in, not where inside
-    /// it. Treating that as the cell's top-left corner biases every
-    /// click up and left by half a cell; the cell centre is the best
-    /// estimate available and is unbiased.
-    pub fn pointer_to_doc(&self, col: u16, row: u16) -> Point {
-        self.screen_to_doc(col as f32 + 0.5, row as f32 + 0.5)
+    /// [`crate::input::Pos`] has already resolved how much the report
+    /// actually knew: an exact sub-cell position under SGR-Pixels
+    /// (?1016), the cell's centre otherwise. Either way the camera
+    /// takes it at face value.
+    pub fn pointer_to_doc(&self, at: crate::input::Pos) -> Point {
+        self.screen_to_doc(at.x, at.y)
     }
 
     pub fn pan_by(&mut self, dcols: f32, drows: f32) {
@@ -156,18 +156,40 @@ mod tests {
         assert!((before.y - after.y).abs() < 1e-3);
     }
 
-    /// A mouse report names a cell, not a position within it. Taking it
-    /// as the top-left corner biases every click up and left by half a
-    /// cell; the centre is unbiased.
+    fn cell_pos(col: u16, row: u16) -> crate::input::Pos {
+        crate::input::Pos {
+            col,
+            row,
+            x: col as f32 + 0.5,
+            y: row as f32 + 0.5,
+        }
+    }
+
+    /// A cell-only report names a cell, not a position within it.
+    /// Taking it as the top-left corner biases every click up and left
+    /// by half a cell; the centre is unbiased.
     #[test]
     fn pointer_lands_mid_cell_not_at_its_corner() {
         let c = cam();
-        let p = c.pointer_to_doc(3, 2);
+        let p = c.pointer_to_doc(cell_pos(3, 2));
         let corner = c.screen_to_doc(3.0, 2.0);
         assert_eq!(p.x - corner.x, c.cell_w / 2.0);
         assert_eq!(p.y - corner.y, c.cell_h / 2.0);
         // Still inside the cell that was reported.
         assert!(p.x > corner.x && p.x < corner.x + c.cell_w);
+    }
+
+    /// A pixel report carries where inside the cell the pointer is,
+    /// and the camera must not throw that away — two presses in one
+    /// cell are two different document points.
+    #[test]
+    fn pointer_keeps_sub_cell_resolution() {
+        let c = cam();
+        let near = crate::input::Pos { col: 3, row: 2, x: 3.1, y: 2.9 };
+        let far = crate::input::Pos { col: 3, row: 2, x: 3.9, y: 2.1 };
+        let (a, b) = (c.pointer_to_doc(near), c.pointer_to_doc(far));
+        assert!(b.x - a.x > 0.0 && (b.x - a.x - 0.8 * c.cell_w).abs() < 1e-3);
+        assert!(a.y - b.y > 0.0 && (a.y - b.y - 0.8 * c.cell_h).abs() < 1e-3);
     }
 
     #[test]

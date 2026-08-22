@@ -352,8 +352,8 @@ mod tests {
         // Pull the unstuffed payload back out and verify two frames.
         let mut s = ApcStream::with_marker(*MARKER_C2T);
         let out = s.feed(&env);
-        assert_eq!(out.payloads.len(), 1);
-        let mut r = Reader::new(&out.payloads[0]);
+        assert_eq!(out.payloads().count(), 1);
+        let mut r = Reader::new(out.payloads().next().unwrap());
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
         let _payload_len = r.u32().unwrap();
         let mut request_ids = Vec::new();

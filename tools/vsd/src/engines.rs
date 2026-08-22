@@ -197,7 +197,11 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             // resolve against the screen the inner program saw. See
             // `veter_host::vge::drive_terminal_stage`.
             let ses_passthrough = ses.process_pty_chunk(&prt_chunk.passthrough);
-            veter_host::vge::drive_terminal_stage(vge, parser, &ses_passthrough);
+            // No hit tester: vsd holds the session state but the
+            // renderer painting it is a different process, so a VGE
+            // `QueryHit` (§15) is answered `err_no_hit_testing`
+            // rather than with geometry nobody here has.
+            veter_host::vge::drive_terminal_stage(vge, parser, &ses_passthrough, None);
             // See the matching note in veter's host loop: an over-cap
             // envelope is dropped without a reply, so report it.
             let dropped = prt.take_apc_overflows() + vge.take_apc_overflows();
@@ -207,7 +211,11 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                      a client exceeded the payload cap"
                 );
             }
-            prt.handle_terminal_events(&prt_chunk.terminal_events);
+            // The portal-set reactions to RIS / DECSTR / 2J / 3J and
+            // the alt-screen swaps rode along inside
+            // `process_pty_chunk_full`, in stream order with the
+            // commands they scope; `after_vt100_process` only has the
+            // post-chunk line origin left to reconcile.
             prt.after_vt100_process(parser);
             prt.flush_pending_events();
             prt.drive_and_flush_vft();

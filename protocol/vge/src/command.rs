@@ -429,6 +429,14 @@ pub enum Command {
     UpdateImage(UpdateImageBody),
     UpdateSize { id: String, new_size: Point },
     UpdateTransform { id: String, transform: Transform },
+    /// §15. Ask what the terminal painted under a point. The point is
+    /// in the sender's own viewport-relative cell coordinates (§5.1)
+    /// and may be fractional: a client with pixel-resolution mouse
+    /// reports (DECSET 1016) divides by the probe's `cell_pixel_*` to
+    /// get here. Answered with a `HitResponse` (§4) naming the
+    /// topmost `DrawText` / `DrawImage` under it, scoped to the
+    /// sender's own elements.
+    QueryHit { point: Point },
 }
 
 const MAX_ID_BYTES: usize = 64;
@@ -984,6 +992,16 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 return Err(ERR_BAD_PAYLOAD);
             }
             Ok(Command::UpdateSize { id, new_size })
+        }
+        CMD_QUERY_HIT => {
+            let point = r.point()?;
+            if !point.x.is_finite() || !point.y.is_finite() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            if !r.at_end() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            Ok(Command::QueryHit { point })
         }
         CMD_UPDATE_TRANSFORM => {
             let id = read_id(&mut r, false)?;

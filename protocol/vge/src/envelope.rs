@@ -4,6 +4,99 @@
 use crate::codec::{Reader, stuff, Writer};
 use crate::frame::*;
 
+/// What a `QueryHit` (§15) landed on. `None` for a miss — the point is
+/// over nothing this scope painted.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct HitBody {
+    pub hit: Option<Hit>,
+}
+
+/// One resolved hit: which draw command the point is over, and where
+/// in it.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct Hit {
+    /// The element's id. Empty for an anonymous element (§6.1) — the
+    /// client did not name it, so there is nothing to name back.
+    pub element_id: String,
+    /// Index of the draw command within that element (§6.3).
+    pub command_index: u32,
+    /// The point in the element's own coordinate space (§9.3), so it
+    /// is directly comparable with the origins the client sent.
+    pub local: crate::codec::Point,
+    pub kind: HitKind,
+}
+
+/// The kind of drawable that was hit. Only `DrawText` and `DrawImage`
+/// are hit-testable (§15); shapes are transparent to the pointer.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum HitKind {
+    /// A `DrawText` run, with the character under the point given as a
+    /// byte range into the run's text — the terminal shaped it, so
+    /// this is the only place that range can come from.
+    Text { byte_offset: u32, byte_len: u32 },
+    Image,
+}
+
+const HIT_FLAG_HIT: u8 = 0b1;
+const HIT_KIND_TEXT: u8 = 1;
+const HIT_KIND_IMAGE: u8 = 2;
+
+impl HitBody {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(32);
+        let Some(h) = &self.hit else {
+            w.u8(0);
+            return w.buf;
+        };
+        w.u8(HIT_FLAG_HIT);
+        w.str(&h.element_id);
+        w.u32(h.command_index);
+        w.f32(h.local.x);
+        w.f32(h.local.y);
+        match h.kind {
+            HitKind::Text { byte_offset, byte_len } => {
+                w.u8(HIT_KIND_TEXT);
+                w.u32(byte_offset);
+                w.u32(byte_len);
+            }
+            HitKind::Image => w.u8(HIT_KIND_IMAGE),
+        }
+        w.buf
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, crate::codec::DecodeError> {
+        let mut r = Reader::new(body);
+        if r.u8()? & HIT_FLAG_HIT == 0 {
+            return Ok(Self { hit: None });
+        }
+        let element_id = r.string()?.to_owned();
+        let command_index = r.u32()?;
+        let local = crate::codec::Point { x: r.f32()?, y: r.f32()? };
+        let kind = match r.u8()? {
+            HIT_KIND_TEXT => HitKind::Text {
+                byte_offset: r.u32()?,
+                byte_len: r.u32()?,
+            },
+            HIT_KIND_IMAGE => HitKind::Image,
+            _ => return Err(crate::codec::DecodeError::bad_payload()),
+        };
+        Ok(Self {
+            hit: Some(Hit {
+                element_id,
+                command_index,
+                local,
+                kind,
+            }),
+        })
+    }
+}
+
 /// Build the body for a ProbeResponse (§2.1).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]

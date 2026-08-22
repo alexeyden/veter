@@ -1660,7 +1660,7 @@ fn probe_host_accent(timeout: Duration) -> Option<Color> {
         if n == 0 {
             return None;
         }
-        if let Some(payload) = apc.feed(&buf[..n]).payloads.into_iter().next() {
+        if let Some(payload) = apc.feed(&buf[..n]).into_payloads().next() {
             return parse_prt_accent(&payload);
         }
     }

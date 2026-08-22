@@ -314,7 +314,7 @@ mod tests {
 
         let mut s = ApcStream::new();
         let out = s.feed(&env);
-        assert!(out.payloads.is_empty());
+        assert!(out.payloads().next().is_none());
         assert_eq!(out.passthrough, env);
     }
 
@@ -328,9 +328,9 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(&env);
         assert!(out.passthrough.is_empty());
-        assert_eq!(out.payloads.len(), 1);
+        assert_eq!(out.payloads().count(), 1);
 
-        let mut r = Reader::new(&out.payloads[0]);
+        let mut r = Reader::new(out.payloads().next().unwrap());
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
         let payload_len = r.u32().unwrap();
         assert_eq!(payload_len as usize, frames.len());
@@ -429,9 +429,9 @@ mod tests {
 
         let mut s = ApcStream::new();
         let out = s.feed(&env);
-        assert_eq!(out.payloads.len(), 1);
+        assert_eq!(out.payloads().count(), 1);
 
-        let payload = &out.payloads[0];
+        let payload = out.payloads().next().unwrap();
         let mut r = Reader::new(payload);
         assert_eq!(r.u8().unwrap(), PROTOCOL_VERSION);
         let _ = r.u32().unwrap();
