@@ -25,7 +25,7 @@
 //! master directly — no input crosses the PRT wire (§9.1).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -4185,14 +4185,50 @@ impl Drop for TtyGuard {
 /// written prefix grows past this, so sustained partial draining can't leak.
 const OUT_COMPACT_THRESHOLD: usize = 64 * 1024;
 
-/// Once this many bytes are queued for the host, stop reading pane PTYs so the
-/// inner shells block instead of vmux buffering without bound (backpressure).
-const OUT_HIGH_WATER: usize = 512 * 1024;
+/// Once this many bytes are queued for the host *on one pane's account*,
+/// stop reading that pane so its inner shell blocks instead of vmux
+/// buffering without bound (backpressure).
+///
+/// Per pane, not per queue. The global form this replaces stopped
+/// reading *every* pane once the shared queue passed its mark, so one
+/// pane flooding the host — a `vsend` upload, a `cat` of something
+/// large — froze every other pane for the duration: they were not the
+/// ones filling the queue, but they paid for it. Gating each pane on
+/// its own contribution keeps the flooder waiting and everyone else
+/// live, and bounds the queue at roughly this times the pane count.
+const PANE_HIGH_WATER: usize = 64 * 1024;
+
+/// Global backstop on the same queue, for the pathological pane count
+/// where `PANE_HIGH_WATER` alone would still add up to a lot of RAM
+/// (and a lot of latency ahead of the chrome updates queued behind it).
+/// Reaching this pauses reads on every pane, as the old rule did.
+const OUT_HARD_CAP: usize = 2 * 1024 * 1024;
+
+/// One pane-owned run of bytes in the queue, recorded as the absolute
+/// stream offset it ends at. A run is credited back to its pane once
+/// `written` reaches that offset — whole runs only, which over-counts a
+/// partially drained one by at most a single read and costs nothing to
+/// track.
+struct OutSeg {
+    owner: String,
+    /// Absolute stream offset one past this run's last byte.
+    end: u64,
+    len: usize,
+}
 
 struct OutQueue {
     fd: RawFd,
     buf: Vec<u8>,
     head: usize,
+    /// Absolute bytes ever enqueued / ever written. Segments are keyed
+    /// off these rather than off `head`, which compaction resets.
+    enqueued: u64,
+    written: u64,
+    /// Pane-owned runs still queued, oldest first.
+    segs: VecDeque<OutSeg>,
+    /// Queued-but-unwritten bytes per pane. Entries are dropped as they
+    /// reach zero, so a closed pane leaves nothing behind.
+    owed: HashMap<String, usize>,
 }
 
 impl OutQueue {
@@ -4207,17 +4243,60 @@ impl OutQueue {
             fd,
             buf: Vec::new(),
             head: 0,
+            enqueued: 0,
+            written: 0,
+            segs: VecDeque::new(),
+            owed: HashMap::new(),
         }
     }
 
     fn enqueue(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+        self.enqueued += bytes.len() as u64;
+    }
+
+    /// Enqueue bytes carrying `owner`'s pane output, so the loop can
+    /// see how much of the queue that one pane is responsible for.
+    fn enqueue_for(&mut self, owner: &str, bytes: &[u8]) {
+        self.enqueue(bytes);
+        match self.owed.get_mut(owner) {
+            Some(v) => *v += bytes.len(),
+            None => {
+                self.owed.insert(owner.to_string(), bytes.len());
+            }
+        }
+        self.segs.push_back(OutSeg {
+            owner: owner.to_string(),
+            end: self.enqueued,
+            len: bytes.len(),
+        });
+    }
+
+    /// Bytes queued on `owner`'s account.
+    fn owed_by(&self, owner: &str) -> usize {
+        self.owed.get(owner).copied().unwrap_or(0)
+    }
+
+    /// Credit back every pane run the last write finished off.
+    fn credit_written(&mut self) {
+        while self.segs.front().is_some_and(|seg| seg.end <= self.written) {
+            let seg = self.segs.pop_front().expect("front checked above");
+            if let Some(v) = self.owed.get_mut(&seg.owner) {
+                *v = v.saturating_sub(seg.len);
+                if *v == 0 {
+                    self.owed.remove(&seg.owner);
+                }
+            }
+        }
     }
 
     /// Drop all queued bytes — used when the destination fd is gone.
     fn clear(&mut self) {
         self.buf.clear();
         self.head = 0;
+        self.written = self.enqueued;
+        self.segs.clear();
+        self.owed.clear();
     }
 
     /// Try to drain the queue to the fd. On a non-blocking fd this stops at
@@ -4229,7 +4308,11 @@ impl OutQueue {
             let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
             match nix::unistd::write(borrowed, &self.buf[self.head..]) {
                 Ok(0) => break,
-                Ok(n) => self.head += n,
+                Ok(n) => {
+                    self.head += n;
+                    self.written += n as u64;
+                    self.credit_written();
+                }
                 Err(Errno::EINTR) => continue,
                 Err(Errno::EAGAIN) => break,
                 Err(e) => return Err(anyhow!("stdout write: {e}")),
@@ -4269,6 +4352,21 @@ fn write_all_stdout(bytes: &[u8]) -> Result<()> {
 /// Bytes still buffered for the host (0 once fully drained).
 fn out_pending() -> usize {
     OUT.with(|q| q.borrow().pending())
+}
+
+/// Queue `bytes` for the host on `pane`'s account — the per-pane
+/// backpressure in the main loop reads the totals this keeps.
+fn write_all_stdout_for_pane(pane: &str, bytes: &[u8]) -> Result<()> {
+    OUT.with(|q| {
+        let mut q = q.borrow_mut();
+        q.enqueue_for(pane, bytes);
+        q.flush()
+    })
+}
+
+/// Bytes still buffered for the host that came out of `pane`.
+fn out_pane_pending(pane: &str) -> usize {
+    OUT.with(|q| q.borrow().owed_by(pane))
 }
 
 /// Drain whatever the `POLLOUT` poll says is writable.
@@ -4760,11 +4858,14 @@ fn main() -> Result<()> {
             None
         };
 
-        // Backpressure: once too much output is already queued for a slow
-        // host, stop reading pane PTYs. Their kernel buffers fill, the inner
-        // shells block on write, and memory stays bounded — while stdin and
-        // the POLLOUT drain keep running so the UI stays responsive.
-        let read_panes = pending < OUT_HIGH_WATER;
+        // Backpressure: once too much of what is queued for a slow host
+        // came out of one pane, stop reading *that* pane. Its kernel
+        // buffer fills, its inner shell blocks on write, and memory
+        // stays bounded — while every other pane keeps being read, and
+        // stdin and the POLLOUT drain keep running so the UI stays
+        // responsive. `OUT_HARD_CAP` is the global backstop; below it,
+        // whether a pane is read is entirely about that pane.
+        let all_panes_paused = pending >= OUT_HARD_CAP;
         // Snapshot the pane fd ordering so we can map back to ids after
         // poll returns. (HashMap iteration is unstable; we capture once.)
         // Only PTY owners: a mirror view has no shell of its own, so
@@ -4788,15 +4889,23 @@ fn main() -> Result<()> {
                 unsafe { BorrowedFd::borrow_raw(raw) }
             })
             .collect();
+        // Which panes we are willing to read this round, in `pane_ids`
+        // order — a pane is paused only while its own bytes are what
+        // the host has not taken yet.
+        let read_pane: Vec<bool> = pane_ids
+            .iter()
+            .map(|id| !all_panes_paused && out_pane_pending(id) < PANE_HIGH_WATER)
+            .collect();
         // One pollfd per pane (preserving `pane_base + i` indexing): read
-        // its output unless we're backpressured, and watch for writability
-        // whenever bytes are queued toward it. The POLLOUT interest is
-        // independent of `read_panes` — relaying download data *into* a
-        // pane must keep flowing even while we've paused reading *out* of
-        // panes, and it's what keeps the loop from blocking on a slow pane.
+        // its output unless that pane is backpressured, and watch for
+        // writability whenever bytes are queued toward it. The POLLOUT
+        // interest is independent of `read_pane` — relaying download data
+        // *into* a pane must keep flowing even while we've paused reading
+        // *out* of it, and it's what keeps the loop from blocking on a
+        // slow pane.
         for (i, id) in pane_ids.iter().enumerate() {
             let mut ev = PollFlags::empty();
-            if read_panes {
+            if read_pane[i] {
                 ev |= PollFlags::POLLIN;
             }
             if state.panes[id]
@@ -4880,7 +4989,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            if read_panes && revents.contains(PollFlags::POLLIN) {
+            if read_pane[i] && revents.contains(PollFlags::POLLIN) {
                 let raw = state.panes[pid]
                     .own_pty()
                     .expect("pane_ids holds only PTY owners")
@@ -4908,7 +5017,9 @@ fn main() -> Result<()> {
                     }),
                     0,
                 )]);
-                write_all_stdout(&env)?;
+                // On this pane's account: it is the one pane whose
+                // reads we pause if the host can't keep up with it.
+                write_all_stdout_for_pane(pid, &env)?;
             } else if revents
                 .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
             {
@@ -6499,6 +6610,67 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `OutQueue` over a pipe whose reader we keep, so a flush can
+    /// be made to drain exactly as far as we want.
+    fn queue_on_pipe() -> (OutQueue, std::fs::File, OwnedFd) {
+        let (rd, wr) = nix::unistd::pipe().unwrap();
+        set_nonblocking(wr.as_raw_fd()).unwrap();
+        let q = OutQueue::with_fd(wr.as_raw_fd());
+        // `wr` goes back to the caller: `OutQueue` holds a raw fd, so
+        // the owner has to outlive it.
+        (q, std::fs::File::from(rd), wr)
+    }
+
+    #[test]
+    fn pane_bytes_are_owed_until_they_are_actually_written() {
+        let (mut q, mut rd, _wr) = queue_on_pipe();
+        q.enqueue_for("p1", &[b'a'; 100]);
+        q.enqueue(&[b'c'; 10]); // chrome: owed by nobody
+        q.enqueue_for("p2", &[b'b'; 50]);
+        // Nothing flushed yet: every pane byte is still on its account.
+        assert_eq!(q.owed_by("p1"), 100);
+        assert_eq!(q.owed_by("p2"), 50);
+
+        q.flush().unwrap();
+        // The pipe took all of it, so both accounts clear — and clear
+        // completely, leaving no entry behind for a pane that may be
+        // about to close.
+        assert_eq!(q.owed_by("p1"), 0);
+        assert_eq!(q.owed_by("p2"), 0);
+        assert!(q.owed.is_empty());
+        assert_eq!(q.pending(), 0);
+
+        let mut buf = [0u8; 160];
+        use std::io::Read;
+        assert_eq!(rd.read(&mut buf).unwrap(), 160);
+    }
+
+    #[test]
+    fn a_flooding_pane_owes_alone() {
+        // The point of the per-pane accounting: with the pipe full, the
+        // pane that filled it is over the high-water mark and the quiet
+        // one is not, so only the flooder stops being read.
+        let (mut q, _rd, _wr) = queue_on_pipe();
+        let flood = vec![b'x'; PANE_HIGH_WATER * 4];
+        q.enqueue_for("p1", &flood);
+        q.enqueue_for("p2", b"a keystroke's worth\r\n");
+        q.flush().unwrap();
+        assert!(q.owed_by("p1") >= PANE_HIGH_WATER);
+        assert!(q.owed_by("p2") < PANE_HIGH_WATER);
+    }
+
+    #[test]
+    fn dropping_the_queue_clears_every_account() {
+        // `clear` runs when the destination fd is gone; leaving stale
+        // per-pane debt behind would gate reads on a queue that no
+        // longer exists.
+        let (mut q, _rd, _wr) = queue_on_pipe();
+        q.enqueue_for("p1", &[b'a'; 10]);
+        q.clear();
+        assert_eq!(q.owed_by("p1"), 0);
+        assert_eq!(q.pending(), 0);
+    }
 
     #[test]
     fn pane_pixels_multiply_cell_size_out_per_pane() {
