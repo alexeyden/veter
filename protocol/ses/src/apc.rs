@@ -27,7 +27,13 @@ use super::frame::{
 /// SES carries only session names and a detach command.
 pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
 
-#[derive(Debug)]
+/// Parser state.
+///
+/// `Copy` on purpose: the body of the envelope in flight lives in
+/// `ApcStream::body`, not in the variant. Keeping the `Vec` out of the
+/// enum is what lets `step` be a branch instead of a move of the whole
+/// state, and what lets `feed` consume a whole run of bytes at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Normal pass-through stream.
     Idle,
@@ -35,15 +41,15 @@ enum State {
     EscPending,
     /// Inside `ESC _ ...`, buffering the 3 marker bytes to decide
     /// SES vs. some other APC.
-    ApcPrefix { marker_buf: Vec<u8> },
+    ApcPrefix,
     /// Confirmed non-SES APC — flush everything (including ESC _ and
     /// already-consumed marker bytes) to passthrough until ST.
     ApcOther,
     /// Confirmed SES — buffer (un-stuffed) bytes until `ESC \`.
-    ApcSes { body: Vec<u8> },
+    ApcSes,
     /// Saw 0x1B inside `ApcSes`; the next byte decides escape
     /// (`0x1B`) vs ST close (`0x5C`).
-    ApcSesEsc { body: Vec<u8> },
+    ApcSesEsc,
     /// Saw 0x1B inside `ApcOther`; the next byte decides whether ST
     /// closes the envelope.
     ApcOtherEsc,
@@ -54,6 +60,26 @@ enum State {
     /// Saw 0x1B while discarding an over-cap body. Distinguishes the
     /// stuffed `ESC ESC` from the `ESC \` that ends the envelope.
     ApcOverflowEsc,
+}
+
+impl State {
+    /// States in which every byte up to the next ESC is handled the
+    /// same way — copied to passthrough, appended to the body, or
+    /// dropped — so `feed` can take the whole run in one call.
+    fn bulkable(self) -> bool {
+        matches!(
+            self,
+            State::Idle | State::ApcOther | State::ApcSes | State::ApcOverflow
+        )
+    }
+}
+
+/// Offset of the next ESC in `buf`. Every state transition in this
+/// parser is triggered by ESC, so this is the only scan the bulk path
+/// needs.
+#[inline]
+fn next_esc(buf: &[u8]) -> Option<usize> {
+    buf.iter().position(|&b| b == ESC)
 }
 
 pub struct ApcStream {
@@ -69,6 +95,13 @@ pub struct ApcStream {
     /// cleared by the host so a drop can be reported rather than
     /// silently swallowing a sender's command.
     overflows: u32,
+    /// Un-stuffed body of the envelope in flight, empty otherwise.
+    body: Vec<u8>,
+    /// The 3 bytes after `ESC _`, while `ApcPrefix` decides whether the
+    /// envelope is ours.
+    marker_buf: [u8; 3],
+    /// How many of `marker_buf` have arrived.
+    marker_len: usize,
 }
 
 #[derive(Default)]
@@ -100,6 +133,9 @@ impl ApcStream {
             marker: *MARKER_C2H,
             max_payload: DEFAULT_MAX_PAYLOAD,
             overflows: 0,
+            body: Vec::new(),
+            marker_buf: [0; 3],
+            marker_len: 0,
         }
     }
 
@@ -109,6 +145,9 @@ impl ApcStream {
             marker,
             max_payload: DEFAULT_MAX_PAYLOAD,
             overflows: 0,
+            body: Vec::new(),
+            marker_buf: [0; 3],
+            marker_len: 0,
         }
     }
 
@@ -128,10 +167,55 @@ impl ApcStream {
 
     pub fn feed(&mut self, input: &[u8]) -> Output {
         let mut out = Output::default();
-        for &b in input {
-            self.step(b, &mut out);
+        let mut i = 0;
+        while i < input.len() {
+            // Bulk path: hand the whole run of bytes before the next
+            // ESC to one `extend_from_slice` instead of stepping the
+            // state machine per byte. Bulk transfer is almost entirely
+            // this path — the per-byte loop it replaces was the host's
+            // throughput ceiling under one.
+            if self.state.bulkable() {
+                let rest = &input[i..];
+                let run = next_esc(rest).unwrap_or(rest.len());
+                if run > 0 {
+                    self.bulk(&rest[..run], &mut out);
+                    i += run;
+                    continue;
+                }
+            }
+            self.step(input[i], &mut out);
+            i += 1;
         }
         out
+    }
+
+    /// Consume `run` — guaranteed ESC-free — in a [`State::bulkable`]
+    /// state.
+    fn bulk(&mut self, run: &[u8], out: &mut Output) {
+        match self.state {
+            State::Idle | State::ApcOther => out.passthrough.extend_from_slice(run),
+            // Over-cap body: these bytes are envelope payload, dropped
+            // rather than passed through, until `ESC \\` resyncs us.
+            State::ApcOverflow => {}
+            State::ApcSes => {
+                // Same cap as the per-byte arm: a body may reach
+                // `max_payload` exactly, and the byte after it overflows.
+                if self.body.len() + run.len() > self.max_payload {
+                    self.state = self.overflow();
+                } else {
+                    self.body.extend_from_slice(run);
+                }
+            }
+            _ => debug_assert!(false, "bulk() in a non-bulkable state"),
+        }
+    }
+
+    /// Drop the body in flight and swallow the rest of the envelope.
+    /// Passing a partial body on would spray binary at the vt100.
+    fn overflow(&mut self) -> State {
+        self.overflows = self.overflows.saturating_add(1);
+        self.body.clear();
+        State::ApcOverflow
     }
 
     /// Drain a deferred lone ESC (state `EscPending`) and return it as
@@ -147,8 +231,7 @@ impl ApcStream {
     }
 
     fn step(&mut self, b: u8, out: &mut Output) {
-        let st = std::mem::replace(&mut self.state, State::Idle);
-        self.state = match st {
+        self.state = match self.state {
             State::Idle => {
                 if b == ESC {
                     State::EscPending
@@ -158,9 +241,10 @@ impl ApcStream {
                 }
             }
             State::EscPending => match b {
-                APC_OPEN => State::ApcPrefix {
-                    marker_buf: Vec::with_capacity(3),
-                },
+                APC_OPEN => {
+                    self.marker_len = 0;
+                    State::ApcPrefix
+                }
                 ESC => {
                     out.push_pass(ESC);
                     State::EscPending
@@ -171,18 +255,18 @@ impl ApcStream {
                     State::Idle
                 }
             },
-            State::ApcPrefix { mut marker_buf } => {
-                marker_buf.push(b);
-                if marker_buf.len() < 3 {
-                    State::ApcPrefix { marker_buf }
-                } else if marker_buf.as_slice() == self.marker {
-                    State::ApcSes { body: Vec::new() }
+            State::ApcPrefix => {
+                self.marker_buf[self.marker_len] = b;
+                self.marker_len += 1;
+                if self.marker_len < 3 {
+                    State::ApcPrefix
+                } else if self.marker_buf == self.marker {
+                    self.body.clear();
+                    State::ApcSes
                 } else {
                     out.push_pass(ESC);
                     out.push_pass(APC_OPEN);
-                    for &mb in &marker_buf {
-                        out.push_pass(mb);
-                    }
+                    out.passthrough.extend_from_slice(&self.marker_buf);
                     State::ApcOther
                 }
             }
@@ -220,21 +304,17 @@ impl ApcStream {
                     State::ApcOther
                 }
             }
-            State::ApcSes { mut body } => {
+            State::ApcSes => {
                 if b == ESC {
-                    State::ApcSesEsc { body }
-                } else if body.len() >= self.max_payload {
-                    // Drop what we have and swallow the rest of the
-                    // envelope. Passing the partial body through
-                    // would spray binary at the vt100.
-                    self.overflows = self.overflows.saturating_add(1);
-                    State::ApcOverflow
+                    State::ApcSesEsc
+                } else if self.body.len() >= self.max_payload {
+                    self.overflow()
                 } else {
-                    body.push(b);
-                    State::ApcSes { body }
+                    self.body.push(b);
+                    State::ApcSes
                 }
             }
-            State::ApcSesEsc { mut body } => {
+            State::ApcSesEsc => {
                 // The cap has to be enforced here as well as on the
                 // plain-byte path. Every byte of a body made entirely
                 // of stuffed escapes arrives through this arm, so
@@ -242,45 +322,45 @@ impl ApcStream {
                 // buffer without bound — the exact shape a hostile
                 // sender would use. `ST_CLOSE` is exempt: it completes
                 // the envelope rather than appending to it.
-                if b != ST_CLOSE && body.len() >= self.max_payload {
-                    self.overflows = self.overflows.saturating_add(1);
-                    self.state = State::ApcOverflow;
+                if b != ST_CLOSE && self.body.len() >= self.max_payload {
+                    self.state = self.overflow();
                     return;
                 }
                 match b {
                     ESC => {
-                        body.push(ESC);
-                        State::ApcSes { body }
+                        self.body.push(ESC);
+                        State::ApcSes
                     }
                     ST_CLOSE => {
-                        out.payloads.push(body);
+                        out.payloads.push(std::mem::take(&mut self.body));
                         State::Idle
                     }
                     ESC_MARK_TILDE => {
-                        body.push(TILDE);
-                        State::ApcSes { body }
+                        self.body.push(TILDE);
+                        State::ApcSes
                     }
                     ESC_MARK_XON => {
-                        body.push(XON);
-                        State::ApcSes { body }
+                        self.body.push(XON);
+                        State::ApcSes
                     }
                     ESC_MARK_XOFF => {
-                        body.push(XOFF);
-                        State::ApcSes { body }
+                        self.body.push(XOFF);
+                        State::ApcSes
                     }
                     ESC_MARK_TAB => {
-                        body.push(TAB);
-                        State::ApcSes { body }
+                        self.body.push(TAB);
+                        State::ApcSes
                     }
                     ESC_MARK_LF => {
-                        body.push(LF);
-                        State::ApcSes { body }
+                        self.body.push(LF);
+                        State::ApcSes
                     }
                     ESC_MARK_CR => {
-                        body.push(CR);
-                        State::ApcSes { body }
+                        self.body.push(CR);
+                        State::ApcSes
                     }
                     _ => {
+                        self.body.clear();
                         // Only the byte-stuffing escapes (ESC-double, the
                         // transport marks) or ST close are valid inside the
                         // envelope. Treat anything else as malformed: discard
