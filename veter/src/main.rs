@@ -797,6 +797,8 @@ struct App {
     parser: Option<vt100::Parser<clipboard::HostCallbacks>>,
     pty: Option<pty::Pty>,
     term_renderer: Option<renderer::TerminalRenderer>,
+    /// Bytes from the PTY reader thread. Bounded — see
+    /// [`PTY_QUEUE_CHUNKS`].
     rx: Option<mpsc::Receiver<Vec<u8>>>,
     vge: Option<vge::VgeEngine>,
     prt: Option<prt::PrtEngine>,
@@ -1158,6 +1160,18 @@ const DOUBLE_CLICK_RADIUS_PX: f64 = 6.0;
 /// ceiling, each pass costs one frame and the terminal stays live under
 /// load; `about_to_wait` schedules the next pass once that frame is out.
 const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// Depth of the PTY reader thread's queue, in reads of up to 64 KiB.
+///
+/// The other half of the drain budget: the budget decides how much of
+/// the queue one frame absorbs, this decides how far the child may run
+/// ahead of the screen before it is made to wait. Four MiB is a couple
+/// of frames' worth of absorption at the rate the pipeline actually
+/// sustains — enough that a bursty writer never stalls on it, small
+/// enough that a sustained flood shows up as backpressure on the writer
+/// within a frame or two instead of as an unbounded backlog nobody can
+/// see.
+const PTY_QUEUE_CHUNKS: usize = 64;
 
 /// How one [`App::process_pty_output`] pass ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4736,8 +4750,23 @@ impl ApplicationHandler for App {
         let pty = pty::Pty::new(term_rows, term_cols, cell_px, self.entry_command.clone())
             .expect("Failed to create PTY");
 
-        // Start PTY reader thread
-        let (tx, rx) = mpsc::channel();
+        // Start PTY reader thread.
+        //
+        // Bounded, and that bound is load-bearing: with an unbounded
+        // channel the reader empties the PTY as fast as the kernel
+        // fills it, so nothing upstream ever feels the main loop's
+        // `PTY_DRAIN_BUDGET`. A `vsend` upload — which has no window of
+        // its own and writes at whatever speed the pipe accepts — then
+        // outruns the drain, and everything it outruns piles up here,
+        // in RAM, unbounded: the screen falls minutes behind the child,
+        // one pane's flood delays every other pane's output (it is all
+        // one stream), and a large enough transfer is an OOM. Blocking
+        // the reader instead fills the PTY buffer, which blocks vmux's
+        // write, which trips its own backpressure, which stops it
+        // reading the flooding pane — real end-to-end flow control,
+        // with the on-screen lag bounded by this queue rather than by
+        // the size of the file.
+        let (tx, rx) = mpsc::sync_channel(PTY_QUEUE_CHUNKS);
         let reader_fd = pty.dup_master().expect("Failed to dup master fd");
         let proxy = self.proxy.clone();
         let wake_pending = self.pty_wake_pending.clone();
