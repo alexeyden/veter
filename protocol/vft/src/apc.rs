@@ -39,6 +39,17 @@ enum State {
     Idle,
     /// Saw 0x1B in Idle; deciding whether it opens APC.
     EscPending,
+    /// A deferred ESC was handed to the consumer by
+    /// [`ApcStream::flush_pending_esc`], and the very next byte
+    /// decides whether that was right. `_` means it wasn't: an
+    /// envelope was split across reads at its opening ESC and the
+    /// rest has now caught up.
+    EscFlushed,
+    /// Reading the marker of an envelope whose ESC we already
+    /// flushed. Same job as `ApcPrefix`, but on a mismatch it
+    /// re-emits only what it holds — the ESC is already gone
+    /// downstream, and re-adding it would double it.
+    RecoverPrefix,
     /// Inside `ESC _ ...`, still buffering the 3 marker bytes to decide
     /// VFT vs. other APC.
     ApcPrefix,
@@ -228,15 +239,52 @@ impl ApcStream {
         out
     }
 
-    /// Drain a deferred lone ESC (state `EscPending`) and return it as a
-    /// single-byte `Vec`. Other states — mid-envelope, etc. — are left
-    /// alone because their bodies must arrive in full.
+    /// Drain a deferred lone ESC (state `EscPending`) and return it so
+    /// the caller can treat it as the keystroke it probably is.
+    ///
+    /// Callers should invoke this when the input source has been idle
+    /// long enough that a buffered ESC is unambiguously a lone
+    /// keystroke rather than the leading byte of an in-flight
+    /// ESC-sequence. With no flush, a lone ESC sits in `EscPending`
+    /// until the next byte arrives — which, for an interactive
+    /// terminal, can mean a modal dismiss key apparently does
+    /// nothing.
+    ///
+    /// "Unambiguously" is a guess, and on a slow link it is sometimes
+    /// wrong: an envelope split across reads at its opening ESC, with
+    /// the rest more than the idle window behind it, looks exactly
+    /// like a keypress. So the guess is not final. The stream moves to
+    /// `EscFlushed` rather than `Idle`, and if `_` and a matching
+    /// marker do turn up, the envelope is parsed as one — the ESC
+    /// went out early, but its payload never reaches the caller as
+    /// input. Before this, everything after that ESC was passed
+    /// through: a multiplexer typed the marker, header and body at
+    /// whichever pane had focus.
+    ///
+    /// Mid-envelope and mid-CSI states are left alone, because their
+    /// bodies must arrive in full. A `RecoverPrefix` whose marker
+    /// never completed is released here, minus the ESC the caller
+    /// already has.
     pub fn flush_pending_esc(&mut self) -> Vec<u8> {
-        if matches!(self.state, State::EscPending) {
-            self.state = State::Idle;
-            vec![ESC]
-        } else {
-            Vec::new()
+        match self.state {
+            State::EscPending => {
+                // Not `Idle`: if the next byte is `_`, this ESC opened
+                // an envelope that was split across reads rather than
+                // a keypress, and `RecoverPrefix` still parses it.
+                self.state = State::EscFlushed;
+                vec![ESC]
+            }
+            // Giving up on a recovery that never completed its marker:
+            // hand back the bytes still held. Without the ESC — the
+            // consumer got that one already.
+            State::RecoverPrefix => {
+                let mut out = vec![APC_OPEN];
+                out.extend_from_slice(&self.marker_buf[..self.marker_len]);
+                self.marker_len = 0;
+                self.state = State::Idle;
+                out
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -265,6 +313,40 @@ impl ApcStream {
                     State::Idle
                 }
             },
+            State::EscFlushed => match b {
+                APC_OPEN => {
+                    self.marker_len = 0;
+                    State::RecoverPrefix
+                }
+                ESC => State::EscPending,
+                _ => {
+                    out.push_pass(b);
+                    State::Idle
+                }
+            },
+            State::RecoverPrefix => {
+                self.marker_buf[self.marker_len] = b;
+                self.marker_len += 1;
+                if self.marker_len < 3 {
+                    State::RecoverPrefix
+                } else if self.marker_buf == self.marker {
+                    // The split envelope, back in one piece.
+                    self.body.clear();
+                    State::ApcVft
+                } else {
+                    // Someone else's APC, or a `_` the user typed after
+                    // pressing Esc. Pass what we hold and return to
+                    // Idle rather than entering `ApcOther`: the ESC is
+                    // downstream already, so a parser after this one is
+                    // in `EscFlushed` too and recovers a foreign
+                    // envelope by the same route. Idle also means a
+                    // typed `Esc _ a b c` can't leave us hunting for a
+                    // terminator that was never coming.
+                    out.push_pass(APC_OPEN);
+                    out.passthrough.extend_from_slice(&self.marker_buf);
+                    State::Idle
+                }
+            }
             State::ApcPrefix => {
                 self.marker_buf[self.marker_len] = b;
                 self.marker_len += 1;
@@ -750,5 +832,47 @@ mod tests {
             assert_eq!(payloads, vec![b"tail".to_vec()], "cut {cut}");
             assert_eq!(s.take_overflows(), 1, "cut {cut}");
         }
+    }
+    /// `ESC _ VFT … ESC \\`, the shape that gets split.
+    fn split_test_envelope() -> Vec<u8> {
+        envelope(b"body")
+    }
+
+    // --- a flushed ESC is remembered, not forgotten ------------------
+
+    /// A multiplexer parses this stream for envelopes *and* forwards
+    /// what is left to a pane as keystrokes, so an envelope that stops
+    /// being recognised gets typed at whatever program is focused.
+    /// That is what happened: a chunk boundary landing on the ESC that
+    /// opens an envelope, with more than the idle window of latency
+    /// behind it, and the ESC went out as a lone keypress. Everything
+    /// after it — marker, header, payload — was then nobody's
+    /// envelope.
+    #[test]
+    fn envelope_split_at_esc_survives_an_idle_flush() {
+        let env = split_test_envelope();
+        let mut s = ApcStream::new();
+
+        assert!(s.feed(&env[..1]).passthrough.is_empty());
+        // The idle window elapses; the consumer is handed the ESC.
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+
+        let out = s.feed(&env[1..]);
+        assert_eq!(out.payloads.len(), 1, "envelope lost after the flush");
+        assert!(
+            out.passthrough.is_empty(),
+            "envelope bytes leaked to the consumer as input: {:?}",
+            String::from_utf8_lossy(&out.passthrough)
+        );
+    }
+
+    /// The flush still has its job to do: a real lone Esc reaches the
+    /// consumer, and the keystroke after it is not swallowed.
+    #[test]
+    fn a_real_lone_esc_still_flushes_and_the_next_key_follows() {
+        let mut s = ApcStream::new();
+        assert!(s.feed(&[ESC]).passthrough.is_empty());
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+        assert_eq!(s.feed(b"a").passthrough, b"a");
     }
 }
