@@ -87,6 +87,26 @@ fn user_shell() -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+/// How long the loop waits on an idle poll before deciding that an ESC
+/// held by the APC parsers was a keypress rather than the first byte of
+/// an envelope — the same trade-off tmux spells `escape-time`, and for
+/// the same reason it defaults to 500 ms there.
+///
+/// It is a guess either way, and the wrong guess costs differently in
+/// each direction. Too long and Esc lags in whatever the focused pane
+/// is running. Too short and an envelope split at its opening ESC gets
+/// its ESC delivered early; the parser recovers the envelope itself
+/// (see `flush_pending_esc`), but the stray ESC still reaches the pane,
+/// where a program may take it for a cancel.
+///
+/// Splits like that are not rare, and are not only a slow-link
+/// phenomenon: the host's pty writer (`veter/src/pty.rs`) hands the
+/// kernel as much as the buffer will take and blocks on the rest until
+/// we drain it, so any envelope can arrive in two pieces separated by
+/// however long our own loop takes to come back around. Under load that
+/// is well past 50 ms, which is what this used to be.
+const ESCAPE_TIME_MS: u16 = 300;
+
 // Debug logging — VMUX_LOG=/path enables byte-level tracing of all four
 // directions: user keystrokes, bytes forwarded to a pane PTY, bytes read
 // from a pane PTY, and the WritePortal payloads we send to the host.
@@ -4917,7 +4937,7 @@ fn main() -> Result<()> {
             fds.push(PollFd::new(pane_borroweds[i], ev));
         }
 
-        let n = match poll(&mut fds, PollTimeout::from(50u16)) {
+        let n = match poll(&mut fds, PollTimeout::from(ESCAPE_TIME_MS)) {
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("poll: {e}")),
