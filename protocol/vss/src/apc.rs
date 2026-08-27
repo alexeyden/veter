@@ -380,12 +380,29 @@ impl ApcStream {
                 }
             }
             State::ApcOtherEsc => {
-                out.push_pass(ESC);
-                out.push_pass(b);
-                if b == ST_CLOSE {
-                    State::Idle
+                if b == APC_OPEN {
+                    // `ESC _` inside what we took for someone else's
+                    // APC. APC strings don't nest, and every envelope in
+                    // this family stuffs a literal ESC as `ESC ESC`
+                    // (§1.3), so this is not payload — we were never
+                    // inside an envelope at all. The way in is a user
+                    // typing `Esc _`, which is a motion in vim and looks
+                    // exactly like an opener whose marker matches
+                    // nothing. Take it as the opener it is. Otherwise we
+                    // would stay in `ApcOther` until some ST happened
+                    // along, passing every envelope that arrived first
+                    // through as text — which a multiplexer types at
+                    // whichever pane has focus.
+                    self.marker_len = 0;
+                    State::ApcPrefix
                 } else {
-                    State::ApcOther
+                    out.push_pass(ESC);
+                    out.push_pass(b);
+                    if b == ST_CLOSE {
+                        State::Idle
+                    } else {
+                        State::ApcOther
+                    }
                 }
             }
             State::ApcVss => {
@@ -864,5 +881,56 @@ mod tests {
         let second_out = second.feed(&first_out.passthrough);
         assert_eq!(second_out.payloads.len(), 1, "foreign envelope lost in the chain");
         assert!(second_out.passthrough.is_empty());
+    }
+
+    /// `Esc _` is a motion in vim, and typing it used to poison the
+    /// parser: the three bytes after `_` are read as a marker, match
+    /// nothing, and leave the stream inside a foreign APC until an ST
+    /// turns up. The next real envelope then went through as text —
+    /// the same garbage-at-the-prompt as a split envelope, from a
+    /// keystroke instead of a chunk boundary.
+    #[test]
+    fn typed_esc_underscore_does_not_swallow_the_next_envelope() {
+        let mut s = ApcStream::new();
+
+        // Typed fast enough to land in one read, so no idle flush
+        // rescues it.
+        let out = s.feed(b"\x1b_abcdef");
+        assert_eq!(
+            out.passthrough, b"\x1b_abcdef",
+            "what the user typed must reach the pane, in order"
+        );
+
+        // An envelope arriving behind it is still an envelope.
+        let out = s.feed(&split_test_envelope());
+        assert_eq!(out.payloads.len(), 1, "envelope lost after a typed `Esc _`");
+        assert!(
+            out.passthrough.is_empty(),
+            "envelope leaked as input: {:?}",
+            String::from_utf8_lossy(&out.passthrough)
+        );
+    }
+
+    /// The resync must not cost us the pass-through contract: a real
+    /// foreign envelope still arrives downstream whole, terminator
+    /// included, and leaves the stream ready for the next one.
+    #[test]
+    fn a_real_foreign_envelope_still_passes_through_verbatim() {
+        let mut foreign = vec![ESC, APC_OPEN];
+        foreign.extend_from_slice(b"xyz");
+        // A payload with the family's own stuffing in it: a literal
+        // ESC travels as `ESC ESC`, which must not read as an opener.
+        foreign.extend_from_slice(b"bo");
+        foreign.extend_from_slice(&[ESC, ESC]);
+        foreign.extend_from_slice(b"_dy");
+        foreign.extend_from_slice(&[ESC, ST_CLOSE]);
+
+        let mut s = ApcStream::new();
+        let out = s.feed(&foreign);
+        assert_eq!(out.passthrough, foreign, "foreign envelope altered");
+
+        let out = s.feed(&split_test_envelope());
+        assert_eq!(out.payloads.len(), 1);
+        assert!(out.passthrough.is_empty());
     }
 }
