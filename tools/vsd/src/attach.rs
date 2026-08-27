@@ -483,6 +483,38 @@ fn apply_probe(
         guard.vge.set_dimensions(cell_px, vge.scale_factor);
         guard.prt.set_metrics(cell_px, vge.scale_factor);
     }
+    if let Some(palette) = outcome.prt.and_then(accent_palette) {
+        // §7.3 — the daemon paints nothing, so it has no palette of
+        // its own; it borrows the attached renderer's, the same way it
+        // borrows its cell metrics, and keeps it after a detach so a
+        // client started in a detached session still gets a themed
+        // accent. Existing portals keep the seed they were spawned
+        // with, as with `set_metrics`.
+        guard.vge.seed_host_styles(palette.clone(), 0);
+        guard.prt.set_host_palette(palette);
+    }
+}
+
+/// The renderer's accent as a one-slot [`HostThemePalette`], if it
+/// themes `host.*` at all. The probe reports one color — the accent
+/// `host.accent` resolves to at the probing engine's depth — not the
+/// renderer's whole palette, so every depth inside the session
+/// resolves to that same accent while the daemon is the one answering.
+/// A renderer re-seeds its own palette over this on attach.
+fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostThemePalette> {
+    use prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES;
+    if prt.vge_features? & FEAT_VGE_HOST_THEMED_STYLES == 0 {
+        return None;
+    }
+    let [r, g, b, a] = prt.accent_rgba?;
+    Some(veter_host::vge::HostThemePalette {
+        accents: vec![vge_protocol::command::Color {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: f32::from(a) / 255.0,
+        }],
+    })
 }
 
 /// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 vsd

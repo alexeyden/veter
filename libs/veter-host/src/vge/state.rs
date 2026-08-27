@@ -752,9 +752,9 @@ impl VgeEngine {
     /// the snapshot — image GPU handles are left
     /// `None` so the renderer lazily registers them on first paint.
     /// `pending_response_bytes`, `pending_image_deletes`,
-    /// `pending_cursor_queries`, and the `auto_reply_*` flags retain
-    /// their previous values (they're engine-policy state, not
-    /// session state).
+    /// `pending_cursor_queries`, the `auto_reply_*` flags and the
+    /// `host.*` style seed retain their previous values (they're
+    /// engine-policy state, not session state).
     pub fn restore_from_binary_snapshot(
         &mut self,
         bytes: &[u8],
@@ -770,6 +770,13 @@ impl VgeEngine {
         self.pending_image_deletes.clear();
         self.pending_uploads.clear();
         self.pending_cursor_queries = 0;
+        // §7.3 — the snapshot carries the *sender's* style table, and
+        // the reserved `host.*` namespace belongs to whoever renders,
+        // not to whoever snapshotted: a daemon that holds the state
+        // paints nothing and may have no palette at all. Re-seed ours
+        // on top, exactly as the RIS/DECSTR path does, so a client's
+        // `StyleRef("host.accent")` still resolves after an attach.
+        self.apply_host_styles();
         // `top_of_live_screen` is intentionally not touched here: the
         // origin element `anchor_line`s reference belongs to vt100 and
         // arrives with the accompanying vt100 fragment. The caller
@@ -2454,6 +2461,22 @@ mod tests {
         // RIS wipes the table; the host re-seeds its reserved entries.
         engine.process_pty_chunk(b"\x1bc");
         assert!((flat_g(&engine.state.shared.styles, "host.accent") - 0.0).abs() < 1e-3);
+        assert!(engine.state.shared.styles.contains_key("host.accent.3"));
+    }
+
+    #[test]
+    fn seed_host_styles_reapplied_after_snapshot_restore() {
+        // A VSS snapshot carries the sender's style table, and the
+        // sender may be a daemon that paints nothing and so has no
+        // palette. `host.*` belongs to whoever renders: the restore
+        // must not leave the renderer's seed overwritten.
+        let donor = VgeEngine::new((9, 20), 1.0);
+        let bytes = donor.binary_snapshot();
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(palette_rgb(), 1);
+        engine.restore_from_binary_snapshot(&bytes).expect("restore");
+        // Depth 1 → slot 1 (green), same as before the restore.
+        assert!((flat_g(&engine.state.shared.styles, "host.accent") - 1.0).abs() < 1e-3);
         assert!(engine.state.shared.styles.contains_key("host.accent.3"));
     }
 

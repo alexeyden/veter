@@ -832,6 +832,12 @@ clients can reference it by `StyleRef` instead of hardcoding colors.
   MUST re-inject its `host.*` entries after any RIS/DECSTR that clears
   the table (§5.4) — otherwise a client's surviving elements would render
   magenta after a reset.
+- The namespace belongs to whoever *renders*, not to whoever holds the
+  state: a host that adopts a style table from elsewhere (a session
+  manager's snapshot, `doc/session-manager.md` §4.3) MUST re-inject its
+  own `host.*` entries over the incoming ones, for the same reason. A
+  state holder that paints nothing has no theme of its own to publish,
+  so an incoming table may carry no `host.*` entries at all.
 - Whether a host populates these is advertised out-of-band. When the
   Portal Extension is also implemented, the host signals it with the
   `host_themed_styles` capability bit (portal-extension.md §10); a client

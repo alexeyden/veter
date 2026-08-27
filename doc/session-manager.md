@@ -144,7 +144,12 @@ going:
   that attached, or the defaults if there has not been one. Sessions
   outlive renderers, and a program started in a detached session must
   still be able to probe and draw. It should not have to know which
-  state it was started in.
+  state it was started in. The accent it reports is borrowed the same
+  way: the daemon paints nothing, so it adopts the `host.accent` the
+  attaching renderer reported (portal-extension.md §10) as a one-slot
+  palette. That one color answers at every depth — the probe carries
+  the renderer's contextual accent, not its whole palette — until a
+  renderer attaches and re-seeds its own.
 
 These are one decision rather than two: **the daemon answers exactly
 those chunks it does not forward**, decided under the same lock that
@@ -383,7 +388,11 @@ scalars (`cell_px`, `scale_factor`). GPU image handles are *not* on
 the wire; the renderer re-creates them lazily through the existing
 `Renderer::register_gpu_image` path on first paint. Lives in
 `veter-host` as `VgeEngine::binary_snapshot()` /
-`restore_from_binary_snapshot()`.
+`restore_from_binary_snapshot()`. The restore re-seeds the reserved
+`host.*` styles afterwards (vector-graphics-extension.md §7.3): the
+accent palette is the *renderer's*, and the daemon that produced the
+snapshot paints nothing, so its table carries whatever palette it
+happened to borrow — or none.
 
 **PrtFragment** — PRT state, recursive. `main` and **`alt`** portal
 sets, `on_alt`, **engine-level `FocusKind` and `CursorStyle`**, and

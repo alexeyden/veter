@@ -490,6 +490,16 @@ impl PrtEngine {
         (self.cell_px, self.scale_factor)
     }
 
+    /// The `host.*` seed a per-portal VGE engine in this scope gets
+    /// (§7.3): this engine's palette, keyed on the portal's depth.
+    /// Used by the snapshot decoder, which rebuilds those engines from
+    /// scratch and must seed them the way `cmd_create_portal` does.
+    pub(in crate::prt) fn host_seed_for_children(
+        &self,
+    ) -> (crate::vge::HostThemePalette, u32) {
+        (self.host_palette.clone(), self.depth + 1)
+    }
+
     /// Build a fresh child PrtEngine sized like one of this engine's
     /// portals (one nesting level deeper), inheriting `Limits`,
     /// `cell_px`, `scale_factor`, the damage-rule rate limit, and the
@@ -2238,6 +2248,41 @@ mod tests {
         assert_eq!(
             portal_accent_rgb(&child.state.current().content("q").unwrap().vge),
             (0.0, 0.0, 1.0),
+        );
+    }
+
+    #[test]
+    fn restored_portals_get_depth_keyed_accent() {
+        // The vsd attach shape: the snapshot comes from an engine with
+        // no palette (a daemon paints nothing, so it has none), and is
+        // restored into the renderer, which does. The rebuilt portal
+        // must be seeded like a freshly created one — otherwise a
+        // client's `StyleRef("host.accent")` renders as the
+        // unresolved-ref color after every attach.
+        let mut donor = PrtEngine::new();
+        dispatch_one(&mut donor, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+        assert!(
+            !donor
+                .state
+                .current()
+                .content("p")
+                .unwrap()
+                .vge
+                .state
+                .shared
+                .styles
+                .contains_key("host.accent"),
+            "unpalletted donor should carry no host.* entries",
+        );
+        let bytes = donor.binary_snapshot();
+
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+        engine.restore_from_binary_snapshot(&bytes).expect("restore");
+        // Depth-1 portal → slot 1 (green).
+        assert_eq!(
+            portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),
+            (0.0, 1.0, 0.0),
         );
     }
 

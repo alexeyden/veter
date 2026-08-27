@@ -49,10 +49,9 @@ pub struct VgeProbeData {
 }
 
 /// Subset of PRT `ProbeBody` that the daemon stores for reference.
-/// PRT metrics other than nesting depth aren't currently consumed by
-/// the snapshot path — they're decoded so future limits work
-/// (e.g. clamping outbound `WritePortal` payloads to
-/// `max_write_bytes`).
+/// PRT metrics other than the accent aren't currently consumed by the
+/// snapshot path — they're decoded so future limits work (e.g.
+/// clamping outbound `WritePortal` payloads to `max_write_bytes`).
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // decoded for future limit-enforcement passes
 pub struct PrtProbeData {
@@ -64,17 +63,24 @@ pub struct PrtProbeData {
     pub max_write_bytes: u32,
     pub features: u8,
     pub max_nesting_depth: u8,
+    /// VGE-integration byte (§10). `None` from a host that predates
+    /// it — the field is positional and simply absent from the body.
+    pub vge_features: Option<u8>,
+    /// The RGBA8 the renderer resolves `host.accent` to at depth 0,
+    /// meaningful only with `FEAT_VGE_HOST_THEMED_STYLES` set in
+    /// `vge_features`. The daemon adopts it as its own palette so a
+    /// client that probes while nothing is attached still gets a
+    /// themed accent instead of falling back to its brand color.
+    pub accent_rgba: Option<[u8; 4]>,
 }
 
 /// Outcome of one probe round.
 #[derive(Debug)]
 pub struct ProbeOutcome {
     pub vge: Option<VgeProbeData>,
-    /// PRT probe data is decoded but not yet consumed — the snapshot
-    /// path only needs VGE cell metrics for now. Keeping it on the
-    /// outcome means future limit-enforcement work can pick it up
-    /// without re-running the probe.
-    #[allow(dead_code)]
+    /// Only the accent is consumed today; the limits ride along so
+    /// future limit-enforcement work can pick them up without
+    /// re-running the probe.
     pub prt: Option<PrtProbeData>,
     /// Grid + pixel dimensions read via `TIOCGWINSZ` on the renderer's
     /// stdin. `None` if the ioctl failed or returned an obviously empty
@@ -238,6 +244,13 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
     let max_write_bytes = r.u32().ok()?;
     let features = r.u8().ok()?;
     let max_nesting_depth = r.u8().ok()?;
+    // Positional tail fields (§10): a host that predates either stops
+    // the body early, which reads back as `None` rather than an error.
+    let vge_features = r.u8().ok();
+    let accent_rgba = match (vge_features, r.u8(), r.u8(), r.u8(), r.u8()) {
+        (Some(_), Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
+        _ => None,
+    };
     Some(PrtProbeData {
         protocol_version,
         max_portals,
@@ -247,6 +260,8 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
         max_write_bytes,
         features,
         max_nesting_depth,
+        vge_features,
+        accent_rgba,
     })
 }
 

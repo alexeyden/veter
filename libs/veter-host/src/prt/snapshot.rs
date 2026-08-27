@@ -398,6 +398,12 @@ fn decode_content(
     // created one — silent in an observer, talkative in a terminal.
     vge.set_auto_reply_commands(parent_engine.portal_auto_reply());
     vge.restore_from_binary_snapshot(vge_bytes)?;
+    // §7.3 — a restored portal is seeded like a freshly created one.
+    // Seeded after the restore rather than before it so this holds
+    // whatever the incoming table says about `host.*`: the palette is
+    // the renderer's, and the snapshot's sender may not have one.
+    let (palette, depth) = parent_engine.host_seed_for_children();
+    vge.seed_host_styles(palette, depth);
 
     let mut children = parent_engine.child_engine_scaffold();
     decode_engine_into(&mut children, children_bytes)?;
