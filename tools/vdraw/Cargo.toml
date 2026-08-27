@@ -5,6 +5,7 @@ edition = "2024"
 description = "Interactive block-diagram editor for VGE-aware terminals."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 vge-render = { path = "../../libs/vge-render" }
 vge-protocol = { path = "../../protocol/vge" }
 prt-protocol = { path = "../../protocol/prt" }

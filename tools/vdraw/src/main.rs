@@ -1081,6 +1081,13 @@ fn parse_args() -> Result<Args> {
             s if s.starts_with("--background=") => {
                 background = Some(PathBuf::from(&s["--background=".len()..]));
             }
+            "--version" | "-V" => {
+                println!(
+                    "vdraw {}",
+                    veter_version::long_version(env!("CARGO_PKG_VERSION"))
+                );
+                std::process::exit(0);
+            }
             s if s.starts_with('-') && s != "-" => bail!("unknown option: {s}"),
             s if path.is_none() => path = Some(PathBuf::from(s)),
             s => bail!("unexpected extra argument: {s}"),

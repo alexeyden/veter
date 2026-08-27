@@ -5,6 +5,7 @@ edition = "2024"
 description = "Display images in a VGE-aware terminal."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 vge-protocol = { path = "../../protocol/vge" }
 vge-render = { path = "../../libs/vge-render" }
 clap = { version = "4", features = ["derive"] }

@@ -5,6 +5,7 @@ edition = "2024"
 description = "Pull a host-side file back to the local filesystem from a VFT-aware terminal."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 vft-protocol = { path = "../../protocol/vft" }
 vft-client = { path = "../vft-client" }
 clap = { version = "4", features = ["derive"] }

@@ -4693,6 +4693,7 @@ Options:
   -P, --prefix <KEY>     prefix key (default Ctrl+Space). Accepts C-a,
                          ctrl+a, ^a, or a bare letter; 'space' for Ctrl+Space
   -h, --help             print this help and exit
+  -V, --version          print the version and the commit it was built from
 
 The accent and prefix options give nested sessions (e.g. over ssh) a
 distinct color and prefix so they are easy to tell apart.
@@ -4719,6 +4720,13 @@ fn parse_cli_args() -> Result<CliOptions> {
             "--prefix" | "-P" => opts.prefix = Some(parse_prefix_key(&take(&mut args)?)?),
             "--help" | "-h" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!(
+                    "vmux {}",
+                    veter_version::long_version(env!("CARGO_PKG_VERSION"))
+                );
                 std::process::exit(0);
             }
             other if other.starts_with("--accent=") => {

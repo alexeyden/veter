@@ -48,7 +48,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli> {
                 std::process::exit(0);
             }
             Some("--version") => {
-                println!("vssh {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "vssh {}",
+                    veter_version::long_version(env!("CARGO_PKG_VERSION"))
+                );
                 std::process::exit(0);
             }
             Some("--vssh-verbose") => cli.verbose = true,
@@ -89,7 +92,7 @@ vssh flags (must come before ssh args):
                           installed tools are immediately usable).
     --vssh-verbose        Log vssh's actions to stderr.
     -h, --help            Show this help.
-    --version             Show vssh version.
+    --version             Show vssh's version and the commit it was built from.
 
 All other arguments pass through to ssh(1) unchanged.
 ";

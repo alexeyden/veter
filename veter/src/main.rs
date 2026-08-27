@@ -5492,6 +5492,20 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    // Before the window: `--version` has to answer from a terminal.
+    // Stop at `-e`, so a flag belonging to the entry-point command
+    // (`veter -e vplay --version`) stays that command's business.
+    if std::env::args()
+        .skip(1)
+        .take_while(|a| a != "-e" && a != "--command")
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "veter {}",
+            veter_version::long_version(env!("CARGO_PKG_VERSION"))
+        );
+        return;
+    }
     let entry_command = parse_entry_command();
     let config = config::Config::load();
     let event_loop = EventLoop::new().unwrap();

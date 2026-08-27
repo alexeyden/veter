@@ -14,6 +14,7 @@ default = ["system-clipboard"]
 system-clipboard = ["dep:arboard"]
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 vge-protocol = { path = "../../protocol/vge" }
 vge-render = { path = "../../libs/vge-render" }
 vge-ui = { path = "../../libs/vge-ui" }

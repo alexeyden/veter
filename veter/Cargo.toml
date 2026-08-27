@@ -17,6 +17,7 @@ name = "veter"
 path = "src/main.rs"
 
 [dependencies]
+veter-version = { path = "../libs/veter-version" }
 veter-host = { path = "../libs/veter-host" }
 vge-protocol = { path = "../protocol/vge" }
 prt-protocol = { path = "../protocol/prt" }

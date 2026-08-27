@@ -51,7 +51,10 @@ use vge_render::tty::{RawTty, drain_stale_stdin, winsize_cols};
 use vge_render::upload::{Encoding, choose_encoding, encode_payload};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Display images inside a VGE-aware terminal.")]
+#[command(
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Display images inside a VGE-aware terminal."
+)]
 #[command(group(
     // The mode-selecting flags are mutually exclusive: pick one of
     // `--mode <m>`, `-r`, `-l`, or `-L Q`, or none (auto-detect).

@@ -3090,6 +3090,7 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
+ "veter-version",
  "vge-protocol",
  "vge-render",
 ]
@@ -3106,6 +3107,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-width",
+ "veter-version",
  "vge-protocol",
  "vge-render",
 ]
@@ -3145,6 +3147,7 @@ dependencies = [
  "swash",
  "toml",
  "veter-host",
+ "veter-version",
  "vft-protocol",
  "vge-protocol",
  "vt100",
@@ -3167,6 +3170,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "veter-version"
+version = "0.1.0"
+
+[[package]]
 name = "vfm"
 version = "0.1.0"
 dependencies = [
@@ -3178,6 +3185,7 @@ dependencies = [
  "prt-protocol",
  "serde",
  "toml",
+ "veter-version",
  "vge-protocol",
  "vge-render",
  "vge-ui",
@@ -3236,6 +3244,7 @@ dependencies = [
  "nix 0.29.0",
  "prt-protocol",
  "ses-protocol",
+ "veter-version",
  "vge-protocol",
  "vge-ui",
 ]
@@ -3250,6 +3259,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "serde_json",
+ "veter-version",
  "vge-protocol",
  "vge-render",
  "zenwebp",
@@ -3270,6 +3280,7 @@ dependencies = [
  "serde_json",
  "ses-protocol",
  "veter-host",
+ "veter-version",
  "vge-protocol",
  "vge-render",
  "vt100",
@@ -3283,6 +3294,7 @@ dependencies = [
  "clap",
  "libc",
  "nix 0.29.0",
+ "veter-version",
  "vft-client",
  "vft-protocol",
 ]
@@ -3297,6 +3309,7 @@ dependencies = [
  "nix 0.29.0",
  "prt-protocol",
  "veter-host",
+ "veter-version",
  "vge-protocol",
  "vss-protocol",
  "vt100",
@@ -3310,6 +3323,7 @@ dependencies = [
  "clap",
  "libc",
  "nix 0.29.0",
+ "veter-version",
  "vft-client",
  "vft-protocol",
 ]
@@ -3328,6 +3342,7 @@ dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
+ "veter-version",
 ]
 
 [[package]]

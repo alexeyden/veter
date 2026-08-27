@@ -41,7 +41,11 @@ mod session;
 use ipc::{Request, Response, SessionInfo};
 
 #[derive(Parser, Debug)]
-#[command(name = "vsd", about = "Per-session veter daemon.")]
+#[command(
+    name = "vsd",
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Per-session veter daemon."
+)]
 struct Cli {
     /// Internal: run the per-session backend in this process,
     /// detached (used by `new`). The caller is responsible for

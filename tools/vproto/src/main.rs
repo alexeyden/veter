@@ -29,6 +29,7 @@ use proto::Proto;
 
 #[derive(Parser, Debug)]
 #[command(
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
     about = "Speak veter's protocols from a script: JSON commands in, JSON responses out",
     long_about = None,
     after_help = "Commands are read from stdin as a JSON array. See `vproto schema` for their shape."

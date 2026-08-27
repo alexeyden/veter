@@ -33,7 +33,7 @@ before.
 
 ```
 protocol/   vge prt vft vss ses   — pure wire format, no state, no I/O
-libs/       veter-host vge-render vge-ui   — shared implementation crates
+libs/       veter-host veter-version vge-render vge-ui   — shared implementation crates
 tools/      the CLI/TUI clients, plus vproto and the vplace script
 vendored/   vt100 femtovg   — third-party forks
 veter/      the GUI terminal
@@ -56,6 +56,7 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`libs/v
 | `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot — and the SGR-Pixels mouse encoding, DECSET 1016). The screen model the host and every portal use. |
 | `libs/veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines. Links no GUI toolkit at all — the two desktop affordances VFT needs (native file picker, open-after-finalize) are the `vft::DesktopHooks` trait, which `veter` implements and `vsd` leaves at its `HeadlessHooks` default. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
+| `libs/veter-version` | The commit every binary was built from. A build script resolves the short sha and commit date at compile time and re-runs when `HEAD` moves; `long_version()` formats the `--version` line each binary prints. Exists because every crate here is `0.1.0` and stays `0.1.0`, so the crate version cannot answer "are these two machines running the same build?" — which is the question that comes up when a bug reproduces on one end of an SSH hop and not the other. No `.git` (a tarball build) reports `unknown` rather than failing. |
 | `libs/vge-render` | Shared client-side helpers for rendering images to a VGE-aware terminal, plus the shared raw-TTY / poll / probe helpers every VGE client uses (`vcat`, `vplay`, `vdraw`, `vfm`, `spinner`, `breakout`). |
 | `libs/vge-ui` | Shared client-side widget toolkit, extracted from `vmux`: accent theme (`theme`), rounded chrome paths (`shape`), the readline-style `LineEditor` (`edit`), the filterable `Picker` (`picker`), the prompt/picker/scrolling modal builders (`modal`), and the key + SGR-mouse `InputParser` (`input`). Pure `vge-protocol` consumer — builds draw commands and parses input, owns no state and does no I/O. Used by `vmux` and `vfm`. |
 | `tools/vproto` | Speak VGE/PRT/SES from a script: a JSON array of commands on stdin becomes one envelope, and the terminal's reply comes back as JSON. Deserializes straight into the protocol crates' own types, so its surface *is* the wire format — the hand-written `vge-cli`/`prt-cli` it replaced reached 11 of VGE's 15 commands and could not name a cursor or marker anchor at all. `send` / `emit` / `measure` / `caps` / `schema`; `emit` writes envelope bytes instead of sending, which is how a VGE envelope becomes the `data_file` of a PRT `WritePortal`. |

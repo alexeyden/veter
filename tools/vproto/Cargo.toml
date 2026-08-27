@@ -5,6 +5,7 @@ edition = "2024"
 description = "Speak veter's protocols from a script: JSON commands in, JSON responses out."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 vge-protocol = { path = "../../protocol/vge", features = ["schemars"] }
 prt-protocol = { path = "../../protocol/prt", features = ["schemars"] }
 ses-protocol = { path = "../../protocol/ses", features = ["schemars"] }

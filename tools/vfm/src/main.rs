@@ -1543,6 +1543,7 @@ options:
                         terminal's themed accent
   -c, --config PATH     config file (default: ~/.config/vfm/config.toml)
   -h, --help            show this help
+  -V, --version         show the version and the commit it was built from
 ";
 
 struct Args {
@@ -1564,6 +1565,13 @@ fn parse_args() -> Result<Option<Args>> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!(
+                    "vfm {}",
+                    veter_version::long_version(env!("CARGO_PKG_VERSION"))
+                );
                 return Ok(None);
             }
             "-a" | "--hidden" => hidden = true,

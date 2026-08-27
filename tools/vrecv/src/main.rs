@@ -44,7 +44,10 @@ use vft_protocol::encode::build_envelope;
 use vft_protocol::frame::*;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Download a host-side file to the local filesystem.")]
+#[command(
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Download a host-side file to the local filesystem."
+)]
 struct Cli {
     /// First positional argument. Either `:host_path` (use the second
     /// argument as the local destination) or a local destination

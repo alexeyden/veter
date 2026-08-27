@@ -93,7 +93,7 @@ fn flat(r: f32, g: f32, b: f32, a: f32) -> Style {
 
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
     about = "Interactive image/video viewer for VGE-aware terminals."
 )]
 struct Cli {

@@ -5,6 +5,7 @@ edition = "2024"
 description = "SSH wrapper that keeps veter-tools fresh on remote hosts."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 anyhow = "1"
 nix = { version = "0.29", features = ["process"] }
 log = "0.4"

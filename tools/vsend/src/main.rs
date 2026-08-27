@@ -41,7 +41,10 @@ use vft_protocol::encode::build_envelope;
 use vft_protocol::frame::*;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Upload a local file to a VFT-aware terminal.")]
+#[command(
+    version = veter_version::long_version(env!("CARGO_PKG_VERSION")),
+    about = "Upload a local file to a VFT-aware terminal."
+)]
 struct Cli {
     /// Local file to upload.
     local: PathBuf,

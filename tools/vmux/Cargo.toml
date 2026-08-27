@@ -5,6 +5,7 @@ edition = "2024"
 description = "Terminal multiplexer over the PRT/VGE extensions."
 
 [dependencies]
+veter-version = { path = "../../libs/veter-version" }
 prt-protocol = { path = "../../protocol/prt" }
 vge-protocol = { path = "../../protocol/vge" }
 ses-protocol = { path = "../../protocol/ses" }
