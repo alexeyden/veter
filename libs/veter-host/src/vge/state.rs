@@ -604,21 +604,26 @@ pub struct VgeEngine {
     /// that PRT remains the sole DSR responder inside a portal —
     /// otherwise both PRT and the per-portal VGE would synthesise a
     /// reply for the same query and the inner program would see two.
+    /// `vsd` toggles it for the same reason across a wider gap: while
+    /// a renderer is attached, that renderer sends the cursor report.
     auto_reply_dsr: bool,
     /// When `false`, every VGE command is still parsed and applied
     /// (so engine state stays consistent — for snapshot replay etc.)
-    /// but **no** response frame is generated. Used by vsd's
-    /// session VGE engine: vsd is a state-mirroring middleman, not
-    /// the authoritative host, so it must not double-answer Probe,
-    /// UploadImage, CreateElement, etc. The real host upstream
-    /// (e.g. local veter's per-portal VGE for the SSH pane) is the
-    /// sole responder. Without this, the inner program (vcat) gets
-    /// two responses to each command; it consumes one and exits, and
-    /// the leftover bytes get read by the shell that takes over the
-    /// inner PTY — which interprets payload bytes like `0x12` (Ctrl-R
-    /// in the payload_len header of a 2-RSP_OK envelope = 18 bytes,
-    /// or in the cell_pixel_height field of a ProbeResponse) as
-    /// keystrokes, triggering reverse-i-search and other surprises.
+    /// but **no** response frame is generated. Used by `vsd` for as
+    /// long as a renderer is attached: the bytes it forwards reach a
+    /// real host (local veter's per-portal VGE for the SSH pane) that
+    /// answers Probe, UploadImage, CreateElement and the rest itself,
+    /// and one command must not collect two answers. Without this the
+    /// inner program (vcat) gets two responses per command; it
+    /// consumes one and exits, and the leftover bytes get read by the
+    /// shell that takes over the inner PTY — which interprets payload
+    /// bytes like `0x12` (Ctrl-R in the payload_len header of a
+    /// 2-RSP_OK envelope = 18 bytes, or in the cell_pixel_height field
+    /// of a ProbeResponse) as keystrokes, triggering reverse-i-search
+    /// and other surprises. It goes back to `true` on detach, where
+    /// there is no upstream host and a client would otherwise be left
+    /// with no answer at all: see
+    /// `vsd::engines::EngineState::set_renderer_attached`.
     auto_reply_commands: bool,
 }
 

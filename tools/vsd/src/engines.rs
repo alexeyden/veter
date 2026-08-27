@@ -5,7 +5,9 @@
 //! worker reads from a dup of the inner PTY master, runs the bytes
 //! through PRT → VGE → vt100 in the same order as
 //! `veter/src/main.rs::App::process_pty_output`, and writes any
-//! engine-generated responses back to the PTY master.
+//! engine-generated responses back to the PTY master — when it is the
+//! one that should be answering at all, which is
+//! [`EngineState::set_renderer_attached`]'s subject.
 //!
 //! Sessions don't attach yet — the externally visible effect of this
 //! module is that PTY output is parsed and accumulated in engine state,
@@ -75,6 +77,11 @@ pub struct EngineState {
     /// attach handler installs this on attach and clears it on detach
     /// or write error.
     pub renderer_stdout: Option<OwnedFd>,
+    /// Whether the engines are currently answering the programs
+    /// inside this session — VGE commands, DSR, and the same two one
+    /// level down inside every portal. Flipped by
+    /// [`EngineState::set_renderer_attached`]; see it for the rule.
+    answering: bool,
     /// Write end of a self-pipe the attach handler uses to wake its
     /// `splice_input` loop when the session itself is gone (inner
     /// program EOF / worker fatal error). Without this the splice
@@ -90,33 +97,61 @@ impl EngineState {
     /// The name reaches the SES engine so an inner `vmux` can learn
     /// which session it lives in.
     pub fn new(session_name: String) -> Self {
-        let mut vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
-        // vsd is a state-mirroring middleman, not the real
-        // terminal. The renderer upstream (e.g. local veter) is the
-        // authoritative VGE host and the sole command responder.
-        // vsd still parses every VGE command and updates its own
-        // engine state for snapshot replay, but it must not generate
-        // response frames — otherwise the inner program (e.g. vcat)
-        // gets two response envelopes per command, consumes one,
-        // and the leftover bytes leak to whatever's now reading the
-        // inner PTY (typically a shell, which interprets payload
-        // bytes like 0x12 as Ctrl-R and triggers reverse-i-search).
-        vge.set_auto_reply_commands(false);
+        let vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
+        let mut prt = PrtEngine::with_metrics_and_wakeup(
+            DEFAULT_CELL_PX,
+            DEFAULT_SCALE,
+            Arc::new(|| {}),
+        );
+        // A fresh session is unattached, so it starts out answering
+        // its own inner programs. `set_renderer_attached` takes over
+        // from the first chunk onwards.
         Self {
             parser: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, DEFAULT_SCROLLBACK),
             vge,
             // No-op VFT wakeup: the daemon has no event loop to nudge.
             // Per-portal VFT workers still tick, but the host loop polls
             // them every chunk anyway via `drive_and_flush_vft`.
-            prt: PrtEngine::with_metrics_and_wakeup(
-                DEFAULT_CELL_PX,
-                DEFAULT_SCALE,
-                Arc::new(|| {}),
-            ),
+            prt,
             ses: SesEngine::with_session(session_name),
             renderer_stdout: None,
+            answering: true,
             attach_shutdown: None,
         }
+    }
+
+    /// Point the reply channel at whoever is the terminal right now.
+    ///
+    /// While a renderer is attached, the bytes this session produces
+    /// reach it and *it* answers them: it is the real terminal, it
+    /// holds the real cell metrics, and it is the only party that can
+    /// answer a question about the frame it painted (VGE §15
+    /// `QueryHit`). The daemon goes quiet, because a second answer
+    /// doesn't cancel the first — the client consumes one and the
+    /// other lands in whatever is reading that pty by then, which for
+    /// an interactive client is its keyboard input.
+    ///
+    /// While nothing is attached there is no such terminal, so the
+    /// daemon answers rather than leave a client hanging: a program
+    /// started in a detached session still gets its probe answered,
+    /// from the metrics of the last renderer that was here. Sessions
+    /// outlive renderers; the programs inside them shouldn't have to
+    /// care which state they were started in.
+    ///
+    /// Callers must derive `attached` from the same `renderer_stdout`
+    /// check that decides whether the chunk is forwarded, under the
+    /// same lock. That is what makes "answered exactly once" a
+    /// property rather than a likelihood: a chunk is answered here iff
+    /// it is not sent somewhere that will answer it.
+    pub fn set_renderer_attached(&mut self, attached: bool) {
+        let should_answer = !attached;
+        if self.answering == should_answer {
+            return;
+        }
+        self.answering = should_answer;
+        self.vge.set_auto_reply_commands(should_answer);
+        self.vge.set_auto_reply_dsr(should_answer);
+        self.prt.set_portal_auto_reply(should_answer);
     }
 }
 
@@ -181,12 +216,21 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            // One decision with two consequences: the chunk goes to
+            // the renderer iff one is attached, and we answer it iff
+            // it is *not* going to a renderer that will answer it
+            // instead. Taken here, under the lock that also guards
+            // the engines, so the two can never disagree about a
+            // chunk.
+            let attached = guard.renderer_stdout.is_some();
+            guard.set_renderer_attached(attached);
             let EngineState {
                 parser,
                 vge,
                 prt,
                 ses,
-                renderer_stdout,
+                renderer_stdout: _,
+                answering: _,
                 attach_shutdown,
             } = &mut *guard;
 
@@ -242,8 +286,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             // renderer parses PRT/VGE/VFT envelopes natively, so we
             // ship the raw chunk we just received from the inner PTY
             // (not the engine-transformed view).
-            let forward = renderer_stdout.is_some();
-            (out, forward)
+            (out, attached)
         };
 
         if !to_write.is_empty() {
@@ -329,5 +372,184 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
         // Drop closes the write end; if there was no attach the fd
         // simply closes here without effect.
         drop(fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prt_protocol::codec::Reader;
+    use prt_protocol::command::{AnchorMode, Command, CreatePortalBody, WritePortalBody};
+    use prt_protocol::encode::build_envelope;
+    use prt_protocol::frame::{EVT_RAW_REPLY, MARKER_T2C};
+
+    /// A session with one portal open, standing in for a `vmux` pane.
+    fn session_with_portal(attached: bool) -> EngineState {
+        let mut st = EngineState::new("s".into());
+        st.set_renderer_attached(attached);
+        let create = Command::CreatePortal(CreatePortalBody {
+            id: "p1".into(),
+            size_w: 80,
+            size_h: 24,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: 100,
+        });
+        let env = build_envelope(&[(create, 1)]);
+        let _ = st.prt.process_pty_chunk_full(&env);
+        let _ = st.prt.take_responses();
+        st
+    }
+
+    /// Write `data` to the portal the way `vmux` relays its pane's
+    /// output, and return everything that came back for the program
+    /// inside it (the `RawReply` payloads, concatenated).
+    fn write_to_portal(st: &mut EngineState, data: Vec<u8>) -> Vec<u8> {
+        let env = build_envelope(&[(
+            Command::WritePortal(WritePortalBody {
+                id: "p1".into(),
+                data,
+            }),
+            2,
+        )]);
+        let _ = st.prt.process_pty_chunk_full(&env);
+        st.prt.flush_pending_events();
+        let resp = st.prt.take_responses();
+
+        let mut inner = Vec::new();
+        let mut s = prt_protocol::apc::ApcStream::with_marker(*MARKER_T2C);
+        let out = s.feed(&resp);
+        for payload in out.payloads() {
+            let mut r = Reader::new(payload);
+            let _version = r.u8();
+            let _payload_len = r.u32();
+            while !r.at_end() {
+                let Ok(ft) = r.u8() else { break };
+                let _rid = r.u32().unwrap_or(0);
+                let Ok(body_len) = r.u32() else { break };
+                let Ok(body) = r.take(body_len as usize) else { break };
+                if ft == EVT_RAW_REPLY {
+                    let mut br = Reader::new(body);
+                    let _id = br.string();
+                    inner.extend_from_slice(br.bytes().unwrap_or(&[]));
+                }
+            }
+        }
+        inner
+    }
+
+    fn vge_probe_envelope() -> Vec<u8> {
+        let mut frames = Vec::new();
+        vge_protocol::envelope::append_frame(
+            &mut frames,
+            vge_protocol::frame::CMD_PROBE,
+            7,
+            &[],
+        );
+        vge_protocol::envelope::wrap_c2t_envelope(&frames)
+    }
+
+    fn has_probe_response(bytes: &[u8]) -> bool {
+        let mut s =
+            vge_protocol::apc::ApcStream::with_marker(*vge_protocol::frame::MARKER_T2C);
+        let out = s.feed(bytes);
+        out.payloads.iter().any(|p| {
+            let mut r = Reader::new(p);
+            let _version = r.u8();
+            let _payload_len = r.u32();
+            r.u8().ok() == Some(vge_protocol::frame::RSP_PROBE)
+        })
+    }
+
+    /// Attached, the renderer answers the client inside the pane —
+    /// it is the real terminal — so the daemon must not answer too.
+    /// Two replies to one probe is what made `vplay` quit on startup:
+    /// it consumed the first and read the second as keystrokes.
+    #[test]
+    fn attached_portal_vge_probe_is_left_to_the_renderer() {
+        let mut st = session_with_portal(true);
+        let reply = write_to_portal(&mut st, vge_probe_envelope());
+        assert!(
+            !has_probe_response(&reply),
+            "daemon answered a probe the renderer is also answering"
+        );
+    }
+
+    /// Detached there is no renderer to answer, and a session that
+    /// outlives its renderer still has to be usable — a client
+    /// started here gets its probe answered by the daemon.
+    #[test]
+    fn detached_portal_vge_probe_is_answered_here() {
+        let mut st = session_with_portal(false);
+        let reply = write_to_portal(&mut st, vge_probe_envelope());
+        assert!(
+            has_probe_response(&reply),
+            "nobody answered the probe: the client would time out"
+        );
+    }
+
+    /// Same rule for the other reply a portal owes its inner program.
+    #[test]
+    fn attached_portal_dsr_is_left_to_the_renderer() {
+        let mut st = session_with_portal(true);
+        let reply = write_to_portal(&mut st, b"\x1b[6n".to_vec());
+        assert!(
+            reply.is_empty(),
+            "daemon sent a cursor report the renderer also sends: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    #[test]
+    fn detached_portal_dsr_is_answered_here() {
+        let mut st = session_with_portal(false);
+        let reply = write_to_portal(&mut st, b"\x1b[6n".to_vec());
+        assert_eq!(String::from_utf8_lossy(&reply), "\u{1b}[1;1R");
+    }
+
+    /// Queries that arrive while the renderer owns the reply channel
+    /// are consumed, not banked: reattaching, or detaching, must not
+    /// flush a burst of stale cursor reports at the inner program.
+    #[test]
+    fn queries_swallowed_while_attached_do_not_pile_up() {
+        let mut st = session_with_portal(true);
+        let _ = write_to_portal(&mut st, b"\x1b[6n\x1b[6n".to_vec());
+        st.set_renderer_attached(false);
+        let reply = write_to_portal(&mut st, b"x".to_vec());
+        assert!(
+            reply.is_empty(),
+            "detaching replayed queries the renderer already answered: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// The host engines follow the same switch: a client talking
+    /// straight to the session (no `vmux` in between) gets one answer
+    /// in either state.
+    #[test]
+    fn host_level_replies_follow_the_same_switch() {
+        for attached in [true, false] {
+            let mut st = EngineState::new("s".into());
+            st.set_renderer_attached(attached);
+            let chunk = vge_probe_envelope();
+            let prt_chunk = st.prt.process_pty_chunk_full(&chunk);
+            let ses_pass = st.ses.process_pty_chunk(&prt_chunk.passthrough);
+            veter_host::vge::drive_terminal_stage(
+                &mut st.vge,
+                &mut st.parser,
+                &ses_pass,
+                None,
+            );
+            let out = st.vge.take_responses();
+            assert_eq!(
+                has_probe_response(&out),
+                !attached,
+                "attached={attached}: wrong party answered the host probe"
+            );
+        }
     }
 }

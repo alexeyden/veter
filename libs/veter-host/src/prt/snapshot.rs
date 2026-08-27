@@ -394,6 +394,9 @@ fn decode_content(
     let (cell_px, scale_factor) = parent_engine.metrics_for_children();
     let mut vge = crate::vge::VgeEngine::new(cell_px, scale_factor);
     vge.set_auto_reply_dsr(false);
+    // A restored portal answers on the same terms as a freshly
+    // created one — silent in an observer, talkative in a terminal.
+    vge.set_auto_reply_commands(parent_engine.portal_auto_reply());
     vge.restore_from_binary_snapshot(vge_bytes)?;
 
     let mut children = parent_engine.child_engine_scaffold();

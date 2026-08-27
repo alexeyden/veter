@@ -269,6 +269,21 @@ pub struct PrtEngine {
     /// which is what the damage-rule unit tests want. Inherited by
     /// sub-engines.
     damage_min_interval: std::time::Duration,
+    /// Whether the portals in this scope answer the programs running
+    /// inside them — VGE commands and DSR cursor reports, the two
+    /// replies a portal owes its inner program.
+    ///
+    /// True everywhere the engine *is* the terminal. `vsd` turns it
+    /// off for as long as a renderer is attached: the bytes it
+    /// forwards reach a real terminal that answers them itself, and
+    /// two answers to one command is one too many — the client
+    /// consumes the first and the second lands in whatever is reading
+    /// that pty by then. It turns back on the moment the renderer
+    /// leaves, because a detached session still has to be usable.
+    /// Inherited by sub-engines, so the rule holds at every nesting
+    /// depth. See `VgeEngine::set_auto_reply_commands`, which draws
+    /// the same line for the engine one level up.
+    portal_auto_reply: bool,
 }
 
 /// Default floor between §8.10 damage-rule evaluations for one portal.
@@ -376,6 +391,7 @@ impl PrtEngine {
             vft_wakeup,
             vft_hooks,
             damage_min_interval: DEFAULT_DAMAGE_MIN_INTERVAL,
+            portal_auto_reply: true,
         }
     }
 
@@ -385,6 +401,36 @@ impl PrtEngine {
     /// sub-engines spawned afterwards inherit it.
     pub fn set_damage_min_interval(&mut self, interval: std::time::Duration) {
         self.damage_min_interval = interval;
+    }
+
+    /// Turn the portal reply channel on or off for this engine and
+    /// everything below it: VGE command responses and DSR cursor
+    /// reports. Off makes the engine a silent observer of its inner
+    /// programs — it still parses every envelope and keeps its state
+    /// current, it just doesn't speak. See [`Self::portal_auto_reply`]
+    /// for who wants that and why.
+    ///
+    /// Takes effect immediately, on portals already open as well as on
+    /// every portal and sub-engine created afterwards, so a session
+    /// daemon can flip it as a renderer attaches and detaches.
+    pub fn set_portal_auto_reply(&mut self, enabled: bool) {
+        self.portal_auto_reply = enabled;
+        // Both sets: a portal suspended on the other screen comes back
+        // when the inner program swaps buffers (§5.4).
+        let sets = [Some(&mut self.state.main), self.state.alt.as_mut()];
+        for set in sets.into_iter().flatten() {
+            for content in set.contents.values_mut() {
+                content.vge.set_auto_reply_commands(enabled);
+                content.children.set_portal_auto_reply(enabled);
+            }
+        }
+    }
+
+    /// Whether the portals in this scope answer their inner programs.
+    /// Read by the snapshot decoder, which builds portals outside
+    /// `cmd_create_portal`.
+    pub(in crate::prt) fn portal_auto_reply(&self) -> bool {
+        self.portal_auto_reply
     }
 
     /// Install the host's desktop hooks for VFT (§7.1 file picker,
@@ -436,6 +482,7 @@ impl PrtEngine {
             self.host_palette.clone(),
         );
         child.damage_min_interval = self.damage_min_interval;
+        child.portal_auto_reply = self.portal_auto_reply;
         child
     }
 
@@ -1226,10 +1273,14 @@ impl PrtEngine {
             self.host_palette.clone(),
         );
         child_engine.damage_min_interval = self.damage_min_interval;
+        child_engine.portal_auto_reply = self.portal_auto_reply;
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
         // §10 + §13.4 — leave PRT as the sole DSR responder inside the
         // portal so an inner `\x1b[6n` produces exactly one reply.
         portal_vge.set_auto_reply_dsr(false);
+        // A silent observer answers nothing: see
+        // `set_portal_auto_reply`.
+        portal_vge.set_auto_reply_commands(self.portal_auto_reply);
         // §7.3 — seed the reserved `host.*` styles, keyed on this portal's
         // depth so nested clients pick up distinct accent colors. No-op
         // when the host palette is empty.
@@ -1550,6 +1601,7 @@ impl PrtEngine {
         // takes `&mut self` and would otherwise alias.
         // Read before the borrow scope below takes `self.state` mutably.
         let damage_min_interval = self.damage_min_interval;
+        let portal_auto_reply = self.portal_auto_reply;
         // One more level of portal nesting for anything inside this
         // write: an inner `QueryHit` resolves against the pick index
         // entry drawn under this portal's id (VGE §15).
@@ -1727,7 +1779,11 @@ impl PrtEngine {
             //       upload-image acks, etc.).
             //    c. DSR cursor-position auto-replies (PRT is the sole
             //       responder; the per-portal VGE has its DSR auto-
-            //       reply turned off so this isn't doubled).
+            //       reply turned off so this isn't doubled). Skipped
+            //       entirely — the queries still consumed, so they
+            //       can't pile up and all answer at once later — when
+            //       this engine doesn't answer its inner programs
+            //       (`portal_auto_reply`).
             //    All surface to the parent client as a single RawReply.
             let mut reverse = portal.children.take_responses();
             reverse.extend_from_slice(&portal.vge.take_responses());
@@ -1735,10 +1791,13 @@ impl PrtEngine {
             reverse.extend_from_slice(&portal.vss.take_responses());
             reverse.extend_from_slice(&portal.ses.take_responses());
             if portal.pending_cursor_queries > 0 {
-                let (row, col) = portal.vt.screen().cursor_position();
-                let reply = format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
-                for _ in 0..portal.pending_cursor_queries {
-                    reverse.extend_from_slice(reply.as_bytes());
+                if portal_auto_reply {
+                    let (row, col) = portal.vt.screen().cursor_position();
+                    let reply =
+                        format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
+                    for _ in 0..portal.pending_cursor_queries {
+                        reverse.extend_from_slice(reply.as_bytes());
+                    }
                 }
                 portal.pending_cursor_queries = 0;
             }
@@ -4136,6 +4195,95 @@ mod tests {
         assert_eq!(
             dsr_bytes, b"\x1b[3;1R",
             "DSR reply for inner should be \"\\x1b[3;1R\" (row 3, col 1)"
+        );
+    }
+
+    /// `set_portal_auto_reply(false)` is what a session daemon uses
+    /// while a renderer is attached: parse everything, answer nothing.
+    /// It has to hold at every depth — a `vmux` inside a `vmux` is two
+    /// levels of portal — and for portals created after the switch,
+    /// which is the normal case (panes come and go).
+    ///
+    /// "Answer nothing" is specifically the two replies a portal owes
+    /// the *program* inside it: VGE command responses and the DSR
+    /// cursor report. Those arrive as bytes on that program's stdin,
+    /// so a second copy is corruption. PRT's own frames are a
+    /// conversation with the multiplexer client instead — parsed as
+    /// frames, matched by request id — and keep flowing.
+    #[test]
+    fn portal_auto_reply_off_silences_every_depth() {
+        use vge_protocol::frame::CMD_PROBE as VGE_CMD_PROBE;
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        let mut vge_frames = Vec::new();
+        vge_protocol::envelope::append_frame(&mut vge_frames, VGE_CMD_PROBE, 9, &[]);
+        let probe = vge_protocol::envelope::wrap_c2t_envelope(&vge_frames);
+
+        // A sub-portal one level down, the same probe inside it, and a
+        // DSR at the outer level: both reply kinds, at both depths.
+        let mut data = encode::build_envelope(&[(
+            Command::CreatePortal(CreatePortalBody {
+                id: "deep".into(),
+                size_w: 40,
+                size_h: 12,
+                origin_x: 0,
+                origin_y: 0,
+                anchor_mode: AnchorMode::Live,
+                is_visible: true,
+                draw_order: 0,
+                flags: 0,
+                scrollback_lines: 0,
+            }),
+            1,
+        )]);
+        data.extend_from_slice(&encode::build_envelope(&[(
+            Command::WritePortal(WritePortalBody {
+                id: "deep".into(),
+                data: probe,
+            }),
+            2,
+        )]));
+        data.extend_from_slice(b"\x1b[6n");
+
+        /// Everything the engine sent back towards the inner program.
+        fn reverse_bytes(frames: &[ParsedFrame]) -> Vec<u8> {
+            match first_event(frames, EVT_RAW_REPLY) {
+                Some(raw) => {
+                    let mut r = Reader::new(&raw.body);
+                    assert_eq!(r.string().unwrap(), "p");
+                    r.bytes().unwrap().to_vec()
+                }
+                None => Vec::new(),
+            }
+        }
+
+        // Portal created *after* the switch.
+        let mut engine = PrtEngine::new();
+        engine.set_portal_auto_reply(false);
+        let silent = reverse_bytes(&create_and_write(&mut engine, "p", 80, 24, &data));
+        assert!(
+            !contains(&silent, b"\x1b_vge"),
+            "a silenced engine answered a VGE command"
+        );
+        assert!(
+            !contains(&silent, b"\x1b[1;1R"),
+            "a silenced engine sent a cursor report"
+        );
+
+        // The same traffic with replies on, so the assertions above
+        // are measuring the switch and not a write that went nowhere.
+        let mut engine = PrtEngine::new();
+        let talking = reverse_bytes(&create_and_write(&mut engine, "p", 80, 24, &data));
+        assert!(
+            contains(&talking, b"\x1b_vge"),
+            "replies on: the nested portal should have answered the probe"
+        );
+        assert!(
+            contains(&talking, b"\x1b[1;1R"),
+            "replies on: the portal should have sent a cursor report"
         );
     }
 

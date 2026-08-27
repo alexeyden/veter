@@ -125,6 +125,46 @@ Each session process owns:
   inner PTY master, and (during an attach) a handler thread plus a
   winsize-watcher thread.
 
+**The daemon mirrors; whoever holds the screen answers.** `vsd`
+parses every VGE envelope the inner program emits and updates its
+engines from it. Whether it *replies* depends on where those bytes are
+going:
+
+- **Attached.** The chunk is forwarded to the renderer, which is the
+  real terminal: it holds the real cell metrics, paints the real
+  frame, and is the only party that can answer a question about what
+  it painted (`QueryHit`, §15 of the VGE spec). It answers, and the
+  reply travels back down the path the bytes came up. The daemon stays
+  quiet — a second answer does not cancel the first. The client
+  consumes one, and the other arrives late and lands in whatever is
+  reading that pty by then; for an interactive client that is its
+  keyboard input, where `ESC _` is not a key.
+- **Detached.** Nothing was forwarded, so nobody else is going to
+  answer, and the daemon does — from the metrics of the last renderer
+  that attached, or the defaults if there has not been one. Sessions
+  outlive renderers, and a program started in a detached session must
+  still be able to probe and draw. It should not have to know which
+  state it was started in.
+
+These are one decision rather than two: **the daemon answers exactly
+those chunks it does not forward**, decided under the same lock that
+guards the engines, which is what makes "answered exactly once" a
+property and not a likelihood. It covers both replies a terminal owes
+a program on its stdin — VGE command responses and the DSR cursor
+report — at the top level and inside every portal at any nesting depth
+(`EngineState::set_renderer_attached`,
+`VgeEngine::set_auto_reply_commands`,
+`PrtEngine::set_portal_auto_reply`). Cursor queries that arrive while
+the renderer owns the channel are consumed, not banked, so a detach
+never flushes a burst of stale reports at the inner program.
+
+PRT's own frames sit outside the rule and both sides emit them: they
+are a conversation with the multiplexer client, matched by request id
+and parsed as frames rather than read as keystrokes, so a duplicate is
+absorbed instead of corrupting anything. SES is the daemon's alone —
+it is the session host, and the renderer's portal would answer "not in
+a session", which is false.
+
 Sessions are identified by string name (≤ 64 bytes, the same rules
 as element IDs in §6.8 of the portal spec). The runtime directory
 acts as the name registry: a name exists iff `<NAME>.sock` is
