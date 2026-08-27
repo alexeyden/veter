@@ -1,6 +1,16 @@
 //! Keyboard + SGR-mouse input parsing for the event loop. Stateful so
 //! escape sequences split across reads are reassembled.
 
+use std::time::{Duration, Instant};
+
+/// How long an unterminated escape sequence may sit in the buffer
+/// before it is thrown away. A control string split across reads (a
+/// protocol reply crossing a network boundary) completes in
+/// milliseconds; one still open after this was never going to close —
+/// `Esc` followed by `_` typed by hand — and holding it any longer
+/// would swallow every keystroke queued behind it.
+const SEQ_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
     Up,
@@ -49,9 +59,21 @@ pub enum Event {
     },
 }
 
-#[derive(Default)]
 pub struct InputParser {
     buf: Vec<u8>,
+    /// When input last arrived. An incomplete sequence is only
+    /// abandoned once nothing has come in for [`SEQ_TIMEOUT`], so a
+    /// reply split across reads is still reassembled.
+    last_input: Instant,
+}
+
+impl Default for InputParser {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            last_input: Instant::now(),
+        }
+    }
 }
 
 impl InputParser {
@@ -63,13 +85,25 @@ impl InputParser {
     /// Incomplete escape sequences are retained for the next call.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
         self.buf.extend_from_slice(bytes);
+        self.last_input = Instant::now();
         self.drain(false)
     }
 
     /// Called on idle timeout: a lone ESC still buffered is treated as
-    /// Quit (rather than the start of an unfinished sequence).
+    /// Quit (rather than the start of an unfinished sequence), and a
+    /// longer sequence that has stopped arriving is discarded.
+    ///
+    /// Dropping it is the lesser evil. If the rest does turn up later
+    /// its bytes read as keys — which is what a whole envelope used to
+    /// do, and needs a second-long stall mid-envelope to happen at all
+    /// — whereas holding it holds every keystroke behind it too, and a
+    /// sequence that never completes would take the keyboard with it.
     pub fn flush(&mut self) -> Vec<Event> {
-        self.drain(true)
+        let events = self.drain(true);
+        if !self.buf.is_empty() && self.last_input.elapsed() > SEQ_TIMEOUT {
+            self.buf.clear();
+        }
+        events
     }
 
     fn drain(&mut self, eof: bool) -> Vec<Event> {
@@ -124,6 +158,22 @@ impl InputParser {
                         } else {
                             break;
                         }
+                    } else if matches!(b[i + 1], b'_' | b'P' | b']' | b'^' | b'X') {
+                        // A control string — APC / DCS / OSC / PM / SOS —
+                        // not a keypress. These reach us as replies the
+                        // terminal sent: a VGE response envelope
+                        // (`ESC _ vge … ESC \`), an OSC colour report,
+                        // a DCS answer. Read as keys they are a burst of
+                        // garbage that starts with a Quit, so skip the
+                        // whole string and emit nothing.
+                        match find_string_end(&b[i..]) {
+                            Some(len) => i += len,
+                            None => break, // incomplete — keep buffering
+                        }
+                    } else if b[i + 1] == b'\\' {
+                        // A stray ST with no string open. Nothing to do
+                        // with it, but it is certainly not a keypress.
+                        i += 2;
                     } else {
                         // Some other ESC-prefixed key we don't handle.
                         out.push(Event::Quit);
@@ -185,6 +235,34 @@ impl InputParser {
         }
         out
     }
+}
+
+/// Length of the control string starting at `s[0] == ESC`, including
+/// its terminator: `ESC \` (ST) for APC / DCS / PM / SOS, and either
+/// that or BEL for OSC. `None` while the terminator is still on its
+/// way.
+///
+/// A literal ESC inside a VGE or PRT payload arrives byte-stuffed as
+/// `ESC ESC` (§1.3 of the extension specs), so the scan steps over
+/// escaped pairs instead of stopping at the first ESC it meets —
+/// otherwise a payload carrying `ESC ESC \` would look like the end of
+/// the envelope and the rest of it would spill out as keystrokes.
+fn find_string_end(s: &[u8]) -> Option<usize> {
+    let osc = s[1] == b']';
+    let mut i = 2;
+    while i < s.len() {
+        match s[i] {
+            0x07 if osc => return Some(i + 1),
+            0x1B => {
+                if *s.get(i + 1)? == b'\\' {
+                    return Some(i + 2);
+                }
+                i += 2; // stuffed `ESC ESC` — step over the pair
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn arrow_from_final(f: u8) -> Option<Event> {
@@ -335,6 +413,74 @@ mod tests {
         let mut p = InputParser::new();
         assert!(p.feed(b"\x1b").is_empty());
         assert_eq!(p.flush(), vec![Event::Quit]);
+    }
+
+    /// Build a VGE ProbeResponse envelope — what the terminal sends
+    /// back, and what a client can find on its stdin when something
+    /// upstream answers a command twice.
+    fn probe_response_envelope() -> Vec<u8> {
+        use vge_protocol::envelope::{ProbeBody, append_frame, wrap_t2c_envelope};
+        let body = ProbeBody {
+            protocol_version: 1,
+            cell_pixel_width: 9,
+            cell_pixel_height: 20,
+            scale_factor: 1.0,
+            max_elements: 4096,
+            max_commands_per_element: 256,
+            max_text_bytes: 65536,
+            max_image_bytes: 32 << 20,
+            max_images: 1024,
+            supported_image_encodings: 0x03,
+            max_nesting_depth: 8,
+        };
+        let mut frames = Vec::new();
+        append_frame(&mut frames, vge_protocol::frame::RSP_PROBE, 1, &body.encode());
+        wrap_t2c_envelope(&frames)
+    }
+
+    #[test]
+    fn stray_vge_envelope_is_not_input() {
+        // The bug this guards: under `vsd` an inner client used to get
+        // two replies to its probe, and the straggler landed in the
+        // event loop. `ESC _` read as "an ESC-prefixed key we don't
+        // handle" — Quit — and vplay exited the moment it started.
+        let mut p = InputParser::new();
+        assert!(p.feed(&probe_response_envelope()).is_empty());
+        // The envelope is fully consumed: a keystroke behind it still
+        // arrives, and arrives as itself.
+        assert_eq!(p.feed(b"+"), vec![Event::ZoomIn]);
+    }
+
+    #[test]
+    fn split_vge_envelope_reassembles() {
+        // Split mid-payload, the way a reply crossing a network
+        // boundary reaches us.
+        let env = probe_response_envelope();
+        let cut = env.len() / 2;
+        let mut p = InputParser::new();
+        assert!(p.feed(&env[..cut]).is_empty());
+        assert!(p.flush().is_empty(), "a half-arrived envelope is not a key");
+        assert!(p.feed(&env[cut..]).is_empty());
+        assert_eq!(p.feed(b"q"), vec![Event::Quit]);
+    }
+
+    #[test]
+    fn osc_reply_is_not_input() {
+        // OSC ends at BEL as well as at ST. `10;rgb:…` would otherwise
+        // read as Fit, StepPrev, a pan and a zoom.
+        let mut p = InputParser::new();
+        assert!(p.feed(b"\x1b]10;rgb:1e1e/1e1e/1e1e\x07").is_empty());
+        assert_eq!(p.feed(b"0"), vec![Event::Fit]);
+    }
+
+    #[test]
+    fn stuffed_esc_does_not_end_the_envelope_early() {
+        // §1.3 byte-stuffing: a literal ESC in a payload arrives as
+        // `ESC ESC`. Scanning naively for `ESC \\` would cut the
+        // envelope short here and spill `q` as a keypress.
+        let mut p = InputParser::new();
+        assert!(p.feed(b"\x1b_vge\x1b\x1b\\q\x1b\\").is_empty());
+        assert_eq!(p.feed(b"."), vec![Event::StepNext]);
     }
 
     #[test]
