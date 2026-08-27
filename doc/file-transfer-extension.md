@@ -955,6 +955,24 @@ engine, because PRT already extracted the byte stream at the
 portal scope) and the inner program falls back to non-VFT
 operation.
 
+**Relays.** A host that is not the user's terminal but a stage on the
+way to one — a session daemon mirroring a session for a renderer
+elsewhere, the case §1.1 describes — MUST NOT implement VFT at any
+depth. The far end of a transfer is the user's filesystem and the
+user's file picker; a relay that answered would move the file on the
+wrong machine, and alongside the terminal that received the same bytes
+and answered too.
+
+Such a host SHOULD nonetheless *extract* VFT envelopes from the stream
+it mirrors and discard them, rather than leave them for its vt100 to
+swallow as above. That works for a probe, whose payload contains no
+ESC. It does not work for file bytes: §1.3 stuffing sends a literal
+ESC as `ESC ESC`, so a chunk containing the pair `ESC \` arrives as
+`ESC ESC \`, which closes the APC string early in a vte-style parser
+and spills the remainder of the payload onto the screen as text. What
+the relay forwards is unaffected — only its own mirrored screen is at
+stake, and a mirror that doesn't match is the one thing it cannot be.
+
 **VFT inside a portal.** When per-portal VFT is implemented:
 
 - `VFT` envelopes inside the portal byte stream are extracted by

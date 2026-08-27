@@ -175,6 +175,9 @@ pub struct VftEngine {
     /// [`HeadlessHooks`](crate::vft::HeadlessHooks); `veter` installs
     /// a real one, `vsd` deliberately does not.
     hooks: Hooks,
+    /// Relay mode: extract VFT envelopes from the byte stream and drop
+    /// them unread. See [`VftEngine::set_relay`].
+    relay: bool,
 }
 
 struct PendingPicker {
@@ -219,7 +222,37 @@ impl VftEngine {
             download_window: DOWNLOAD_WINDOW_BYTES,
             wakeup,
             hooks,
+            relay: false,
         }
+    }
+
+    /// Make this engine a **relay**: it still lifts `ESC _ VFT …`
+    /// envelopes out of the byte stream, but decodes nothing, starts
+    /// nothing, and answers nothing.
+    ///
+    /// For a session daemon, which is what wants this. VFT moves a
+    /// file between the program's filesystem and *the user's* —
+    /// §7.1's file picker, §6.1's open-after-finalize, one desktop
+    /// session. A daemon has none of that: it would write the file on
+    /// the wrong machine, with `HeadlessHooks` for a picker, and
+    /// answer alongside the terminal that also received the bytes. So
+    /// it implements nothing and relays instead, exactly as §1.1
+    /// describes ("a remote `vsd` consuming PRT + VGE while a `vsend`
+    /// running inside its session emits VFT bytes that must reach the
+    /// local user's terminal"). The forwarding is of the raw chunk,
+    /// so what the terminal upstream receives is untouched.
+    ///
+    /// The envelopes are still *extracted*, rather than left in the
+    /// stream for the vt100 to swallow the way §10 suggests. That
+    /// holds for a probe, whose payload has no ESC in it, but not for
+    /// file bytes: §1.3 stuffing turns a literal ESC into `ESC ESC`,
+    /// so a chunk containing the pair `ESC \` reaches the parser as
+    /// `ESC ESC \`, which ends the APC string early — and the rest of
+    /// the payload lands on the grid as text. Any file of any size
+    /// contains that pair sooner or later. Extracting keeps the
+    /// mirrored screen exact, which is the daemon's whole job.
+    pub fn set_relay(&mut self, relay: bool) {
+        self.relay = relay;
     }
 
     /// Install the host's desktop hooks after construction. Used by
@@ -262,8 +295,10 @@ impl VftEngine {
     /// asynchronous worker events are surfaced by `drive()`.
     pub fn process_pty_chunk(&mut self, input: &[u8]) -> Vec<u8> {
         let out = self.apc.feed(input);
-        for payload in out.payloads {
-            self.handle_envelope_payload(&payload);
+        if !self.relay {
+            for payload in out.payloads {
+                self.handle_envelope_payload(&payload);
+            }
         }
         out.passthrough
     }

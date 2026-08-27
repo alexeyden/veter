@@ -3,7 +3,7 @@
 //! Each [`Session`](crate::session::Session) owns an `Arc<Mutex<EngineState>>`
 //! and spawns one of these workers when the session is created. The
 //! worker reads from a dup of the inner PTY master, runs the bytes
-//! through PRT → VGE → vt100 in the same order as
+//! through PRT → VFT → SES → VGE → vt100 in the same order as
 //! `veter/src/main.rs::App::process_pty_output`, and writes any
 //! engine-generated responses back to the PTY master — when it is the
 //! one that should be answering at all, which is
@@ -41,6 +41,7 @@ use anyhow::{Context, Result};
 
 use veter_host::prt::PrtEngine;
 use veter_host::ses::SesEngine;
+use veter_host::vft::VftEngine;
 use veter_host::vge::VgeEngine;
 
 /// Default grid size used until the renderer attaches and reports its
@@ -66,6 +67,16 @@ pub struct EngineState {
     pub parser: vt100::Parser,
     pub vge: VgeEngine,
     pub prt: PrtEngine,
+    /// Host-level VFT **relay** (`VftEngine::set_relay`). The daemon
+    /// implements no file transfer — see `new` — but it must still
+    /// lift `ESC _ VFT …` envelopes out of the stream before the
+    /// vt100 sees them. A stuffed payload byte pair `ESC \` closes
+    /// the APC string early in the parser and the rest of the file's
+    /// bytes land on the mirrored grid as text; the renderer, which
+    /// does extract them, would show nothing of the sort, and the
+    /// mirror is supposed to match. The portals do the same one level
+    /// down, via `PrtEngine::set_vft_relay`.
+    pub vft: VftEngine,
     /// SES engine carrying this session's name. Answers a `vmux` SES
     /// probe with `in_session = true` + the name, and turns a `Detach`
     /// command into a self-pipe wake (see `worker_main`).
@@ -106,13 +117,30 @@ impl EngineState {
         // A fresh session is unattached, so it starts out answering
         // its own inner programs. `set_renderer_attached` takes over
         // from the first chunk onwards.
+        //
+        // VFT is the one extension the daemon never implements, in
+        // either state. A transfer's destination is the user's
+        // machine — its file picker, its desktop — and that is the
+        // renderer's, never ours; a daemon that answered would write
+        // the file on the wrong host, silently, alongside the
+        // terminal that received the same bytes. So each portal
+        // lifts VFT envelopes out of its byte stream (they would
+        // otherwise spill onto the mirrored grid, see
+        // `VftEngine::set_relay`) and drops them, while the verbatim
+        // forward carries the real transfer upstream. `vft-protocol`
+        // §1.1 names this exact arrangement; the host-level engine
+        // has never been instantiated here for the same reason.
+        prt.set_vft_relay(true);
+        let mut vft = VftEngine::with_wakeup(Arc::new(|| {}));
+        vft.set_relay(true);
         Self {
             parser: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, DEFAULT_SCROLLBACK),
             vge,
-            // No-op VFT wakeup: the daemon has no event loop to nudge.
-            // Per-portal VFT workers still tick, but the host loop polls
-            // them every chunk anyway via `drive_and_flush_vft`.
+            // No-op VFT wakeup: the daemon has no event loop to
+            // nudge, and with the relay above there are no per-portal
+            // workers left to nudge it from.
             prt,
+            vft,
             ses: SesEngine::with_session(session_name),
             renderer_stdout: None,
             answering: true,
@@ -187,12 +215,13 @@ fn dup_owned(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
 /// whatever remains. After every chunk we run both engines'
 /// `after_vt100_process` hooks and write back any pending responses.
 ///
-/// VFT is intentionally **not** instantiated host-side in vsd: per
+/// VFT is intentionally **not** implemented in vsd, at any depth: per
 /// the architecture sketch in `doc/session-manager.md`, VFT envelopes
 /// ride through the daemon verbatim (the pass-through contract in
-/// `doc/file-transfer-extension.md` §1.1 makes this normative). The
-/// per-portal VFT engines inside the PRT tree still tick via
-/// `drive_and_flush_vft`.
+/// `doc/file-transfer-extension.md` §1.1 makes this normative). No
+/// host-level engine is instantiated at all, and the per-portal ones
+/// in the PRT tree are relays: they lift the envelopes out of the
+/// byte stream, so the mirrored grid stays exact, and drop them.
 fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<EngineState>>) {
     let mut reader = std::fs::File::from(reader_fd);
     let mut writer = std::fs::File::from(writer_fd);
@@ -228,6 +257,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 parser,
                 vge,
                 prt,
+                vft,
                 ses,
                 renderer_stdout: _,
                 answering: _,
@@ -235,12 +265,16 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
+            // VFT is extracted and dropped (the engine is a relay):
+            // the transfer belongs to the renderer, but the envelope
+            // must not reach the vt100 — see the field's doc.
+            let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
             // SES is consumed here — the inner vmux is the SES client,
             // vsd is its host — and VGE runs last as the terminal
             // stage, driving the vt100 itself so element origins
             // resolve against the screen the inner program saw. See
             // `veter_host::vge::drive_terminal_stage`.
-            let ses_passthrough = ses.process_pty_chunk(&prt_chunk.passthrough);
+            let ses_passthrough = ses.process_pty_chunk(&vft_passthrough);
             // No hit tester: vsd holds the session state but the
             // renderer painting it is a different process, so a VGE
             // `QueryHit` (§15) is answered `err_no_hit_testing`
@@ -525,6 +559,56 @@ mod tests {
             "detaching replayed queries the renderer already answered: {:?}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    fn vft_probe_envelope() -> Vec<u8> {
+        let mut frames = Vec::new();
+        veter_host::vft::envelope::append_frame(
+            &mut frames,
+            veter_host::vft::frame::CMD_PROBE,
+            5,
+            &[],
+        );
+        veter_host::vft::envelope::wrap_c2h_envelope(&frames)
+    }
+
+    /// A `vsend` inside a pane talks to the *renderer* — that is
+    /// where the user's filesystem and file picker are. The daemon
+    /// answers nothing, attached or not: a second answer from the
+    /// wrong machine is worse than none.
+    #[test]
+    fn portal_vft_is_never_answered_here() {
+        for attached in [true, false] {
+            let mut st = session_with_portal(attached);
+            let reply = write_to_portal(&mut st, vft_probe_envelope());
+            assert!(
+                reply.is_empty(),
+                "attached={attached}: daemon answered a VFT command: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+    }
+
+    /// …and the envelope is still lifted out of the stream, so file
+    /// bytes never reach the grid this session will hand the next
+    /// renderer as a snapshot. Directly on the session pty, not in a
+    /// pane: the host pipeline needs the relay stage too.
+    #[test]
+    fn host_level_vft_never_reaches_the_mirrored_grid() {
+        let mut st = EngineState::new("s".into());
+        // A chunk carrying the stuffed pair that ends an APC string
+        // early in the vt100 parser (§1.3 turns a literal ESC into
+        // `ESC ESC`, so file bytes `ESC \` arrive as `ESC ESC \`).
+        let mut chunk = b"before\x1b_VFT".to_vec();
+        chunk.extend_from_slice(b"\x1b\x1b\\FILEBYTES\x1b\\after".as_ref());
+
+        let prt_chunk = st.prt.process_pty_chunk_full(&chunk);
+        let vft_passthrough = st.vft.process_pty_chunk(&prt_chunk.passthrough);
+        let ses_pass = st.ses.process_pty_chunk(&vft_passthrough);
+        veter_host::vge::drive_terminal_stage(&mut st.vge, &mut st.parser, &ses_pass, None);
+
+        let screen = st.parser.screen().contents();
+        assert_eq!(screen.trim_end(), "beforeafter", "file bytes reached the grid");
     }
 
     /// The host engines follow the same switch: a client talking

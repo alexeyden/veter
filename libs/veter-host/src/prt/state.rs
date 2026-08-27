@@ -284,6 +284,15 @@ pub struct PrtEngine {
     /// depth. See `VgeEngine::set_auto_reply_commands`, which draws
     /// the same line for the engine one level up.
     portal_auto_reply: bool,
+    /// Whether the portals in this scope *implement* VFT or merely
+    /// relay it. A relay lifts the envelopes out of the byte stream —
+    /// so they never reach a vt100 that would spill their payload
+    /// onto the grid — and drops them, leaving the file transfer to
+    /// the terminal the bytes are forwarded to. `vsd` sets this for
+    /// good, not per attach: unlike a screen, a file has one correct
+    /// destination and it is never the daemon's machine. See
+    /// `VftEngine::set_relay`. Inherited by sub-engines.
+    vft_relay: bool,
 }
 
 /// Default floor between §8.10 damage-rule evaluations for one portal.
@@ -392,6 +401,7 @@ impl PrtEngine {
             vft_hooks,
             damage_min_interval: DEFAULT_DAMAGE_MIN_INTERVAL,
             portal_auto_reply: true,
+            vft_relay: false,
         }
     }
 
@@ -431,6 +441,20 @@ impl PrtEngine {
     /// `cmd_create_portal`.
     pub(in crate::prt) fn portal_auto_reply(&self) -> bool {
         self.portal_auto_reply
+    }
+
+    /// Relay VFT rather than implement it, in this scope and every
+    /// scope below. See [`Self::vft_relay`] for why a session daemon
+    /// wants that and a terminal never does.
+    pub fn set_vft_relay(&mut self, relay: bool) {
+        self.vft_relay = relay;
+        let sets = [Some(&mut self.state.main), self.state.alt.as_mut()];
+        for set in sets.into_iter().flatten() {
+            for content in set.contents.values_mut() {
+                content.vft.set_relay(relay);
+                content.children.set_vft_relay(relay);
+            }
+        }
     }
 
     /// Install the host's desktop hooks for VFT (§7.1 file picker,
@@ -483,6 +507,7 @@ impl PrtEngine {
         );
         child.damage_min_interval = self.damage_min_interval;
         child.portal_auto_reply = self.portal_auto_reply;
+        child.vft_relay = self.vft_relay;
         child
     }
 
@@ -491,10 +516,12 @@ impl PrtEngine {
     /// snapshotted; on
     /// reattach every portal starts with an empty transfer table.
     pub(in crate::prt) fn spawn_portal_vft(&self) -> crate::vft::VftEngine {
-        crate::vft::VftEngine::with_wakeup_and_hooks(
+        let mut vft = crate::vft::VftEngine::with_wakeup_and_hooks(
             self.vft_wakeup.clone(),
             self.vft_hooks.clone(),
-        )
+        );
+        vft.set_relay(self.vft_relay);
+        vft
     }
 
     /// Replace `state` with one decoded from a binary snapshot. Used
@@ -812,6 +839,13 @@ impl PrtEngine {
     /// so the resulting envelopes ride out via the next
     /// `take_responses`.
     pub fn drive_and_flush_vft(&mut self) {
+        if self.vft_relay {
+            // Nothing to drive here or below: a relay starts no
+            // transfers, so it owns no workers. Skipping the walk
+            // also spares the daemon a per-chunk clone of every
+            // portal id in the tree.
+            return;
+        }
         let portal_ids: Vec<String> = self
             .state
             .current()
@@ -1274,6 +1308,7 @@ impl PrtEngine {
         );
         child_engine.damage_min_interval = self.damage_min_interval;
         child_engine.portal_auto_reply = self.portal_auto_reply;
+        child_engine.vft_relay = self.vft_relay;
         let mut portal_vge = crate::vge::VgeEngine::new(self.cell_px, self.scale_factor);
         // §10 + §13.4 — leave PRT as the sole DSR responder inside the
         // portal so an inner `\x1b[6n` produces exactly one reply.
@@ -1288,11 +1323,9 @@ impl PrtEngine {
 
         // §10 (vft-in-portal) — every portal owns its own VFT engine.
         // Workers share the host's wakeup so async events from any
-        // depth tick the host's main loop.
-        let portal_vft = crate::vft::VftEngine::with_wakeup_and_hooks(
-            self.vft_wakeup.clone(),
-            self.vft_hooks.clone(),
-        );
+        // depth tick the host's main loop. In a relay it parses and
+        // drops instead (`vft_relay`).
+        let portal_vft = self.spawn_portal_vft();
 
         let set = self.state.current_mut();
         let creation_seq = set.next_seq();
@@ -4284,6 +4317,93 @@ mod tests {
         assert!(
             contains(&talking, b"\x1b[1;1R"),
             "replies on: the portal should have sent a cursor report"
+        );
+    }
+
+    /// A relay portal (what a session daemon runs) must answer no VFT
+    /// command — the transfer belongs to the terminal the bytes are
+    /// forwarded to, which has the user's filesystem and file picker
+    /// — and must still take the envelopes *out* of the byte stream,
+    /// so the mirrored grid matches the one that terminal paints.
+    #[test]
+    fn vft_relay_answers_nothing_and_leaves_the_grid_clean() {
+        fn probe_envelope() -> Vec<u8> {
+            let mut frames = Vec::new();
+            vft_protocol::envelope::append_frame(
+                &mut frames,
+                vft_protocol::frame::CMD_PROBE,
+                5,
+                &[],
+            );
+            vft_protocol::envelope::wrap_c2h_envelope(&frames)
+        }
+
+        let mut data = b"before".to_vec();
+        data.extend_from_slice(&probe_envelope());
+        data.extend_from_slice(b"after");
+
+        let mut engine = PrtEngine::new();
+        engine.set_vft_relay(true);
+        let frames = create_and_write(&mut engine, "p", 80, 24, &data);
+        assert!(
+            first_event(&frames, EVT_RAW_REPLY).is_none(),
+            "a relay answered a VFT command"
+        );
+        let screen = engine
+            .state
+            .current()
+            .content("p")
+            .unwrap()
+            .vt
+            .screen()
+            .contents();
+        assert_eq!(screen.trim_end(), "beforeafter");
+
+        // Implementing it is still the default, and still works.
+        let mut engine = PrtEngine::new();
+        let frames = create_and_write(&mut engine, "p", 80, 24, &data);
+        assert!(
+            first_event(&frames, EVT_RAW_REPLY).is_some(),
+            "a terminal should answer a VFT probe from inside a portal"
+        );
+    }
+
+    /// Why a relay extracts rather than leaving the envelope for the
+    /// vt100 to swallow, which is what §10 of the VFT spec assumes a
+    /// non-implementing host can do. That holds for a probe, whose
+    /// payload has no ESC in it. It does not hold for file bytes:
+    /// §1.3 stuffing sends a literal ESC as `ESC ESC`, so a chunk
+    /// containing the pair `ESC \` arrives as `ESC ESC \`, ends the
+    /// APC string early in the parser, and spills the rest of the
+    /// payload onto the grid as text.
+    #[test]
+    fn vft_relay_swallows_a_payload_the_vt100_would_have_spilled() {
+        // A "file chunk" carrying the pair that breaks the APC scan.
+        let mut envelope = b"\x1b_VFT".to_vec();
+        envelope.extend_from_slice(b"\x1b\x1b\\FILEBYTES");
+        envelope.extend_from_slice(b"\x1b\\");
+
+        let mut bare = vt100::Parser::new(4, 40, 0);
+        bare.process(&envelope);
+        assert!(
+            bare.screen().contents().contains("FILEBYTES"),
+            "premise of this test: an unextracted payload reaches the grid"
+        );
+
+        let mut engine = PrtEngine::new();
+        engine.set_vft_relay(true);
+        let _ = create_and_write(&mut engine, "p", 80, 24, &envelope);
+        let screen = engine
+            .state
+            .current()
+            .content("p")
+            .unwrap()
+            .vt
+            .screen()
+            .contents();
+        assert!(
+            screen.trim().is_empty(),
+            "relay let file bytes onto the mirrored grid: {screen:?}"
         );
     }
 

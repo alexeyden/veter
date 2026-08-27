@@ -158,6 +158,21 @@ report — at the top level and inside every portal at any nesting depth
 the renderer owns the channel are consumed, not banked, so a detach
 never flushes a burst of stale reports at the inner program.
 
+VFT runs the other way round from VGE: the daemon never implements
+it, attached or not. A transfer's far end is the user's filesystem —
+§7.1's file picker, §6.1's open-after-finalize, one desktop session —
+and that is the renderer's machine, never the daemon's. So the host
+stream and every portal run a VFT **relay**: envelopes are lifted out
+of the byte stream and dropped, while the verbatim forward carries the
+transfer to the terminal that can actually complete it
+(`VftEngine::set_relay`, `PrtEngine::set_vft_relay`). Lifting them out
+matters as much as not answering them: a stuffed payload pair `ESC \`
+ends the APC string early in a vte-based parser, and the rest of the
+file's bytes would land on the mirrored grid as text — a screen the
+renderer never showed, which the next attach would then hand back as a
+snapshot. With nothing attached a transfer simply doesn't start, which
+is the honest outcome: there is no destination.
+
 PRT's own frames sit outside the rule and both sides emit them: they
 are a conversation with the multiplexer client, matched by request id
 and parsed as frames rather than read as keystrokes, so a duplicate is
