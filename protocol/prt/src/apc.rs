@@ -170,6 +170,14 @@ pub struct ApcStream {
     marker_buf: [u8; 3],
     /// How many of `marker_buf` have arrived.
     marker_len: usize,
+    /// In `RecoverPrefix`, how many of `marker_buf`'s bytes an earlier
+    /// `flush_pending_esc` already handed to the caller — `None` before
+    /// the first flush of this recovery, at which point the `_` goes
+    /// out too. Set back to `None` whenever `RecoverPrefix` is
+    /// (re-)entered. A repeat idle flush must not re-emit what an
+    /// earlier one already sent, and the final exit (match or
+    /// mismatch) must only emit the bytes that are still unsent.
+    recover_flushed: Option<usize>,
     /// Parameter / intermediate bytes of the CSI being observed.
     csi: Vec<u8>,
 }
@@ -252,6 +260,7 @@ impl ApcStream {
             body: Vec::new(),
             marker_buf: [0; 3],
             marker_len: 0,
+            recover_flushed: None,
             csi: Vec::new(),
         }
     }
@@ -265,6 +274,7 @@ impl ApcStream {
             body: Vec::new(),
             marker_buf: [0; 3],
             marker_len: 0,
+            recover_flushed: None,
             csi: Vec::new(),
         }
     }
@@ -371,9 +381,17 @@ impl ApcStream {
     /// whichever pane had focus.
     ///
     /// Mid-envelope and mid-CSI states are left alone, because their
-    /// bodies must arrive in full. A `RecoverPrefix` whose marker
-    /// never completed is released here, minus the ESC the caller
-    /// already has.
+    /// bodies must arrive in full. A `RecoverPrefix` still short of its
+    /// marker hands back whatever it holds — but, unlike the ESC
+    /// above, it does *not* give up on recovering the envelope:
+    /// nothing stops the rest of a genuinely split envelope from
+    /// arriving behind a second idle gap (a slow link, or nesting —
+    /// `vmux -> ssh -> vsd -> vmux` stacks several of these idle
+    /// windows), and every byte flushed so far is one this pane
+    /// already typed regardless. So the state stays `RecoverPrefix`;
+    /// only the accounting of what has already gone out moves,
+    /// tracked by `recover_flushed` so a later flush or the eventual
+    /// match/mismatch exit doesn't repeat it.
     pub fn flush_pending_esc(&mut self) -> Vec<u8> {
         match self.state {
             State::EscPending => {
@@ -383,14 +401,17 @@ impl ApcStream {
                 self.state = State::EscFlushed;
                 vec![ESC]
             }
-            // Giving up on a recovery that never completed its marker:
-            // hand back the bytes still held. Without the ESC — the
-            // consumer got that one already.
             State::RecoverPrefix => {
-                let mut out = vec![APC_OPEN];
-                out.extend_from_slice(&self.marker_buf[..self.marker_len]);
-                self.marker_len = 0;
-                self.state = State::Idle;
+                let mut out = Vec::new();
+                let already = match self.recover_flushed {
+                    None => {
+                        out.push(APC_OPEN);
+                        0
+                    }
+                    Some(n) => n,
+                };
+                out.extend_from_slice(&self.marker_buf[already..self.marker_len]);
+                self.recover_flushed = Some(self.marker_len);
                 out
             }
             _ => Vec::new(),
@@ -437,6 +458,7 @@ impl ApcStream {
             State::EscFlushed => match b {
                 APC_OPEN => {
                     self.marker_len = 0;
+                    self.recover_flushed = None;
                     State::RecoverPrefix
                 }
                 ESC => State::EscPending,
@@ -451,20 +473,31 @@ impl ApcStream {
                 if self.marker_len < 3 {
                     State::RecoverPrefix
                 } else if self.marker_buf == self.marker {
-                    // The split envelope, back in one piece.
+                    // The split envelope, back in one piece. Whatever
+                    // an idle flush already forwarded from the prefix
+                    // is stuck at the pane, but the rest is ours again.
                     self.body.clear();
+                    self.recover_flushed = None;
                     State::ApcPrt
                 } else {
                     // Someone else's APC, or a `_` the user typed after
-                    // pressing Esc. Pass what we hold and return to
+                    // pressing Esc. Pass whatever of `marker_buf` an
+                    // idle flush hasn't already sent, and return to
                     // Idle rather than entering `ApcOther`: the ESC is
                     // downstream already, so a parser after this one is
                     // in `EscFlushed` too and recovers a foreign
                     // envelope by the same route. Idle also means a
                     // typed `Esc _ a b c` can't leave us hunting for a
                     // terminator that was never coming.
-                    out.push_pass(APC_OPEN);
-                    out.passthrough.extend_from_slice(&self.marker_buf);
+                    let already = match self.recover_flushed {
+                        None => {
+                            out.push_pass(APC_OPEN);
+                            0
+                        }
+                        Some(n) => n,
+                    };
+                    out.passthrough.extend_from_slice(&self.marker_buf[already..]);
+                    self.recover_flushed = None;
                     State::Idle
                 }
             }
@@ -1243,17 +1276,59 @@ mod tests {
         assert_eq!(out.payloads().count(), 1);
     }
 
-    /// Esc, `_`, then nothing: the marker never completes. The held
-    /// bytes come back on the next flush rather than waiting forever
-    /// — again without a second ESC.
+    /// Esc, `_`, then nothing: the marker never completes on the
+    /// first flush either. A repeat idle flush must not duplicate
+    /// what an earlier one already released, and — unlike the plain
+    /// ESC case — must not give up on the recovery: the marker can
+    /// still complete later. Once it turns out to mismatch, only the
+    /// not-yet-flushed tail comes out.
     #[test]
-    fn flush_releases_a_recovery_that_never_completed() {
+    fn a_repeated_flush_does_not_give_up_or_duplicate() {
         let mut s = ApcStream::new();
         s.feed(&[ESC]);
         assert_eq!(s.flush_pending_esc(), vec![ESC]);
         assert!(s.feed(b"_P").passthrough.is_empty());
         assert_eq!(s.flush_pending_esc(), b"_P".to_vec());
-        assert_eq!(s.feed(b"x").passthrough, b"x");
+        // A second idle gap with nothing new to report: nothing is
+        // re-sent, and the recovery is still alive.
+        assert_eq!(s.flush_pending_esc(), Vec::<u8>::new());
+        // The rest of the marker mismatches — a plain `Esc _ P x y`,
+        // not an envelope. Only the tail an earlier flush hadn't
+        // already sent comes out; `_P` isn't repeated.
+        assert_eq!(s.feed(b"xy").passthrough, b"xy");
+        // And still usable afterwards.
+        let out = s.feed(&split_test_envelope());
+        assert_eq!(out.payloads().count(), 1);
+    }
+
+    /// The case the previous test's old behavior broke: the marker
+    /// completes only after a *second* idle flush already released
+    /// part of the prefix. Nesting stacks idle windows (`vmux -> ssh
+    /// -> vsd -> vmux`, each hop with its own), so surviving one flush
+    /// mid-recovery isn't enough — it has to survive more than one.
+    #[test]
+    fn recovery_survives_more_than_one_idle_flush() {
+        let env = split_test_envelope();
+        let mut s = ApcStream::new();
+
+        assert!(s.feed(&env[..1]).passthrough.is_empty()); // ESC alone
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+        assert!(s.feed(&env[1..2]).passthrough.is_empty()); // `_`
+        // No marker bytes have arrived yet — the flush still owes the
+        // caller the `_` itself.
+        assert_eq!(s.flush_pending_esc(), vec![APC_OPEN]);
+        assert!(s.feed(&env[2..3]).passthrough.is_empty()); // marker byte 1
+        // Released, unavoidably — but the recovery keeps going rather
+        // than resyncing to Idle.
+        assert_eq!(s.flush_pending_esc(), env[2..3].to_vec());
+
+        let out = s.feed(&env[3..]);
+        assert_eq!(out.payloads().count(), 1, "envelope lost after two idle flushes");
+        assert!(
+            out.passthrough.is_empty(),
+            "envelope leaked as input: {:?}",
+            String::from_utf8_lossy(&out.passthrough)
+        );
     }
 
     /// Someone else's envelope, split the same way, running through a
