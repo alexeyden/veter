@@ -203,7 +203,18 @@ impl Grid {
         // aligned.
         // With an active scroll region (or before the rows are lazily
         // allocated) the legacy truncate/extend behavior applies.
-        if !self.rows.is_empty() && !self.scroll_region_active() {
+        // Same when there is no scrollback to push into (the alternate
+        // grid is always constructed with `scrollback_len: 0`): without
+        // it a shrink would delete top rows outright, keyed off wherever
+        // the cursor happens to sit — meaningless for a full-screen
+        // program's own cursor-relative redraw, which expects a resize
+        // to change geometry only and leave existing content in place
+        // until it repaints. Legacy truncate/extend doesn't reflow
+        // anything either, so it can't corrupt such a redraw.
+        if !self.rows.is_empty()
+            && !self.scroll_region_active()
+            && self.scrollback_len > 0
+        {
             if size.rows < self.size.rows {
                 let keep = usize::from(size.rows);
                 let push = usize::from(self.pos.row + 1).saturating_sub(keep);

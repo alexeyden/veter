@@ -1776,6 +1776,54 @@ mod resize_tests {
         assert_eq!(p.screen().top_of_live_screen(), 0);
         assert_eq!(p.screen().scrollback_fill(), 0);
     }
+
+    #[test]
+    fn alt_screen_shrink_keeps_top_rows_instead_of_discarding_them() {
+        // A full-screen program (no scroll region, cursor parked near
+        // the bottom by its own cursor-relative redraw) on the
+        // alternate screen, which has no scrollback to push into.
+        let mut p = Parser::new(10, 20, 100);
+        p.process(b"\x1b[?1049h");
+        // 9 lines, not 10: the trailing `\r\n` after the last one would
+        // otherwise overflow the 10-row screen and scroll line0 off
+        // for real, which is a different code path than the resize
+        // this test is about.
+        for i in 0..9 {
+            p.process(format!("line{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[8;1H"); // park the cursor mid-screen, Ink-style
+
+        p.screen_mut().set_size(6, 20);
+        // Before the fix this deleted `(cursor.row + 1) - 6 = 2` rows
+        // off the top with nowhere to put them, corrupting content the
+        // program never asked to move. The alt grid has no scrollback,
+        // so a shrink must fall back to plain truncate/extend: the top
+        // rows stay exactly where the program left them.
+        assert!(p.screen().contents().starts_with("line0"));
+        assert_eq!(p.screen().scrollback_fill(), 0);
+
+        p.screen_mut().set_size(10, 20);
+        p.process(b"\x1b[?1049l");
+        // The main screen underneath was never touched by the alt
+        // screen's resize.
+        assert_eq!(p.screen().top_of_live_screen(), 0);
+    }
+
+    #[test]
+    fn shrink_without_scrollback_capacity_truncates_instead_of_discarding() {
+        // Even on the main screen, a grid configured with zero
+        // scrollback capacity has nowhere to push rows into, so a
+        // shrink must not delete them either.
+        let mut p = Parser::new(10, 20, 0);
+        for i in 0..9 {
+            p.process(format!("line{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[8;1H");
+
+        p.screen_mut().set_size(6, 20);
+        assert!(p.screen().contents().starts_with("line0"));
+        assert_eq!(p.screen().top_of_live_screen(), 0);
+    }
 }
 
 /// `top_of_live_screen` is the absolute line coordinate VGE elements
