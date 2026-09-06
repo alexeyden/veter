@@ -36,9 +36,20 @@ use crate::vss::{VssEngine, VssSegment};
 /// a `DetachNotify` can put back the view the snapshot replaced (the
 /// user's ssh shell, their `vmux` pane). Three binary snapshots in the
 /// same format used on the wire, so there is no second in-memory shape
-/// just for this. Saved on the first `SnapshotBegin` of an attach.
+/// just for this.
 #[derive(Clone)]
 pub struct PreAttachBackup {
+    /// The `sequence_id` of the snapshot this was stashed against.
+    ///
+    /// An attach that dies without sending `DetachNotify` — a dropped
+    /// connection — leaves its stash behind. Keeping it and skipping
+    /// the stash on the *next* attach means a later detach restores a
+    /// screen from two attaches ago, which is not what the pane was
+    /// showing when the user typed `vsd attach`; what it was showing
+    /// is the dead session's leftovers, and that is what they expect
+    /// back. So a snapshot with a different id is a different attach,
+    /// and re-stashes.
+    pub sequence_id: u32,
     pub vt: Vec<u8>,
     pub vge: Vec<u8>,
     pub prt: Vec<u8>,
@@ -125,10 +136,11 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 walk.restores += 1;
                 // First snapshot of an attach: stash what it is about
                 // to replace, so a later DetachNotify can put it back.
-                // Later snapshots in the same attach overwrite without
-                // re-stashing.
-                if backup.is_none() {
+                // Later snapshots of the *same* attach overwrite
+                // without re-stashing; see the `sequence_id` field.
+                if backup.as_ref().is_none_or(|b| b.sequence_id != cs.sequence_id) {
                     *backup = Some(PreAttachBackup {
+                        sequence_id: cs.sequence_id,
                         vt: parser.screen().binary_snapshot(),
                         vge: vge.binary_snapshot(),
                         prt: prt.binary_snapshot(),
@@ -139,24 +151,46 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 // — no partial-apply corruption. The `Reject`
                 // envelope for a version mismatch was already queued
                 // by the VSS engine.
-                let _ = parser.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes);
-                let _ = vge.restore_from_binary_snapshot(&cs.vge_bytes);
-                let _ = prt.restore_from_binary_snapshot(&cs.prt_bytes);
-                // The line origin both sub-engines anchor against came
-                // in with the vt100 fragment restored just above.
-                vge.sync_top_of_live_screen(parser);
-                prt.sync_top_of_live_screen(parser);
+                restore(parser, vge, prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes);
             }
             VssSegment::Detach => {
                 if let Some(b) = backup.take() {
-                    let _ = parser.screen_mut().restore_from_binary_snapshot(&b.vt);
-                    let _ = vge.restore_from_binary_snapshot(&b.vge);
-                    let _ = prt.restore_from_binary_snapshot(&b.prt);
-                    vge.sync_top_of_live_screen(parser);
-                    prt.sync_top_of_live_screen(parser);
+                    restore(parser, vge, prt, &b.vt, &b.vge, &b.prt);
                 }
             }
         }
     }
     walk
+}
+
+/// Install one set of engine snapshots, then put the grid back to the
+/// size *this* context is being drawn at.
+///
+/// `restore_from_binary_snapshot` installs the sender's grid geometry
+/// along with its contents, and the sender's is only right at the
+/// instant the snapshot was taken. Attach, resize the window, detach:
+/// the stash was made at the pre-resize size, so restoring it silently
+/// puts the receiving portal's vt100 back to a size nothing else in
+/// the renderer agrees with, and it stays there until the next resize
+/// happens to correct it.
+fn restore<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    vge: &mut VgeEngine,
+    prt: &mut PrtEngine,
+    vt_bytes: &[u8],
+    vge_bytes: &[u8],
+    prt_bytes: &[u8],
+) {
+    let (rows, cols) = parser.screen().size();
+    let _ = parser.screen_mut().restore_from_binary_snapshot(vt_bytes);
+    if parser.screen().size() != (rows, cols) {
+        parser.screen_mut().set_size(rows, cols);
+    }
+    let _ = vge.restore_from_binary_snapshot(vge_bytes);
+    let _ = prt.restore_from_binary_snapshot(prt_bytes);
+    // The line origin both sub-engines anchor against came in with the
+    // vt100 fragment restored just above — and moved again if the
+    // resize pushed rows into scrollback.
+    vge.sync_top_of_live_screen(parser);
+    prt.sync_top_of_live_screen(parser);
 }

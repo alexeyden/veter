@@ -98,15 +98,19 @@ impl Host {
 /// A snapshot envelope carrying the state of a host that has `text`
 /// on its screen and nothing else.
 fn snapshot_envelope(text: &[u8]) -> Vec<u8> {
-    let mut parser = vt100::Parser::new(24, 80, 100);
+    snapshot_of(24, 80, 7, text)
+}
+
+fn snapshot_of(rows: u16, cols: u16, sequence_id: u32, text: &[u8]) -> Vec<u8> {
+    let mut parser = vt100::Parser::new(rows, cols, 100);
     parser.process(text);
     let vge = VgeEngine::new(CELL, 1.0);
     let prt = PrtEngine::new();
     vss_protocol::encode_snapshot(
         vss_protocol::frame::SNAPSHOT_VERSION,
-        24,
-        80,
-        7,
+        rows,
+        cols,
+        sequence_id,
         &parser.screen().binary_snapshot(),
         &vge.binary_snapshot(),
         &prt.binary_snapshot(),
@@ -221,4 +225,57 @@ fn the_unordered_pipeline_loses_a_portal_created_after_the_snapshot() {
         !host.prt.state.current().portals.contains_key("p1"),
         "premise: unordered, the restore wipes the portal created after it"
     );
+}
+
+/// A snapshot carries the sender's grid geometry, which is only right
+/// at the instant it was taken. Installing it leaves the receiver's
+/// vt100 at a size nothing else in the renderer agrees with, until
+/// some later resize happens to correct it.
+#[test]
+fn a_restore_keeps_the_receiving_context_s_own_size() {
+    let mut host = Host::new();
+    assert_eq!(host.parser.screen().size(), (24, 80));
+    host.feed(&snapshot_of(10, 40, 3, b"smaller"));
+
+    assert_eq!(host.parser.screen().size(), (24, 80));
+    assert_eq!(host.screen(), "smaller");
+}
+
+/// An attach that dies without a `DetachNotify` used to leave its
+/// stash behind, so the *next* attach didn't take one and a later
+/// detach restored a screen from two attaches ago. What the pane was
+/// actually showing when the user re-attached is the dead session's
+/// leftovers, and that is what they should get back.
+#[test]
+fn a_second_attach_stashes_what_is_on_screen_now() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+    host.feed(&snapshot_of(24, 80, 1, b"session one"));
+    assert_eq!(host.screen(), "session one");
+
+    // The connection drops here: no DetachNotify. A fresh attach
+    // arrives with its own sequence id.
+    host.feed(&snapshot_of(24, 80, 2, b"session two"));
+    assert_eq!(host.screen(), "session two");
+
+    host.feed(&vss_protocol::encode_detach_notify());
+    assert_eq!(
+        host.screen(),
+        "session one",
+        "detach restored a stash from before the previous attach"
+    );
+}
+
+/// Two snapshots of the *same* attach must not re-stash — the second
+/// would capture the first one's restored screen and the detach would
+/// put the session back instead of the pane.
+#[test]
+fn a_second_snapshot_of_one_attach_does_not_re_stash() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+    host.feed(&snapshot_of(24, 80, 5, b"session"));
+    host.feed(&snapshot_of(24, 80, 5, b"session redrawn"));
+    host.feed(&vss_protocol::encode_detach_notify());
+
+    assert_eq!(host.screen(), "my shell");
 }
