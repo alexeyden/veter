@@ -56,6 +56,8 @@ pub fn decrqm(private: bool, mode: u16, screen: &vt100::Screen) -> Vec<u8> {
         match mode {
             // DECCKM — application cursor keys.
             1 => Some(screen.application_cursor()),
+            // DECAWM.
+            7 => Some(screen.autowrap()),
             // X10 mouse reporting.
             9 => Some(screen.mouse_protocol_mode() == Mode::Press),
             // DECTCEM — the mode is *cursor visible*, so it is set
@@ -126,6 +128,14 @@ mod tests {
         let p = screen_after(b"");
         assert_eq!(decrqm(true, 12345, p.screen()), b"\x1b[?12345;0$y".to_vec());
         assert_eq!(decrqm(false, 4, p.screen()), b"\x1b[4;0$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_reports_autowrap() {
+        let p = screen_after(b"");
+        assert_eq!(decrqm(true, 7, p.screen()), b"\x1b[?7;1$y".to_vec());
+        let p = screen_after(b"\x1b[?7l");
+        assert_eq!(decrqm(true, 7, p.screen()), b"\x1b[?7;2$y".to_vec());
     }
 
     #[test]

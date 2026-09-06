@@ -6,6 +6,10 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+/// DECAWM (`?7`) is on by default and `modes` starts at zero, so the
+/// bit records the *absence* of auto-wrap. Storing it the other way
+/// round would make every existing snapshot decode as "wrap off".
+const MODE_NO_AUTOWRAP: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -63,10 +67,14 @@ pub struct Screen {
     alternate_grid: crate::grid::Grid,
 
     attrs: crate::attrs::Attrs,
+    /// DECSC slot for the main grid. Per-grid, like `Grid::saved_pos`
+    /// — see [`Screen::saved_sgr_mut`].
     saved_attrs: crate::attrs::Attrs,
+    alternate_saved_attrs: crate::attrs::Attrs,
 
     charset: crate::charset::CharsetState,
     saved_charset: crate::charset::CharsetState,
+    alternate_saved_charset: crate::charset::CharsetState,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -90,9 +98,11 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            alternate_saved_attrs: crate::attrs::Attrs::default(),
 
             charset: crate::charset::CharsetState::default(),
             saved_charset: crate::charset::CharsetState::default(),
+            alternate_saved_charset: crate::charset::CharsetState::default(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -323,9 +333,11 @@ impl Screen {
 
         crate::snapshot::encode_attrs(&mut w, &self.attrs);
         crate::snapshot::encode_attrs(&mut w, &self.saved_attrs);
+        crate::snapshot::encode_attrs(&mut w, &self.alternate_saved_attrs);
 
         crate::snapshot::encode_charset_state(&mut w, &self.charset);
         crate::snapshot::encode_charset_state(&mut w, &self.saved_charset);
+        crate::snapshot::encode_charset_state(&mut w, &self.alternate_saved_charset);
 
         w.u8(self.modes);
         crate::snapshot::encode_mouse_mode(&mut w, self.mouse_protocol_mode);
@@ -357,9 +369,11 @@ impl Screen {
 
         let attrs = crate::snapshot::decode_attrs(&mut r)?;
         let saved_attrs = crate::snapshot::decode_attrs(&mut r)?;
+        let alternate_saved_attrs = crate::snapshot::decode_attrs(&mut r)?;
 
         let charset = crate::snapshot::decode_charset_state(&mut r)?;
         let saved_charset = crate::snapshot::decode_charset_state(&mut r)?;
+        let alternate_saved_charset = crate::snapshot::decode_charset_state(&mut r)?;
 
         let modes = r.u8()?;
         let mouse_protocol_mode = crate::snapshot::decode_mouse_mode(&mut r)?;
@@ -375,8 +389,10 @@ impl Screen {
         self.alternate_grid = alternate_grid;
         self.attrs = attrs;
         self.saved_attrs = saved_attrs;
+        self.alternate_saved_attrs = alternate_saved_attrs;
         self.charset = charset;
         self.saved_charset = saved_charset;
+        self.alternate_saved_charset = alternate_saved_charset;
         self.modes = modes;
         self.mouse_protocol_mode = mouse_protocol_mode;
         self.mouse_protocol_encoding = mouse_protocol_encoding;
@@ -769,6 +785,14 @@ impl Screen {
         self.mode(MODE_HIDE_CURSOR)
     }
 
+    /// Whether DECAWM (`?7`) is enabled — the default. With it off,
+    /// a character printed at the last column overwrites it instead of
+    /// moving to the next row.
+    #[must_use]
+    pub fn autowrap(&self) -> bool {
+        !self.mode(MODE_NO_AUTOWRAP)
+    }
+
     /// Returns whether the terminal should be in bracketed paste mode.
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
@@ -862,14 +886,38 @@ impl Screen {
 
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
-        self.saved_attrs = self.attrs;
-        self.saved_charset = self.charset;
+        let (attrs, charset) = (self.attrs, self.charset);
+        let (saved_attrs, saved_charset) = self.saved_sgr_mut();
+        *saved_attrs = attrs;
+        *saved_charset = charset;
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = self.saved_attrs;
-        self.charset = self.saved_charset;
+        let (attrs, charset) = {
+            let (a, c) = self.saved_sgr_mut();
+            (*a, *c)
+        };
+        self.attrs = attrs;
+        self.charset = charset;
+    }
+
+    /// The DECSC slot belonging to the grid currently in view.
+    ///
+    /// `saved_pos` has always been per-grid; the attributes and
+    /// charset were not, so a DECSC issued *inside* the alt screen
+    /// overwrote what `?1049h` saved on the way in, and `?1049l` then
+    /// restored the alt screen's SGR onto the main one. Full-screen
+    /// programs save and restore the cursor constantly, so the shell
+    /// they returned to inherited whatever colour they last used.
+    fn saved_sgr_mut(
+        &mut self,
+    ) -> (&mut crate::attrs::Attrs, &mut crate::charset::CharsetState) {
+        if self.modes & MODE_ALTERNATE_SCREEN != 0 {
+            (&mut self.alternate_saved_attrs, &mut self.alternate_saved_charset)
+        } else {
+            (&mut self.saved_attrs, &mut self.saved_charset)
+        }
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -963,7 +1011,11 @@ impl Screen {
                 wrap = true;
             }
         }
-        self.grid_mut().col_wrap(width, wrap);
+        if self.mode(MODE_NO_AUTOWRAP) {
+            self.grid_mut().col_no_wrap(width);
+        } else {
+            self.grid_mut().col_wrap(width, wrap);
+        }
         let pos = self.grid().pos();
 
         if width == 0 {
@@ -1215,6 +1267,21 @@ impl Screen {
         self.grid_mut().row_dec_scroll(1);
     }
 
+    /// IND (`ESC D`) — index: down one row, scrolling at the bottom of
+    /// the scroll region. RI's counterpart, and it was a no-op here:
+    /// anything using it to advance a line (less, and any program
+    /// driving a scroll region by hand) painted over the row it was
+    /// already on.
+    pub(crate) fn ind(&mut self) {
+        self.grid_mut().row_inc_scroll(1);
+    }
+
+    /// NEL (`ESC E`) — next line: IND plus a carriage return.
+    pub(crate) fn nel(&mut self) {
+        self.grid_mut().row_inc_scroll(1);
+        self.grid_mut().col_set(0);
+    }
+
     // SO (0x0E) / SI (0x0F): swap GL between G1 and G0.
     pub(crate) fn shift_out(&mut self) {
         self.charset.shift_out();
@@ -1396,6 +1463,7 @@ impl Screen {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(true),
+                [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
                 [47] => self.enter_alternate_grid(),
@@ -1436,6 +1504,7 @@ impl Screen {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(false),
+                [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
                 [47] => {
@@ -1533,6 +1602,15 @@ impl Screen {
                     self.attrs.fgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
+                // The ITU-T T.416 form `38:2:<colour-space>:r:g:b`,
+                // whose colour-space id is almost always empty. Every
+                // library that emits colons emits this one, and it was
+                // being dropped on the floor — the text came out in
+                // the previous colour with no hint why.
+                [38, 2, _colour_space, r, g, b] => {
+                    self.attrs.fgcolor =
+                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                }
                 [38, 5, i] => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*i));
                 }
@@ -1559,6 +1637,11 @@ impl Screen {
                     self.attrs.bgcolor = crate::Color::Idx(to_u8!(*n) - 40);
                 }
                 [48, 2, r, g, b] => {
+                    self.attrs.bgcolor =
+                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                }
+                // See the `38:2::r:g:b` note above.
+                [48, 2, _colour_space, r, g, b] => {
                     self.attrs.bgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
@@ -2442,5 +2525,217 @@ mod wide_char_safety_tests {
             .expect("restore");
         assert!(!p2.screen().cell(0, 2).unwrap().is_wide());
         p2.process(b"\x1b[1;3H\x1b[K");
+    }
+}
+
+#[cfg(test)]
+mod xterm_semantics_tests {
+    use crate::Parser;
+
+    fn row(p: &Parser, row: u16) -> String {
+        let (_, cols) = p.screen().size();
+        (0..cols)
+            .map(|c| {
+                let s = p.screen().cell(row, c).unwrap().contents();
+                if s.is_empty() { " ".to_string() } else { s.to_string() }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// DECSTBM homes the cursor to the page's home position, not the
+    /// region's. Homing to the region put the cursor rows down the
+    /// screen for every program that sets a region without DECOM.
+    #[test]
+    fn decstbm_homes_to_absolute_one_one() {
+        let mut p = Parser::new(24, 80, 0);
+        p.process(b"\x1b[5;20r");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+    }
+
+    /// …and to the region's top when origin mode says coordinates are
+    /// region-relative.
+    #[test]
+    fn decstbm_homes_to_the_region_under_origin_mode() {
+        let mut p = Parser::new(24, 80, 0);
+        p.process(b"\x1b[?6h\x1b[5;20r");
+        assert_eq!(p.screen().cursor_position(), (4, 0));
+    }
+
+    /// IL and DL are ignored with the cursor outside the scroll
+    /// region. Without the guard they shuffled rows the command has no
+    /// business touching.
+    #[test]
+    fn il_and_dl_outside_the_scroll_region_are_no_ops() {
+        for seq in [b"\x1b[L".as_ref(), b"\x1b[M".as_ref()] {
+            let mut p = Parser::new(6, 10, 0);
+            p.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+            // Region rows 3..4 (1-based), cursor parked on row 1.
+            p.process(b"\x1b[3;4r\x1b[1;1H");
+            p.process(seq);
+            for (i, expected) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+                let i = u16::try_from(i).unwrap();
+                assert_eq!(&row(&p, i), expected, "seq {seq:?} moved row {i}");
+            }
+        }
+    }
+
+    /// DL must not pull rows from below the region into it.
+    #[test]
+    fn dl_is_bounded_by_the_scroll_region() {
+        let mut p = Parser::new(6, 10, 0);
+        p.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+        p.process(b"\x1b[2;3r\x1b[2;1H\x1b[9M");
+        assert_eq!(row(&p, 0), "a");
+        assert_eq!(row(&p, 1), "");
+        assert_eq!(row(&p, 2), "");
+        assert_eq!(row(&p, 3), "d", "DL reached past the region");
+        assert_eq!(row(&p, 5), "f");
+    }
+
+    /// RI with the cursor above a scroll region moves it (or, at row
+    /// 0, does nothing) — it does not scroll a region it isn't in.
+    #[test]
+    fn ri_above_the_scroll_region_does_not_scroll_it() {
+        let mut p = Parser::new(5, 10, 0);
+        p.process(b"a\r\nb\r\nc\r\nd\r\ne");
+        p.process(b"\x1b[3;5r\x1b[1;1H\x1bM");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+        for (i, expected) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            let i = u16::try_from(i).unwrap();
+            assert_eq!(&row(&p, i), expected, "row {i} moved");
+        }
+    }
+
+    /// With no region set the whole grid is the region, so the
+    /// ordinary "RI at the top scrolls" case still works.
+    #[test]
+    fn ri_at_the_top_still_scrolls_without_a_region() {
+        let mut p = Parser::new(3, 10, 0);
+        p.process(b"a\r\nb\r\nc\x1b[1;1H\x1bM");
+        assert_eq!(row(&p, 0), "");
+        assert_eq!(row(&p, 1), "a");
+    }
+
+    /// IND advances a row, scrolling at the bottom of the region. It
+    /// was a no-op, so anything using it to advance a line painted
+    /// over the row it was already on.
+    #[test]
+    fn ind_advances_a_row() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"abc\x1bD");
+        assert_eq!(p.screen().cursor_position(), (1, 3));
+        p.process(b"x");
+        assert_eq!(row(&p, 0), "abc");
+        assert_eq!(row(&p, 1), "   x");
+    }
+
+    /// NEL is IND plus a carriage return.
+    #[test]
+    fn nel_advances_a_row_and_returns_to_column_zero() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"abc\x1bEx");
+        assert_eq!(row(&p, 1), "x");
+        assert_eq!(p.screen().cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn ind_scrolls_at_the_bottom_of_the_region() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"a\r\nb\r\nc\r\nd");
+        p.process(b"\x1b[1;3r\x1b[3;1H\x1bD");
+        assert_eq!(row(&p, 0), "b");
+        assert_eq!(row(&p, 1), "c");
+        assert_eq!(row(&p, 2), "");
+        assert_eq!(row(&p, 3), "d", "the row below the region moved");
+    }
+
+    /// A DECSC inside the alt screen used to overwrite what `?1049h`
+    /// saved on the way in, so the shell a full-screen program
+    /// returned to inherited whatever colour it last used.
+    #[test]
+    fn decsc_in_the_alt_screen_leaves_the_main_screen_s_sgr_alone() {
+        let mut p = Parser::new(4, 10, 0);
+        // Main screen: red text, then into the alt screen.
+        p.process(b"\x1b[31m\x1b[?1049h");
+        // A full-screen program saving and restoring around green.
+        p.process(b"\x1b[32m\x1b7\x1b[34m\x1b8");
+        p.process(b"\x1b[?1049l");
+        assert_eq!(p.screen().fgcolor(), crate::Color::Idx(1), "main SGR clobbered");
+    }
+
+    /// EL at the pending-wrap position: `pos.col` is `cols` there, so
+    /// `cols..cols` erased nothing. xterm erases from the last column.
+    #[test]
+    fn el_at_the_pending_wrap_position_erases_the_last_column() {
+        let mut p = Parser::new(2, 4, 0);
+        p.process(b"abcd");
+        assert_eq!(row(&p, 0), "abcd");
+        p.process(b"\x1b[K");
+        assert_eq!(row(&p, 0), "abc");
+    }
+
+    /// The ITU-T T.416 colon form with an empty colour-space id, which
+    /// is what almost everything that emits colons emits.
+    #[test]
+    fn colon_truecolor_with_an_empty_colour_space_is_applied() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[38:2::10:20:30mx");
+        assert_eq!(p.screen().fgcolor(), crate::Color::Rgb(10, 20, 30));
+        p.process(b"\x1b[48:2::40:50:60my");
+        assert_eq!(p.screen().bgcolor(), crate::Color::Rgb(40, 50, 60));
+    }
+
+    #[test]
+    fn colon_truecolor_without_the_colour_space_still_works() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[38:2:10:20:30mx");
+        assert_eq!(p.screen().fgcolor(), crate::Color::Rgb(10, 20, 30));
+    }
+
+    /// With DECAWM off the cursor stays on the row and the last cell
+    /// is overwritten, rather than the text wrapping.
+    #[test]
+    fn decawm_off_overwrites_the_last_column() {
+        let mut p = Parser::new(4, 4, 0);
+        p.process(b"\x1b[?7l");
+        p.process(b"abcdef");
+        assert_eq!(p.screen().cursor_position().0, 0, "output wrapped");
+        assert_eq!(row(&p, 0), "abcf");
+        assert_eq!(row(&p, 1), "");
+    }
+
+    #[test]
+    fn decawm_is_on_by_default_and_can_be_turned_back_on() {
+        let mut p = Parser::new(4, 4, 0);
+        assert!(p.screen().autowrap());
+        p.process(b"\x1b[?7l");
+        assert!(!p.screen().autowrap());
+        p.process(b"\x1b[?7h");
+        assert!(p.screen().autowrap());
+        p.process(b"abcde");
+        assert_eq!(p.screen().cursor_position(), (1, 1));
+    }
+
+    /// `Grid::set_size` resizes every row every time, so clearing the
+    /// soft-wrap flag on a same-length resize meant any resize at all
+    /// broke the wrap joining of every wrapped line on screen.
+    #[test]
+    fn a_height_only_resize_keeps_soft_wrap_flags() {
+        let mut p = Parser::new(3, 4, 100);
+        p.process(b"abcdef");
+        let before = p.screen().contents();
+        p.screen_mut().set_size(5, 4);
+        assert_eq!(p.screen().contents(), before);
+    }
+
+    #[test]
+    fn a_same_size_resize_keeps_soft_wrap_flags() {
+        let mut p = Parser::new(3, 4, 100);
+        p.process(b"abcdef");
+        let before = p.screen().contents();
+        p.screen_mut().set_size(3, 4);
+        assert_eq!(p.screen().contents(), before);
     }
 }

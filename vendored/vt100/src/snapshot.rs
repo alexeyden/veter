@@ -17,11 +17,13 @@
 /// match — see [`Screen::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v3: per-grid DECSC attributes and charset, so a save/restore
+///   inside the alt screen stops clobbering the main screen's.
 /// - v2: per-grid `top_of_live_screen`, so scrollback-anchored VGE /
 ///   PRT objects survive a restore without the engines carrying their
 ///   own copy of the line origin.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 2;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
 
 /// Error returned when a `Screen` binary snapshot cannot be decoded:
 /// wrong kind version, truncated payload, or otherwise malformed.

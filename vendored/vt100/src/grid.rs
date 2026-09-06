@@ -827,8 +827,14 @@ impl Grid {
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
+        // `pos.col` reaches `cols` at the pending-wrap position — the
+        // cursor has written the last cell but not yet moved to the
+        // next row. `cols..cols` is empty, so EL erased nothing there;
+        // xterm erases from the last column, which is where the cursor
+        // is being drawn.
+        let start = pos.col.min(size.cols.saturating_sub(1));
         let row = self.current_row_mut();
-        for col in pos.col..size.cols {
+        for col in start..size.cols {
             row.erase(col, attrs);
         }
     }
@@ -885,8 +891,21 @@ impl Grid {
         }
     }
 
+    /// IL — insert blank lines at the cursor, pushing the rest of the
+    /// scroll region down.
+    ///
+    /// A no-op with the cursor outside the region, per xterm. Without
+    /// that guard the loop below removed `scroll_bottom` and inserted
+    /// at a `pos.row` outside the region, shuffling rows the command
+    /// has no business touching.
     pub fn insert_lines(&mut self, count: u16) {
-        for _ in 0..count {
+        if !self.in_scroll_region() {
+            return;
+        }
+        // Nothing past a region's worth of lines can have an effect:
+        // the region is already all blank by then.
+        let room = self.scroll_bottom - self.pos.row + 1;
+        for _ in 0..count.min(room) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows.insert(usize::from(self.pos.row), self.new_row());
             // self.scroll_bottom is maintained to always be a valid row
@@ -894,8 +913,17 @@ impl Grid {
         }
     }
 
+    /// DL — delete lines at the cursor, pulling the rest of the scroll
+    /// region up. Same out-of-region rule as [`Self::insert_lines`].
     pub fn delete_lines(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.pos.row)) {
+        if !self.in_scroll_region() {
+            return;
+        }
+        // Bounded by the region, not the grid: deleting past
+        // `scroll_bottom` would pull rows from below it into the
+        // region.
+        let room = self.scroll_bottom - self.pos.row + 1;
+        for _ in 0..count.min(room) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             self.rows.remove(usize::from(self.pos.row));
@@ -945,8 +973,13 @@ impl Grid {
             self.scroll_top = 0;
             self.scroll_bottom = self.size().rows - 1;
         }
-        self.pos.row = self.scroll_top;
-        self.pos.col = 0;
+        // DECSTBM homes the cursor. To the *page's* home position,
+        // not the region's — `set_pos` adds `scroll_top` only under
+        // origin mode, which is the whole distinction origin mode
+        // exists to make. Homing to the region unconditionally put the
+        // cursor rows down the screen for any program that sets a
+        // region without DECOM, which is most of them.
+        self.set_pos(Pos { row: 0, col: 0 });
     }
 
     fn in_scroll_region(&self) -> bool {
@@ -993,7 +1026,14 @@ impl Grid {
         let extra_lines = count.saturating_sub(self.pos.row);
         self.pos.row = self.pos.row.saturating_sub(count);
         let lines = self.row_clamp_top(in_scroll_region);
-        self.scroll_down(lines + extra_lines);
+        // Only from inside the region. RI with the cursor *above* a
+        // scroll region moves it up (or, at row 0, nowhere) — it does
+        // not scroll a region the cursor isn't in. With no region set
+        // the whole grid is the region, so the ordinary
+        // "RI at the top scrolls" case is unaffected.
+        if in_scroll_region {
+            self.scroll_down(lines + extra_lines);
+        }
     }
 
     pub fn row_set(&mut self, i: u16) {
@@ -1023,6 +1063,15 @@ impl Grid {
     pub fn col_set(&mut self, i: u16) {
         self.pos.col = i;
         self.col_clamp();
+    }
+
+    /// DECAWM off: keep the cursor on this row so the character
+    /// overwrites the last cell(s) instead of moving to the next line.
+    pub fn col_no_wrap(&mut self, width: u16) {
+        let last_start = self.size.cols.saturating_sub(width);
+        if self.pos.col > last_start {
+            self.pos.col = last_start;
+        }
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {

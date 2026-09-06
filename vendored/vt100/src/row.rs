@@ -74,6 +74,16 @@ impl Row {
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
+        // A resize to the length the row already has is not a resize.
+        // `Grid::set_size` calls this on every row every time, height-
+        // only and same-size resizes included, so clearing the
+        // soft-wrap flag unconditionally meant any resize at all broke
+        // the wrap joining of every wrapped line on screen — and a
+        // later width change then reflowed against flags that were
+        // already gone.
+        if usize::from(len) == self.cells.len() {
+            return;
+        }
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
         self.repair_trailing_wide();

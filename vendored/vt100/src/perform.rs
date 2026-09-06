@@ -88,6 +88,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 b'=' => self.screen.deckpam(),
                 b'>' => self.screen.deckpnm(),
                 b'M' => self.screen.ri(),
+                b'D' => self.screen.ind(),
+                b'E' => self.screen.nel(),
                 b'c' => self.screen.ris(),
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
                 _ => {
