@@ -828,10 +828,12 @@ fn splice_input(
     // before forwarding bytes to the inner PTY. The renderer queues
     // SnapshotAccepted / SnapshotRejected frames in response to the
     // attach-time snapshot; those bytes route back through PRT
-    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. v1 of vsd
-    // doesn't act on them yet (no version-mismatch UI), but they must
-    // not reach the inner shell — `ESC _` is meta-paren and the
-    // payload chars get inserted as literal keystrokes.
+    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. The one that
+    // matters was already read and acted on by `await_snapshot_ack`
+    // before the splice began — an attach sends one snapshot — so
+    // anything reaching here is a straggler. It still must not reach
+    // the inner shell: `ESC _` is meta-paren and the payload chars get
+    // inserted as literal keystrokes.
     let mut vss_filter =
         vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
     // Bounded poll timeout so a lone Esc keystroke that lands in
@@ -910,9 +912,9 @@ fn splice_input(
         // Filter out any renderer-side VSS envelopes; what's left is
         // user keystrokes destined for the inner shell.
         let vss_out = vss_filter.feed(&buf[..n]);
-        // `vss_out.payloads` would carry SnapshotAccepted / Rejected
-        // bodies if v1.1 grows version-mismatch UX; for now we drop
-        // them.
+        // `vss_out.payloads` carries any late SnapshotAccepted /
+        // Rejected bodies. The verdict this attach turns on was
+        // already taken before the splice started; these are dropped.
         if vss_out.passthrough.is_empty() {
             continue;
         }
