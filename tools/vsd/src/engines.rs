@@ -243,6 +243,120 @@ impl EngineState {
     }
 }
 
+/// What one chunk from the inner PTY produced.
+pub struct ChunkOutcome {
+    /// Bytes owed to the programs inside the session — engine
+    /// responses and events — for the caller to write to the master.
+    pub replies: Vec<u8>,
+    /// Bytes to forward to the attached renderer, or `None` when
+    /// there isn't one.
+    pub forward: Option<Vec<u8>>,
+}
+
+impl EngineState {
+    /// Run one chunk of inner-PTY output through the engines and say
+    /// what it owes to each side.
+    ///
+    /// The stage order here differs from the renderer's in one place:
+    /// **SES runs first**, because its passthrough is what gets
+    /// forwarded. SES is the `vmux` ↔ `vsd` control channel and the
+    /// daemon is its host; the renderer is not a session, so its own
+    /// per-portal SES engine would answer the same probe with "not in
+    /// a session" — a second, contradictory answer to a question only
+    /// this process can answer. Every APC parser passes foreign
+    /// markers through verbatim, so moving SES to the front costs
+    /// nothing and is what makes the strip possible.
+    pub fn process_chunk(&mut self, chunk: &[u8]) -> ChunkOutcome {
+        // One decision with several consequences: the chunk goes to
+        // the renderer iff one is attached, and we answer it iff it is
+        // *not* going to a renderer that will answer it instead. Taken
+        // here, under the lock that also guards the engines, so the
+        // two can never disagree about a chunk.
+        let attached = self.renderer_stdout.is_some();
+        self.set_renderer_attached(attached);
+        let EngineState {
+            parser,
+            vge,
+            prt,
+            vft,
+            ses,
+            renderer_stdout: _,
+            answering: _,
+            attach_shutdown,
+            master_write: _,
+        } = self;
+
+        let ses_passthrough = ses.process_pty_chunk(chunk);
+        let prt_chunk = prt.process_pty_chunk_full(&ses_passthrough);
+        // VFT is extracted and dropped (the engine is a relay): the
+        // transfer belongs to the renderer, but the envelope must not
+        // reach the vt100 — see the field's doc.
+        let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
+        // VGE runs last as the terminal stage, driving the vt100
+        // itself so element origins resolve against the screen the
+        // inner program saw. See
+        // `veter_host::vge::drive_terminal_stage`.
+        //
+        // No hit tester: vsd holds the session state but the renderer
+        // painting it is a different process, so a VGE `QueryHit`
+        // (§15) is answered `err_no_hit_testing` rather than with
+        // geometry nobody here has.
+        veter_host::vge::drive_terminal_stage(vge, parser, &vft_passthrough, None);
+        // See the matching note in veter's host loop: an over-cap
+        // envelope is dropped without a reply, so report it.
+        let dropped = prt.take_apc_overflows() + vge.take_apc_overflows();
+        if dropped > 0 {
+            eprintln!(
+                "vsd: dropped {dropped} oversized APC envelope(s); \
+                 a client exceeded the payload cap"
+            );
+        }
+        // The portal-set reactions to RIS / DECSTR / 2J / 3J and the
+        // alt-screen swaps rode along inside `process_pty_chunk_full`,
+        // in stream order with the commands they scope;
+        // `after_vt100_process` only has the post-chunk line origin
+        // left to reconcile.
+        prt.after_vt100_process(parser);
+        prt.flush_pending_events();
+        prt.drive_and_flush_vft();
+
+        // PRT follows the same "answered exactly once" rule as VGE and
+        // DSR. Attached, the renderer runs these same commands off the
+        // forwarded chunk and answers them itself, so a reply from
+        // here is a second one for the same request id — and a second
+        // PRT probe advertising *this* process's limits and accent
+        // rather than the terminal's. Drained either way: a discarded
+        // queue must not accumulate.
+        let prt_replies = prt.take_responses();
+        let mut replies = if attached { Vec::new() } else { prt_replies };
+        replies.extend_from_slice(&vge.take_responses());
+        // SES is the exception, and the reason the strip above exists:
+        // the daemon is the only party that knows the session name, so
+        // it answers whether or not a renderer is attached.
+        replies.extend_from_slice(&ses.take_responses());
+
+        // A SES `Detach` command wakes the attach handler's
+        // `splice_input` loop via the self-pipe — the exact same
+        // teardown path as the `Ctrl+\ d` hotkey. With no renderer
+        // attached `attach_shutdown` is `None` and this is a no-op.
+        if ses.take_detach_requests() > 0
+            && let Some(fd) = attach_shutdown.as_ref()
+        {
+            // SAFETY: `fd` is borrowed from the OwnedFd held in
+            // `attach_shutdown`; we only write, never close it.
+            let borrowed =
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+            let _ = nix::unistd::write(borrowed, &[0u8]);
+        }
+
+        // What the renderer gets is the chunk minus the SES envelopes
+        // — otherwise verbatim, since it parses PRT / VGE / VFT
+        // natively and must see exactly what the inner program wrote.
+        let forward = attached.then_some(ses_passthrough);
+        ChunkOutcome { replies, forward }
+    }
+}
+
 /// Dup the master fd twice (one read handle, one write handle) and
 /// spawn the per-session worker. Returns the shared engine handle so
 /// the attach path can lock it to serialize a snapshot or to forward
@@ -310,89 +424,14 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             }
         };
 
-        let (to_write, forward_to_renderer) = {
+        let outcome = {
             let mut guard = match engines.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            // One decision with two consequences: the chunk goes to
-            // the renderer iff one is attached, and we answer it iff
-            // it is *not* going to a renderer that will answer it
-            // instead. Taken here, under the lock that also guards
-            // the engines, so the two can never disagree about a
-            // chunk.
-            let attached = guard.renderer_stdout.is_some();
-            guard.set_renderer_attached(attached);
-            let EngineState {
-                parser,
-                vge,
-                prt,
-                vft,
-                ses,
-                renderer_stdout: _,
-                answering: _,
-                attach_shutdown,
-                master_write: _,
-            } = &mut *guard;
-
-            let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
-            // VFT is extracted and dropped (the engine is a relay):
-            // the transfer belongs to the renderer, but the envelope
-            // must not reach the vt100 — see the field's doc.
-            let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
-            // SES is consumed here — the inner vmux is the SES client,
-            // vsd is its host — and VGE runs last as the terminal
-            // stage, driving the vt100 itself so element origins
-            // resolve against the screen the inner program saw. See
-            // `veter_host::vge::drive_terminal_stage`.
-            let ses_passthrough = ses.process_pty_chunk(&vft_passthrough);
-            // No hit tester: vsd holds the session state but the
-            // renderer painting it is a different process, so a VGE
-            // `QueryHit` (§15) is answered `err_no_hit_testing`
-            // rather than with geometry nobody here has.
-            veter_host::vge::drive_terminal_stage(vge, parser, &ses_passthrough, None);
-            // See the matching note in veter's host loop: an over-cap
-            // envelope is dropped without a reply, so report it.
-            let dropped = prt.take_apc_overflows() + vge.take_apc_overflows();
-            if dropped > 0 {
-                eprintln!(
-                    "vsd: dropped {dropped} oversized APC envelope(s); \
-                     a client exceeded the payload cap"
-                );
-            }
-            // The portal-set reactions to RIS / DECSTR / 2J / 3J and
-            // the alt-screen swaps rode along inside
-            // `process_pty_chunk_full`, in stream order with the
-            // commands they scope; `after_vt100_process` only has the
-            // post-chunk line origin left to reconcile.
-            prt.after_vt100_process(parser);
-            prt.flush_pending_events();
-            prt.drive_and_flush_vft();
-
-            let mut out = prt.take_responses();
-            out.extend_from_slice(&vge.take_responses());
-            out.extend_from_slice(&ses.take_responses());
-
-            // A SES `Detach` command wakes the attach handler's
-            // `splice_input` loop via the self-pipe — the exact same
-            // teardown path as the `Ctrl+\ d` hotkey. With no renderer
-            // attached `attach_shutdown` is `None` and this is a no-op.
-            if ses.take_detach_requests() > 0
-                && let Some(fd) = attach_shutdown.as_ref()
-            {
-                // SAFETY: `fd` is borrowed from the OwnedFd held in
-                // `attach_shutdown`; we only write, never close it.
-                let borrowed =
-                    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-                let _ = nix::unistd::write(borrowed, &[0u8]);
-            }
-
-            // Forward verbatim to the renderer while attached. The
-            // renderer parses PRT/VGE/VFT envelopes natively, so we
-            // ship the raw chunk we just received from the inner PTY
-            // (not the engine-transformed view).
-            (out, attached)
+            guard.process_chunk(&buf[..n])
         };
+        let ChunkOutcome { replies: to_write, forward } = outcome;
 
         if !to_write.is_empty() {
             // Best effort: a failed write back to the inner program
@@ -410,7 +449,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             }
         }
 
-        if forward_to_renderer {
+        if let Some(forward) = forward {
             // Write outside the engines lock so a slow renderer
             // doesn't stall the engines. We dup the fd briefly to
             // avoid holding the lock during the write; on write error
@@ -435,7 +474,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 let raw = stdout.as_raw_fd();
                 let mut wrote_ok = true;
                 let mut off = 0;
-                while off < n {
+                while off < forward.len() {
                     match nix::unistd::write(
                         // SAFETY: `raw` is borrowed from the `stdout`
                         // dup we own for this write. write(2) takes a
@@ -443,7 +482,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                         unsafe {
                             std::os::fd::BorrowedFd::borrow_raw(raw)
                         },
-                        &buf[off..n],
+                        &forward[off..],
                     ) {
                         Ok(0) => {
                             wrote_ok = false;
@@ -678,6 +717,92 @@ mod tests {
                 "attached={attached}: wrong party answered the host DA1"
             );
         }
+    }
+
+    /// An `EngineState` that believes a renderer is attached.
+    ///
+    /// `process_chunk` derives that from `renderer_stdout` itself —
+    /// under the same lock, so the "answer it iff we don't forward it"
+    /// decision can't disagree with itself — so a test has to hand it
+    /// a real fd. The pipe is never read; nothing here writes to it.
+    fn attached_state() -> (EngineState, OwnedFd) {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut st = EngineState::new("s".into());
+        st.renderer_stdout = Some(write_fd);
+        (st, read_fd)
+    }
+
+    /// PRT follows the same "answered exactly once" rule as VGE and
+    /// DSR. Attached, the renderer runs the same commands off the
+    /// forwarded chunk, so a reply from here is a second one for the
+    /// same request id — and a PRT probe from here advertises the
+    /// daemon's limits and accent instead of the terminal's.
+    #[test]
+    fn attached_prt_commands_are_answered_by_the_renderer_alone() {
+        let (mut st, _read) = attached_state();
+        let out = st.process_chunk(&build_envelope(&[(Command::Probe, 3)]));
+        assert!(
+            out.replies.is_empty(),
+            "the daemon answered a PRT command the renderer also answers"
+        );
+        assert!(out.forward.is_some(), "the renderer got nothing to answer");
+    }
+
+    #[test]
+    fn detached_prt_commands_are_answered_here() {
+        let mut st = EngineState::new("s".into());
+        let out = st.process_chunk(&build_envelope(&[(Command::Probe, 3)]));
+        assert!(
+            !out.replies.is_empty(),
+            "nobody answered the probe: the client would time out"
+        );
+        assert!(out.forward.is_none(), "forwarded with no renderer attached");
+    }
+
+    /// SES is the one channel only the daemon can answer — it is the
+    /// process that knows the session name — so the renderer must not
+    /// see the envelopes at all. Its own per-portal SES engine would
+    /// answer the same probe with "not in a session", which is the
+    /// opposite of the truth.
+    #[test]
+    fn ses_envelopes_are_stripped_from_what_the_renderer_sees() {
+        let (mut st, _read) = attached_state();
+        let mut frames = Vec::new();
+        veter_host::ses::envelope::append_frame(
+            &mut frames,
+            veter_host::ses::frame::CMD_PROBE,
+            11,
+            &[],
+        );
+        let mut chunk = b"before".to_vec();
+        chunk.extend_from_slice(&veter_host::ses::envelope::wrap_c2h_envelope(&frames));
+        chunk.extend_from_slice(b"after");
+
+        let out = st.process_chunk(&chunk);
+        assert_eq!(
+            out.forward.as_deref(),
+            Some(b"beforeafter".as_ref()),
+            "a SES envelope reached the renderer"
+        );
+        assert!(
+            !out.replies.is_empty(),
+            "the daemon didn't answer the SES probe it consumed"
+        );
+    }
+
+    /// Everything else still reaches the renderer byte for byte: it
+    /// parses PRT / VGE / VFT natively and has to see what the inner
+    /// program actually wrote.
+    #[test]
+    fn everything_but_ses_is_forwarded_verbatim() {
+        let (mut st, _read) = attached_state();
+        let mut chunk = b"text ".to_vec();
+        chunk.extend_from_slice(&vge_probe_envelope());
+        chunk.extend_from_slice(&build_envelope(&[(Command::Probe, 3)]));
+        chunk.extend_from_slice(&vft_probe_envelope());
+        chunk.extend_from_slice(b" more");
+
+        assert_eq!(st.process_chunk(&chunk).forward.as_deref(), Some(&chunk[..]));
     }
 
     fn vft_probe_envelope() -> Vec<u8> {

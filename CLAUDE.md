@@ -87,7 +87,7 @@ Stages 2–4 are pure byte filters, and each one's APC parser passes the *other*
 
 After the chunk, the byte filters' `after_vt100_process` hooks observe the resulting screen state (scroll position, alt-screen swaps, scrollback eviction); VGE's already ran inside the terminal stage. Engine-generated responses/events are written back to the PTY master.
 
-`vsd`'s worker loop (`tools/vsd/src/engines.rs`) runs the same stages by hand rather than through `drive_chunk`, because the daemon *sends* snapshots and holds no `VssEngine` of its own.
+`vsd`'s worker loop (`tools/vsd/src/engines.rs::EngineState::process_chunk`) runs the same stages by hand rather than through `drive_chunk`, because the daemon *sends* snapshots and holds no `VssEngine` of its own. It also runs **SES first**: its passthrough is what gets forwarded to the attached renderer, and SES is the one channel only the daemon can answer (it is the process that knows the session name), so the envelopes must not reach a renderer whose own per-portal SES engine would answer "not in a session". Everything else is forwarded byte for byte. The same "answered exactly once" switch suppresses the daemon's VGE, DSR and PRT replies while a renderer is attached — that renderer runs the same commands off the forwarded chunk and answers them itself.
 
 ## Portals are recursive
 
