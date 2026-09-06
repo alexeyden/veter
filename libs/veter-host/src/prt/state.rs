@@ -1694,13 +1694,18 @@ impl PrtEngine {
             //    in-place update from an in-place *repaint*.
             let scroll_before = portal.vt.screen().scroll_committed();
             let (cursor_row_before, _) = portal.vt.screen().cursor_position();
+            // SES leads, outside the walk: a multiplexer client running
+            // in this portal talks to the per-portal engine, which
+            // reports "not in a session", and nothing downstream cares
+            // where in the stream its envelopes sat. See
+            // `crate::pipeline`.
+            let ses_passthrough = portal.ses.process_pty_chunk(&b.data);
             let walk = crate::pipeline::drive_chunk(
-                &b.data,
+                &ses_passthrough,
                 crate::pipeline::Engines {
                     vss: &mut portal.vss,
                     prt: &mut portal.children,
                     vft: &mut portal.vft,
-                    ses: &mut portal.ses,
                     vge: &mut portal.vge,
                     parser: &mut portal.vt,
                 },

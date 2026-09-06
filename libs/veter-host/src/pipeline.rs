@@ -24,9 +24,15 @@
 //!
 //! So VSS segments the chunk and the rest of the walk runs once per
 //! run of bytes, with each restore applied in between.
+//!
+//! SES is the one stage that is *not* here. It runs ahead of this, in
+//! each caller, and `chunk` is what it left behind — because `vsd`
+//! forwards that passthrough to its renderer, and needs it as one
+//! contiguous piece rather than per segment. Running it up front is
+//! safe for the same reason the order of the filters below is free,
+//! and it keeps every caller's stage order the same.
 
 use crate::prt::PrtEngine;
-use crate::ses::SesEngine;
 use crate::vft::VftEngine;
 use crate::vge::VgeEngine;
 use crate::vge::state::HitTester;
@@ -61,7 +67,6 @@ pub struct Engines<'a, CB: vt100::Callbacks> {
     pub vss: &'a mut VssEngine,
     pub prt: &'a mut PrtEngine,
     pub vft: &'a mut VftEngine,
-    pub ses: &'a mut SesEngine,
     pub vge: &'a mut VgeEngine,
     pub parser: &'a mut vt100::Parser<CB>,
 }
@@ -82,15 +87,17 @@ pub struct ChunkWalk {
 
 /// Run one chunk through the whole pipeline for one context.
 ///
-/// `backup` is the context's pre-attach stash: filled on the first
-/// snapshot of an attach and consumed by a `DetachNotify`.
+/// `chunk` must already have been through this context's SES engine —
+/// see the module docs. `backup` is the context's pre-attach stash:
+/// filled on the first snapshot of an attach and consumed by a
+/// `DetachNotify`.
 pub fn drive_chunk<CB: vt100::Callbacks>(
     chunk: &[u8],
     e: Engines<'_, CB>,
     backup: &mut Option<PreAttachBackup>,
     hit: Option<&dyn HitTester>,
 ) -> ChunkWalk {
-    let Engines { vss, prt, vft, ses, vge, parser } = e;
+    let Engines { vss, prt, vft, vge, parser } = e;
     let mut walk = ChunkWalk::default();
 
     for seg in vss.process_pty_chunk_segments(chunk) {
@@ -129,8 +136,7 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 // during this run (e.g. a Finalised reply for an
                 // EndUpload whose writer had nothing left queued).
                 vft.drive();
-                let ses_pass = ses.process_pty_chunk(&vft_pass);
-                crate::vge::drive_terminal_stage(vge, parser, &ses_pass, hit);
+                crate::vge::drive_terminal_stage(vge, parser, &vft_pass, hit);
             }
             VssSegment::Restore(cs) => {
                 walk.restores += 1;

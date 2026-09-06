@@ -43,13 +43,14 @@ impl Host {
     }
 
     fn feed(&mut self, chunk: &[u8]) {
+        // SES leads, outside the walk — see `veter_host::pipeline`.
+        let chunk = self.ses.process_pty_chunk(chunk);
         drive_chunk(
-            chunk,
+            &chunk,
             Engines {
                 vss: &mut self.vss,
                 prt: &mut self.prt,
                 vft: &mut self.vft,
-                ses: &mut self.ses,
                 vge: &mut self.vge,
                 parser: &mut self.parser,
             },

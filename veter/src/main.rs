@@ -4459,13 +4459,18 @@ impl App {
                     // Nothing to read back at this level: the reset
                     // that aborts VFT transfers is applied inside, and
                     // only a portal counts DSR queries off the events.
+                    // SES leads, outside the walk: the local renderer
+                    // is not a session, so its engine just answers a
+                    // vmux probe with "no session" and its envelopes
+                    // never reach the vt100. Nothing downstream cares
+                    // where in the stream they sat.
+                    let ses_passthrough = ses.process_pty_chunk(&data);
                     let _walk = veter_host::pipeline::drive_chunk(
-                        &data,
+                        &ses_passthrough,
                         veter_host::pipeline::Engines {
                             vss,
                             prt,
                             vft,
-                            ses,
                             vge: engine,
                             parser,
                         },

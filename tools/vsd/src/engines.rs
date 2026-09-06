@@ -39,10 +39,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use veter_host::pipeline::{drive_chunk, Engines, PreAttachBackup};
 use veter_host::prt::PrtEngine;
 use veter_host::ses::SesEngine;
 use veter_host::vft::VftEngine;
 use veter_host::vge::VgeEngine;
+use veter_host::vss::VssEngine;
 
 /// Default grid size used until the renderer attaches and reports its
 /// actual cell count. Mirrors `veter/src/main.rs`'s startup defaults.
@@ -77,6 +79,27 @@ pub struct EngineState {
     /// mirror is supposed to match. The portals do the same one level
     /// down, via `PrtEngine::set_vft_relay`.
     pub vft: VftEngine,
+    /// VSS engine for snapshots arriving *from* below.
+    ///
+    /// The daemon is a snapshot sender, so this looks redundant — but
+    /// a `vsd attach` to a second session, run from a shell inside
+    /// this one, writes `ESC _ VSS …` straight onto this session's
+    /// pty. Two things go wrong without a stage here. The envelope
+    /// reaches the vt100, and a stuffed payload byte pair `ESC \`
+    /// closes the APC string early in the parser, spraying the rest of
+    /// a multi-hundred-KiB binary snapshot onto the mirrored grid as
+    /// text — the same mechanism the VFT relay exists for. And the
+    /// renderer downstream *does* apply that snapshot to its portal,
+    /// so a mirror that ignored it would diverge from the screen it is
+    /// supposed to be a copy of, and hand the next attach a snapshot
+    /// of a session that has moved on.
+    ///
+    /// So it applies, exactly as the renderer does — and stays quiet
+    /// about it while attached, since the renderer sends the
+    /// `SnapshotAccepted` that the sending daemon is waiting for.
+    pub vss: VssEngine,
+    /// Pre-attach stash for the above, mirroring the renderer's.
+    vss_backup: Option<PreAttachBackup>,
     /// SES engine carrying this session's name. Answers a `vmux` SES
     /// probe with `in_session = true` + the name, and turns a `Detach`
     /// command into a self-pipe wake (see `worker_main`).
@@ -162,6 +185,8 @@ impl EngineState {
             prt,
             vft,
             ses: SesEngine::with_session(session_name),
+            vss: VssEngine::new(),
+            vss_backup: None,
             renderer_stdout: None,
             answering: true,
             attach_shutdown: None,
@@ -280,6 +305,8 @@ impl EngineState {
             prt,
             vft,
             ses,
+            vss,
+            vss_backup,
             renderer_stdout: _,
             answering: _,
             attach_shutdown,
@@ -287,21 +314,18 @@ impl EngineState {
         } = self;
 
         let ses_passthrough = ses.process_pty_chunk(chunk);
-        let prt_chunk = prt.process_pty_chunk_full(&ses_passthrough);
-        // VFT is extracted and dropped (the engine is a relay): the
-        // transfer belongs to the renderer, but the envelope must not
-        // reach the vt100 — see the field's doc.
-        let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
-        // VGE runs last as the terminal stage, driving the vt100
-        // itself so element origins resolve against the screen the
-        // inner program saw. See
-        // `veter_host::vge::drive_terminal_stage`.
-        //
+        // The rest is the shared walk: VSS splitting the chunk, then
+        // PRT → VFT → VGE+vt100 per run of bytes between snapshots.
         // No hit tester: vsd holds the session state but the renderer
         // painting it is a different process, so a VGE `QueryHit`
         // (§15) is answered `err_no_hit_testing` rather than with
         // geometry nobody here has.
-        veter_host::vge::drive_terminal_stage(vge, parser, &vft_passthrough, None);
+        drive_chunk(
+            &ses_passthrough,
+            Engines { vss, prt, vft, vge, parser },
+            vss_backup,
+            None,
+        );
         // See the matching note in veter's host loop: an over-cap
         // envelope is dropped without a reply, so report it.
         let dropped = prt.take_apc_overflows() + vge.take_apc_overflows();
@@ -312,10 +336,9 @@ impl EngineState {
             );
         }
         // The portal-set reactions to RIS / DECSTR / 2J / 3J and the
-        // alt-screen swaps rode along inside `process_pty_chunk_full`,
-        // in stream order with the commands they scope;
-        // `after_vt100_process` only has the post-chunk line origin
-        // left to reconcile.
+        // alt-screen swaps rode along inside the PRT stage, in stream
+        // order with the commands they scope; `after_vt100_process`
+        // only has the post-chunk line origin left to reconcile.
         prt.after_vt100_process(parser);
         prt.flush_pending_events();
         prt.drive_and_flush_vft();
@@ -328,7 +351,12 @@ impl EngineState {
         // rather than the terminal's. Drained either way: a discarded
         // queue must not accumulate.
         let prt_replies = prt.take_responses();
-        let mut replies = if attached { Vec::new() } else { prt_replies };
+        let vss_replies = vss.take_responses();
+        let mut replies = if attached {
+            Vec::new()
+        } else {
+            [prt_replies, vss_replies].concat()
+        };
         replies.extend_from_slice(&vge.take_responses());
         // SES is the exception, and the reason the strip above exists:
         // the daemon is the only party that knows the session name, so
@@ -853,6 +881,99 @@ mod tests {
 
         let screen = st.parser.screen().contents();
         assert_eq!(screen.trim_end(), "beforeafter", "file bytes reached the grid");
+    }
+
+    /// A snapshot of a 24x80 screen showing `text`, as a `vsd attach`
+    /// to another session would write it onto this session's pty.
+    fn nested_snapshot(text: &[u8]) -> Vec<u8> {
+        let mut vt = vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0);
+        vt.process(text);
+        let vge = VgeEngine::new(DEFAULT_CELL_PX, DEFAULT_SCALE);
+        let prt = PrtEngine::new();
+        vss_protocol::encode_snapshot(
+            vss_protocol::SNAPSHOT_VERSION,
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            77,
+            &vt.screen().binary_snapshot(),
+            &vge.binary_snapshot(),
+            &prt.binary_snapshot(),
+            vss_protocol::DEFAULT_MAX_FRAGMENT_BYTES,
+        )
+    }
+
+    /// The daemon is a snapshot *sender*, but a `vsd attach` to a
+    /// second session run from a shell inside this one writes VSS
+    /// straight onto this session's pty. Without a stage for it, a
+    /// stuffed `ESC \` pair closes the APC string early in the vt100
+    /// parser and the rest of a several-hundred-KiB binary snapshot
+    /// lands on the mirrored grid as text — the same mechanism the VFT
+    /// relay exists for.
+    #[test]
+    fn nested_vss_never_reaches_the_mirrored_grid() {
+        let mut bare = vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0);
+        let mut chunk = b"before\x1b_VSS".to_vec();
+        chunk.extend_from_slice(b"\x1b\x1b\\SNAPSHOTBYTES\x1b\\after".as_ref());
+        bare.process(&chunk);
+        assert!(
+            bare.screen().contents().contains("SNAPSHOTBYTES"),
+            "premise of this test: an unextracted payload reaches the grid"
+        );
+
+        let mut st = EngineState::new("s".into());
+        st.process_chunk(&chunk);
+        assert_eq!(
+            st.parser.screen().contents().trim_end(),
+            "beforeafter",
+            "snapshot bytes reached the grid"
+        );
+    }
+
+    /// …and it is *applied*, not just swallowed. The renderer
+    /// downstream applies it to its portal, so a mirror that ignored
+    /// it would diverge from the screen it is a copy of — and hand the
+    /// next attach a snapshot of a session that has moved on.
+    #[test]
+    fn nested_vss_is_applied_to_the_mirror() {
+        let mut st = EngineState::new("s".into());
+        st.process_chunk(b"my shell");
+        st.process_chunk(&nested_snapshot(b"other session"));
+        assert_eq!(
+            st.parser.screen().contents().trim_end(),
+            "other session",
+            "the mirror ignored a snapshot the renderer will apply"
+        );
+
+        // And a detach puts back what the attach replaced.
+        st.process_chunk(&vss_protocol::encode_detach_notify());
+        assert_eq!(st.parser.screen().contents().trim_end(), "my shell");
+    }
+
+    /// Detached, the daemon is the only host, so it sends the
+    /// `SnapshotAccepted` the other daemon is waiting on. Attached,
+    /// the renderer sends it and a second one from here is the §1.5
+    /// duplicate-reply hazard.
+    #[test]
+    fn nested_vss_is_acknowledged_by_exactly_one_party() {
+        let mut st = EngineState::new("s".into());
+        let detached = st.process_chunk(&nested_snapshot(b"other"));
+        assert!(
+            !detached.replies.is_empty(),
+            "nobody acknowledged the snapshot: the sender would time out"
+        );
+
+        let (mut st, _read) = attached_state();
+        let out = st.process_chunk(&nested_snapshot(b"other"));
+        assert!(
+            out.replies.is_empty(),
+            "the daemon acknowledged a snapshot the renderer also acknowledges"
+        );
+        // Unlike SES, the envelope still goes downstream: the renderer
+        // has its own portal to apply it to.
+        assert!(
+            out.forward.is_some_and(|f| f.windows(5).any(|w| w == b"\x1b_VSS")),
+            "the renderer never saw the snapshot"
+        );
     }
 
     /// The host engines follow the same switch: a client talking
