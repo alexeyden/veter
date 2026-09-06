@@ -102,7 +102,14 @@ pub(crate) fn encode_state(
 
 pub(crate) struct DecodedState {
     pub state: VgeState,
+    /// The sender's cell metrics. Still on the wire — the reader has
+    /// to consume them to reach what follows, and they are useful in a
+    /// hexdump — but deliberately *not* installed on restore: metrics
+    /// belong to whoever renders. See
+    /// `VgeEngine::restore_from_binary_snapshot`.
+    #[allow(dead_code)]
     pub cell_px: (u16, u16),
+    #[allow(dead_code)]
     pub scale_factor: f32,
 }
 

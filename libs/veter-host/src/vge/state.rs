@@ -720,6 +720,17 @@ impl VgeEngine {
         self.scale_factor = scale_factor;
     }
 
+    /// The cell metrics this engine reports to its clients — the
+    /// renderer's, never a snapshot sender's. See
+    /// [`Self::restore_from_binary_snapshot`].
+    pub fn cell_px(&self) -> (u16, u16) {
+        self.cell_px
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
     pub fn top_of_live_screen(&self) -> i64 {
         self.top_of_live_screen
     }
@@ -776,8 +787,14 @@ impl VgeEngine {
     ) -> Result<(), crate::vge::snapshot::SnapshotError> {
         let decoded = crate::vge::snapshot::decode_state(bytes)?;
         self.state = decoded.state;
-        self.cell_px = decoded.cell_px;
-        self.scale_factor = decoded.scale_factor;
+        // Cell metrics are the *receiver's*, and are deliberately not
+        // taken from the snapshot — the same rule PRT already applies
+        // to `portal_auto_reply` and `vft_relay`. The sender's are
+        // whatever the last renderer to probe it reported, or the 8x16
+        // defaults if that probe timed out; adopting them would make a
+        // renderer whose zoom has changed since lay out every element
+        // against a cell size that isn't on screen, until the next
+        // `set_dimensions` happens to correct it.
         // Reset transient state that doesn't belong to the snapshot:
         // any in-flight responses or cursor queries from before the
         // restore are stale.
@@ -3841,7 +3858,9 @@ mod tests {
     fn binary_snapshot_round_trips_byte_equal() {
         let e1 = populate_engine();
         let bytes1 = e1.binary_snapshot();
-        let mut e2 = VgeEngine::new((9, 20), 1.0); // different defaults
+        // Same metrics as the source: a restore keeps the receiver's,
+        // so byte-equality is only a statement about the state.
+        let mut e2 = VgeEngine::new((9, 20), 1.25);
         e2.restore_from_binary_snapshot(&bytes1).expect("restore");
         let bytes2 = e2.binary_snapshot();
         assert_eq!(bytes1, bytes2);
@@ -3876,22 +3895,30 @@ mod tests {
     fn binary_snapshot_empty_engine_round_trips() {
         let e1 = VgeEngine::new((9, 20), 1.5);
         let bytes1 = e1.binary_snapshot();
-        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        let mut e2 = VgeEngine::new((9, 20), 1.5);
         e2.restore_from_binary_snapshot(&bytes1).unwrap();
         let bytes2 = e2.binary_snapshot();
         assert_eq!(bytes1, bytes2);
     }
 
+    /// The metrics are on the wire, but a restore does not adopt them:
+    /// they describe the sender's screen, and for an attach the sender
+    /// is a daemon that paints nothing. See
+    /// `restore_from_binary_snapshot`.
     #[test]
-    fn binary_snapshot_carries_cell_px_and_scale() {
+    fn a_restore_keeps_the_receivers_cell_px_and_scale() {
         let e1 = VgeEngine::new((11, 24), 2.5);
         let bytes = e1.binary_snapshot();
-        let mut e2 = VgeEngine::new((1, 1), 1.0);
+        let mut e2 = VgeEngine::new((7, 15), 1.0);
         e2.restore_from_binary_snapshot(&bytes).unwrap();
-        // Round-trip another snapshot from the restored engine; both
-        // engines must serialize identically.
-        let bytes2 = e2.binary_snapshot();
-        assert_eq!(bytes, bytes2);
+
+        assert_eq!(e2.cell_px(), (7, 15));
+        assert!((e2.scale_factor() - 1.0).abs() < f32::EPSILON);
+        assert_ne!(
+            bytes,
+            e2.binary_snapshot(),
+            "the receiver re-serializes its own metrics, not the sender's"
+        );
     }
 
     #[test]

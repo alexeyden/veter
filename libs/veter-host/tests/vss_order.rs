@@ -279,3 +279,19 @@ fn a_second_snapshot_of_one_attach_does_not_re_stash() {
 
     assert_eq!(host.screen(), "my shell");
 }
+
+/// Cell metrics belong to whoever renders. A snapshot carries the
+/// sender's — the daemon's, which are the last renderer's or the 8x16
+/// defaults if its probe timed out — and installing them would lay
+/// every element out against a cell size that isn't on screen.
+#[test]
+fn a_restore_keeps_the_receiver_s_cell_metrics() {
+    let mut host = Host::new();
+    host.vge.set_dimensions((11, 24), 2.0);
+
+    // The snapshot in `snapshot_of` is built with the 8x16 default.
+    host.feed(&snapshot_of(24, 80, 4, b"restored"));
+
+    assert_eq!(host.vge.cell_px(), (11, 24));
+    assert!((host.vge.scale_factor() - 2.0).abs() < f32::EPSILON);
+}
