@@ -70,15 +70,31 @@ impl Row {
     pub fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
-        if last_cell.is_wide() {
-            last_cell.clear(*last_cell.attrs());
-        }
+        self.repair_trailing_wide();
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
+        self.repair_trailing_wide();
+    }
+
+    /// Clear a wide character's head if it ended up in the last column
+    /// with its continuation cut off.
+    ///
+    /// A width shrink truncates every row, and the cut can land between
+    /// the two halves of a wide character. The rest of the grid assumes
+    /// a head always has a cell after it — [`Self::clear_wide`] and the
+    /// wide-write path in `Screen::text` both step to `col + 1` — so an
+    /// orphaned head is a latent panic reachable from ordinary program
+    /// output after a window resize. `truncate` has always repaired it;
+    /// `resize`, which is what `Grid::set_size` actually calls, did not.
+    fn repair_trailing_wide(&mut self) {
+        if let Some(last) = self.cells.last_mut() {
+            if last.is_wide() {
+                last.clear(*last.attrs());
+            }
+        }
     }
 
     pub fn wrap(&mut self, wrap: bool) {
@@ -101,10 +117,14 @@ impl Row {
         r: &mut crate::snapshot::Reader,
     ) -> Result<Self, crate::snapshot::SnapshotError> {
         let n = r.varu()? as usize;
-        // Cap at u16::MAX since Row::cols() is u16 elsewhere.
-        if n > u16::MAX as usize {
+        // Cap at u16::MAX since Row::cols() is u16 elsewhere, and at
+        // what is left of the payload: a cell is at least one byte on
+        // the wire, so a count past that can only be corruption. The
+        // second bound is what keeps `with_capacity` from aborting the
+        // process on an absurd length — an abort no `Result` can catch.
+        if n > u16::MAX as usize || n > r.remaining() {
             return Err(crate::snapshot::SnapshotError::bad_payload(
-                "row cell count exceeds u16::MAX",
+                "implausible row cell count",
             ));
         }
         let mut cells = Vec::with_capacity(n);
@@ -112,19 +132,44 @@ impl Row {
             cells.push(crate::cell::Cell::deserialize_binary(r)?);
         }
         let wrapped = r.bool()?;
-        Ok(Self { cells, wrapped })
+        let mut row = Self { cells, wrapped };
+        // A row whose last cell is a wide head has no continuation to
+        // go with it. Repair rather than reject: the sender may simply
+        // be a build whose resize path predates
+        // `repair_trailing_wide`, and one unrepresentable glyph is not
+        // a reason to throw away a whole session's state.
+        row.repair_trailing_wide();
+        Ok(row)
     }
 
+    /// Clear the other half of the wide character at `col`, if there is
+    /// one.
+    ///
+    /// Every index here is bounds-checked. [`Self::repair_trailing_wide`]
+    /// keeps a head from being orphaned in the last column in the first
+    /// place, but this is also reached from a restored snapshot, whose
+    /// bytes come off the wire from a possibly different build — and the
+    /// cost of being wrong is the whole terminal process, every portal
+    /// in it included.
     pub fn clear_wide(&mut self, col: u16) {
-        let cell = &self.cells[usize::from(col)];
-        let other = if cell.is_wide() {
-            &mut self.cells[usize::from(col + 1)]
-        } else if cell.is_wide_continuation() {
-            &mut self.cells[usize::from(col - 1)]
+        let idx = usize::from(col);
+        let (wide, continuation) = match self.cells.get(idx) {
+            Some(cell) => (cell.is_wide(), cell.is_wide_continuation()),
+            None => return,
+        };
+        let other_idx = if wide {
+            idx + 1
+        } else if continuation {
+            match idx.checked_sub(1) {
+                Some(i) => i,
+                None => return,
+            }
         } else {
             return;
         };
-        other.clear(*other.attrs());
+        if let Some(other) = self.cells.get_mut(other_idx) {
+            other.clear(*other.attrs());
+        }
     }
 
     pub fn write_contents(

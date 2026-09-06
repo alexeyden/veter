@@ -108,9 +108,21 @@ impl<'a> Reader<'a> {
     pub(crate) fn at_end(&self) -> bool {
         self.pos >= self.buf.len()
     }
+    /// Bytes left unread. Decoders that size a `Vec` from a length
+    /// field on the wire bound it by this first: an element costs at
+    /// least a byte, so nothing longer than the rest of the payload can
+    /// be real, and `Vec::with_capacity` on a bogus length *aborts* the
+    /// process rather than returning an error we could handle.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
-        if self.pos + n > self.buf.len() {
-            return Err(SnapshotError::bad_payload("truncated"));
+        // `checked_add`, not `pos + n`: a length read off the wire can
+        // be large enough to wrap the sum, and a wrapped sum passes
+        // this check.
+        match self.pos.checked_add(n) {
+            Some(end) if end <= self.buf.len() => {}
+            _ => return Err(SnapshotError::bad_payload("truncated")),
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;

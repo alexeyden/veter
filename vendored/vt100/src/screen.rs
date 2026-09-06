@@ -923,6 +923,16 @@ impl Screen {
             // width() can only return 0, 1, or 2
             .unwrap();
 
+        // A character wider than the whole grid can never be drawn.
+        // Bail before `col_wrap`, whose `cols - width` underflows on a
+        // one-column grid, and before the write path below, which would
+        // otherwise leave a wide head in the last column with no
+        // continuation cell after it — the orphan `Row::clear_wide` and
+        // the wide-write path both assume away.
+        if width > size.cols {
+            return;
+        }
+
         // Remember this glyph for REP (CSI Ps b). Zero-width (combining)
         // characters aren't repeatable graphic characters, so skip them.
         if width > 0 {
@@ -2317,5 +2327,120 @@ mod binary_snapshot_tests {
         let mut p2 = Parser::new(2, 4, 0);
         let err = p2.screen_mut().restore_from_binary_snapshot(&bytes);
         assert!(err.is_err());
+    }
+
+    /// Offset of the main grid's `pos.row` field: the u16 kind version,
+    /// then the grid's `rows` / `cols`.
+    const POS_ROW_OFFSET: usize = 2 + 2 + 2;
+
+    /// A cursor past the last row must be refused, not installed. It
+    /// used to restore cleanly and panic on the next printed byte —
+    /// and these bytes arrive over SSH from a build we don't control,
+    /// so "the sender wouldn't do that" isn't a guarantee.
+    #[test]
+    fn cursor_outside_the_grid_rejects() {
+        let mut p = Parser::new(24, 80, 100);
+        p.process(b"hello");
+        let mut bytes = p.screen().binary_snapshot();
+        bytes[POS_ROW_OFFSET..POS_ROW_OFFSET + 2]
+            .copy_from_slice(&200u16.to_le_bytes());
+
+        let mut p2 = Parser::new(24, 80, 100);
+        assert!(p2.screen_mut().restore_from_binary_snapshot(&bytes).is_err());
+        // The rejected snapshot left the screen usable.
+        p2.process(b"x");
+        assert_eq!(p2.screen().cell(0, 0).unwrap().contents(), "x");
+    }
+
+    /// An absurd row count is refused rather than handed to
+    /// `Vec::with_capacity`, which aborts the process — past any
+    /// `Result` the caller could act on.
+    #[test]
+    fn implausible_row_count_rejects_instead_of_aborting() {
+        let p = Parser::new(2, 4, 0);
+        let bytes = p.screen().binary_snapshot();
+        // The grid's row-count varu follows the fixed header: kind
+        // version + rows/cols + pos + saved_pos + scroll top/bottom +
+        // two mode bools.
+        let count_at = 2 + (2 + 2) + (2 + 2) + (2 + 2) + 2 + 2 + 1 + 1;
+        let mut corrupt = bytes[..count_at].to_vec();
+        // LEB128 for a value near u64::MAX.
+        corrupt.extend_from_slice(&[0xFF; 9]);
+        corrupt.push(0x01);
+        corrupt.extend_from_slice(&bytes[count_at..]);
+
+        let mut p2 = Parser::new(2, 4, 0);
+        assert!(p2
+            .screen_mut()
+            .restore_from_binary_snapshot(&corrupt)
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod wide_char_safety_tests {
+    use crate::Parser;
+
+    /// A width shrink can cut the continuation half off a wide
+    /// character, leaving its head alone in the last column. Erasing
+    /// that cell stepped to `col + 1` and panicked the whole process.
+    #[test]
+    fn erase_over_a_wide_head_orphaned_by_a_shrink() {
+        let mut p = Parser::new(24, 4, 100);
+        p.process("ab\u{4e00}".as_bytes());
+        p.screen_mut().set_size(24, 3);
+        p.process(b"\x1b[1;3H\x1b[K");
+        assert_eq!(p.screen().cell(0, 2).unwrap().contents(), "");
+    }
+
+    /// Same orphan, reached by overwriting it instead of erasing it.
+    #[test]
+    fn print_over_a_wide_head_orphaned_by_a_shrink() {
+        let mut p = Parser::new(24, 4, 100);
+        p.process("ab\u{4e00}".as_bytes());
+        p.screen_mut().set_size(24, 3);
+        p.process(b"\x1b[1;3Hx");
+        assert_eq!(p.screen().cell(0, 2).unwrap().contents(), "x");
+    }
+
+    /// The shrink itself must leave no orphan behind: the head is
+    /// cleared along with its lost continuation.
+    #[test]
+    fn a_width_shrink_leaves_no_orphaned_wide_head() {
+        let mut p = Parser::new(24, 4, 100);
+        p.process("ab\u{4e00}".as_bytes());
+        p.screen_mut().set_size(24, 3);
+        assert!(!p.screen().cell(0, 2).unwrap().is_wide());
+    }
+
+    /// A character wider than the grid can't be drawn at all.
+    /// `cols - width` used to underflow before anything noticed.
+    #[test]
+    fn wide_char_on_a_one_column_grid_is_dropped() {
+        let mut p = Parser::new(24, 1, 100);
+        p.process("\u{4e00}".as_bytes());
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+        // Still usable afterwards.
+        p.process(b"x");
+        assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "x");
+    }
+
+    /// A snapshot carrying an orphaned head — from a build whose
+    /// resize path predates the repair — is fixed up on the way in
+    /// rather than becoming a panic on the receiver.
+    #[test]
+    fn restored_orphaned_wide_head_is_repaired() {
+        let mut p = Parser::new(24, 4, 100);
+        p.process("ab\u{4e00}".as_bytes());
+        p.screen_mut().set_size(24, 3);
+        let bytes = p.screen().binary_snapshot();
+
+        let mut p2 = Parser::new(24, 3, 100);
+        p2.screen_mut()
+            .restore_from_binary_snapshot(&bytes)
+            .expect("restore");
+        assert!(!p2.screen().cell(0, 2).unwrap().is_wide());
+        p2.process(b"\x1b[1;3H\x1b[K");
     }
 }

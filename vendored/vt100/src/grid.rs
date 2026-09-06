@@ -153,24 +153,81 @@ impl Grid {
         let origin_mode = r.bool()?;
         let saved_origin_mode = r.bool()?;
 
-        let n = r.varu()? as usize;
-        if n > u16::MAX as usize {
+        // Everything above is a bare field read; nothing has been
+        // validated yet. These bytes arrive over SSH from a build we
+        // don't control, and the fields below are load-bearing
+        // invariants for every index in this module — a cursor outside
+        // the grid, or a row shorter than `cols`, panics on the next
+        // printed character rather than here. Check them while we can
+        // still return an error.
+        if size.rows == 0 || size.cols == 0 {
             return Err(crate::snapshot::SnapshotError::bad_payload(
-                "grid row count exceeds u16::MAX",
+                "grid snapshot has a zero dimension",
+            ));
+        }
+        if pos.row >= size.rows
+            || pos.col >= size.cols
+            || saved_pos.row >= size.rows
+            || saved_pos.col >= size.cols
+        {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "grid snapshot cursor is outside the grid",
+            ));
+        }
+        if scroll_top > scroll_bottom || scroll_bottom >= size.rows {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "grid snapshot scroll region is outside the grid",
+            ));
+        }
+
+        let n = r.varu()? as usize;
+        // Bounded by the payload as well as by `u16`, so an absurd
+        // count can't abort the process inside `with_capacity`.
+        if n > u16::MAX as usize || n > r.remaining() {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "implausible grid row count",
             ));
         }
         let mut rows = Vec::with_capacity(n);
         for _ in 0..n {
             rows.push(crate::row::Row::deserialize_binary(r)?);
         }
+        // Rows are allocated lazily, so an empty `rows` is the legal
+        // "not yet drawn to" state. Anything else must match the grid
+        // it claims to be.
+        if !rows.is_empty() {
+            if rows.len() != usize::from(size.rows) {
+                return Err(crate::snapshot::SnapshotError::bad_payload(
+                    "grid snapshot row count disagrees with its own size",
+                ));
+            }
+            if rows
+                .iter()
+                .any(|row| row.cells_slice().len() != usize::from(size.cols))
+            {
+                return Err(crate::snapshot::SnapshotError::bad_payload(
+                    "grid snapshot row is not `cols` cells wide",
+                ));
+            }
+        }
 
         let scrollback_len = r.varu()? as usize;
         let sb_count = r.varu()? as usize;
+        if sb_count > r.remaining() {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "implausible scrollback row count",
+            ));
+        }
         let mut scrollback = std::collections::VecDeque::with_capacity(sb_count);
         for _ in 0..sb_count {
             scrollback.push_back(crate::row::Row::deserialize_binary(r)?);
         }
         let scrollback_offset = r.varu()? as usize;
+        if scrollback_offset > scrollback.len() {
+            return Err(crate::snapshot::SnapshotError::bad_payload(
+                "grid snapshot scrollback offset is past its scrollback",
+            ));
+        }
         let top_of_live_screen = r.i64()?;
 
         Ok(Self {
