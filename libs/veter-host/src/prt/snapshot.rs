@@ -35,7 +35,7 @@ use prt_protocol::command::CursorStyle;
 ///   `PortalAnchor::Scrollback { anchor_line }` values stay aligned
 ///   with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 5;
 
 /// Error returned when a PRT binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -363,6 +363,7 @@ fn encode_content(c: &PortalContent, w: &mut Writer) {
 
     encode_polled(&c.state_cache, w);
     w.u32(c.pending_cursor_queries);
+    w.u32(c.pending_extended_cursor_queries);
 }
 
 fn decode_content(
@@ -379,6 +380,7 @@ fn decode_content(
 
     let state_cache = decode_polled(r)?;
     let pending_cursor_queries = r.u32()?;
+    let pending_extended_cursor_queries = r.u32()?;
 
     // Build a fresh buffer scaffold the way `cmd_create_portal` does.
     let rows = size_h as u16;
@@ -449,5 +451,6 @@ fn decode_content(
         damage_baseline: None,
         last_damage_eval: None,
         pending_cursor_queries,
+        pending_extended_cursor_queries,
     })
 }

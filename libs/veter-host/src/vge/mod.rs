@@ -154,6 +154,22 @@ mod tests {
         );
     }
 
+    /// DECXCPR gets its own reply, carrying the DEC-private `?` back
+    /// so a sender that asked the private form can tell it apart.
+    #[test]
+    fn decxcpr_is_answered_with_the_private_form() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"ab\x1b[?6n", None);
+        assert_eq!(engine.take_responses(), b"\x1b[?1;3R".to_vec());
+    }
+
+    #[test]
+    fn dsr_and_decxcpr_in_one_chunk_get_one_reply_each() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"ab\x1b[6n\x1b[?6n", None);
+        assert_eq!(engine.take_responses(), b"\x1b[1;3R\x1b[?1;3R".to_vec());
+    }
+
     /// The query bytes still reach the vt100 — the engine observes
     /// them, it doesn't consume them.
     #[test]

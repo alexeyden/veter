@@ -39,6 +39,10 @@ pub enum TerminalEvent {
     /// from the post-process cursor position and folds it into the
     /// portal's RawReply event (§13.4).
     CursorPositionQuery,
+    /// `ESC [ ? 6 n` — DECXCPR, the DEC-private spelling of the same
+    /// question, answered `ESC [ ? <row> ; <col> R` and folded into
+    /// the portal's RawReply the same way (§13.4).
+    ExtendedCursorPositionQuery,
     /// `ESC [ 2 J` — erase entire visible screen (§5.8). vt100 wipes the
     /// cells in place but doesn't push them to scrollback, so portals
     /// anchored to the live region would otherwise stay rendered on top
@@ -641,9 +645,13 @@ impl ApcStream {
                     if self.csi.as_slice() == b"!" && b == b'p' {
                         out.push_event(TerminalEvent::SoftReset);
                     }
-                    // DSR cursor-position query is `ESC [ 6 n`.
+                    // DSR cursor-position query is `ESC [ 6 n`;
+                    // DECXCPR is the same with a DEC-private `?`.
                     if self.csi.as_slice() == b"6" && b == b'n' {
                         out.push_event(TerminalEvent::CursorPositionQuery);
+                    }
+                    if self.csi.as_slice() == b"?6" && b == b'n' {
+                        out.push_event(TerminalEvent::ExtendedCursorPositionQuery);
                     }
                     if b == b'J' && self.csi.as_slice() == b"2" {
                         out.push_event(TerminalEvent::EraseDisplay);
@@ -820,6 +828,20 @@ mod tests {
         v.push(ESC);
         v.push(ST_CLOSE);
         v
+    }
+
+    /// DECXCPR (`ESC [ ? 6 n`) is DSR with a DEC-private `?`, and the
+    /// two must not be confused: their replies differ by that `?`.
+    #[test]
+    fn decxcpr_and_dsr_are_told_apart() {
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[?6n");
+        assert_eq!(events(&out), vec![TerminalEvent::ExtendedCursorPositionQuery]);
+        assert_eq!(out.passthrough, b"\x1b[?6n");
+
+        let mut s = ApcStream::new();
+        let out = s.feed(b"\x1b[6n");
+        assert_eq!(events(&out), vec![TerminalEvent::CursorPositionQuery]);
     }
 
     #[test]

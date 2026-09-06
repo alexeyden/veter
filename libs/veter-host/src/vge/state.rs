@@ -598,6 +598,9 @@ pub struct VgeEngine {
     /// until vt100 has processed the chunk so the reply reflects
     /// post-process cursor state.
     pending_cursor_queries: u32,
+    /// The same, for the DEC-private DECXCPR spelling (`ESC [ ? 6 n`).
+    /// Counted apart because the reply carries the `?` back.
+    pending_extended_cursor_queries: u32,
     /// When `false`, `\x1b[6n` queries observed in the byte stream are
     /// not counted into `pending_cursor_queries` and so produce no
     /// auto-reply. PRT in v1 uses this for per-portal VGE engines so
@@ -659,6 +662,7 @@ impl VgeEngine {
             pending_uploads: HashMap::new(),
             pending_image_deletes: Vec::new(),
             pending_cursor_queries: 0,
+            pending_extended_cursor_queries: 0,
             auto_reply_dsr: true,
             auto_reply_queries: true,
             auto_reply_commands: true,
@@ -802,6 +806,7 @@ impl VgeEngine {
         self.pending_image_deletes.clear();
         self.pending_uploads.clear();
         self.pending_cursor_queries = 0;
+        self.pending_extended_cursor_queries = 0;
         // §7.3 — the snapshot carries the *sender's* style table, and
         // the reserved `host.*` namespace belongs to whoever renders,
         // not to whoever snapshotted: a daemon that holds the state
@@ -912,6 +917,11 @@ impl VgeEngine {
                     self.pending_cursor_queries += 1;
                 }
             }
+            ExtendedCursorPositionQuery => {
+                if self.auto_reply_dsr {
+                    self.pending_extended_cursor_queries += 1;
+                }
+            }
             EraseDisplay => {
                 // vt100 wipes the cells in place but doesn't push them
                 // to scrollback, so top_of_live_screen is unchanged.
@@ -991,15 +1001,24 @@ impl VgeEngine {
         &mut self,
         parser: &vt100::Parser<CB>,
     ) {
-        if self.pending_cursor_queries == 0 {
+        if self.pending_cursor_queries == 0 && self.pending_extended_cursor_queries == 0
+        {
             return;
         }
         let (row, col) = parser.screen().cursor_position();
-        let resp = format!("\x1b[{};{}R", row as u32 + 1, col as u32 + 1);
+        let (row, col) = (u32::from(row) + 1, u32::from(col) + 1);
+        let plain = format!("\x1b[{row};{col}R");
+        // DECXCPR's answer echoes the private `?` back, so a sender
+        // that asked the private form can tell the reply apart.
+        let private = format!("\x1b[?{row};{col}R");
         for _ in 0..self.pending_cursor_queries {
-            self.pending_response_bytes.extend_from_slice(resp.as_bytes());
+            self.pending_response_bytes.extend_from_slice(plain.as_bytes());
+        }
+        for _ in 0..self.pending_extended_cursor_queries {
+            self.pending_response_bytes.extend_from_slice(private.as_bytes());
         }
         self.pending_cursor_queries = 0;
+        self.pending_extended_cursor_queries = 0;
     }
 
     /// Update top-of-live-screen tracking and react to alt-screen

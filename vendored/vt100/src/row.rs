@@ -59,6 +59,19 @@ impl Row {
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
+        // Unchecked on purpose. A wide head only ever sits where it has
+        // a continuation cell after it — `repair_trailing_wide` clears
+        // one orphaned by a shrink or arriving in a snapshot, and
+        // `Screen::text` drops a character wider than the grid rather
+        // than planting one. So `cols() - 2` below cannot underflow.
+        // A bounds check here would buy nothing and quietly weaken
+        // that: the next reader would take the orphan case for
+        // possible. The assert is the documentation, and fails loudly
+        // in tests if either guard is ever removed.
+        debug_assert!(
+            !self.cells[usize::from(i)].is_wide() || usize::from(i) + 1 < self.cells.len(),
+            "wide head at the last column: a repair guard was lost"
+        );
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);

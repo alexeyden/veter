@@ -886,9 +886,9 @@ impl PrtEngine {
     /// to this engine, at the point in the stream it was seen:
     /// HardReset/SoftReset wipe this engine's active portal set,
     /// EraseDisplay/EraseScrollback cull it, the alt-screen swaps move
-    /// it aside and back (§5.4), and CursorPositionQuery is left to
-    /// the caller (the parent vt100 owner answers it; the engine
-    /// itself has no vt100 to query).
+    /// it aside and back (§5.4), and the two cursor-position queries
+    /// are left to the caller (the parent vt100 owner answers them;
+    /// the engine itself has no vt100 to query).
     fn handle_terminal_event(&mut self, ev: TerminalEvent) {
         match ev {
             TerminalEvent::HardReset => {
@@ -906,7 +906,8 @@ impl PrtEngine {
             TerminalEvent::EraseScrollback => self.cull_for_erase_scrollback(),
             TerminalEvent::AltScreenEnter => self.enter_alt_scope(),
             TerminalEvent::AltScreenLeave => self.leave_alt_scope(),
-            TerminalEvent::CursorPositionQuery => {}
+            TerminalEvent::CursorPositionQuery
+            | TerminalEvent::ExtendedCursorPositionQuery => {}
         }
     }
 
@@ -1364,6 +1365,7 @@ impl PrtEngine {
             damage_baseline: None,
             last_damage_eval: None,
             pending_cursor_queries: 0,
+            pending_extended_cursor_queries: 0,
         };
         let content_id = set.insert_content(content);
         let portal = Portal {
@@ -1713,9 +1715,16 @@ impl PrtEngine {
                 inner_hit,
             );
             for ev in &walk.terminal_events {
-                if matches!(ev, TerminalEvent::CursorPositionQuery) {
-                    portal.pending_cursor_queries =
-                        portal.pending_cursor_queries.saturating_add(1);
+                match ev {
+                    TerminalEvent::CursorPositionQuery => {
+                        portal.pending_cursor_queries =
+                            portal.pending_cursor_queries.saturating_add(1);
+                    }
+                    TerminalEvent::ExtendedCursorPositionQuery => {
+                        portal.pending_extended_cursor_queries =
+                            portal.pending_extended_cursor_queries.saturating_add(1);
+                    }
+                    _ => {}
                 }
             }
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
@@ -1765,16 +1774,24 @@ impl PrtEngine {
             reverse.extend_from_slice(&portal.vft.take_responses());
             reverse.extend_from_slice(&portal.vss.take_responses());
             reverse.extend_from_slice(&portal.ses.take_responses());
-            if portal.pending_cursor_queries > 0 {
+            if portal.pending_cursor_queries > 0
+                || portal.pending_extended_cursor_queries > 0
+            {
                 if portal_auto_reply {
                     let (row, col) = portal.vt.screen().cursor_position();
-                    let reply =
-                        format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1);
+                    let (row, col) = (u32::from(row) + 1, u32::from(col) + 1);
+                    let plain = format!("\x1b[{row};{col}R");
+                    // DECXCPR's answer echoes the private `?` back.
+                    let private = format!("\x1b[?{row};{col}R");
                     for _ in 0..portal.pending_cursor_queries {
-                        reverse.extend_from_slice(reply.as_bytes());
+                        reverse.extend_from_slice(plain.as_bytes());
+                    }
+                    for _ in 0..portal.pending_extended_cursor_queries {
+                        reverse.extend_from_slice(private.as_bytes());
                     }
                 }
                 portal.pending_cursor_queries = 0;
+                portal.pending_extended_cursor_queries = 0;
             }
 
             (raw_events, old_cache, new_cache, reverse, activity)
@@ -4507,6 +4524,29 @@ mod tests {
                 .contains_key("c1"),
             "the sub-portal created after the snapshot was wiped by it"
         );
+    }
+
+    /// Inside a portal PRT is the sole responder for both cursor
+    /// queries, and each gets its own spelling back.
+    #[test]
+    fn portal_answers_dsr_and_decxcpr_separately() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 10, 2),
+        );
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"abc\x1b[6n\x1b[?6n".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        let raw = first_event(&frames, EVT_RAW_REPLY).unwrap();
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "p");
+        assert_eq!(r.bytes().unwrap(), b"\x1b[1;4R\x1b[?1;4R");
     }
 
     /// The queries PRT answers none of: a program inside a portal gets

@@ -40,6 +40,12 @@ pub enum TerminalEvent {
     /// reply, so the engine emits the response itself after vt100
     /// finishes processing the chunk.
     CursorPositionQuery,
+    /// `ESC [ ? 6 n` — DECXCPR, the DEC-private spelling of the same
+    /// question. Answered `ESC [ ? <row> ; <col> R`, with the `?` the
+    /// sender is matching on: a client that asked the private form and
+    /// got the plain reply has to guess whether the terminal answered
+    /// it or something else did.
+    ExtendedCursorPositionQuery,
     /// `ESC [ 2 J` — erase entire visible screen. The text cells are
     /// wiped in place; vt100 doesn't expose this as a scroll so VGE
     /// elements anchored to the live region would otherwise stick
@@ -729,9 +735,13 @@ impl ApcStream {
                     if self.csi.as_slice() == b"!" && b == b'p' {
                         out.push_event(TerminalEvent::SoftReset);
                     }
-                    // DSR cursor-position query is `ESC [ 6 n`.
+                    // DSR cursor-position query is `ESC [ 6 n`;
+                    // DECXCPR is the same with a DEC-private `?`.
                     if self.csi.as_slice() == b"6" && b == b'n' {
                         out.push_event(TerminalEvent::CursorPositionQuery);
+                    }
+                    if self.csi.as_slice() == b"?6" && b == b'n' {
+                        out.push_event(TerminalEvent::ExtendedCursorPositionQuery);
                     }
                     // Erase In Display:
                     //   `ESC [ 2 J` — wipe live region.
@@ -911,6 +921,18 @@ mod tests {
         let mut s = ApcStream::new();
         let out = s.feed(input);
         (out.events, out.passthrough)
+    }
+
+    /// DECXCPR is DSR with a DEC-private `?`, and the two must not be
+    /// confused: their replies differ by that same `?`.
+    #[test]
+    fn decxcpr_and_dsr_are_told_apart() {
+        let (events, pass) = events_of(b"\x1b[?6n");
+        assert_eq!(events, vec![TerminalEvent::ExtendedCursorPositionQuery]);
+        assert_eq!(pass, b"\x1b[?6n");
+
+        let (events, _) = events_of(b"\x1b[6n");
+        assert_eq!(events, vec![TerminalEvent::CursorPositionQuery]);
     }
 
     #[test]

@@ -312,6 +312,9 @@ pub struct PortalContent {
     /// haven't yet been answered. Drained after `vt.process` so the
     /// reply reflects post-process cursor state (§13.4).
     pub pending_cursor_queries: u32,
+    /// The same, for DECXCPR (`ESC [ ? 6 n`). Counted apart because
+    /// its reply carries the DEC-private `?` back.
+    pub pending_extended_cursor_queries: u32,
 }
 
 impl PortalContent {
