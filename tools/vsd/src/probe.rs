@@ -132,17 +132,33 @@ pub fn run(stdin_fd: &OwnedFd, stdout_fd: &OwnedFd, timeout: Duration) -> Result
             break;
         }
         let remaining = deadline - now;
-        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ms = u16::try_from(remaining.as_millis()).unwrap_or(u16::MAX);
         // SAFETY: borrowed for the duration of the poll call only.
         let borrowed = stdin_fd.as_fd();
         let mut pollfds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-        let ready = poll(&mut pollfds, PollTimeout::from(ms as u16))
-            .map_err(|e| anyhow!("poll(stdin): {e}"))?;
+        // EINTR is not a failure: any signal delivered while we sit
+        // here — SIGWINCH from the user resizing mid-attach, SIGCHLD,
+        // the SIGTERM the session installs a handler for — interrupts
+        // the call, and propagating that killed the whole attach. Both
+        // of this attach's other read loops (`await_snapshot_ack`,
+        // `splice_input`) already retry; this one is between them.
+        //
+        // `continue`, not an inner retry loop, so the deadline is
+        // re-checked: a stream of signals must not extend the probe
+        // past its timeout.
+        let ready = match poll(&mut pollfds, PollTimeout::from(ms)) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(anyhow!("poll(stdin): {e}")),
+        };
         if ready == 0 {
             break;
         }
-        let n = nix::unistd::read(stdin_fd.as_raw_fd(), &mut buf)
-            .map_err(|e| anyhow!("read(stdin): {e}"))?;
+        let n = match nix::unistd::read(stdin_fd.as_raw_fd(), &mut buf) {
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(anyhow!("read(stdin): {e}")),
+        };
         if n == 0 {
             break;
         }
@@ -362,6 +378,70 @@ fn log_probe_chunk(chunk: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signal arriving mid-probe used to kill the whole attach:
+    /// `poll` and `read` returned EINTR and the error went straight
+    /// up. Signals are ordinary here — SIGWINCH from a resize during
+    /// the handshake, SIGCHLD, the SIGTERM the session handles — so
+    /// the probe has to ride them out and fall back to its defaults
+    /// like any other renderer that doesn't answer.
+    ///
+    /// The signal is delivered with `pthread_kill` to this test's own
+    /// thread rather than `kill` to the process, so nothing else in
+    /// the test binary sees it.
+    #[test]
+    fn a_signal_during_the_probe_does_not_kill_the_attach() {
+        use nix::sys::signal::{
+            sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        extern "C" fn interrupt(_: libc::c_int) {}
+
+        // No SA_RESTART: the point is for the handler to make the
+        // blocked syscall return EINTR rather than resume it.
+        let action = SigAction::new(
+            SigHandler::Handler(interrupt),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+        // SAFETY: the handler does nothing at all, which is trivially
+        // async-signal-safe.
+        unsafe { sigaction(Signal::SIGUSR1, &action).expect("sigaction") };
+
+        // A renderer that never answers: the probe will sit in `poll`
+        // for its whole timeout, which is the window we interrupt.
+        let (stdin_read, _stdin_write) = nix::unistd::pipe().expect("pipe");
+        let (_out_read, out_write) = nix::unistd::pipe().expect("pipe");
+
+        let target = unsafe { libc::pthread_self() } as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let killer = std::thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+                unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR1) };
+            }
+        });
+
+        let outcome = run(&stdin_read, &out_write, Duration::from_millis(150));
+        stop.store(true, Ordering::Release);
+        killer.join().expect("killer thread");
+
+        let outcome = outcome.expect("a signal killed the probe");
+        assert!(outcome.vge.is_none(), "nobody answered, so there is nothing to parse");
+        assert!(outcome.prt.is_none());
+
+        // SAFETY: restore the default so no later test inherits it.
+        unsafe {
+            sigaction(
+                Signal::SIGUSR1,
+                &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+            )
+            .expect("sigaction restore");
+        }
+    }
 
     #[test]
     fn parses_vge_probe_response() {
