@@ -50,6 +50,115 @@ use crate::probe;
 /// connection.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long to wait for the renderer's `SnapshotAccepted` /
+/// `SnapshotRejected` before giving up on it — `doc/session-manager.md`
+/// §4.4 step 4. Longer than [`PROBE_TIMEOUT`] because the snapshot
+/// itself is on the wire ahead of the answer: a few hundred KiB of
+/// grid and images have to arrive and be applied before the renderer
+/// can say anything.
+///
+/// Silence is not an error. A renderer that doesn't speak VSS never
+/// answers, and the attach proceeds — it just means nothing restored
+/// our state, which is what the detach path keys its `ESC c` on.
+const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a version-mismatch banner stays on screen before the
+/// attach tears itself down (§4.2). Long enough to read one line.
+const REJECT_BANNER_HOLD: Duration = Duration::from_secs(2);
+
+/// What the renderer said about the snapshot we sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotAck {
+    /// It restored our state; it now has a stash of its own view to
+    /// put back on detach.
+    Accepted,
+    /// It refused. `reason` is the `SnapshotRejected` code: 1 version,
+    /// 2 malformed, 3 capacity.
+    Rejected(u8),
+    /// Nothing came back inside [`ACK_TIMEOUT`] — an older renderer,
+    /// or one that doesn't speak VSS at all.
+    Silent,
+}
+
+impl SnapshotAck {
+    fn reject_reason(reason: u8) -> &'static str {
+        match reason {
+            1 => "the renderer and this daemon were built from different \
+                  snapshot versions",
+            2 => "the renderer could not parse the snapshot",
+            3 => "the renderer could not hold a snapshot this large",
+            _ => "the renderer refused the snapshot",
+        }
+    }
+}
+
+/// Wait for the renderer's verdict on the snapshot we just wrote.
+///
+/// Bytes that aren't a VSS upstream envelope are the user typing
+/// during the attach; they come back as typeahead for the caller to
+/// forward, exactly as the probe phase does, rather than being
+/// swallowed.
+fn await_snapshot_ack(
+    stdin_fd: &OwnedFd,
+    sequence_id: u32,
+    timeout: Duration,
+) -> Result<(SnapshotAck, Vec<u8>)> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::time::Instant;
+
+    let mut apc = vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
+    let mut typeahead = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok((SnapshotAck::Silent, typeahead));
+        }
+        let ms = (deadline - now).as_millis().min(u128::from(u16::MAX)) as u16;
+        let mut fds = [PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(ms)) {
+            Ok(0) => return Ok((SnapshotAck::Silent, typeahead)),
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(anyhow!("poll(stdin) waiting for snapshot ack: {e}")),
+        }
+        let n = match nix::unistd::read(stdin_fd.as_raw_fd(), &mut buf) {
+            Ok(0) => return Ok((SnapshotAck::Silent, typeahead)),
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(anyhow!("read(stdin) waiting for snapshot ack: {e}")),
+        };
+        let out = apc.feed(&buf[..n]);
+        typeahead.extend_from_slice(&out.passthrough);
+        for payload in &out.payloads {
+            let mut verdict = None;
+            let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
+                if let Ok(frame) = vss_protocol::frames::UpstreamFrame::parse(frame_type, body)
+                {
+                    verdict = Some(match frame {
+                        vss_protocol::frames::UpstreamFrame::SnapshotAccepted { sequence_id: id } => {
+                            (id, SnapshotAck::Accepted)
+                        }
+                        vss_protocol::frames::UpstreamFrame::SnapshotRejected {
+                            sequence_id: id,
+                            reason,
+                        } => (id, SnapshotAck::Rejected(reason)),
+                    });
+                }
+                Ok::<(), u16>(())
+            });
+            // An answer to some other snapshot is not ours to act on.
+            if let Some((id, ack)) = verdict
+                && id == sequence_id
+            {
+                return Ok((ack, typeahead));
+            }
+        }
+    }
+}
+
 /// Cadence for the mid-attach SIGWINCH watcher. The renderer's stdio
 /// is a tty fd that's been handed over to us via `SCM_RIGHTS`; we
 /// don't share a controlling tty with it, so the kernel doesn't
@@ -222,7 +331,7 @@ fn handler_main(
     // Step 3: while still under the lock, install the stdout fd on
     // engines so the worker starts forwarding live bytes the moment
     // we release.
-    {
+    let ack = {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot: Vec<u8> = Vec::new();
         // No ATTACH_ENTER (alt-screen wrap) for the VSS path: the
@@ -248,11 +357,12 @@ fn handler_main(
         let vge_bytes = guard.vge.binary_snapshot();
         let prt_bytes = guard.prt.binary_snapshot();
         let (rows, cols) = guard.parser.screen().size();
+        let sequence_id = next_sequence_id();
         let vss_env = vss_protocol::encode_snapshot(
             vss_protocol::SNAPSHOT_VERSION,
             rows,
             cols,
-            next_sequence_id(),
+            sequence_id,
             &vt_bytes,
             &vge_bytes,
             &prt_bytes,
@@ -266,10 +376,45 @@ fn handler_main(
         let stdout_raw = stdout_fd.as_raw_fd();
         write_all_raw(stdout_raw, &snapshot).with_context(|| "writing snapshot")?;
 
+        // §4.4 step 4 — wait for the renderer's verdict *before*
+        // handing it live bytes. Still under the engines lock: the
+        // worker blocks rather than forwarding output into a pane
+        // that has not accepted the state it belongs to, and nothing
+        // is lost — the bytes it already read are processed and
+        // forwarded once we release.
+        let (ack, typeahead) = await_snapshot_ack(&stdin_fd, sequence_id, ACK_TIMEOUT)
+            .with_context(|| "waiting for the renderer's snapshot verdict")?;
+        if !typeahead.is_empty() {
+            let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
+            write_all_raw(master_writer_fd.as_raw_fd(), &typeahead)
+                .with_context(|| "forwarding ack-phase typeahead")?;
+        }
+
+        // §4.4 step 6 / §4.2 — a refused snapshot means the renderer
+        // has none of this session's state. Forwarding live bytes into
+        // that pane would paint a session's output over whatever the
+        // user was looking at, with no way back. Say why, hold long
+        // enough to read it, and tear the attach down.
+        if let SnapshotAck::Rejected(reason) = ack {
+            let banner = format!(
+                "\r\nvsd: cannot attach — {}.\r\n     \
+                 Rebuild `veter` and `vsd` from the same commit.\r\n",
+                SnapshotAck::reject_reason(reason)
+            );
+            let _ = write_all_raw(stdout_raw, banner.as_bytes());
+            drop(guard);
+            std::thread::sleep(REJECT_BANNER_HOLD);
+            restore_tty_canonical(stdin_fd.as_raw_fd());
+            return Err(anyhow!(
+                "renderer rejected the snapshot (reason {reason})"
+            ));
+        }
+
         guard.renderer_stdout = Some(
             dup_owned(&stdout_fd).with_context(|| "duping renderer stdout for worker")?,
         );
-    }
+        ack
+    };
 
     // Step 4: spawn the SIGWINCH watcher so the renderer can resize
     // its window mid-attach. The watcher polls `TIOCGWINSZ` on its
@@ -339,8 +484,17 @@ fn handler_main(
     // including modes.
     let detach_env = vss_protocol::encode_detach_notify();
     let _ = write_all_raw(stdout_fd.as_raw_fd(), &detach_env);
-    // Belt-and-suspenders: `ESC c` (RIS — full terminal reset).
-    let _ = write_all_raw(stdout_fd.as_raw_fd(), b"\x1bc");
+    // `ESC c` (RIS) only if nobody took the snapshot. It used to go
+    // out unconditionally, a few bytes behind `DetachNotify` — and
+    // vt100's `ris()` builds a fresh `Screen`, so it wiped the
+    // pre-attach view the notify had just restored, scrollback,
+    // `top_of_live_screen` and VGE anchors included. The stash was
+    // dead on arrival. When the renderer never accepted the snapshot
+    // there is nothing to restore and a reset *is* the right cleanup:
+    // the pane still carries whatever modes the session left behind.
+    if ack != SnapshotAck::Accepted {
+        let _ = write_all_raw(stdout_fd.as_raw_fd(), b"\x1bc");
+    }
 
     // Explicitly restore tty termios here (instead of relying on
     // `RawTty::Drop` only). The Drop path was leaving the stdin tty
@@ -952,6 +1106,47 @@ mod tests {
             forwarded.push(b);
         }
         (forwarded, false)
+    }
+
+    /// Feed `bytes` through a pipe as if the renderer had sent them,
+    /// and ask what verdict came back.
+    fn ack_of(bytes: &[u8], timeout_ms: u64) -> (SnapshotAck, Vec<u8>) {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        nix::unistd::write(&write_fd, bytes).expect("write");
+        drop(write_fd);
+        await_snapshot_ack(&read_fd, 42, Duration::from_millis(timeout_ms))
+            .expect("ack")
+    }
+
+    #[test]
+    fn an_accept_for_our_sequence_id_is_read() {
+        let (ack, typeahead) = ack_of(&vss_protocol::encode_accepted(42), 500);
+        assert_eq!(ack, SnapshotAck::Accepted);
+        assert!(typeahead.is_empty());
+    }
+
+    #[test]
+    fn a_reject_carries_its_reason() {
+        let (ack, _) = ack_of(&vss_protocol::encode_rejected(42, 1), 500);
+        assert_eq!(ack, SnapshotAck::Rejected(1));
+    }
+
+    /// A renderer that doesn't speak VSS answers nothing, and the
+    /// attach goes ahead anyway — but the keystrokes the user typed
+    /// while waiting must not be eaten.
+    #[test]
+    fn silence_keeps_the_user_s_typeahead() {
+        let (ack, typeahead) = ack_of(b"ls -l\r", 60);
+        assert_eq!(ack, SnapshotAck::Silent);
+        assert_eq!(typeahead, b"ls -l\r");
+    }
+
+    /// An answer about a different attach is not ours to act on.
+    #[test]
+    fn an_ack_for_another_snapshot_is_ignored() {
+        let (ack, typeahead) = ack_of(&vss_protocol::encode_accepted(7), 60);
+        assert_eq!(ack, SnapshotAck::Silent);
+        assert!(typeahead.is_empty(), "envelope leaked into the inner PTY");
     }
 
     #[test]

@@ -332,6 +332,7 @@ to PRT / VGE / VFT and routed by the same per-portal pipeline:
 | 0x03 | `VgeFragment`   | `varu index`, `varu total`, `bytes payload` |
 | 0x04 | `PrtFragment`   | `varu index`, `varu total`, `bytes payload` |
 | 0x05 | `SnapshotEnd`   | `u32 sequence_id` |
+| 0x06 | `DetachNotify`  | *(empty)* |
 
 #### Frame types (renderer → engine, marker `vss`)
 
@@ -345,16 +346,36 @@ envelopes without busting any single APC budget. Reassembly is by
 `(frame_type, total)` count; a complete `Vt+Vge+Prt` set within one
 `Begin … End` window applies atomically.
 
+`sequence_id` identifies the **attach**, not the snapshot: every
+attach uses a fresh one, and the renderer keys its pre-attach stash
+(§4.5) on it. A second snapshot bearing the same id is a redraw of
+the same attach and must not re-stash; a different id means the
+previous attach is over — however it ended — and what is on screen
+now is what a later `DetachNotify` should put back. Ids are not
+required to be ordered or dense, only distinct across the attaches a
+renderer might see in one lifetime, so a daemon that restarts must
+not begin again at the value its predecessor used.
+
+`DetachNotify` closes an attach: the renderer restores the state it
+stashed on the first `SnapshotBegin` of that attach and drops the
+stash. It carries no `sequence_id` — a renderer holds at most one
+attach at a time — and is not answered.
+
 ### 4.2 Version policy
 
 `snapshot_version` is a single monotonic `u32` baked into both
 binaries at build time. Bump on every breaking change to any
 sub-snapshot layout. **Strict match.** On mismatch the renderer
 emits `SnapshotRejected { reason = 1 }`; `vsd` writes a plain-text
-banner to the renderer's alt-screen view, holds for ~2 s, and tears
-the attach down via the existing `ATTACH_LEAVE`. No replay fallback.
-The operational expectation is that `vsd` and `veter` ship in
-lockstep.
+banner to the renderer's pane, holds for ~2 s, and tears the attach
+down. No replay fallback. The operational expectation is that `vsd`
+and `veter` ship in lockstep.
+
+A refused snapshot must also stop the attach from *starting*: the
+renderer holds none of the session's state, so live output forwarded
+into that pane would paint over whatever the user was looking at with
+no way back. `vsd` therefore waits for the verdict before it installs
+the renderer's stdout on the engines (§4.4).
 
 ### 4.3 Snapshot payload
 
@@ -415,15 +436,32 @@ composition (lines ~237–245). Under the engines lock:
 2. Wrap them into
    `SnapshotBegin → VtFragment* → VgeFragment* → PrtFragment* → SnapshotEnd`
    envelopes via `vss-protocol::encode_snapshot`.
-3. Write `ATTACH_ENTER` (`CSI ?1049 h`) + envelopes to the
-   renderer's stdout.
+3. Write the envelopes to the renderer's stdout. **No
+   `ATTACH_ENTER`** (`CSI ?1049 h`) around them: the snapshot's
+   `modes` byte authoritatively says whether the context is on the
+   main or the alternate grid, and `restore_from_binary_snapshot`
+   replaces that state wholesale. An `ATTACH_ENTER` written first
+   would reach the receiving vt100 *after* the snapshot applied — the
+   bytes flow through the same pipeline — leaving it on an empty alt
+   grid with the session's content hidden in main. The pre-attach
+   view is restored by the §4.5 stash and `DetachNotify`, not by an
+   alt-screen round trip.
 4. Read upstream for `SnapshotAccepted` / `SnapshotRejected` with a
-   ~1 s timeout (matches the existing `PROBE_TIMEOUT`).
+   ~1 s timeout, still under the engines lock. Longer than the 500 ms
+   `PROBE_TIMEOUT` because the snapshot is on the wire ahead of the
+   answer. Holding the lock across the wait blocks the worker rather
+   than losing anything: the bytes it has already read are processed
+   and forwarded once the lock is released.
 5. On accept: install the renderer-stdout fd on the engines so the
    worker forwards live PTY bytes; release the lock; splice input
    and run the winsize watcher exactly as today.
-6. On reject: print a plain-text mismatch banner to the alt-screen
-   view; `ATTACH_LEAVE`; tear the attach down.
+6. On reject: write a plain-text banner naming the reason to the
+   renderer's pane, hold ~2 s, restore its termios, and tear the
+   attach down without ever installing the stdout fd.
+7. On silence — an older renderer, or one that doesn't speak VSS —
+   proceed as for an accept. Nothing restored the state, so nothing
+   stashed the pre-attach view either, and the detach path sends
+   `ESC c` instead of relying on a stash that does not exist.
 
 The per-session worker thread (`tools/vsd/src/engines.rs`) is
 **unchanged**: it keeps forwarding inner-PTY bytes verbatim once
