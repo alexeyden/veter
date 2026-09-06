@@ -18,6 +18,7 @@
 
 pub mod env;
 pub mod prt;
+pub mod query;
 pub mod ses;
 pub mod vft;
 pub mod vge;

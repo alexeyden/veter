@@ -52,11 +52,70 @@ pub enum TerminalEvent {
     /// `top_of_live_screen`. `clear(1)` typically emits `2J` followed
     /// by `3J`, so the two together wipe all VGE elements.
     EraseScrollback,
+    /// `ESC [ c` / `ESC [ 0 c` — DA1, primary device attributes. Like
+    /// DSR, vt100 parses it and replies to nothing, so the engine
+    /// answers. Unlike DSR this one is not optional in practice: vim,
+    /// neovim and tmux send DA1 at startup and *block* on the answer
+    /// until their own timeout, so a terminal that stays silent costs
+    /// every one of them a visible stall on every launch.
+    DeviceAttributes1,
+    /// `ESC [ > c` / `ESC [ > 0 c` — DA2, secondary device attributes:
+    /// "which terminal are you, and what version".
+    DeviceAttributes2,
+    /// `ESC [ > q` / `ESC [ > 0 q` — XTVERSION, the modern spelling of
+    /// the same question, answered with a name rather than a number.
+    XtVersion,
+    /// `ESC [ ? Ps $ p` (private) or `ESC [ Ps $ p` (ANSI) — DECRQM,
+    /// "is mode `Ps` set?". Answered from the vt100's own mode state,
+    /// or as "not recognised" for a mode the screen doesn't track —
+    /// which is still an answer, and still unblocks the sender.
+    ModeQuery { private: bool, mode: u16 },
 }
 
 /// Cap on CSI body length we'll buffer for matching. Long sequences
 /// (mostly mode set/reset chains) past this just reset the observer.
 const CSI_BUF_CAP: usize = 32;
+
+/// Match a completed CSI — `params` is everything between `ESC [` and
+/// the final byte `final_byte` — against the terminal queries nothing
+/// in this stack used to answer.
+///
+/// Kept separate from the reset/erase matches above because these four
+/// share a shape: the sender is *waiting* for a reply, so failing to
+/// recognise one costs a stall rather than a missed repaint.
+fn query_event(params: &[u8], final_byte: u8) -> Option<TerminalEvent> {
+    match final_byte {
+        // DA1 `CSI c` / `CSI 0 c`; DA2 `CSI > c` / `CSI > 0 c`.
+        b'c' => match params {
+            b"" | b"0" => Some(TerminalEvent::DeviceAttributes1),
+            b">" | b">0" => Some(TerminalEvent::DeviceAttributes2),
+            _ => None,
+        },
+        // XTVERSION `CSI > q` / `CSI > 0 q`. The `>` is what separates
+        // it from DECLL (`CSI Ps q`) and DECSCUSR (`CSI Ps SP q`).
+        b'q' => match params {
+            b">" | b">0" => Some(TerminalEvent::XtVersion),
+            _ => None,
+        },
+        // DECRQM `CSI ? Ps $ p` / `CSI Ps $ p`. The `$` intermediate
+        // is what separates it from DECSTR (`CSI ! p`).
+        b'p' => {
+            let rest = params.strip_suffix(b"$")?;
+            let (private, digits) = match rest.strip_prefix(b"?") {
+                Some(d) => (true, d),
+                None => (false, rest),
+            };
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // A mode number past u16 can't be one we know; treat the
+            // sequence as unrecognised rather than wrapping it.
+            let mode: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+            Some(TerminalEvent::ModeQuery { private, mode })
+        }
+        _ => None,
+    }
+}
 
 /// Default cap on a single envelope's **unstuffed** payload.
 ///
@@ -683,6 +742,9 @@ impl ApcStream {
                     if b == b'J' && self.csi.as_slice() == b"3" {
                         out.push_event(TerminalEvent::EraseScrollback);
                     }
+                    if let Some(ev) = query_event(&self.csi, b) {
+                        out.push_event(ev);
+                    }
                     State::Idle
                 } else {
                     self.csi.push(b);
@@ -841,6 +903,80 @@ mod tests {
         buf.truncate(buf.len()); // no-op, just reuse
         assert_eq!(out.passthrough, vec![ESC, APC_OPEN, b'G', b'a', b'b', b'c', ESC, ST_CLOSE]);
         assert!(out.payloads.is_empty());
+    }
+
+    /// Every query is observed *and* still passed through: the vt100
+    /// behind us has to see the bytes it always saw.
+    fn events_of(input: &[u8]) -> (Vec<TerminalEvent>, Vec<u8>) {
+        let mut s = ApcStream::new();
+        let out = s.feed(input);
+        (out.events, out.passthrough)
+    }
+
+    #[test]
+    fn da1_is_observed_in_both_spellings() {
+        for input in [b"\x1b[c".as_ref(), b"\x1b[0c".as_ref()] {
+            let (events, pass) = events_of(input);
+            assert_eq!(events, vec![TerminalEvent::DeviceAttributes1]);
+            assert_eq!(pass, input);
+        }
+    }
+
+    #[test]
+    fn da2_is_observed_and_not_confused_with_da1() {
+        for input in [b"\x1b[>c".as_ref(), b"\x1b[>0c".as_ref()] {
+            let (events, _) = events_of(input);
+            assert_eq!(events, vec![TerminalEvent::DeviceAttributes2]);
+        }
+    }
+
+    #[test]
+    fn xtversion_is_observed() {
+        for input in [b"\x1b[>q".as_ref(), b"\x1b[>0q".as_ref()] {
+            let (events, _) = events_of(input);
+            assert_eq!(events, vec![TerminalEvent::XtVersion]);
+        }
+    }
+
+    /// `CSI Ps q` is DECLL and `CSI Ps SP q` is DECSCUSR — both common,
+    /// neither a version query. The `>` is the whole difference.
+    #[test]
+    fn cursor_style_and_leds_are_not_xtversion() {
+        for input in [b"\x1b[2q".as_ref(), b"\x1b[2 q".as_ref(), b"\x1b[q".as_ref()] {
+            let (events, _) = events_of(input);
+            assert!(events.is_empty(), "matched {input:?} as a query");
+        }
+    }
+
+    #[test]
+    fn decrqm_is_observed_in_both_flavours() {
+        let (events, _) = events_of(b"\x1b[?2004$p");
+        assert_eq!(
+            events,
+            vec![TerminalEvent::ModeQuery { private: true, mode: 2004 }]
+        );
+        let (events, _) = events_of(b"\x1b[4$p");
+        assert_eq!(
+            events,
+            vec![TerminalEvent::ModeQuery { private: false, mode: 4 }]
+        );
+    }
+
+    /// DECSTR is `CSI ! p` and DECRQM is `CSI Ps $ p`; they share a
+    /// final byte and nothing else. Matching one as the other would
+    /// wipe VGE state on a mode query.
+    #[test]
+    fn decstr_is_not_a_mode_query() {
+        let (events, _) = events_of(b"\x1b[!p");
+        assert_eq!(events, vec![TerminalEvent::SoftReset]);
+    }
+
+    /// A mode number too large for `u16` is not one we could answer,
+    /// and must not wrap into one we would.
+    #[test]
+    fn absurd_mode_number_is_not_a_query() {
+        let (events, _) = events_of(b"\x1b[?99999999$p");
+        assert!(events.is_empty());
     }
 
     #[test]

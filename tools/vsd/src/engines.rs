@@ -179,6 +179,7 @@ impl EngineState {
         self.answering = should_answer;
         self.vge.set_auto_reply_commands(should_answer);
         self.vge.set_auto_reply_dsr(should_answer);
+        self.vge.set_auto_reply_queries(should_answer);
         self.prt.set_portal_auto_reply(should_answer);
     }
 }
@@ -559,6 +560,48 @@ mod tests {
             "detaching replayed queries the renderer already answered: {:?}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// DA1 follows the same rule as the VGE probe and DSR: exactly one
+    /// party answers. Attached, that party is the renderer reading the
+    /// forwarded chunk; the daemon must stay quiet or the program in
+    /// the pane reads the spare reply as keystrokes.
+    #[test]
+    fn portal_da1_follows_the_attached_switch() {
+        for attached in [true, false] {
+            let mut st = session_with_portal(attached);
+            let reply = write_to_portal(&mut st, b"\x1b[c".to_vec());
+            assert_eq!(
+                reply == veter_host::query::DA1,
+                !attached,
+                "attached={attached}: wrong party answered DA1: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+    }
+
+    /// …and the same one level up, for a client talking straight to
+    /// the session with no `vmux` in between.
+    #[test]
+    fn host_level_da1_follows_the_attached_switch() {
+        for attached in [true, false] {
+            let mut st = EngineState::new("s".into());
+            st.set_renderer_attached(attached);
+            let prt_chunk = st.prt.process_pty_chunk_full(b"\x1b[c");
+            let ses_pass = st.ses.process_pty_chunk(&prt_chunk.passthrough);
+            veter_host::vge::drive_terminal_stage(
+                &mut st.vge,
+                &mut st.parser,
+                &ses_pass,
+                None,
+            );
+            let out = st.vge.take_responses();
+            assert_eq!(
+                out == veter_host::query::DA1,
+                !attached,
+                "attached={attached}: wrong party answered the host DA1"
+            );
+        }
     }
 
     fn vft_probe_envelope() -> Vec<u8> {

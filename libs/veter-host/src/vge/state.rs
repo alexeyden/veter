@@ -607,6 +607,14 @@ pub struct VgeEngine {
     /// `vsd` toggles it for the same reason across a wider gap: while
     /// a renderer is attached, that renderer sends the cursor report.
     auto_reply_dsr: bool,
+    /// When `false`, the terminal identification and mode queries —
+    /// DA1, DA2, XTVERSION, DECRQM — observed in the byte stream go
+    /// unanswered. Separate from `auto_reply_dsr` because the two have
+    /// different owners: inside a portal PRT is the sole DSR
+    /// responder, but nothing in PRT answers *these*, so a per-portal
+    /// engine keeps them on. `vsd` turns both off together while a
+    /// renderer is attached, since that renderer answers them itself.
+    auto_reply_queries: bool,
     /// When `false`, every VGE command is still parsed and applied
     /// (so engine state stays consistent — for snapshot replay etc.)
     /// but **no** response frame is generated. Used by `vsd` for as
@@ -652,6 +660,7 @@ impl VgeEngine {
             pending_image_deletes: Vec::new(),
             pending_cursor_queries: 0,
             auto_reply_dsr: true,
+            auto_reply_queries: true,
             auto_reply_commands: true,
         }
     }
@@ -682,6 +691,12 @@ impl VgeEngine {
     /// `auto_reply_dsr` — used by per-portal VGE engines.
     pub fn set_auto_reply_dsr(&mut self, enabled: bool) {
         self.auto_reply_dsr = enabled;
+    }
+
+    /// Toggle auto-replies to DA1 / DA2 / XTVERSION / DECRQM. See the
+    /// field doc on `auto_reply_queries`.
+    pub fn set_auto_reply_queries(&mut self, enabled: bool) {
+        self.auto_reply_queries = enabled;
     }
 
     /// Toggle VGE command auto-replies. See the field doc on
@@ -806,7 +821,9 @@ impl VgeEngine {
             self.handle_envelope_payload(&payload, None, None);
         }
         for ev in out.events {
-            self.handle_terminal_event(ev);
+            // Same reason as the payloads above: no screen to answer a
+            // DECRQM from on this path.
+            self.handle_terminal_event(ev, None);
         }
         out.passthrough
     }
@@ -831,13 +848,27 @@ impl VgeEngine {
     }
 
     /// Apply one terminal event extracted by [`Self::feed_segments`].
-    pub fn apply_terminal_event(&mut self, ev: vge_protocol::TerminalEvent) {
-        self.handle_terminal_event(ev);
+    ///
+    /// `screen` is the vt100 as of this point in the stream — the text
+    /// before the event has already reached it. DECRQM is answered
+    /// from it directly rather than queued, so a program that queries
+    /// a mode and changes it in the same write gets the answer that
+    /// was true when it asked.
+    pub fn apply_terminal_event(
+        &mut self,
+        ev: vge_protocol::TerminalEvent,
+        screen: Option<&vt100::Screen>,
+    ) {
+        self.handle_terminal_event(ev, screen);
     }
 
     /// React to a side-channel terminal event observed in the byte
     /// stream (resets, cursor-position queries, etc.).
-    fn handle_terminal_event(&mut self, ev: vge_protocol::TerminalEvent) {
+    fn handle_terminal_event(
+        &mut self,
+        ev: vge_protocol::TerminalEvent,
+        screen: Option<&vt100::Screen>,
+    ) {
         use vge_protocol::TerminalEvent::*;
         match ev {
             HardReset | SoftReset => {
@@ -877,6 +908,21 @@ impl VgeEngine {
                 // with `clear(1)` which emits `2J` followed by `3J`.
                 self.drop_top_level_where(|el, top| el.anchor_line < top);
             }
+            // The identification queries carry no state, so they are
+            // answered where they are seen. Unlike DSR there is nothing
+            // to wait for — and unlike DSR the sender is *blocked*
+            // until the answer arrives.
+            DeviceAttributes1 => self.answer_query(crate::query::DA1),
+            DeviceAttributes2 => self.answer_query(crate::query::DA2),
+            XtVersion => self.answer_query(crate::query::XTVERSION),
+            ModeQuery { private, mode } => {
+                // No screen means no honest answer to give: silence
+                // beats reporting a mode's state from nowhere.
+                if let Some(screen) = screen {
+                    let reply = crate::query::decrqm(private, mode, screen);
+                    self.answer_query(&reply);
+                }
+            }
         }
     }
 
@@ -909,6 +955,14 @@ impl VgeEngine {
     /// PTY master.
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response_bytes)
+    }
+
+    /// Queue a reply to a terminal identification / mode query, if
+    /// this engine is the one that answers them.
+    fn answer_query(&mut self, reply: &[u8]) {
+        if self.auto_reply_queries {
+            self.pending_response_bytes.extend_from_slice(reply);
+        }
     }
 
     /// Reply to any pending DSR cursor-position queries with the

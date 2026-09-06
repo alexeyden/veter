@@ -397,6 +397,7 @@ fn decode_content(
     // A restored portal answers on the same terms as a freshly
     // created one — silent in an observer, talkative in a terminal.
     vge.set_auto_reply_commands(parent_engine.portal_auto_reply());
+    vge.set_auto_reply_queries(parent_engine.portal_auto_reply());
     vge.restore_from_binary_snapshot(vge_bytes)?;
     // §7.3 — a restored portal is seeded like a freshly created one.
     // Seeded after the restore rather than before it so this holds

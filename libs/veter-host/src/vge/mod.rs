@@ -70,7 +70,7 @@ pub fn drive_terminal_stage<CB: vt100::Callbacks>(
                     engine.after_vt100_process(parser);
                     text_pending = false;
                 }
-                engine.apply_terminal_event(ev);
+                engine.apply_terminal_event(ev, Some(parser.screen()));
             }
         }
     }
@@ -139,6 +139,44 @@ mod tests {
         // the parser's line origin before any command is applied.
         engine.after_vt100_process(&mut parser);
         (engine, parser)
+    }
+
+    /// Nothing in this stack answered DA1 before, so vim, neovim and
+    /// tmux each ate their own timeout on every start. The reply is
+    /// queued on the same channel as VGE responses.
+    #[test]
+    fn da1_and_xtversion_are_answered() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[c\x1b[>q", None);
+        assert_eq!(
+            engine.take_responses(),
+            [crate::query::DA1, crate::query::XTVERSION].concat()
+        );
+    }
+
+    /// The query bytes still reach the vt100 — the engine observes
+    /// them, it doesn't consume them.
+    #[test]
+    fn query_bytes_still_reach_the_screen_untouched() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"a\x1b[cb", None);
+        assert_eq!(parser.screen().contents().trim_end(), "ab");
+    }
+
+    /// DECRQM is answered where it is seen, not queued to the end of
+    /// the chunk: a program that asks about a mode and then changes it
+    /// in the same write must get the state it asked about.
+    #[test]
+    fn decrqm_reports_the_state_at_the_moment_it_was_asked() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(
+            &mut engine,
+            &mut parser,
+            b"\x1b[?2004h\x1b[?2004$p\x1b[?2004l",
+            None,
+        );
+        assert_eq!(engine.take_responses(), b"\x1b[?2004;1$y".to_vec());
+        assert!(!parser.screen().bracketed_paste());
     }
 
     #[test]

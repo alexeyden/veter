@@ -431,6 +431,7 @@ impl PrtEngine {
         for set in sets.into_iter().flatten() {
             for content in set.contents.values_mut() {
                 content.vge.set_auto_reply_commands(enabled);
+                content.vge.set_auto_reply_queries(enabled);
                 content.children.set_portal_auto_reply(enabled);
             }
         }
@@ -1326,6 +1327,11 @@ impl PrtEngine {
         // A silent observer answers nothing: see
         // `set_portal_auto_reply`.
         portal_vge.set_auto_reply_commands(self.portal_auto_reply);
+        // DA1 / DA2 / XTVERSION / DECRQM are the portal VGE engine's to
+        // answer, unlike DSR just above: PRT answers none of them, and
+        // a program inside the portal blocks on DA1 exactly as it would
+        // on the host grid.
+        portal_vge.set_auto_reply_queries(self.portal_auto_reply);
         // §7.3 — seed the reserved `host.*` styles, keyed on this portal's
         // depth so nested clients pick up distinct accent colors. No-op
         // when the host palette is empty.
@@ -4477,6 +4483,62 @@ mod tests {
         let data = r.bytes().unwrap();
         // Exactly one DSR reply, not two.
         assert_eq!(data, b"\x1b[1;4R");
+    }
+
+    /// The queries PRT answers none of: a program inside a portal gets
+    /// them from the portal's own VGE engine, whose `auto_reply_dsr`
+    /// is off but whose `auto_reply_queries` is not. Without this the
+    /// program blocks until its own DA1 timeout — in a pane, on every
+    /// start.
+    #[test]
+    fn portal_answers_da1_and_decrqm() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 10, 2),
+        );
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"\x1b[?2004h\x1b[c\x1b[?2004$p".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        let raw = first_event(&frames, EVT_RAW_REPLY).unwrap();
+        let mut r = Reader::new(&raw.body);
+        assert_eq!(r.string().unwrap(), "p");
+        let data = r.bytes().unwrap();
+        assert_eq!(
+            data,
+            [crate::query::DA1, b"\x1b[?2004;1$y"].concat(),
+            "portal answered {:?}",
+            String::from_utf8_lossy(data)
+        );
+    }
+
+    /// A portal that isn't answering its inner programs at all — vsd
+    /// with a renderer attached — must not answer these either, or the
+    /// program gets two DA1 replies and reads the spare as keystrokes.
+    #[test]
+    fn silent_portal_answers_no_queries() {
+        let mut engine = PrtEngine::new();
+        engine.set_portal_auto_reply(false);
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 10, 2),
+        );
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data: b"\x1b[c\x1b[>q".to_vec(),
+        });
+        let frames = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+        assert!(
+            first_event(&frames, EVT_RAW_REPLY).is_none(),
+            "a silent portal answered a query"
+        );
     }
 
     // ---- §10 (vft-in-portal): per-portal VFT plumbing ----------------
