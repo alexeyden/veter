@@ -7,6 +7,6 @@
 
 pub mod state;
 
-pub use state::{CompletedSnapshot, RejectReason, VssEngine};
+pub use state::{CompletedSnapshot, RejectReason, VssEngine, VssSegment};
 
 pub use vss_protocol::*;

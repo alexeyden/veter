@@ -18,7 +18,7 @@ pub mod envelope;
 pub mod frame;
 pub mod frames;
 
-pub use apc::{ApcStream, Output};
+pub use apc::{ApcStream, Output, Segment};
 pub use codec::{stuff, DecodeError, DecodeResult, Reader, Writer};
 pub use envelope::{
     append_downstream, append_frame, append_upstream, encode_accepted, encode_detach_notify,

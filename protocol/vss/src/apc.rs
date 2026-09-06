@@ -133,9 +133,49 @@ pub struct Output {
     pub payloads: Vec<Vec<u8>>,
 }
 
-impl Output {
+/// One piece of the input stream, **in the order it arrived**.
+///
+/// [`Output`] answers "what was in this chunk"; `Segment` answers "in
+/// what order", and for VSS that distinction is the difference between
+/// a correct attach and a corrupt one. A snapshot replaces the
+/// receiving context's engines wholesale, so text before it belongs on
+/// the *old* screen and commands after it belong to the *restored*
+/// engines. A whole-chunk filter gets both backwards — see
+/// `doc/session-manager.md` §4.5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    /// Bytes destined for the next layer, verbatim.
+    Pass(Vec<u8>),
+    /// One fully-received, un-stuffed VSS payload.
+    Payload(Vec<u8>),
+}
+
+/// Accumulator the parser writes into. Consecutive passthrough bytes
+/// coalesce into one `Pass`, so a chunk of plain text is a single
+/// segment rather than one per byte.
+#[derive(Default)]
+struct SegmentSink {
+    segments: Vec<Segment>,
+}
+
+impl SegmentSink {
     fn push_pass(&mut self, b: u8) {
-        self.passthrough.push(b);
+        match self.segments.last_mut() {
+            Some(Segment::Pass(v)) => v.push(b),
+            _ => self.segments.push(Segment::Pass(vec![b])),
+        }
+    }
+
+    /// Bulk form of [`Self::push_pass`] for a whole ESC-free run.
+    fn push_pass_slice(&mut self, bytes: &[u8]) {
+        match self.segments.last_mut() {
+            Some(Segment::Pass(v)) => v.extend_from_slice(bytes),
+            _ => self.segments.push(Segment::Pass(bytes.to_vec())),
+        }
+    }
+
+    fn push_payload(&mut self, payload: Vec<u8>) {
+        self.segments.push(Segment::Payload(payload));
     }
 }
 
@@ -188,8 +228,12 @@ impl ApcStream {
         std::mem::take(&mut self.overflows)
     }
 
-    pub fn feed(&mut self, input: &[u8]) -> Output {
-        let mut out = Output::default();
+    /// Split `input` into ordered segments. This is the form a caller
+    /// that applies snapshots consumes, so it can run the rest of the
+    /// pipeline on the bytes before a snapshot and the bytes after it
+    /// separately, with the restore in between.
+    pub fn feed_segments(&mut self, input: &[u8]) -> Vec<Segment> {
+        let mut out = SegmentSink::default();
         let mut i = 0;
         while i < input.len() {
             // Bulk path: hand the whole run of bytes before the next
@@ -209,14 +253,28 @@ impl ApcStream {
             self.step(input[i], &mut out);
             i += 1;
         }
+        out.segments
+    }
+
+    /// Order-free view of the same extraction: everything the chunk
+    /// contained, grouped by kind. Correct for every caller that is a
+    /// plain byte filter.
+    pub fn feed(&mut self, input: &[u8]) -> Output {
+        let mut out = Output::default();
+        for seg in self.feed_segments(input) {
+            match seg {
+                Segment::Pass(bytes) => out.passthrough.extend_from_slice(&bytes),
+                Segment::Payload(p) => out.payloads.push(p),
+            }
+        }
         out
     }
 
     /// Consume `run` — guaranteed ESC-free — in a [`State::bulkable`]
     /// state.
-    fn bulk(&mut self, run: &[u8], out: &mut Output) {
+    fn bulk(&mut self, run: &[u8], out: &mut SegmentSink) {
         match self.state {
-            State::Idle | State::ApcOther => out.passthrough.extend_from_slice(run),
+            State::Idle | State::ApcOther => out.push_pass_slice(run),
             // Over-cap body: these bytes are envelope payload, dropped
             // rather than passed through, until `ESC \\` resyncs us.
             State::ApcOverflow => {}
@@ -301,7 +359,7 @@ impl ApcStream {
         }
     }
 
-    fn step(&mut self, b: u8, out: &mut Output) {
+    fn step(&mut self, b: u8, out: &mut SegmentSink) {
         self.state = match self.state {
             State::Idle => {
                 if b == ESC {
@@ -367,7 +425,7 @@ impl ApcStream {
                         }
                         Some(n) => n,
                     };
-                    out.passthrough.extend_from_slice(&self.marker_buf[already..]);
+                    out.push_pass_slice(&self.marker_buf[already..]);
                     self.recover_flushed = None;
                     State::Idle
                 }
@@ -383,7 +441,7 @@ impl ApcStream {
                 } else {
                     out.push_pass(ESC);
                     out.push_pass(APC_OPEN);
-                    out.passthrough.extend_from_slice(&self.marker_buf);
+                    out.push_pass_slice(&self.marker_buf);
                     State::ApcOther
                 }
             }
@@ -466,7 +524,7 @@ impl ApcStream {
                         State::ApcVss
                     }
                     ST_CLOSE => {
-                        out.payloads.push(std::mem::take(&mut self.body));
+                        out.push_payload(std::mem::take(&mut self.body));
                         State::Idle
                     }
                     ESC_MARK_TILDE => {
@@ -521,6 +579,50 @@ mod tests {
         v.push(ESC);
         v.push(ST_CLOSE);
         v
+    }
+
+    /// The two views of one chunk must not disagree; `feed` is
+    /// defined as a fold of `feed_segments`, and this is what pins
+    /// that down against the bulk path.
+    #[test]
+    fn feed_and_feed_segments_agree() {
+        let mut input = b"before".to_vec();
+        input.extend_from_slice(&envelope_e2r(b"abcdef"));
+        input.extend_from_slice(b"after");
+
+        let out = ApcStream::new().feed(&input);
+
+        let mut split = ApcStream::new();
+        let mut pass = Vec::new();
+        let mut payloads = Vec::new();
+        for seg in split.feed_segments(&input) {
+            match seg {
+                Segment::Pass(b) => pass.extend_from_slice(&b),
+                Segment::Payload(p) => payloads.push(p),
+            }
+        }
+        assert_eq!(out.passthrough, pass);
+        assert_eq!(out.payloads, payloads);
+    }
+
+    /// The ordering the segmented path exists for: text before the
+    /// snapshot, text after it, and a boundary between them the
+    /// caller can act on.
+    #[test]
+    fn segments_keep_the_snapshot_between_the_text_around_it() {
+        let mut input = b"before".to_vec();
+        input.extend_from_slice(&envelope_e2r(b"snap"));
+        input.extend_from_slice(b"after");
+
+        let mut s = ApcStream::new();
+        assert_eq!(
+            s.feed_segments(&input),
+            vec![
+                Segment::Pass(b"before".to_vec()),
+                Segment::Payload(b"snap".to_vec()),
+                Segment::Pass(b"after".to_vec()),
+            ]
+        );
     }
 
     #[test]

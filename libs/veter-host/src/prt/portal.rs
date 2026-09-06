@@ -80,17 +80,12 @@ impl Callbacks for PortalCallbacks {
     }
 }
 
-/// Stashed pre-attach state used by the VSS "restore on detach"
-/// path. Held as raw binary-snapshot bytes — that's the same wire
-/// format used for over-the-wire attaches, so we avoid a separate
-/// in-memory shape just for this. Saved on the first
-/// `SnapshotBegin` of an attach; restored on `DetachNotify`.
-#[derive(Clone)]
-pub struct PreAttachBackup {
-    pub vt: Vec<u8>,
-    pub vge: Vec<u8>,
-    pub prt: Vec<u8>,
-}
+/// Stashed pre-attach state used by the VSS "restore on detach" path.
+/// One type for the host grid and every portal, since the stash is
+/// the same three snapshots either way — see
+/// [`crate::pipeline::PreAttachBackup`], which is also where it is
+/// saved and restored.
+pub use crate::pipeline::PreAttachBackup;
 
 /// Per-row content fingerprint of a portal's visible grid — the
 /// baseline the §8.10 damage rule diffs against.

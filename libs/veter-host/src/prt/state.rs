@@ -1668,116 +1668,19 @@ impl PrtEngine {
                 .content_mut(&b.id)
                 .expect("contains_key checked above");
 
-            // 1. Route through the portal's PRT ApcStream. Sub-portal
-            //    envelopes embedded in the byte stream are dispatched
-            //    against `portal.children`'s scope. Terminal events
-            //    (CursorPositionQuery, RIS/DECSTR/2J/3J inside portal)
-            //    are surfaced for us to act on against THIS portal's
-            //    vt100 and its sub-portal scope.
-            let chunk = portal.children.process_pty_chunk_with_hit(&b.data, inner_hit);
-            for ev in &chunk.terminal_events {
-                if matches!(ev, TerminalEvent::CursorPositionQuery) {
-                    portal.pending_cursor_queries =
-                        portal.pending_cursor_queries.saturating_add(1);
-                }
-            }
-
-            // §5.7 / §5.8 / §5.4 — RIS / DECSTR / 2J / 3J and the
-            // alt-screen swaps observed inside this portal's byte
-            // stream are scoped to this portal: `process_pty_chunk_full`
-            // already applied them to `portal.children`'s sub-portal
-            // table, in stream order with the sub-portal commands
-            // around them. The bytes themselves still flow to
-            // portal.vt below, which resets / erases / swaps its own
-            // grid on the same sequences.
-
-            // §10 (vft-in-portal) — RIS / DECSTR inside the portal
-            // also abort every transfer in this portal's VFT engine.
-            // EraseDisplay / EraseScrollback do not affect VFT (file
-            // transfer carries no on-screen state).
-            for ev in &chunk.terminal_events {
-                if matches!(ev, TerminalEvent::HardReset | TerminalEvent::SoftReset) {
-                    portal
-                        .vft
-                        .abort_all(vft_protocol::frame::ABORT_HOST_RESET, "");
-                }
-            }
-
-            // 2. §10 (vft-in-portal) — extract any ESC_VFT envelopes.
-            //    VFT has no on-screen state so it does not observe
-            //    terminal events on its own apc; the abort_all call
-            //    above covers RIS/DECSTR.
-            let vft_passthrough = portal.vft.process_pty_chunk(&chunk.passthrough);
-
-            // Drain any worker events that arrived synchronously
-            // during this command (e.g. a Finalised reply for an
-            // EndUpload whose writer had nothing left queued).
-            portal.vft.drive();
-
-            // 2c. VSS — extract any ESC_VSS envelopes carrying a
-            //     binary engine-state snapshot from a vsd attach
-            //     running inside this portal. Apply each completed
-            //     snapshot to this portal's own engines (vt100,
-            //     children PRT, per-portal VGE). See
-            //     `doc/session-manager.md` §4.5.
-            let vss_passthrough = portal.vss.process_pty_chunk(&vft_passthrough);
-            let completed = portal.vss.take_completed_snapshots();
-            for cs in completed {
-                // On the *first* snapshot of an attach window, stash
-                // the portal's current state so a DetachNotify can
-                // roll back to the pre-attach view (the user's ssh
-                // shell, vmux pane, etc.). Subsequent snapshots in
-                // the same attach overwrite without re-stashing.
-                if portal.pre_attach_backup.is_none() {
-                    portal.pre_attach_backup = Some(super::portal::PreAttachBackup {
-                        vt: portal.vt.screen().binary_snapshot(),
-                        vge: portal.vge.binary_snapshot(),
-                        prt: portal.children.binary_snapshot(),
-                    });
-                }
-                if let Err(_e) = portal.vt.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes) {
-                    // On any restore error we drop the snapshot
-                    // silently; the Reject envelope was already queued
-                    // by VssEngine if the version mismatched. Other
-                    // errors leave the portal in its pre-snapshot
-                    // state, which is the right failure mode (no
-                    // partial-apply corruption).
-                }
-                let _ = portal.vge.restore_from_binary_snapshot(&cs.vge_bytes);
-                let _ = portal.children.restore_from_binary_snapshot(&cs.prt_bytes);
-                // The line origin both sub-engines anchor against came
-                // in with the vt100 fragment restored just above.
-                portal.vge.sync_top_of_live_screen(&portal.vt);
-                portal.children.sync_top_of_live_screen(&portal.vt);
-            }
-            // 2d. VSS detach — restore the pre-attach state if a
-            //     DetachNotify came through. Multiple coalesced
-            //     notifies still produce one restore. After restoring,
-            //     drop the backup so the next attach saves anew.
-            if portal.vss.take_detach_signals() > 0 {
-                if let Some(backup) = portal.pre_attach_backup.take() {
-                    let _ = portal.vt.screen_mut().restore_from_binary_snapshot(&backup.vt);
-                    let _ = portal.vge.restore_from_binary_snapshot(&backup.vge);
-                    let _ = portal.children.restore_from_binary_snapshot(&backup.prt);
-                    portal.vge.sync_top_of_live_screen(&portal.vt);
-                    portal.children.sync_top_of_live_screen(&portal.vt);
-                }
-            }
-
-            // 2e. SES — extract any ESC_SES envelopes a multiplexer
-            //     client running inside this portal emitted. The
-            //     per-portal engine reports "not in a session"; its
-            //     `ses` responses join the reverse channel below.
-            let ses_passthrough = portal.ses.process_pty_chunk(&vss_passthrough);
-
-            // 3. §10 — per-portal VGE, the portal's terminal stage.
-            //    Same structure as the host pipeline: VGE runs last and
-            //    drives the portal's vt100 itself, interleaving text
-            //    with command application so element origins resolve
-            //    against the screen the inner program actually saw. The
-            //    engine handles its own RIS/DECSTR/2J/3J reactions on
-            //    its own apc, so inside-portal scoping for VGE elements
-            //    works the same way it does for sub-portals.
+            // 1..3. The whole pipeline for this portal — VSS first and
+            //    segmenting, then PRT → VFT → SES → VGE+vt100 once per
+            //    run of bytes between snapshots. Identical to the host
+            //    walk; see `crate::pipeline`.
+            //
+            //    §5.7 / §5.8 / §5.4 — RIS / DECSTR / 2J / 3J and the
+            //    alt-screen swaps observed inside this portal's byte
+            //    stream are scoped to this portal: the PRT stage
+            //    already applied them to `portal.children`'s
+            //    sub-portal table, in stream order with the sub-portal
+            //    commands around them. The bytes themselves still flow
+            //    to portal.vt, which resets / erases / swaps its own
+            //    grid on the same sequences.
             //
             //    The `PortalCallbacks` instance accumulates Bell /
             //    Title / Icon / Clipboard / OSC events throughout. The
@@ -1791,14 +1694,32 @@ impl PrtEngine {
             //    in-place update from an in-place *repaint*.
             let scroll_before = portal.vt.screen().scroll_committed();
             let (cursor_row_before, _) = portal.vt.screen().cursor_position();
-            crate::vge::drive_terminal_stage(
-                &mut portal.vge,
-                &mut portal.vt,
-                &ses_passthrough,
+            let walk = crate::pipeline::drive_chunk(
+                &b.data,
+                crate::pipeline::Engines {
+                    vss: &mut portal.vss,
+                    prt: &mut portal.children,
+                    vft: &mut portal.vft,
+                    ses: &mut portal.ses,
+                    vge: &mut portal.vge,
+                    parser: &mut portal.vt,
+                },
+                &mut portal.pre_attach_backup,
                 inner_hit,
             );
+            for ev in &walk.terminal_events {
+                if matches!(ev, TerminalEvent::CursorPositionQuery) {
+                    portal.pending_cursor_queries =
+                        portal.pending_cursor_queries.saturating_add(1);
+                }
+            }
             let (cursor_row_after, _) = portal.vt.screen().cursor_position();
-            let committed_line = portal.vt.screen().scroll_committed() != scroll_before
+            // A restore replaced the grid part-way through, so the
+            // sampling above straddles two different screens and says
+            // nothing. Replacing the whole view is activity by any
+            // reading of the word.
+            let committed_line = walk.restores > 0
+                || portal.vt.screen().scroll_committed() != scroll_before
                 || cursor_row_after > cursor_row_before;
             let activity =
                 Self::portal_activity(portal, committed_line, damage_min_interval);
@@ -4483,6 +4404,104 @@ mod tests {
         let data = r.bytes().unwrap();
         // Exactly one DSR reply, not two.
         assert_eq!(data, b"\x1b[1;4R");
+    }
+
+    // ---- VSS ordering inside a portal (BUGS.md §1.1) ----------------
+
+    /// A snapshot envelope for a portal-sized screen showing `text`.
+    fn portal_snapshot_envelope(rows: u16, cols: u16, text: &[u8]) -> Vec<u8> {
+        let mut vt = vt100::Parser::new(rows, cols, 0);
+        vt.process(text);
+        let vge = crate::vge::VgeEngine::new((8, 16), 1.0);
+        let prt = PrtEngine::new();
+        vss_protocol::encode_snapshot(
+            vss_protocol::frame::SNAPSHOT_VERSION,
+            rows,
+            cols,
+            9,
+            &vt.screen().binary_snapshot(),
+            &vge.binary_snapshot(),
+            &prt.binary_snapshot(),
+            vss_protocol::frame::DEFAULT_MAX_FRAGMENT_BYTES,
+        )
+    }
+
+    fn portal_screen(engine: &PrtEngine, id: &str) -> String {
+        engine
+            .state
+            .current()
+            .content(id)
+            .unwrap()
+            .vt
+            .screen()
+            .contents()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The portal path had the *opposite* wrong ordering to the host
+    /// one: it applied the restore before feeding the chunk's text to
+    /// the portal's vt100, so text that preceded the snapshot was
+    /// painted onto the screen that replaced it.
+    #[test]
+    fn portal_text_before_a_snapshot_does_not_land_on_the_restored_screen() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 20, 4),
+        );
+        let mut data = b"hello".to_vec();
+        data.extend_from_slice(&portal_snapshot_envelope(4, 20, b"restored"));
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data,
+        });
+        let _ = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        assert_eq!(
+            portal_screen(&engine, "p"),
+            "restored",
+            "text before the snapshot was painted on the restored screen"
+        );
+    }
+
+    /// …and a sub-portal created after the snapshot belongs to the
+    /// children engine the snapshot installed, not the one it replaced.
+    #[test]
+    fn portal_subportal_created_after_a_snapshot_survives_the_restore() {
+        let mut engine = PrtEngine::new();
+        let _ = dispatch_one(
+            &mut engine,
+            CMD_CREATE_PORTAL,
+            1,
+            &make_create_body("p", 20, 4),
+        );
+
+        let mut inner_frames = Vec::new();
+        append_frame(&mut inner_frames, CMD_CREATE_PORTAL, 5, &make_create_body("c1", 5, 2));
+        let mut data = portal_snapshot_envelope(4, 20, b"restored");
+        data.extend_from_slice(&wrap_c2t_envelope(&inner_frames));
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: "p".into(),
+            data,
+        });
+        let _ = dispatch_full(&mut engine, CMD_WRITE_PORTAL, 2, &body);
+
+        assert!(
+            engine
+                .state
+                .current()
+                .content("p")
+                .unwrap()
+                .children
+                .state
+                .current()
+                .portals
+                .contains_key("c1"),
+            "the sub-portal created after the snapshot was wiped by it"
+        );
     }
 
     /// The queries PRT answers none of: a program inside a portal gets

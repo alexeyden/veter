@@ -148,6 +148,28 @@ pub struct VssEngine {
     detach_signals: usize,
 }
 
+/// One piece of a chunk, in arrival order: bytes for the rest of the
+/// pipeline, or a state change that must be applied *between* two runs
+/// of it.
+///
+/// A snapshot replaces the receiving context's engines wholesale, so
+/// where it sits in the stream is the whole story: text before it
+/// belongs on the screen being replaced, and a PRT command after it
+/// belongs to the engines that replaced them. Draining completed
+/// snapshots after a whole chunk gets both backwards — see
+/// [`VssEngine::process_pty_chunk_segments`].
+pub enum VssSegment {
+    /// Bytes that did not belong to a VSS envelope.
+    Pass(Vec<u8>),
+    /// A snapshot completed at this point in the stream; apply it to
+    /// the owning context's engines before processing anything after.
+    Restore(CompletedSnapshot),
+    /// A `DetachNotify` arrived at this point; roll back to the
+    /// pre-attach state. Coalesced per envelope, matching
+    /// [`VssEngine::take_detach_signals`].
+    Detach,
+}
+
 impl Default for VssEngine {
     fn default() -> Self {
         Self::new()
@@ -166,21 +188,58 @@ impl VssEngine {
         }
     }
 
+    /// Feed raw PTY bytes through the VSS layer, ordered.
+    ///
+    /// This is the form a caller that *applies* snapshots wants; the
+    /// two drains ([`Self::take_completed_snapshots`],
+    /// [`Self::take_detach_signals`]) return nothing for what came
+    /// back here, so use one style or the other, not both.
+    pub fn process_pty_chunk_segments(&mut self, input: &[u8]) -> Vec<VssSegment> {
+        let mut out = Vec::new();
+        for seg in self.apc.feed_segments(input) {
+            match seg {
+                vss_protocol::apc::Segment::Pass(bytes) => {
+                    out.push(VssSegment::Pass(bytes));
+                }
+                vss_protocol::apc::Segment::Payload(payload) => {
+                    self.absorb_payload(&payload);
+                    // Whatever that envelope produced happened *here*,
+                    // between the bytes around it.
+                    out.extend(self.completed.drain(..).map(VssSegment::Restore));
+                    if std::mem::take(&mut self.detach_signals) > 0 {
+                        out.push(VssSegment::Detach);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply one envelope payload, turning a parse failure into the
+    /// same `Reject` + builder teardown both entry points want.
+    fn absorb_payload(&mut self, payload: &[u8]) {
+        if self.handle_payload(payload).is_err() {
+            // Bubble malformed envelopes as a Reject when we know
+            // the sequence_id; otherwise silently swallow.
+            if let Some(seq) = self.builder.as_ref().map(|b| b.sequence_id) {
+                self.reject(seq, REJECT_MALFORMED);
+            }
+            self.builder = None;
+        }
+    }
+
     /// Feed raw PTY bytes through the VSS layer. Returns whatever
     /// bytes did not belong to a VSS envelope so the caller can
     /// forward them to the next layer (vt100 at the host level, or
     /// the inner program's per-portal vt100).
+    ///
+    /// Order-free, and therefore only correct for a caller that does
+    /// not apply the snapshots it extracts — see
+    /// [`Self::process_pty_chunk_segments`] for one that does.
     pub fn process_pty_chunk(&mut self, input: &[u8]) -> Vec<u8> {
         let out = self.apc.feed(input);
         for payload in out.payloads {
-            if let Err(()) = self.handle_payload(&payload) {
-                // Bubble malformed envelopes as a Reject when we know
-                // the sequence_id; otherwise silently swallow.
-                if let Some(seq) = self.builder.as_ref().map(|b| b.sequence_id) {
-                    self.reject(seq, REJECT_MALFORMED);
-                }
-                self.builder = None;
-            }
+            self.absorb_payload(&payload);
         }
         out.passthrough
     }

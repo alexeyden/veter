@@ -17,6 +17,7 @@
 //! pass through to the renderer where the real picker lives.
 
 pub mod env;
+pub mod pipeline;
 pub mod prt;
 pub mod query;
 pub mod ses;

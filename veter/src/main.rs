@@ -781,17 +781,6 @@ fn whole_line_marker(
     (anchor != word_anchor).then_some(anchor)
 }
 
-/// Host-level pre-attach state stashed on the first VSS
-/// `SnapshotBegin` so a `DetachNotify` later can roll back to the
-/// view the user had before they attached. Same idea as
-/// `veter_host::prt::portal::PreAttachBackup` but for the outermost
-/// host engines.
-struct HostVssBackup {
-    vt: Vec<u8>,
-    vge: Vec<u8>,
-    prt: Vec<u8>,
-}
-
 struct App {
     // Terminal state (dropped first — no GL dependency)
     parser: Option<vt100::Parser<clipboard::HostCallbacks>>,
@@ -814,7 +803,7 @@ struct App {
     /// `vsd attach` writes to the host's outermost vt100 / VGE /
     /// PRT instead of into a vmux pane portal. Saved on the first
     /// VSS `SnapshotBegin` of an attach; restored on `DetachNotify`.
-    vss_pre_attach_backup: Option<HostVssBackup>,
+    vss_pre_attach_backup: Option<veter_host::pipeline::PreAttachBackup>,
     clipboard: clipboard::ClipboardManager,
 
     // GL state (dropped in reverse-creation order so the EGL surface
@@ -4459,29 +4448,30 @@ impl App {
             }
             match rx.try_recv() {
                 Ok(data) => {
-                    // Pipeline: a prefix of order-insensitive byte
-                    // filters, then one segment-aware terminal stage.
+                    // The whole pipeline — VSS splitting the chunk,
+                    // then PRT → VFT → SES → VGE+vt100 once per run of
+                    // bytes between snapshots. One implementation,
+                    // shared with the per-portal walk in
+                    // `prt::cmd_write_portal`; see `pipeline` for why
+                    // the order is what it is and why VSS can't be
+                    // just another filter.
                     //
-                    // PRT extracts ESC_PRT envelopes and observes
-                    // RIS/DECSTR/2J/3J; VFT extracts ESC_VFT from its
-                    // passthrough; VSS extracts ESC_VSS snapshot
-                    // frames; SES is consumed by the immediate host
-                    // (the local renderer is not a session, so it just
-                    // answers a vmux probe with "no session", and its
-                    // envelopes never reach the vt100). Each engine's
-                    // apc passes the others' markers through verbatim,
-                    // so their relative order is free.
-                    //
-                    // VGE is last and drives the vt100 itself, because
-                    // its element origins are viewport-relative at
-                    // command-processing time — see
-                    // `vge::drive_terminal_stage`. Nothing may be
-                    // inserted between it and the parser.
-                    let prt_chunk = prt.process_pty_chunk_with_hit(&data, hit);
-                    let vft_passthrough = vft.process_pty_chunk(&prt_chunk.passthrough);
-                    let vss_passthrough = vss.process_pty_chunk(&vft_passthrough);
-                    let ses_passthrough = ses.process_pty_chunk(&vss_passthrough);
-                    vge::drive_terminal_stage(engine, parser, &ses_passthrough, hit);
+                    // Nothing to read back at this level: the reset
+                    // that aborts VFT transfers is applied inside, and
+                    // only a portal counts DSR queries off the events.
+                    let _walk = veter_host::pipeline::drive_chunk(
+                        &data,
+                        veter_host::pipeline::Engines {
+                            vss,
+                            prt,
+                            vft,
+                            ses,
+                            vge: engine,
+                            parser,
+                        },
+                        vss_backup,
+                        hit,
+                    );
                     // An over-cap envelope is dropped without a reply —
                     // there is no request_id left to answer, and a
                     // hostile stream should not get one. Say so, or the
@@ -4492,77 +4482,6 @@ impl App {
                             "veter: dropped {dropped} oversized APC envelope(s); \
                              a client exceeded the payload cap"
                         );
-                    }
-                    // Apply any completed host-level VSS snapshots.
-                    // A snapshot arriving at this level replaces the
-                    // host's vt100 / VGE / PRT engines wholesale —
-                    // used when vsd runs directly under a veter
-                    // host with no intervening vmux pane. The more
-                    // common case is per-portal snapshots, handled
-                    // by `prt::WritePortal` recursively.
-                    let completed = vss.take_completed_snapshots();
-                    for cs in completed {
-                        // First snapshot of an attach: stash the
-                        // pre-attach state so DetachNotify can roll
-                        // it back later.
-                        if vss_backup.is_none() {
-                            *vss_backup = Some(HostVssBackup {
-                                vt: parser.screen().binary_snapshot(),
-                                vge: engine.binary_snapshot(),
-                                prt: prt.binary_snapshot(),
-                            });
-                        }
-                        if let Err(e) =
-                            parser.screen_mut().restore_from_binary_snapshot(&cs.vt_bytes)
-                        {
-                            eprintln!("veter: host VSS vt100 restore failed: {e}");
-                        }
-                        if let Err(e) = engine.restore_from_binary_snapshot(&cs.vge_bytes) {
-                            eprintln!("veter: host VSS VGE restore failed: {e}");
-                        }
-                        if let Err(e) = prt.restore_from_binary_snapshot(&cs.prt_bytes) {
-                            eprintln!("veter: host VSS PRT restore failed: {e}");
-                        }
-                        // The line origin the VGE elements and
-                        // Scrollback portals anchor against came in
-                        // with the vt100 fragment restored just above.
-                        engine.sync_top_of_live_screen(parser);
-                        prt.sync_top_of_live_screen(parser);
-                    }
-                    // DetachNotify: roll back to whatever we stashed
-                    // on the first snapshot of this attach.
-                    if vss.take_detach_signals() > 0 {
-                        if let Some(backup) = vss_backup.take() {
-                            if let Err(e) =
-                                parser.screen_mut().restore_from_binary_snapshot(&backup.vt)
-                            {
-                                eprintln!("veter: host VSS detach-restore vt100 failed: {e}");
-                            }
-                            if let Err(e) = engine.restore_from_binary_snapshot(&backup.vge) {
-                                eprintln!("veter: host VSS detach-restore VGE failed: {e}");
-                            }
-                            if let Err(e) = prt.restore_from_binary_snapshot(&backup.prt) {
-                                eprintln!("veter: host VSS detach-restore PRT failed: {e}");
-                            }
-                            engine.sync_top_of_live_screen(parser);
-                            prt.sync_top_of_live_screen(parser);
-                        }
-                    }
-                    // PRT's own host-screen reactions — scope_reset /
-                    // cull on RIS/DECSTR/2J/3J, alt-screen swap — ran
-                    // inside `process_pty_chunk_full`, interleaved with
-                    // the commands they scope. What is left for after
-                    // the vt100 has seen the chunk is the line origin
-                    // refresh and scrollback eviction.
-                    // §5.6 — VFT has no apc-side observation of resets,
-                    // so it relies on PRT's terminal event stream.
-                    for ev in &prt_chunk.terminal_events {
-                        match ev {
-                            prt::TerminalEvent::HardReset | prt::TerminalEvent::SoftReset => {
-                                vft.abort_all(vft_protocol::frame::ABORT_HOST_RESET, "");
-                            }
-                            _ => {}
-                        }
                     }
                     prt.after_vt100_process(parser);
                     prt.flush_pending_events();
