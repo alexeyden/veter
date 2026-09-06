@@ -95,12 +95,32 @@ pub struct EngineState {
     answering: bool,
     /// Write end of a self-pipe the attach handler uses to wake its
     /// `splice_input` loop when the session itself is gone (inner
-    /// program EOF / worker fatal error). Without this the splice
-    /// stays blocked on the renderer's stdin and the attached
-    /// terminal "hangs" after the user types `exit` / Ctrl+D inside
-    /// the session. Installed by the attach handler before splicing,
-    /// cleared on detach.
+    /// program EOF / worker fatal error, `vsd kill`, SIGTERM).
+    /// Without this the splice stays blocked on the renderer's stdin
+    /// and the attached terminal "hangs" — worse, on a shutdown path
+    /// the process exits with the handler mid-splice, so its
+    /// `RawTty` guard never runs and the user's terminal is left
+    /// `-echo -icanon -opost`. Installed by the attach handler before
+    /// splicing, cleared on detach. Signal it through
+    /// [`Self::signal_attach_shutdown`].
     pub attach_shutdown: Option<OwnedFd>,
+    /// Serialises writes to the inner PTY master.
+    ///
+    /// Two threads write to it: this worker, sending engine replies
+    /// (PRT responses, `PortalActivity` events, DSR reports), and the
+    /// attach handler's `splice_input`, sending the renderer's input.
+    /// Neither is a single `write(2)` — a large renderer reply, such
+    /// as a VFT download frame relayed to `vrecv`, exceeds the 4 KiB
+    /// pty input buffer and goes out in pieces — so without a lock a
+    /// PRT event lands in the middle of one and the envelope reaching
+    /// the remote `vmux` is corrupt.
+    ///
+    /// Deliberately *not* the engines lock: a write to a full pty
+    /// buffer blocks, and the engines lock is what the attach path
+    /// takes to serialize a snapshot. Grab an `Arc` clone once per
+    /// thread rather than reaching through the engines lock on each
+    /// write.
+    master_write: Arc<Mutex<()>>,
 }
 
 impl EngineState {
@@ -145,6 +165,7 @@ impl EngineState {
             renderer_stdout: None,
             answering: true,
             attach_shutdown: None,
+            master_write: Arc::new(Mutex::new(())),
         }
     }
 
@@ -171,6 +192,44 @@ impl EngineState {
     /// same lock. That is what makes "answered exactly once" a
     /// property rather than a likelihood: a chunk is answered here iff
     /// it is not sent somewhere that will answer it.
+    /// Resize the mirrored grid, the way the renderer's own resize
+    /// path does.
+    ///
+    /// `set_size` alone is not the whole job: a vertical resize moves
+    /// the live screen relative to scrollback (xterm-style push/pull),
+    /// so both sub-engines have to re-read the line origin their
+    /// anchors are relative to. `veter`'s `WindowEvent::Resized` runs
+    /// all three; the daemon used to run only the first and lag by a
+    /// chunk, leaving anchored elements and portals placed against the
+    /// pre-resize origin until the next byte arrived.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+        self.prt.after_vt100_process(&mut self.parser);
+        self.vge.after_vt100_process(&mut self.parser);
+    }
+
+    /// A handle on the inner PTY master's write lock, for a thread
+    /// that is about to start writing to it. See the field.
+    pub fn master_write_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.master_write)
+    }
+
+    /// Wake an attach handler blocked in `splice_input`, if there is
+    /// one. Every shutdown path owes the attached terminal this: the
+    /// handler is what restores its termios and sends `DetachNotify`,
+    /// and it is blocked on the renderer's stdin until something
+    /// pokes the self-pipe. Idempotent — a second byte on the pipe
+    /// just wakes a loop that has already left.
+    pub fn signal_attach_shutdown(&self) {
+        if let Some(fd) = self.attach_shutdown.as_ref() {
+            // SAFETY: borrowed from the OwnedFd we hold; we only
+            // write, never close it.
+            let borrowed =
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+            let _ = nix::unistd::write(borrowed, &[0u8]);
+        }
+    }
+
     pub fn set_renderer_attached(&mut self, attached: bool) {
         let should_answer = !attached;
         if self.answering == should_answer {
@@ -226,6 +285,16 @@ fn dup_owned(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
 fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<EngineState>>) {
     let mut reader = std::fs::File::from(reader_fd);
     let mut writer = std::fs::File::from(writer_fd);
+    // Grabbed once: the attach handler's splice thread writes to the
+    // same master, and a reply interleaved into the middle of a
+    // multi-write renderer frame corrupts it. See the field.
+    let master_write = {
+        let guard = match engines.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.master_write_lock()
+    };
     let mut buf = [0u8; 4096];
     loop {
         let n = match reader.read(&mut buf) {
@@ -263,6 +332,7 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 renderer_stdout: _,
                 answering: _,
                 attach_shutdown,
+                master_write: _,
             } = &mut *guard;
 
             let prt_chunk = prt.process_pty_chunk_full(&buf[..n]);
@@ -327,7 +397,13 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
         if !to_write.is_empty() {
             // Best effort: a failed write back to the inner program
             // means it has gone away; the next read will EOF and we'll
-            // exit the loop.
+            // exit the loop. The engines lock is already released
+            // here, so blocking on a full pty buffer under the write
+            // lock can't stall an attach mid-snapshot.
+            let _w = match master_write.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if let Err(e) = writer.write_all(&to_write) {
                 eprintln!("vsd: worker write error: {e}");
                 break;
@@ -340,7 +416,12 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
             // avoid holding the lock during the write; on write error
             // we clear `renderer_stdout` so the next chunk doesn't
             // retry into a closed pipe.
-            let raw = {
+            // A `dup`, not the raw fd number: a detach drops the
+            // OwnedFd the moment we release the lock, and the next
+            // `dup`/`open` anywhere in the process can hand that
+            // number to something else — which would then receive
+            // this chunk of the session's output.
+            let stdout = {
                 let guard = match engines.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
@@ -348,16 +429,17 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
                 guard
                     .renderer_stdout
                     .as_ref()
-                    .map(|fd| fd.as_raw_fd())
+                    .and_then(|fd| dup_owned(fd).ok())
             };
-            if let Some(raw) = raw {
+            if let Some(stdout) = stdout {
+                let raw = stdout.as_raw_fd();
                 let mut wrote_ok = true;
                 let mut off = 0;
                 while off < n {
                     match nix::unistd::write(
-                        // SAFETY: `raw` is borrowed from the OwnedFd
-                        // held by engines.renderer_stdout; we don't
-                        // close it. write(2) takes a BorrowedFd.
+                        // SAFETY: `raw` is borrowed from the `stdout`
+                        // dup we own for this write. write(2) takes a
+                        // BorrowedFd.
                         unsafe {
                             std::os::fd::BorrowedFd::borrow_raw(raw)
                         },
@@ -392,21 +474,15 @@ fn worker_main(reader_fd: OwnedFd, writer_fd: OwnedFd, engines: Arc<Mutex<Engine
     // hangs after the user types `exit` or Ctrl+D inside the session.
     // A single byte on the self-pipe is enough; the attach handler's
     // poll loop wakes, sees the readable fd, and tears the splice down.
-    let shutdown = {
+    {
         let mut guard = match engines.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.attach_shutdown.take()
-    };
-    if let Some(fd) = shutdown {
-        let borrowed = unsafe {
-            std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_fd())
-        };
-        let _ = nix::unistd::write(borrowed, &[0u8]);
-        // Drop closes the write end; if there was no attach the fd
-        // simply closes here without effect.
-        drop(fd);
+        guard.signal_attach_shutdown();
+        // Dropping the taken fd closes the write end; if there was no
+        // attach it simply closes here without effect.
+        guard.attach_shutdown = None;
     }
 }
 

@@ -131,6 +131,29 @@ pub fn start(
     Ok(())
 }
 
+/// A `sequence_id` for this attach's snapshot, distinct from every
+/// other attach's.
+///
+/// It is how the renderer tells one attach from the next: its
+/// `PreAttachBackup` is keyed on this, so a new id means "this is a
+/// different attach, stash what is on screen now". Seeded from the
+/// clock rather than starting at 1, so a daemon that restarts doesn't
+/// hand a renderer the same id its previous stash was keyed on.
+fn next_sequence_id() -> u32 {
+    use std::sync::atomic::AtomicU32;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let seed = NEXT.load(Ordering::Acquire);
+    if seed == 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.subsec_nanos() | 1);
+        // Racing threads would both seed; attaches are serialized by
+        // the `attached` flag, so this can't actually happen.
+        NEXT.store(now, Ordering::Release);
+    }
+    NEXT.fetch_add(1, Ordering::AcqRel)
+}
+
 fn dup_owned(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
     let raw = nix::unistd::dup(fd.as_raw_fd()).map_err(std::io::Error::other)?;
     // SAFETY: dup(2) returned a fresh fd we now solely own.
@@ -168,7 +191,15 @@ fn handler_main(
     let outcome = probe::run(&stdin_fd, &stdout_fd, PROBE_TIMEOUT)
         .with_context(|| "running upstream probe")?;
     apply_probe(&engines, &master_writer_fd, &outcome);
+    // Every write to the inner PTY master from this thread goes
+    // through the same lock the worker takes; see
+    // `EngineState::master_write`.
+    let master_write = {
+        let guard = engines.lock().unwrap_or_else(|e| e.into_inner());
+        guard.master_write_lock()
+    };
     if !outcome.typeahead.is_empty() {
+        let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
         write_all_raw(master_writer_fd.as_raw_fd(), &outcome.typeahead)
             .with_context(|| "forwarding probe-phase typeahead")?;
     }
@@ -221,7 +252,7 @@ fn handler_main(
             vss_protocol::SNAPSHOT_VERSION,
             rows,
             cols,
-            1, // sequence_id — only one snapshot per attach for v1
+            next_sequence_id(),
             &vt_bytes,
             &vge_bytes,
             &prt_bytes,
@@ -277,8 +308,13 @@ fn handler_main(
     // isn't guaranteed (a `vmux` pane can still hold the master open),
     // so relying on stdin alone left the attach spliced forever and the
     // `attached` flag stuck at `true`, refusing every re-attach.
-    let result =
-        splice_input(&stdin_fd, master_writer_fd, shutdown_read, ipc_socket.as_fd());
+    let result = splice_input(
+        &stdin_fd,
+        master_writer_fd,
+        shutdown_read,
+        ipc_socket.as_fd(),
+        &master_write,
+    );
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
     // on engines so the worker stops writing / signaling, then emit a
@@ -452,7 +488,7 @@ fn winsize_main(
         // to the (still-attached) renderer.
         {
             let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
-            guard.parser.screen_mut().set_size(ws.rows, ws.cols);
+            guard.resize(ws.rows, ws.cols);
         }
         probe::set_inner_winsize(raw_master, ws);
     }
@@ -471,7 +507,7 @@ fn apply_probe(
     let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ws) = outcome.winsize {
-        guard.parser.screen_mut().set_size(ws.rows, ws.cols);
+        guard.resize(ws.rows, ws.cols);
         // SIGWINCH the inner program so its next redraw is at the
         // right size. Best effort; the engines have already been
         // resized so a stale dimension on the slave's tty is the only
@@ -616,11 +652,21 @@ fn splice_input(
     master_writer_fd: OwnedFd,
     shutdown_read: OwnedFd,
     ipc_fd: BorrowedFd<'_>,
+    master_write: &Mutex<()>,
 ) -> Result<()> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
     let stdin_raw = stdin_fd.as_raw_fd();
     let writer_raw = master_writer_fd.as_raw_fd();
+    // The worker thread writes engine replies to the same master. A
+    // renderer frame larger than the 4 KiB pty input buffer goes out
+    // in pieces, and without this lock a PRT event lands in the
+    // middle of one — corrupting the envelope for the remote vmux or
+    // vrecv on the other end. See `EngineState::master_write`.
+    let write_master = |data: &[u8]| -> Result<()> {
+        let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
+        write_all_raw(writer_raw, data)
+    };
     let mut buf = [0u8; 4096];
     let mut scanner = DetachScanner::default();
     let mut trace_log = open_input_trace();
@@ -681,7 +727,7 @@ fn splice_input(
             if !flushed.is_empty() {
                 let out = scanner.feed(&flushed);
                 if !out.forward.is_empty() {
-                    write_all_raw(writer_raw, &out.forward)
+                    write_master(&out.forward)
                         .with_context(|| "writing flushed Esc to inner PTY")?;
                 }
                 if out.detach {
@@ -694,7 +740,7 @@ fn splice_input(
         let n = match nix::unistd::read(stdin_raw, &mut buf) {
             Ok(0) => {
                 if let Some(b) = scanner.flush_on_eof() {
-                    let _ = write_all_raw(writer_raw, &[b]);
+                    let _ = write_master(&[b]);
                 }
                 return Ok(());
             }
@@ -719,7 +765,7 @@ fn splice_input(
 
         let out = scanner.feed(&vss_out.passthrough);
         if !out.forward.is_empty() {
-            write_all_raw(writer_raw, &out.forward)
+            write_master(&out.forward)
                 .with_context(|| "writing renderer input to inner PTY")?;
         }
         if out.detach {

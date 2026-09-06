@@ -36,6 +36,63 @@ const DEFAULT_COLS: u16 = 80;
 /// live in `attach.rs`. Here we only need the child-poll cadence.
 const CHILD_POLL_INTERVAL_MS: u16 = 250;
 
+/// Write end of the SIGTERM self-pipe, as a raw fd, for the signal
+/// handler to reach. `-1` until [`install_sigterm_handler`] runs.
+///
+/// A signal handler may call only async-signal-safe functions, so it
+/// writes one byte here and does nothing else; the accept loop polls
+/// the read end and does the real work. Without a handler at all,
+/// SIGTERM's default action kills the process outright — skipping the
+/// socket unlink, the child's own teardown, and (if a renderer is
+/// attached) the termios restore that leaves the user's terminal
+/// usable. `doc/session-manager.md` lists SIGTERM as a clean exit
+/// path.
+static SIGTERM_PIPE_WRITE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_sigterm(_signum: libc::c_int) {
+    let fd = SIGTERM_PIPE_WRITE.load(Ordering::Acquire);
+    if fd >= 0 {
+        // write(2) is async-signal-safe. A failure here means the
+        // pipe is full — one byte is already pending, which is all
+        // the accept loop needs.
+        unsafe {
+            libc::write(fd, [0u8].as_ptr().cast(), 1);
+        }
+    }
+}
+
+/// Install the SIGTERM (and SIGHUP) handler and return the read end of
+/// its self-pipe for the accept loop to poll.
+fn install_sigterm_handler() -> Result<OwnedFd> {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+    let (read_fd, write_fd) =
+        nix::unistd::pipe().context("creating SIGTERM self-pipe")?;
+    SIGTERM_PIPE_WRITE.store(write_fd.as_raw_fd(), Ordering::Release);
+    // Leaked on purpose: the handler holds the raw number for the
+    // life of the process, and closing it would leave the handler
+    // writing to a recycled fd.
+    std::mem::forget(write_fd);
+
+    let action = SigAction::new(
+        SigHandler::Handler(on_sigterm),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    // SAFETY: `on_sigterm` calls only `write(2)` and an atomic load,
+    // both async-signal-safe.
+    unsafe {
+        sigaction(Signal::SIGTERM, &action).context("installing SIGTERM handler")?;
+        // A closing terminal sends SIGHUP; the session is meant to
+        // outlive its renderer, but if the *daemon's* own terminal
+        // goes away it should still exit cleanly rather than be
+        // killed mid-attach.
+        sigaction(Signal::SIGHUP, &action).context("installing SIGHUP handler")?;
+    }
+    Ok(read_fd)
+}
+
 /// Run the session process. Blocks until the inner PTY child exits,
 /// a `Kill` IPC arrives, or SIGTERM is delivered. Returns `Ok(())` on
 /// any clean shutdown; `Err` only on a setup-time failure where the
@@ -101,6 +158,7 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
         child: child_pid,
         created_at: Instant::now(),
         attached: Arc::new(AtomicBool::new(false)),
+        child_reaped: AtomicBool::new(false),
         engines,
     };
 
@@ -144,6 +202,11 @@ struct SessionState {
     /// True iff a renderer is currently attached. Flipped atomically
     /// by the attach handler thread.
     attached: Arc<AtomicBool>,
+    /// Set once `child_alive` has seen the child exit and reaped it.
+    /// After that the pid is free for the kernel to reuse, so
+    /// `shutdown`'s `SIGTERM` would land on whatever process got it
+    /// next — someone else's, on a busy machine.
+    child_reaped: AtomicBool,
     engines: Arc<Mutex<EngineState>>,
 }
 
@@ -158,16 +221,28 @@ impl SessionState {
     }
 
     fn child_alive(&self) -> bool {
+        if self.child_reaped.load(Ordering::Acquire) {
+            return false;
+        }
         match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => true,
-            Ok(_) => false,
-            Err(_) => false,
+            // Either it exited (and this call reaped it) or it is not
+            // ours to wait for. Either way the pid is no longer a
+            // handle on our child.
+            Ok(_) | Err(_) => {
+                self.child_reaped.store(true, Ordering::Release);
+                false
+            }
         }
     }
 
     fn shutdown(&self) {
+        if self.child_reaped.load(Ordering::Acquire) {
+            return;
+        }
         let _ = kill(self.child, Signal::SIGTERM);
         let _ = waitpid(self.child, Some(WaitPidFlag::WNOHANG));
+        self.child_reaped.store(true, Ordering::Release);
     }
 }
 
@@ -203,6 +278,7 @@ fn accept_loop(listener: &UnixListener, session: &SessionState) -> Result<()> {
         .context("setting listener non-blocking")?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let sigterm_fd = install_sigterm_handler()?;
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -212,11 +288,27 @@ fn accept_loop(listener: &UnixListener, session: &SessionState) -> Result<()> {
             return Ok(());
         }
 
-        let mut fds = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+        let mut fds = [
+            PollFd::new(listener.as_fd(), PollFlags::POLLIN),
+            PollFd::new(sigterm_fd.as_fd(), PollFlags::POLLIN),
+        ];
         match poll(&mut fds, PollTimeout::from(CHILD_POLL_INTERVAL_MS)) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("accept poll: {e}")),
+        }
+
+        // A signal arrived. Same teardown as `Kill`: wake the attach
+        // handler so it restores the terminal it put in raw mode,
+        // then let `run` do the waiting and the unlinking.
+        if fds[1]
+            .revents()
+            .unwrap_or(PollFlags::empty())
+            .intersects(PollFlags::POLLIN)
+        {
+            let guard = session.engines.lock().unwrap_or_else(|e| e.into_inner());
+            guard.signal_attach_shutdown();
+            return Ok(());
         }
 
         let revents = fds[0].revents().unwrap_or(PollFlags::empty());
@@ -285,6 +377,20 @@ fn handle_connection(
         }
         Request::Kill => {
             shutdown.store(true, Ordering::Release);
+            // Wake an attached renderer's handler. `run` waits below
+            // for `attached` to clear, but nothing else pokes the
+            // handler — it is blocked in `splice_input` on the
+            // renderer's stdin — so the wait would time out and the
+            // process would exit with the handler mid-splice: no
+            // `DetachNotify`, and no termios restore, leaving the
+            // user's terminal `-echo -icanon -opost`.
+            {
+                let guard = session
+                    .engines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.signal_attach_shutdown();
+            }
             let _ = Response::Ok.write_to(&mut stream);
         }
         Request::Status => {
