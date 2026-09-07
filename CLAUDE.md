@@ -53,7 +53,7 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`libs/v
 | Crate | Role |
 |---|---|
 | `protocol/*` — `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. VGE/PRT/SES carry optional default-off `serde` and `schemars` features so `vproto` can read the same types as JSON and generate their schema; nothing else enables them. |
-| `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot — and the SGR-Pixels mouse encoding, DECSET 1016). The screen model the host and every portal use. |
+| `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot — and the SGR-Pixels mouse encoding, DECSET 1016). The screen model the host and every portal use. The sequence coverage is measured against `infocmp xterm-256color` — terminfo is the set of sequences real programs emit — so anything in that entry should either be implemented or be a deliberate omission with a comment saying so. |
 | `libs/veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines. Links no GUI toolkit at all — the two desktop affordances VFT needs (native file picker, open-after-finalize) are the `vft::DesktopHooks` trait, which `veter` implements and `vsd` leaves at its `HeadlessHooks` default. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
 | `libs/veter-version` | The commit every binary was built from. A build script resolves the short sha and commit date at compile time and re-runs when `HEAD` moves; `long_version()` formats the `--version` line each binary prints. Exists because every crate here is `0.1.0` and stays `0.1.0`, so the crate version cannot answer "are these two machines running the same build?" — which is the question that comes up when a bug reproduces on one end of an SSH hop and not the other. No `.git` (a tarball build) reports `unknown` rather than failing. |
@@ -88,6 +88,30 @@ Stages 0, 2 and 3 are pure byte filters, and each one's APC parser passes the *o
 After the chunk, the byte filters' `after_vt100_process` hooks observe the resulting screen state (scroll position, alt-screen swaps, scrollback eviction); VGE's already ran inside the terminal stage. Engine-generated responses/events are written back to the PTY master.
 
 `vsd` runs the same walk, and what it forwards to an attached renderer is its SES passthrough — everything byte for byte except the SES envelopes, which only the daemon can answer (it is the process that knows the session name) and which would otherwise reach a renderer whose own per-portal SES engine would answer "not in a session". It holds a `VssEngine` too, despite being a snapshot *sender*: a `vsd attach` to a second session, run from a shell inside this one, writes `ESC _ VSS …` straight onto this session's pty, and the daemon has to apply it for the same reason the renderer does — the mirror must match the screen it is a copy of, or the next attach ships a snapshot of a session that has moved on. The "answered exactly once" switch suppresses the daemon's VGE, DSR, PRT and VSS replies while a renderer is attached; that renderer runs the same commands off the forwarded chunk and answers them itself.
+
+## What answers a query, and where
+
+Three layers reply to the child, and which one owns a given sequence is
+not obvious from the sequence:
+
+- **The vt100 fork** applies everything that only changes screen state
+  — SGR, the mode families (SM/RM and DECSET/DECRST), DECSTR, DECSCUSR
+  — and routes what it cannot answer alone to a `vt100::Callbacks`
+  method.
+- **`veter-host::query`** owns the *format* of every reply that names
+  the terminal: DA1, DA2, XTVERSION, DECRQM, the XTWINOPS size reports
+  and the OSC colour reports. Two engines emit them (VGE at host level,
+  PRT inside a portal) and they must not disagree about what terminal
+  this is.
+- **The renderer** answers what only it knows — cell pixel metrics, the
+  palette, the default fore/background — through `HostCallbacks`, which
+  queues a `TerminalRequest` for `App::drain_terminal_requests` rather
+  than replying in place. Inside a portal the same callbacks re-emit as
+  PRT `Osc` events, because there the client owns the answer.
+
+A query that goes unanswered is not a cosmetic bug: the sender blocks on
+it. That is what an unanswered DA1 cost every vim/tmux launch, and what
+an unanswered `OSC 11 ; ?` costs them now.
 
 ## Portals are recursive
 

@@ -83,9 +83,41 @@ impl ClipboardManager {
     }
 }
 
+/// Something the child asked the terminal for that only the App can
+/// answer or apply: it needs the window, the palette or the cell
+/// metrics, none of which the parser has.
+///
+/// Queued rather than acted on in place, because a `vt100::Callbacks`
+/// impl sees only the screen — the same reason OSC 52 and the window
+/// title are queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalRequest {
+    /// `CSI 22 t` / `CSI 23 t` — terminfo `smcup` / `rmcup`.
+    PushTitle,
+    /// See [`PushTitle`](Self::PushTitle).
+    PopTitle,
+    /// `CSI 14 t` / `CSI 16 t` / `CSI 18 t`, by op. The sender blocks.
+    SizeReport(u16),
+    /// `OSC 4 ; i ; <spec>`, with the spec already parsed — a spec that
+    /// doesn't parse never becomes a request.
+    SetPalette(u8, (u8, u8, u8)),
+    /// `OSC 4 ; i ; ?`.
+    QueryPalette(u8),
+    /// `OSC 104`, for one entry or (with `None`) the whole table.
+    ResetPalette(Option<u8>),
+    /// `OSC 10 / 11 / 12 ; <spec>`.
+    SetDynamic(vt100::DynamicColor, (u8, u8, u8)),
+    /// `OSC 10 / 11 / 12 ; ?` — vim and neovim both send this at
+    /// startup and wait for the answer.
+    QueryDynamic(vt100::DynamicColor),
+    /// `OSC 110 / 111 / 112`.
+    ResetDynamic(vt100::DynamicColor),
+}
+
 /// vt100 callbacks installed on the host parser. Buffers OSC 52 set
 /// payloads (decoded from base64) and OSC 0/2 window titles for the App
-/// to drain each tick.
+/// to drain each tick, along with the [`TerminalRequest`]s that need
+/// state the parser doesn't have.
 #[derive(Default)]
 pub struct HostCallbacks {
     pub pending_set: Vec<String>,
@@ -94,6 +126,23 @@ pub struct HostCallbacks {
     /// retitles per prompt would otherwise queue a burst of titles the
     /// window can never show.
     pub pending_title: Option<String>,
+    /// Queued in arrival order: a palette write and the query that
+    /// reads it back must not be reordered.
+    pub pending_requests: Vec<TerminalRequest>,
+}
+
+impl HostCallbacks {
+    /// Cap on the queue, so a program that spins on colour queries
+    /// faster than the App drains cannot grow it without bound. A
+    /// screenful of distinct requests is far more than anything real
+    /// sends between two frames.
+    const MAX_PENDING_REQUESTS: usize = 256;
+
+    fn request(&mut self, req: TerminalRequest) {
+        if self.pending_requests.len() < Self::MAX_PENDING_REQUESTS {
+            self.pending_requests.push(req);
+        }
+    }
 }
 
 impl vt100::Callbacks for HostCallbacks {
@@ -123,6 +172,70 @@ impl vt100::Callbacks for HostCallbacks {
         // since a window with no icon-name concept has nowhere to put
         // the other half.
         self.pending_title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    fn push_window_title(&mut self, _: &mut vt100::Screen) {
+        self.request(TerminalRequest::PushTitle);
+    }
+
+    fn pop_window_title(&mut self, _: &mut vt100::Screen) {
+        self.request(TerminalRequest::PopTitle);
+    }
+
+    fn report_window_size(&mut self, _: &mut vt100::Screen, op: u16) {
+        self.request(TerminalRequest::SizeReport(op));
+    }
+
+    fn set_palette_color(
+        &mut self,
+        _: &mut vt100::Screen,
+        index: u8,
+        spec: &[u8],
+    ) {
+        // A spec we can't read is dropped here rather than queued: the
+        // App has nothing better to do with it either.
+        if let Some(rgb) = veter_host::query::parse_color_spec(spec) {
+            self.request(TerminalRequest::SetPalette(index, rgb));
+        }
+    }
+
+    fn query_palette_color(&mut self, _: &mut vt100::Screen, index: u8) {
+        self.request(TerminalRequest::QueryPalette(index));
+    }
+
+    fn reset_palette_color(
+        &mut self,
+        _: &mut vt100::Screen,
+        index: Option<u8>,
+    ) {
+        self.request(TerminalRequest::ResetPalette(index));
+    }
+
+    fn set_dynamic_color(
+        &mut self,
+        _: &mut vt100::Screen,
+        which: vt100::DynamicColor,
+        spec: &[u8],
+    ) {
+        if let Some(rgb) = veter_host::query::parse_color_spec(spec) {
+            self.request(TerminalRequest::SetDynamic(which, rgb));
+        }
+    }
+
+    fn query_dynamic_color(
+        &mut self,
+        _: &mut vt100::Screen,
+        which: vt100::DynamicColor,
+    ) {
+        self.request(TerminalRequest::QueryDynamic(which));
+    }
+
+    fn reset_dynamic_color(
+        &mut self,
+        _: &mut vt100::Screen,
+        which: vt100::DynamicColor,
+    ) {
+        self.request(TerminalRequest::ResetDynamic(which));
     }
 }
 

@@ -56,10 +56,14 @@ pub fn decrqm(private: bool, mode: u16, screen: &vt100::Screen) -> Vec<u8> {
         match mode {
             // DECCKM — application cursor keys.
             1 => Some(screen.application_cursor()),
+            // DECSCNM — reverse video, which terminfo's `flash` uses.
+            5 => Some(screen.reverse_video()),
             // DECAWM.
             7 => Some(screen.autowrap()),
             // X10 mouse reporting.
             9 => Some(screen.mouse_protocol_mode() == Mode::Press),
+            // Cursor blink, which DECSCUSR's odd parameters also set.
+            12 => Some(screen.cursor_blink()),
             // DECTCEM — the mode is *cursor visible*, so it is set
             // when the screen is not hiding it.
             25 => Some(!screen.hide_cursor()),
@@ -69,6 +73,8 @@ pub fn decrqm(private: bool, mode: u16, screen: &vt100::Screen) -> Vec<u8> {
             // the screen would do if asked to set it.
             47 | 1047 | 1049 => Some(screen.alternate_screen()),
             1000 => Some(screen.mouse_protocol_mode() == Mode::PressRelease),
+            // Focus reporting — the renderer sends CSI I / CSI O.
+            1004 => Some(screen.focus_reporting()),
             1002 => Some(screen.mouse_protocol_mode() == Mode::ButtonMotion),
             1003 => Some(screen.mouse_protocol_mode() == Mode::AnyMotion),
             1005 => Some(screen.mouse_protocol_encoding() == Enc::Utf8),
@@ -78,10 +84,13 @@ pub fn decrqm(private: bool, mode: u16, screen: &vt100::Screen) -> Vec<u8> {
             _ => None,
         }
     } else {
-        // No ANSI mode is modelled by the screen: IRM and LNM are both
-        // unimplemented, and claiming otherwise would be a lie the
-        // sender acts on.
-        None
+        match mode {
+            // IRM — insert/replace (terminfo `smir` / `rmir`).
+            4 => Some(screen.insert_mode()),
+            // LNM — LF also does a carriage return.
+            20 => Some(screen.newline_mode()),
+            _ => None,
+        }
     };
 
     let value = match state {
@@ -91,6 +100,118 @@ pub fn decrqm(private: bool, mode: u16, screen: &vt100::Screen) -> Vec<u8> {
     };
     let prefix = if private { "?" } else { "" };
     format!("\x1b[{prefix}{mode};{value}$y").into_bytes()
+}
+
+/// Answer one XTWINOPS size query (`CSI 14 t`, `CSI 16 t`,
+/// `CSI 18 t`).
+///
+/// xterm answers each with a different leading code — `4` for the text
+/// area in pixels, `6` for one cell, `8` for the text area in cells —
+/// and puts height before width in all three. Programs ask so they can
+/// size graphics against the grid, and they block on the reply.
+///
+/// Returns `None` for an op this doesn't answer, so the caller leaves
+/// the sequence alone rather than inventing a report.
+#[must_use]
+pub fn window_size_report(
+    op: u16,
+    rows: u16,
+    cols: u16,
+    cell_width_px: u16,
+    cell_height_px: u16,
+) -> Option<Vec<u8>> {
+    let (code, height, width) = match op {
+        14 => (
+            4,
+            rows.saturating_mul(cell_height_px),
+            cols.saturating_mul(cell_width_px),
+        ),
+        16 => (6, cell_height_px, cell_width_px),
+        18 => (8, rows, cols),
+        _ => return None,
+    };
+    Some(format!("\x1b[{code};{height};{width}t").into_bytes())
+}
+
+/// Format one colour the way the OSC colour reports do.
+///
+/// xterm reports sixteen bits per channel and answers an eight-bit
+/// value by repeating each byte — `0xab` becomes `abab` — which is
+/// what makes both ends of the range come out exactly right (`ff`
+/// becomes `ffff`, not `ff00`). Clients that parse these expect the
+/// doubling.
+fn rgb_spec(r: u8, g: u8, b: u8) -> String {
+    format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+/// Answer an `OSC 10 / 11 / 12 ; ?` query.
+///
+/// vim's `t_RB` and neovim's `background` detection both send
+/// `OSC 11 ; ? ST` at startup and wait for it; unanswered, it costs the
+/// same stall at launch an unanswered DA1 did.
+#[must_use]
+pub fn dynamic_color_report(
+    which: vt100::DynamicColor,
+    (r, g, b): (u8, u8, u8),
+) -> Vec<u8> {
+    let code = match which {
+        vt100::DynamicColor::Foreground => 10,
+        vt100::DynamicColor::Background => 11,
+        vt100::DynamicColor::Cursor => 12,
+    };
+    format!("\x1b]{code};{}\x1b\\", rgb_spec(r, g, b)).into_bytes()
+}
+
+/// Answer an `OSC 4 ; <index> ; ?` palette query.
+#[must_use]
+pub fn palette_color_report(index: u8, (r, g, b): (u8, u8, u8)) -> Vec<u8> {
+    format!("\x1b]4;{index};{}\x1b\\", rgb_spec(r, g, b)).into_bytes()
+}
+
+/// Parse an X colour specification as it appears in OSC 4 / 10 / 11 /
+/// 12: `rgb:R/G/B` with one to four hex digits per channel, or the
+/// `#RGB` / `#RRGGBB` / `#RRRRGGGGBBBB` forms.
+///
+/// Short channels scale rather than truncate, so `rgb:f/f/f` and
+/// `rgb:ffff/ffff/ffff` both come out white.
+#[must_use]
+pub fn parse_color_spec(spec: &[u8]) -> Option<(u8, u8, u8)> {
+    let spec = std::str::from_utf8(spec).ok()?.trim();
+
+    fn channel(s: &str) -> Option<u8> {
+        if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(s, 16).ok()?;
+        let bits = 4 * u32::try_from(s.len()).ok()?;
+        let max = (1u32 << bits) - 1;
+        u8::try_from(v * 255 / max).ok()
+    }
+
+    if let Some(rest) = spec.strip_prefix("rgb:") {
+        let mut parts = rest.split('/');
+        let r = channel(parts.next()?)?;
+        let g = channel(parts.next()?)?;
+        let b = channel(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some((r, g, b));
+    }
+
+    if let Some(rest) = spec.strip_prefix('#') {
+        if rest.is_empty() || rest.len() % 3 != 0 || rest.len() > 12 {
+            return None;
+        }
+        let n = rest.len() / 3;
+        return Some((
+            channel(&rest[..n])?,
+            channel(&rest[n..2 * n])?,
+            channel(&rest[2 * n..])?,
+        ));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -127,7 +248,68 @@ mod tests {
     fn decrqm_answers_unknown_modes_rather_than_staying_silent() {
         let p = screen_after(b"");
         assert_eq!(decrqm(true, 12345, p.screen()), b"\x1b[?12345;0$y".to_vec());
-        assert_eq!(decrqm(false, 4, p.screen()), b"\x1b[4;0$y".to_vec());
+        // KAM (`CSI 2 h`) is a real ANSI mode the screen doesn't model.
+        assert_eq!(decrqm(false, 2, p.screen()), b"\x1b[2;0$y".to_vec());
+    }
+
+    /// IRM and LNM used to report "not recognised" because the screen
+    /// didn't model them. It does now, so the report is the truth.
+    #[test]
+    fn decrqm_reports_the_ansi_modes_the_screen_now_models() {
+        let p = screen_after(b"");
+        assert_eq!(decrqm(false, 4, p.screen()), b"\x1b[4;2$y".to_vec());
+        let p = screen_after(b"\x1b[4h\x1b[20h");
+        assert_eq!(decrqm(false, 4, p.screen()), b"\x1b[4;1$y".to_vec());
+        assert_eq!(decrqm(false, 20, p.screen()), b"\x1b[20;1$y".to_vec());
+    }
+
+    /// `CSI 14 t` / `16 t` / `18 t` each answer with their own leading
+    /// code, height before width.
+    #[test]
+    fn window_size_reports_use_xterms_shapes() {
+        assert_eq!(
+            window_size_report(14, 24, 80, 9, 20).unwrap(),
+            b"\x1b[4;480;720t".to_vec(),
+        );
+        assert_eq!(
+            window_size_report(16, 24, 80, 9, 20).unwrap(),
+            b"\x1b[6;20;9t".to_vec(),
+        );
+        assert_eq!(
+            window_size_report(18, 24, 80, 9, 20).unwrap(),
+            b"\x1b[8;24;80t".to_vec(),
+        );
+        assert!(window_size_report(99, 24, 80, 9, 20).is_none());
+    }
+
+    /// The colour reports double each byte, so both ends of the range
+    /// land exactly: `ff` reports as `ffff`, not `ff00`.
+    #[test]
+    fn colour_reports_widen_each_channel_to_sixteen_bits() {
+        assert_eq!(
+            dynamic_color_report(vt100::DynamicColor::Background, (0x1e, 0x1e, 0x1e)),
+            b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\".to_vec(),
+        );
+        assert_eq!(
+            palette_color_report(9, (0xff, 0x00, 0x80)),
+            b"\x1b]4;9;rgb:ffff/0000/8080\x1b\\".to_vec(),
+        );
+    }
+
+    #[test]
+    fn colour_specs_parse_in_every_shape_clients_send() {
+        assert_eq!(parse_color_spec(b"rgb:ff/00/80"), Some((0xff, 0x00, 0x80)));
+        assert_eq!(
+            parse_color_spec(b"rgb:ffff/0000/8080"),
+            Some((0xff, 0x00, 0x80)),
+        );
+        // A short channel scales rather than truncates.
+        assert_eq!(parse_color_spec(b"rgb:f/f/f"), Some((255, 255, 255)));
+        assert_eq!(parse_color_spec(b"#ff0080"), Some((0xff, 0x00, 0x80)));
+        assert_eq!(parse_color_spec(b"#f08"), Some((0xff, 0x00, 0x88)));
+        assert_eq!(parse_color_spec(b"?"), None);
+        assert_eq!(parse_color_spec(b"rgb:zz/00/00"), None);
+        assert_eq!(parse_color_spec(b"rgb:ff/00"), None);
     }
 
     #[test]

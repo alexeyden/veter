@@ -78,6 +78,73 @@ impl Callbacks for PortalCallbacks {
         self.events
             .push(RawCallbackEvent::Osc(params.iter().map(|p| p.to_vec()).collect()));
     }
+
+    // The palette and dynamic-colour OSCs used to arrive as
+    // `unhandled_osc` and go out to the PRT client as `Osc` events.
+    // They have dedicated callbacks now, so re-emit them in the same
+    // shape: inside a portal these are still the client's to answer,
+    // and dropping them would take away something vmux already sees.
+    fn set_palette_color(&mut self, _: &mut Screen, index: u8, spec: &[u8]) {
+        self.push_osc(&[b"4", index.to_string().as_bytes(), spec]);
+    }
+
+    fn query_palette_color(&mut self, _: &mut Screen, index: u8) {
+        self.push_osc(&[b"4", index.to_string().as_bytes(), b"?"]);
+    }
+
+    fn reset_palette_color(&mut self, _: &mut Screen, index: Option<u8>) {
+        match index {
+            None => self.push_osc(&[b"104"]),
+            Some(i) => self.push_osc(&[b"104", i.to_string().as_bytes()]),
+        }
+    }
+
+    fn set_dynamic_color(
+        &mut self,
+        _: &mut Screen,
+        which: vt100::DynamicColor,
+        spec: &[u8],
+    ) {
+        self.push_osc(&[dynamic_color_code(which).as_bytes(), spec]);
+    }
+
+    fn query_dynamic_color(
+        &mut self,
+        _: &mut Screen,
+        which: vt100::DynamicColor,
+    ) {
+        self.push_osc(&[dynamic_color_code(which).as_bytes(), b"?"]);
+    }
+
+    fn reset_dynamic_color(
+        &mut self,
+        _: &mut Screen,
+        which: vt100::DynamicColor,
+    ) {
+        let code = match which {
+            vt100::DynamicColor::Foreground => "110",
+            vt100::DynamicColor::Background => "111",
+            vt100::DynamicColor::Cursor => "112",
+        };
+        self.push_osc(&[code.as_bytes()]);
+    }
+}
+
+impl PortalCallbacks {
+    fn push_osc(&mut self, params: &[&[u8]]) {
+        self.events.push(RawCallbackEvent::Osc(
+            params.iter().map(|p| p.to_vec()).collect(),
+        ));
+    }
+}
+
+/// The OSC number that sets each dynamic colour.
+fn dynamic_color_code(which: vt100::DynamicColor) -> &'static str {
+    match which {
+        vt100::DynamicColor::Foreground => "10",
+        vt100::DynamicColor::Background => "11",
+        vt100::DynamicColor::Cursor => "12",
+    }
 }
 
 /// Stashed pre-attach state used by the VSS "restore on detach" path.

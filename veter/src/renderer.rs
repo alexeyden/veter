@@ -219,34 +219,259 @@ fn ansi_color(idx: u8) -> Color {
 /// Terminal default background. Also the "selected" foreground for VGE
 /// text (`draw_vge_text_selected`), which reverse-videos against the
 /// text's own colour the way a selected cell does.
-const DEFAULT_BG: Color = Color {
+pub const DEFAULT_BG: Color = Color {
     r: 30.0 / 255.0,
     g: 30.0 / 255.0,
     b: 30.0 / 255.0,
     a: 1.0,
 };
 
-fn resolve_cell_colors(cell: &vt100::Cell, is_cursor: bool, is_selected: bool) -> (Color, Color) {
-    let default_fg = Color::rgb(204, 204, 204);
-    let default_bg = DEFAULT_BG;
+/// Terminal default foreground, before any OSC 10 override.
+const DEFAULT_FG: Color = Color {
+    r: 204.0 / 255.0,
+    g: 204.0 / 255.0,
+    b: 204.0 / 255.0,
+    a: 1.0,
+};
 
+/// The colour table a program can rewrite from inside the terminal:
+/// the 256 indexed entries (`OSC 4`, terminfo `initc`) plus the three
+/// "dynamic" colours (`OSC 10 / 11 / 12`, terminfo `Cs`). Every entry
+/// is an override over the built-in value, so `OSC 104` / `OSC 110`
+/// and friends reset by clearing rather than by remembering a copy of
+/// the defaults.
+#[derive(Clone)]
+pub struct Palette {
+    indexed: [Option<Color>; 256],
+    default_fg: Option<Color>,
+    default_bg: Option<Color>,
+    cursor: Option<Color>,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            indexed: [None; 256],
+            default_fg: None,
+            default_bg: None,
+            cursor: None,
+        }
+    }
+}
+
+impl Palette {
+    #[must_use]
+    pub fn indexed(&self, i: u8) -> Color {
+        self.indexed[i as usize].unwrap_or_else(|| ansi_color(i))
+    }
+
+    #[must_use]
+    pub fn fg(&self) -> Color {
+        self.default_fg.unwrap_or(DEFAULT_FG)
+    }
+
+    #[must_use]
+    pub fn bg(&self) -> Color {
+        self.default_bg.unwrap_or(DEFAULT_BG)
+    }
+
+    /// The cursor colour a program asked for with `OSC 12`, or `None`
+    /// to keep the built-in look (the cell drawn in reverse video).
+    #[must_use]
+    pub fn cursor(&self) -> Option<Color> {
+        self.cursor
+    }
+
+    pub fn set_indexed(&mut self, i: u8, rgb: (u8, u8, u8)) {
+        self.indexed[i as usize] = Some(Color::rgb(rgb.0, rgb.1, rgb.2));
+    }
+
+    /// `OSC 104` — one entry, or the whole table when `i` is `None`.
+    pub fn reset_indexed(&mut self, i: Option<u8>) {
+        match i {
+            Some(i) => self.indexed[i as usize] = None,
+            None => self.indexed = [None; 256],
+        }
+    }
+
+    pub fn set_dynamic(&mut self, which: vt100::DynamicColor, rgb: (u8, u8, u8)) {
+        let c = Some(Color::rgb(rgb.0, rgb.1, rgb.2));
+        match which {
+            vt100::DynamicColor::Foreground => self.default_fg = c,
+            vt100::DynamicColor::Background => self.default_bg = c,
+            vt100::DynamicColor::Cursor => self.cursor = c,
+        }
+    }
+
+    pub fn reset_dynamic(&mut self, which: vt100::DynamicColor) {
+        match which {
+            vt100::DynamicColor::Foreground => self.default_fg = None,
+            vt100::DynamicColor::Background => self.default_bg = None,
+            vt100::DynamicColor::Cursor => self.cursor = None,
+        }
+    }
+
+    /// What to answer an `OSC 10 / 11 / 12 ; ?` query with. The cursor
+    /// has no colour of its own until one is set, and reports the
+    /// foreground it would otherwise be drawn against.
+    #[must_use]
+    pub fn dynamic_rgb(&self, which: vt100::DynamicColor) -> (u8, u8, u8) {
+        rgb8(match which {
+            vt100::DynamicColor::Foreground => self.fg(),
+            vt100::DynamicColor::Background => self.bg(),
+            vt100::DynamicColor::Cursor => self.cursor.unwrap_or_else(|| self.fg()),
+        })
+    }
+
+    #[must_use]
+    pub fn indexed_rgb(&self, i: u8) -> (u8, u8, u8) {
+        rgb8(self.indexed(i))
+    }
+}
+
+/// A femtovg colour as the eight-bit triple the OSC reports carry.
+fn rgb8(c: Color) -> (u8, u8, u8) {
+    (
+        (c.r * 255.0 + 0.5) as u8,
+        (c.g * 255.0 + 0.5) as u8,
+        (c.b * 255.0 + 0.5) as u8,
+    )
+}
+
+/// One cell's worth of a straight underline: solid, doubled, dotted
+/// or dashed. Dots and dashes are sized off the rule's own thickness so
+/// they keep their proportions at any font size.
+fn straight_underline(
+    path: &mut Path,
+    style: vt100::UnderlineStyle,
+    x: f32,
+    y: f32,
+    width: f32,
+    thickness: f32,
+) {
+    match style {
+        vt100::UnderlineStyle::Single => path.rect(x, y, width, thickness),
+        vt100::UnderlineStyle::Double => {
+            path.rect(x, y, width, thickness);
+            path.rect(x, y + thickness * 2.0, width, thickness);
+        }
+        vt100::UnderlineStyle::Dotted => {
+            dashes(path, x, y, width, thickness, thickness, thickness * 2.0);
+        }
+        vt100::UnderlineStyle::Dashed => {
+            dashes(
+                path,
+                x,
+                y,
+                width,
+                thickness,
+                thickness * 3.0,
+                thickness * 3.0,
+            );
+        }
+        // Curly is stroked, not filled — see `curly_underline`.
+        vt100::UnderlineStyle::Curly => path.rect(x, y, width, thickness),
+    }
+}
+
+/// Lay `on`-long marks separated by `off` across `width`, phased on the
+/// absolute x so the pattern lines up across cell boundaries instead of
+/// restarting in each one.
+fn dashes(
+    path: &mut Path,
+    x: f32,
+    y: f32,
+    width: f32,
+    thickness: f32,
+    on: f32,
+    off: f32,
+) {
+    let period = on + off;
+    let start = (x / period).floor() * period;
+    let mut mark = start;
+    while mark < x + width {
+        let x0 = mark.max(x);
+        let x1 = (mark + on).min(x + width);
+        if x1 > x0 {
+            path.rect(x0, y, x1 - x0, thickness);
+        }
+        mark += period;
+    }
+}
+
+/// One cell of the squiggle nvim draws under a diagnostic. Sampled
+/// rather than drawn as two arcs so the wave keeps its phase across
+/// cells — the sample positions come off the absolute x.
+fn curly_underline(
+    path: &mut Path,
+    x: f32,
+    y: f32,
+    width: f32,
+    thickness: f32,
+) {
+    let period = (thickness * 6.0).max(4.0);
+    let amplitude = thickness;
+    let step = (period / 6.0).max(1.0);
+    let mut px = x;
+    let sample = |px: f32| {
+        y + amplitude
+            * (std::f32::consts::TAU * (px / period)).sin()
+    };
+    path.move_to(px, sample(px));
+    while px < x + width {
+        px = (px + step).min(x + width);
+        path.line_to(px, sample(px));
+    }
+}
+
+fn resolve_cell_colors(
+    cell: &vt100::Cell,
+    is_cursor: bool,
+    is_selected: bool,
+    palette: &Palette,
+    reverse_video: bool,
+) -> (Color, Color) {
     let mut fg = match cell.fgcolor() {
-        vt100::Color::Default => default_fg,
+        vt100::Color::Default => palette.fg(),
         vt100::Color::Idx(i) => {
             let i = if cell.bold() && i < 8 { i + 8 } else { i };
-            ansi_color(i)
+            palette.indexed(i)
         }
         vt100::Color::Rgb(r, g, b) => Color::rgb(r, g, b),
     };
 
     let mut bg = match cell.bgcolor() {
-        vt100::Color::Default => default_bg,
-        vt100::Color::Idx(i) => ansi_color(i),
+        vt100::Color::Default => palette.bg(),
+        vt100::Color::Idx(i) => palette.indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::rgb(r, g, b),
     };
 
-    if cell.inverse() ^ is_cursor ^ is_selected {
+    // DECSCNM (`?5`) reverses the whole screen, cell colours included —
+    // it is what terminfo's `flash` blinks the window with. It stacks
+    // with the per-cell inversions rather than overriding them.
+    if cell.inverse() ^ is_selected ^ reverse_video {
         std::mem::swap(&mut fg, &mut bg);
+    }
+
+    // The block cursor. Without an `OSC 12` colour it is the cell in
+    // reverse video, which is what veter has always drawn; with one it
+    // paints that colour behind the character and the character in the
+    // background it was sitting on, the way xterm does.
+    if is_cursor {
+        match palette.cursor() {
+            Some(cursor) => {
+                fg = bg;
+                bg = cursor;
+            }
+            None => std::mem::swap(&mut fg, &mut bg),
+        }
+    }
+
+    // SGR 8, terminfo `invis`: the glyph is drawn in the background it
+    // sits on. Painting it rather than skipping it keeps the cell's
+    // width and any selection highlight behind it intact.
+    if cell.conceal() {
+        fg = bg;
     }
 
     (fg, bg)
@@ -1430,6 +1655,25 @@ pub struct TerminalRenderer {
     /// built-in accent slot 0; `set_selection_accent` overrides it from
     /// `[accent]`.
     selection_accent: Color,
+
+    /// The colour table, as OSC 4 / 10 / 11 / 12 have left it.
+    pub palette: Palette,
+
+    /// The on half of the blink cycle, driven by the App's clock. Both
+    /// `SGR 5` text and a blinking cursor read it, so everything on
+    /// screen blinks in step.
+    pub blink_phase: bool,
+    /// Set by a render pass that painted something blinking, so the App
+    /// knows to schedule the next frame. Cleared by
+    /// [`take_blink_seen`](Self::take_blink_seen).
+    blink_seen: bool,
+
+    /// Bold / italic / bold-italic faces of the primary family,
+    /// resolved on first use and indexed by `bold | italic << 1`. The
+    /// outer `Option` is "not looked up yet"; the inner one is `None`
+    /// when the family has no distinct face and the primary is used
+    /// as-is.
+    styled_faces: [Option<Option<u16>>; 4],
 }
 
 impl TerminalRenderer {
@@ -1522,10 +1766,100 @@ impl TerminalRenderer {
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
             selection_accent: Color::rgb(0x56, 0x79, 0x9f),
+            palette: Palette::default(),
+            blink_phase: true,
+            blink_seen: false,
+            styled_faces: [None; 4],
         }
     }
 
     /// Override the VGE selection outline colour from user config.
+    /// Whether the frame just drawn contained anything that blinks, so
+    /// the caller knows to come back for the other half of the cycle.
+    pub fn take_blink_seen(&mut self) -> bool {
+        std::mem::take(&mut self.blink_seen)
+    }
+
+    /// The faces to draw bold / italic grid cells with, indexed by
+    /// `bold | italic << 1` and resolved out of the primary font's own
+    /// family so they share its metrics.
+    ///
+    /// `None` in a slot means the family offers no distinct face there
+    /// and the primary should be used — which is what every cell used
+    /// to get, bold being nothing but a brighter colour and italic
+    /// nothing at all. Resolved once, on the first frame that asks.
+    fn grid_styled_faces(&mut self) -> [Option<u16>; 4] {
+        if self.styled_faces[0].is_none() {
+            for slot in 0..4 {
+                let resolved =
+                    self.resolve_styled_face(slot & 1 != 0, slot & 2 != 0);
+                self.styled_faces[slot] = Some(resolved);
+            }
+        }
+        // Slot 0 is the unstyled face, which is the primary by
+        // definition, so it is always `Some(None)` once resolved.
+        std::array::from_fn(|i| self.styled_faces[i].flatten())
+    }
+
+    fn resolve_styled_face(&mut self, bold: bool, italic: bool) -> Option<u16> {
+        use parley::style::{FontStyle as PStyle, FontWeight};
+
+        let cell = self.cell_metrics();
+        let mut builder =
+            self.layout_cx
+                .ranged_builder(&mut self.font_cx, "m", 1.0, false);
+        builder.push_default(StyleProperty::Brush(Color::white()));
+        let stack: FontStack<'_> = if self.font_family.is_empty() {
+            FontStack::from(GenericFamily::Monospace)
+        } else {
+            FontStack::List(Cow::Owned(vec![
+                FontFamily::Named(Cow::Borrowed(self.font_family.as_str())),
+                FontFamily::Generic(GenericFamily::Monospace),
+            ]))
+        };
+        builder.push_default(stack);
+        builder.push_default(StyleProperty::FontSize(self.font_size));
+        builder.push_default(StyleProperty::FontWeight(if bold {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        }));
+        builder.push_default(StyleProperty::FontStyle(if italic {
+            PStyle::Italic
+        } else {
+            PStyle::Normal
+        }));
+        let mut layout: Layout<Color> = builder.build("m");
+        layout.break_all_lines(None);
+
+        let mut face: Option<(Vec<u8>, usize)> = None;
+        'outer: for line in layout.lines() {
+            for item in line.items() {
+                if let PositionedLayoutItem::GlyphRun(run_layout) = item {
+                    let font = run_layout.run().font();
+                    face = Some((
+                        font.data.as_ref().to_vec(),
+                        font.index as usize,
+                    ));
+                    break 'outer;
+                }
+            }
+        }
+        let (data, index) = face?;
+        // A family with no bold or no italic of its own resolves right
+        // back to the regular face. Going through the fallback path for
+        // that would cost a second glyph cache for identical output.
+        if index == self.font_index && data == self.font_data {
+            return None;
+        }
+        Some(register_fallback(
+            &mut self.fallback_fonts,
+            &data,
+            index,
+            cell,
+        ))
+    }
+
     pub fn set_selection_accent(&mut self, accent: Color) {
         self.selection_accent = accent;
     }
@@ -2070,7 +2404,32 @@ impl TerminalRenderer {
         search_highlights: Option<&[HighlightSpan]>,
     ) {
         let (rows, cols) = screen.size();
-        let default_bg = DEFAULT_BG;
+        let default_bg = self.palette.bg();
+        // DECSCNM (`?5`) — terminfo's `flash` is a tenth of a second of
+        // this.
+        let reverse_video = screen.reverse_video();
+        // DECSCUSR (`CSI Ps SP q`). The shape belongs to the screen
+        // being drawn, so a portal running vim gets a bar while the
+        // host keeps its block, with no extra plumbing.
+        let cursor_shape = screen.cursor_shape();
+        let cursor_lit = !screen.cursor_blink() || self.blink_phase;
+        if focused_cursor.is_some() && screen.cursor_blink() {
+            self.blink_seen = true;
+        }
+        // Only a block cursor is drawn by inverting its cell; a bar or
+        // an underline is a rule painted over one, so the cell beneath
+        // keeps its own colours.
+        let block_cursor =
+            matches!(cursor_shape, vt100::CursorShape::Block) && cursor_lit;
+        let cursor_cell =
+            |row: u16, col: u16| block_cursor && focused_cursor == Some((row, col));
+        // Resolving a styled face borrows the whole renderer, so it has
+        // to happen before the primary `FontRef` below pins `font_data`
+        // for the rest of the pass. All four go at once on the first
+        // frame — the alternative, resolving on demand, would need a
+        // scan of the grid every frame to find out which are wanted.
+        let styled_faces = self.grid_styled_faces();
+        let palette = self.palette.clone();
         let selected = |r, c| selection.map(|s| s.contains(r, c)).unwrap_or(false);
         // Per-cell search-highlight color, or None if cell is unhit.
         // The current match takes precedence over other matches on the
@@ -2102,10 +2461,11 @@ impl TerminalRenderer {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let is_cursor = focused_cursor == Some((row, col));
+                let is_cursor = cursor_cell(row, col);
                 let sel = selected(row, col);
                 let hl = highlight_color(row, col);
-                let (_, base_bg) = resolve_cell_colors(cell, is_cursor, sel);
+                let (_, base_bg) =
+                    resolve_cell_colors(cell, is_cursor, sel, &palette, reverse_video);
                 // Search highlight overrides everything except cursor/selection.
                 // Selection wins over a non-current match so the user's
                 // explicit selection stays visible.
@@ -2157,8 +2517,23 @@ impl TerminalRenderer {
                 // primitives; the font glyphs leave gaps because the
                 // cell box includes leading and weights are inconsistent.
                 // Short-circuit before the font lookup.
-                let is_cursor = focused_cursor == Some((row, col));
-                let (fg, _) = resolve_cell_colors(cell, is_cursor, selected(row, col));
+                let is_cursor = cursor_cell(row, col);
+                let (fg, _) = resolve_cell_colors(
+                    cell,
+                    is_cursor,
+                    selected(row, col),
+                    &palette,
+                    reverse_video,
+                );
+                // SGR 5, terminfo `blink`: skip the glyph on the off
+                // half of the cycle. The cell's background, decorations
+                // and any selection stay put — only the text winks.
+                if cell.blink() {
+                    self.blink_seen = true;
+                    if !self.blink_phase {
+                        continue;
+                    }
+                }
                 let cx = ox_px + col as f32 * self.cell_width;
                 let cy = oy_px + row as f32 * self.cell_height;
                 let code = ch as u32;
@@ -2181,7 +2556,25 @@ impl TerminalRenderer {
                     continue;
                 }
 
-                let (glyph_id, font_id) = {
+                // Bold and italic draw from the family's own faces.
+                // Until these existed, bold was nothing but a brighter
+                // colour and italic was nothing at all.
+                let styled = if cell.bold() || cell.italic() {
+                    styled_faces[usize::from(cell.bold())
+                        | (usize::from(cell.italic()) << 1)]
+                } else {
+                    None
+                };
+                let styled_glyph = styled.and_then(|fid| {
+                    let fb = &self.fallback_fonts[(fid - 1) as usize];
+                    let fr = FontRef::from_index(&fb.data, fb.index)?;
+                    let gid = fr.charmap().map(ch);
+                    (gid != 0).then_some((gid, fid))
+                });
+
+                let (glyph_id, font_id) = if let Some(sg) = styled_glyph {
+                    sg
+                } else {
                     let gid = primary_charmap.map(ch);
                     if gid != 0 {
                         (gid, 0u16)
@@ -2298,6 +2691,152 @@ impl TerminalRenderer {
                 &Paint::color(Color::white()),
             );
         }
+
+        self.draw_cell_decorations(
+            canvas,
+            screen,
+            scroll_offset,
+            ox_px,
+            oy_px,
+            &palette,
+            reverse_video,
+            &|r, c| selected(r, c),
+        );
+
+        // A bar or underline cursor is a rule of its own rather than an
+        // inversion, painted last so it sits over the glyph.
+        if let Some((crow, ccol)) = focused_cursor
+            && cursor_lit
+            && !block_cursor
+        {
+            let thickness = (self.cell_height / 12.0).max(2.0);
+            let x = ox_px + f32::from(ccol) * self.cell_width;
+            let y = oy_px + f32::from(crow) * self.cell_height;
+            let mut path = Path::new();
+            match cursor_shape {
+                vt100::CursorShape::Bar => {
+                    path.rect(x, y, thickness, self.cell_height);
+                }
+                vt100::CursorShape::Underline => {
+                    path.rect(
+                        x,
+                        y + self.cell_height - thickness,
+                        self.cell_width,
+                        thickness,
+                    );
+                }
+                vt100::CursorShape::Block => unreachable!("handled above"),
+            }
+            let color = palette.cursor().unwrap_or_else(|| palette.fg());
+            canvas.fill_path(&path, &Paint::color(color));
+        }
+    }
+
+    /// Underline (all five shapes), strikethrough and overline for the
+    /// cells of one screen.
+    ///
+    /// A separate pass, after the glyphs, because the glyph path
+    /// batches by texture and colour and has nowhere to hang a rule.
+    /// Rules accumulate into one path per colour so a run of underlined
+    /// text costs one fill, not one per cell — and so adjacent cells
+    /// meet without a seam.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cell_decorations<T: Renderer>(
+        &mut self,
+        canvas: &mut Canvas<T>,
+        screen: &vt100::Screen,
+        scroll_offset: usize,
+        ox_px: f32,
+        oy_px: f32,
+        palette: &Palette,
+        reverse_video: bool,
+        selected: &dyn Fn(u16, u16) -> bool,
+    ) {
+        let (rows, cols) = screen.size();
+        let thickness = (self.font_size / 16.0).max(1.0);
+        let underline_y = self.ascent + (self.cell_height - self.ascent) * 0.5;
+        let strike_y = self.ascent - self.ascent * 0.35;
+
+        // Straight rules by colour, and curly ones separately: a
+        // squiggle has to be stroked, not filled.
+        let mut fills: HashMap<u32, Path> = HashMap::new();
+        let mut curls: HashMap<u32, Path> = HashMap::new();
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = screen.cell_at(scroll_offset, row, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let style = cell.underline_style();
+                if style.is_none() && !cell.strikethrough() && !cell.overline() {
+                    continue;
+                }
+                // Blinking text takes its rules with it.
+                if cell.blink() && !self.blink_phase {
+                    continue;
+                }
+                let (fg, _) = resolve_cell_colors(
+                    cell,
+                    false,
+                    selected(row, col),
+                    palette,
+                    reverse_video,
+                );
+                let x = ox_px + f32::from(col) * self.cell_width;
+                let y = oy_px + f32::from(row) * self.cell_height;
+                let w = self.cell_width * if cell.is_wide() { 2.0 } else { 1.0 };
+                let key = color_key(fg);
+
+                if let Some(style) = style {
+                    match style {
+                        vt100::UnderlineStyle::Curly => {
+                            let path = curls.entry(key).or_default();
+                            curly_underline(
+                                path,
+                                x,
+                                y + underline_y,
+                                w,
+                                thickness,
+                            );
+                        }
+                        other => {
+                            let path = fills.entry(key).or_default();
+                            straight_underline(
+                                path,
+                                other,
+                                x,
+                                y + underline_y,
+                                w,
+                                thickness,
+                            );
+                        }
+                    }
+                }
+                if cell.strikethrough() {
+                    fills.entry(key).or_default().rect(
+                        x,
+                        y + strike_y,
+                        w,
+                        thickness,
+                    );
+                }
+                if cell.overline() {
+                    fills.entry(key).or_default().rect(x, y, w, thickness);
+                }
+            }
+        }
+
+        for (key, path) in &fills {
+            canvas.fill_path(path, &Paint::color(key_to_color(*key)));
+        }
+        for (key, path) in &curls {
+            let mut paint = Paint::color(key_to_color(*key));
+            paint.set_line_width(thickness);
+            canvas.stroke_path(path, &paint);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2395,6 +2934,145 @@ impl TerminalRenderer {
             path.rounded_rect(bar_x, thumb_y, bar_width, thumb_height, 3.0);
             canvas.fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, 90)));
         }
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    fn cell_after(bytes: &[u8]) -> vt100::Parser {
+        let mut p = vt100::Parser::new(4, 20, 0);
+        p.process(bytes);
+        p
+    }
+
+    #[test]
+    fn osc_4_overrides_one_entry_and_104_puts_it_back() {
+        let mut pal = Palette::default();
+        assert_eq!(pal.indexed_rgb(1), rgb8(ansi_color(1)));
+        pal.set_indexed(1, (1, 2, 3));
+        assert_eq!(pal.indexed_rgb(1), (1, 2, 3));
+        pal.reset_indexed(Some(1));
+        assert_eq!(pal.indexed_rgb(1), rgb8(ansi_color(1)));
+
+        pal.set_indexed(1, (1, 2, 3));
+        pal.set_indexed(2, (4, 5, 6));
+        pal.reset_indexed(None);
+        assert_eq!(pal.indexed_rgb(2), rgb8(ansi_color(2)));
+    }
+
+    /// An `OSC 11 ; ?` before anything sets it must report the real
+    /// default background, not black — that answer decides whether vim
+    /// picks a light or a dark colourscheme.
+    #[test]
+    fn the_dynamic_colours_report_the_defaults_until_they_are_set() {
+        let mut pal = Palette::default();
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Background),
+            rgb8(DEFAULT_BG),
+        );
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Foreground),
+            rgb8(DEFAULT_FG),
+        );
+        // With no cursor colour of its own, the cursor reports the
+        // foreground it is drawn against.
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Cursor),
+            rgb8(DEFAULT_FG),
+        );
+        pal.set_dynamic(vt100::DynamicColor::Cursor, (9, 9, 9));
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Cursor), (9, 9, 9));
+        pal.reset_dynamic(vt100::DynamicColor::Cursor);
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Cursor),
+            rgb8(DEFAULT_FG),
+        );
+    }
+
+    #[test]
+    fn a_palette_override_reaches_the_cell_colours() {
+        let p = cell_after(b"\x1b[31mx");
+        let cell = p.screen().cell(0, 0).unwrap();
+        let mut pal = Palette::default();
+        pal.set_indexed(1, (10, 20, 30));
+        let (fg, _) = resolve_cell_colors(cell, false, false, &pal, false);
+        assert_eq!(rgb8(fg), (10, 20, 30));
+    }
+
+    /// DECSCNM reverses the whole screen, and stacks with the per-cell
+    /// inversion rather than overriding it.
+    #[test]
+    fn decscnm_reverses_the_screen_and_stacks_with_sgr_7() {
+        let p = cell_after(b"x\x1b[7my");
+        let plain = p.screen().cell(0, 0).unwrap();
+        let inverse = p.screen().cell(0, 1).unwrap();
+        let pal = Palette::default();
+
+        let (fg, bg) = resolve_cell_colors(plain, false, false, &pal, true);
+        assert_eq!((rgb8(fg), rgb8(bg)), (rgb8(pal.bg()), rgb8(pal.fg())));
+
+        // Reversed twice is not reversed at all.
+        let (fg, bg) = resolve_cell_colors(inverse, false, false, &pal, true);
+        assert_eq!((rgb8(fg), rgb8(bg)), (rgb8(pal.fg()), rgb8(pal.bg())));
+    }
+
+    /// SGR 8 draws the glyph in the background it sits on, so the text
+    /// is invisible but the cell keeps its shape.
+    #[test]
+    fn conceal_paints_the_glyph_in_its_own_background() {
+        let p = cell_after(b"\x1b[8;44mx");
+        let cell = p.screen().cell(0, 0).unwrap();
+        let pal = Palette::default();
+        let (fg, bg) = resolve_cell_colors(cell, false, false, &pal, false);
+        assert_eq!(rgb8(fg), rgb8(bg));
+    }
+
+    /// Without `OSC 12` the block cursor is the cell in reverse video,
+    /// which is what veter has always drawn; with one it paints that
+    /// colour behind the character.
+    #[test]
+    fn the_block_cursor_takes_an_osc_12_colour() {
+        let p = cell_after(b"x");
+        let cell = p.screen().cell(0, 0).unwrap();
+
+        let pal = Palette::default();
+        let (fg, bg) = resolve_cell_colors(cell, true, false, &pal, false);
+        assert_eq!((rgb8(fg), rgb8(bg)), (rgb8(pal.bg()), rgb8(pal.fg())));
+
+        let mut pal = Palette::default();
+        pal.set_dynamic(vt100::DynamicColor::Cursor, (200, 0, 0));
+        let (fg, bg) = resolve_cell_colors(cell, true, false, &pal, false);
+        assert_eq!(rgb8(bg), (200, 0, 0));
+        assert_eq!(rgb8(fg), rgb8(pal.bg()), "text takes the cell's background");
+    }
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::*;
+
+    /// Dashes are phased on the absolute x, so a run of underlined
+    /// cells reads as one dashed rule instead of restarting in each
+    /// cell.
+    #[test]
+    fn dashes_keep_their_phase_across_a_cell_boundary() {
+        fn marks(x: f32, width: f32) -> Vec<(u32, u32)> {
+            let mut path = Path::new();
+            dashes(&mut path, x, 0.0, width, 1.0, 2.0, 2.0);
+            path.verbs()
+                .filter_map(|v| match v {
+                    femtovg::Verb::MoveTo(px, _) => Some(px),
+                    _ => None,
+                })
+                .map(|px| (px as u32, 0))
+                .collect()
+        }
+        // Two adjacent 8px cells produce the same marks as one 16px run.
+        let split: Vec<_> =
+            marks(0.0, 8.0).into_iter().chain(marks(8.0, 8.0)).collect();
+        assert_eq!(split, marks(0.0, 16.0));
     }
 }
 

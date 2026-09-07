@@ -781,6 +781,10 @@ fn whole_line_marker(
     (anchor != word_anchor).then_some(anchor)
 }
 
+/// Half of the blink cycle: how long `SGR 5` text and a blinking
+/// cursor stay in one phase. xterm's default is the same half-second.
+const BLINK_PERIOD: Duration = Duration::from_millis(500);
+
 struct App {
     // Terminal state (dropped first — no GL dependency)
     parser: Option<vt100::Parser<clipboard::HostCallbacks>>,
@@ -840,6 +844,20 @@ struct App {
     /// Deadline for the next auto-scroll step while dragging past the
     /// viewport edge. None when not auto-scrolling.
     autoscroll_deadline: Option<Instant>,
+    /// Window titles stacked by `CSI 22 t`, popped by `CSI 23 t` —
+    /// terminfo's `smcup` / `rmcup` for xterm-256color carry the pair,
+    /// which is how a full-screen program's title change is undone when
+    /// it exits. Bounded, so a program that only ever pushes cannot
+    /// grow it without end.
+    title_stack: Vec<String>,
+    /// Whether the window holds keyboard focus. Only interesting to a
+    /// program that turned focus reporting (`?1004`) on.
+    window_focused: bool,
+    /// The on half of the blink cycle, and the instant the next flip is
+    /// due. Armed only by a frame that actually drew something blinking,
+    /// so a screen without any costs no wakeups.
+    blink_on: bool,
+    blink_deadline: Option<Instant>,
     /// Most recent left-press recorded in the local-selection branch
     /// (time, target, pixel position). A subsequent press within
     /// `DOUBLE_CLICK_INTERVAL` and `DOUBLE_CLICK_RADIUS_PX` of the
@@ -2059,6 +2077,10 @@ impl App {
             vge_selection: None,
             pending_image_click: None,
             autoscroll_deadline: None,
+            title_stack: Vec::new(),
+            window_focused: true,
+            blink_on: true,
+            blink_deadline: None,
             last_click: None,
             mouse_buttons_held: 0,
             last_motion_report: None,
@@ -4384,6 +4406,143 @@ impl App {
         }
     }
 
+    /// How many titles `CSI 22 t` may stack before the oldest is
+    /// dropped. xterm's own limit is in the same range; the point is
+    /// only that a program which pushes without popping cannot make the
+    /// terminal grow.
+    const TITLE_STACK_LIMIT: usize = 16;
+
+    /// Apply and answer the [`clipboard::TerminalRequest`]s the
+    /// host-direct child queued this pass: the XTWINOPS title stack and
+    /// size reports, and the OSC palette and dynamic-colour commands.
+    ///
+    /// Answered here, on the tick the bytes arrived, because every
+    /// query in the list is one the sender blocks on — an unanswered
+    /// `OSC 11 ; ?` costs vim and neovim the same startup stall an
+    /// unanswered DA1 used to.
+    fn drain_terminal_requests(&mut self) {
+        use clipboard::TerminalRequest as Req;
+
+        let Some(parser) = &mut self.parser else {
+            return;
+        };
+        let requests: Vec<Req> =
+            parser.callbacks_mut().pending_requests.drain(..).collect();
+        if requests.is_empty() {
+            return;
+        }
+        let (rows, cols) = parser.screen().size();
+
+        let mut reply = Vec::new();
+        let mut title_op = None;
+        for req in requests {
+            match req {
+                Req::PushTitle | Req::PopTitle => title_op = Some(req),
+                Req::SizeReport(op) => {
+                    // Cell metrics come from the renderer, which does
+                    // not exist until the window does. Before then
+                    // there is no honest answer, so none is sent.
+                    if let Some(tr) = &self.term_renderer
+                        && let Some(bytes) = veter_host::query::window_size_report(
+                            op,
+                            rows,
+                            cols,
+                            tr.cell_width as u16,
+                            tr.cell_height as u16,
+                        )
+                    {
+                        reply.extend_from_slice(&bytes);
+                    }
+                }
+                Req::SetPalette(i, rgb) => {
+                    if let Some(tr) = &mut self.term_renderer {
+                        tr.palette.set_indexed(i, rgb);
+                    }
+                }
+                Req::ResetPalette(i) => {
+                    if let Some(tr) = &mut self.term_renderer {
+                        tr.palette.reset_indexed(i);
+                    }
+                }
+                Req::QueryPalette(i) => {
+                    if let Some(tr) = &self.term_renderer {
+                        reply.extend_from_slice(
+                            &veter_host::query::palette_color_report(
+                                i,
+                                tr.palette.indexed_rgb(i),
+                            ),
+                        );
+                    }
+                }
+                Req::SetDynamic(which, rgb) => {
+                    if let Some(tr) = &mut self.term_renderer {
+                        tr.palette.set_dynamic(which, rgb);
+                    }
+                }
+                Req::ResetDynamic(which) => {
+                    if let Some(tr) = &mut self.term_renderer {
+                        tr.palette.reset_dynamic(which);
+                    }
+                }
+                Req::QueryDynamic(which) => {
+                    if let Some(tr) = &self.term_renderer {
+                        reply.extend_from_slice(
+                            &veter_host::query::dynamic_color_report(
+                                which,
+                                tr.palette.dynamic_rgb(which),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        match title_op {
+            Some(Req::PushTitle) => {
+                if self.title_stack.len() >= Self::TITLE_STACK_LIMIT {
+                    self.title_stack.remove(0);
+                }
+                self.title_stack.push(self.window_title.clone());
+            }
+            Some(Req::PopTitle) => {
+                if let Some(title) = self.title_stack.pop() {
+                    self.window_title = title;
+                    if let Some(w) = &self.window {
+                        w.set_title(&self.window_title);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if !reply.is_empty()
+            && let Some(pty) = &self.pty
+        {
+            let _ = pty.write_all(&reply);
+        }
+    }
+
+    /// Tell a `?1004` client that the window gained or lost focus.
+    ///
+    /// Host level only: PRT carries display direction, never input
+    /// (see the crate docs), so a portal's focus is its client's to
+    /// decide and never travels this way.
+    fn report_focus_change(&mut self, focused: bool) {
+        if self.window_focused == focused {
+            return;
+        }
+        self.window_focused = focused;
+        let Some(parser) = &self.parser else {
+            return;
+        };
+        if !parser.screen().focus_reporting() {
+            return;
+        }
+        if let Some(pty) = &self.pty {
+            let _ = pty.write_all(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
     /// Process PTY output, for up to [`PTY_DRAIN_BUDGET`] of wall clock.
     fn process_pty_output(&mut self) -> PtyPass {
         let rx = match &self.rx {
@@ -4749,6 +4908,10 @@ impl ApplicationHandler for App {
             // confirmation panel instead of quitting; a second request
             // while the panel is already up changes nothing, since the
             // answer has to come from the panel itself.
+            WindowEvent::Focused(focused) => {
+                self.report_focus_change(focused);
+            }
+
             WindowEvent::CloseRequested => {
                 if !self.config.window.confirm_close {
                     event_loop.exit();
@@ -5234,7 +5397,14 @@ impl ApplicationHandler for App {
                 let accent = self.config.accent_primary().to_femto();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
-                canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(30, 30, 30));
+                // The window's ground is the terminal's background, so
+                // an `OSC 11` reaches the margins around the grid too
+                // and not just the cells.
+                let ground = self
+                    .term_renderer
+                    .as_ref()
+                    .map_or(renderer::DEFAULT_BG, |tr| tr.palette.bg());
+                canvas.clear_rect(0, 0, size.width, size.height, ground);
 
                 if let (Some(parser), Some(tr), Some(engine), Some(prt)) = (
                     &mut self.parser,
@@ -5255,6 +5425,12 @@ impl ApplicationHandler for App {
                     for gpu_id in prt.take_all_pending_image_deletes() {
                         tr.release_gpu_image(canvas, gpu_id);
                     }
+
+                    // Hand the blink phase down before anything draws:
+                    // `SGR 5` text and a blinking cursor both read it,
+                    // so the whole frame agrees about which half of the
+                    // cycle it is.
+                    tr.blink_phase = self.blink_on;
 
                     // Probe actual scrollback buffer size (no public accessor)
                     let current = parser.screen().scrollback();
@@ -5345,6 +5521,17 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // Re-arm the blink clock if this frame drew anything
+                // that blinks. Asking the renderer, rather than
+                // scanning the grid here, keeps the question where the
+                // answer already is — and covers portals, which draw
+                // through the same pass.
+                if let Some(tr) = &mut self.term_renderer
+                    && tr.take_blink_seen()
+                {
+                    self.blink_deadline = Some(Instant::now() + BLINK_PERIOD);
+                }
+
                 canvas.flush();
                 self.gl_surface
                     .as_ref()
@@ -5365,6 +5552,7 @@ impl ApplicationHandler for App {
         self.pty_backlog = pass.backlog;
         self.drain_pending_clipboard();
         self.drain_pending_window_title();
+        self.drain_terminal_requests();
         self.validate_selection();
         // PTY output may have advanced the target parser's scrollback;
         // rebuild the search index so live matches stay accurate.
@@ -5399,16 +5587,32 @@ impl ApplicationHandler for App {
         // sits past the viewport edge. Schedule a wakeup at
         // `autoscroll_deadline`; once it elapses, scroll one row,
         // re-arm if still out of bounds, and reschedule.
-        let Some(deadline) = self.autoscroll_deadline else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        };
         let now = Instant::now();
-        if now >= deadline {
+
+        // The blink flip. Armed only while the last frame actually drew
+        // something blinking, so an ordinary screen never wakes for it.
+        if let Some(deadline) = self.blink_deadline
+            && now >= deadline
+        {
+            self.blink_on = !self.blink_on;
+            self.blink_deadline = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
+        if let Some(deadline) = self.autoscroll_deadline
+            && now >= deadline
+        {
             self.autoscroll_step();
             self.maybe_arm_autoscroll();
         }
-        match self.autoscroll_deadline {
+
+        let next = match (self.autoscroll_deadline, self.blink_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match next {
             Some(d) => event_loop.set_control_flow(ControlFlow::WaitUntil(d)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
@@ -6041,6 +6245,65 @@ mod image_crop_tests {
 #[cfg(test)]
 mod window_title_tests {
     use super::*;
+
+    use clipboard::TerminalRequest as Req;
+
+    fn requests_from(bytes: &[u8]) -> Vec<Req> {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, clipboard::HostCallbacks::default());
+        parser.process(bytes);
+        std::mem::take(&mut parser.callbacks_mut().pending_requests)
+    }
+
+    /// The queries a program blocks on have to reach the App, which is
+    /// the only layer that knows the palette and the cell metrics.
+    #[test]
+    fn the_queries_that_block_a_sender_reach_the_app() {
+        assert_eq!(
+            requests_from(b"\x1b]11;?\x07"),
+            vec![Req::QueryDynamic(vt100::DynamicColor::Background)],
+        );
+        assert_eq!(requests_from(b"\x1b[16t"), vec![Req::SizeReport(16)]);
+        assert_eq!(requests_from(b"\x1b]4;9;?\x07"), vec![Req::QueryPalette(9)]);
+    }
+
+    /// terminfo's `initc` and `oc`, and the `smcup` / `rmcup` title
+    /// stack.
+    #[test]
+    fn palette_and_title_commands_arrive_parsed_and_in_order() {
+        assert_eq!(
+            requests_from(b"\x1b]4;1;rgb:ff/00/80\x1b\\"),
+            vec![Req::SetPalette(1, (0xff, 0x00, 0x80))],
+        );
+        assert_eq!(requests_from(b"\x1b]104\x07"), vec![Req::ResetPalette(None)]);
+        assert_eq!(
+            requests_from(b"\x1b[22;0;0t\x1b[23;0;0t"),
+            vec![Req::PushTitle, Req::PopTitle],
+        );
+        // A spec that doesn't parse is dropped rather than queued.
+        assert!(requests_from(b"\x1b]11;lolwhat\x07").is_empty());
+    }
+
+    /// `OSC 10 ; fg ; bg` names each colour after the last, so one
+    /// command can carry several.
+    #[test]
+    fn a_chained_dynamic_colour_command_sets_each_in_turn() {
+        assert_eq!(
+            requests_from(b"\x1b]10;#ffffff;#000000\x07"),
+            vec![
+                Req::SetDynamic(vt100::DynamicColor::Foreground, (255, 255, 255)),
+                Req::SetDynamic(vt100::DynamicColor::Background, (0, 0, 0)),
+            ],
+        );
+    }
+
+    /// A program spinning on colour queries must not be able to grow
+    /// the queue without bound.
+    #[test]
+    fn the_request_queue_is_bounded() {
+        let flood = b"\x1b]11;?\x07".repeat(1000);
+        assert!(requests_from(&flood).len() <= 256);
+    }
 
     #[test]
     fn title_is_shown_against_the_app_name() {
