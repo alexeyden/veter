@@ -1,7 +1,12 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes
-const CONTENT_BYTES: usize = 22;
+// Chosen to make the size of the cell struct 32 bytes: 21 content
+// bytes + the length/wide-flag byte + a 10-byte `Attrs` (two 4-byte
+// `Color`s and a `u16` mode). It was 22 while `Attrs::mode` was a
+// `u8`; the underline styles needed the extra bit, and a cell that
+// divides a cache line is worth more than the 22nd byte of combining
+// marks — `append` never used the last four anyway.
+const CONTENT_BYTES: usize = 21;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
@@ -207,5 +212,42 @@ impl Cell {
     #[must_use]
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
+    }
+
+    /// The shape of the cell's underline, or `None` if it has none.
+    /// [`underline`](Self::underline) answers the same question
+    /// without naming the shape.
+    #[must_use]
+    pub fn underline_style(&self) -> Option<crate::UnderlineStyle> {
+        self.attrs.underline_style()
+    }
+
+    /// Returns whether the cell should be rendered with the blinking
+    /// text attribute (`SGR 5`, terminfo `blink`).
+    #[must_use]
+    pub fn blink(&self) -> bool {
+        self.attrs.blink()
+    }
+
+    /// Returns whether the cell's text should be hidden (`SGR 8`,
+    /// terminfo `invis`) — drawn in the background colour rather than
+    /// left out, so a selection still copies it.
+    #[must_use]
+    pub fn conceal(&self) -> bool {
+        self.attrs.conceal()
+    }
+
+    /// Returns whether the cell should be rendered struck through
+    /// (`SGR 9`, terminfo `smxx`).
+    #[must_use]
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
+
+    /// Returns whether the cell should be rendered with a line above
+    /// it (`SGR 53`).
+    #[must_use]
+    pub fn overline(&self) -> bool {
+        self.attrs.overline()
     }
 }

@@ -361,6 +361,13 @@ impl Grid {
         self.col_clamp();
     }
 
+    /// DECSTR resets the DECSC slot to the home position without
+    /// touching the live cursor.
+    pub fn reset_saved_cursor(&mut self) {
+        self.saved_pos = Pos { row: 0, col: 0 };
+        self.saved_origin_mode = false;
+    }
+
     pub fn save_cursor(&mut self) {
         self.saved_pos = self.pos;
         self.saved_origin_mode = self.origin_mode;
@@ -1058,6 +1065,12 @@ impl Grid {
         self.pos.col -= self.pos.col % 8;
         self.pos.col += 8;
         self.col_clamp();
+    }
+
+    /// CBT — back up to the previous tab stop. Stops are every eight
+    /// columns; column 0 is a floor, not a wrap.
+    pub fn col_back_tab(&mut self) {
+        self.pos.col = self.pos.col.saturating_sub(1) / 8 * 8;
     }
 
     pub fn col_set(&mut self, i: u16) {

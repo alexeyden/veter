@@ -17,13 +17,16 @@
 /// match — see [`Screen::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v4: `Attrs::mode` widened to `u16` (underline styles, blink,
+///   conceal, strikethrough, overline), plus the DECSCUSR cursor
+///   shape and the widened `Screen::modes` word.
 /// - v3: per-grid DECSC attributes and charset, so a save/restore
 ///   inside the alt screen stops clobbering the main screen's.
 /// - v2: per-grid `top_of_live_screen`, so scrollback-anchored VGE /
 ///   PRT objects survive a restore without the engines carrying their
 ///   own copy of the line origin.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 3;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
 
 /// Error returned when a `Screen` binary snapshot cannot be decoded:
 /// wrong kind version, truncated payload, or otherwise malformed.
@@ -215,6 +218,25 @@ pub(crate) fn decode_color(r: &mut Reader) -> Result<crate::attrs::Color, Snapsh
     }
 }
 
+pub(crate) fn encode_cursor_shape(w: &mut Writer, c: crate::screen::CursorShape) {
+    w.u8(match c {
+        crate::screen::CursorShape::Block => 0u8,
+        crate::screen::CursorShape::Underline => 1,
+        crate::screen::CursorShape::Bar => 2,
+    });
+}
+
+pub(crate) fn decode_cursor_shape(
+    r: &mut Reader,
+) -> Result<crate::screen::CursorShape, SnapshotError> {
+    Ok(match r.u8()? {
+        0 => crate::screen::CursorShape::Block,
+        1 => crate::screen::CursorShape::Underline,
+        2 => crate::screen::CursorShape::Bar,
+        _ => return Err(SnapshotError::bad_payload("unknown cursor shape tag")),
+    })
+}
+
 pub(crate) fn encode_mouse_mode(w: &mut Writer, m: crate::screen::MouseProtocolMode) {
     let tag = match m {
         crate::screen::MouseProtocolMode::None => 0u8,
@@ -297,13 +319,13 @@ pub(crate) fn decode_charset_state(
 pub(crate) fn encode_attrs(w: &mut Writer, a: &crate::attrs::Attrs) {
     encode_color(w, a.fgcolor);
     encode_color(w, a.bgcolor);
-    w.u8(a.mode);
+    w.u16(a.mode);
 }
 
 pub(crate) fn decode_attrs(r: &mut Reader) -> Result<crate::attrs::Attrs, SnapshotError> {
     Ok(crate::attrs::Attrs {
         fgcolor: decode_color(r)?,
         bgcolor: decode_color(r)?,
-        mode: r.u8()?,
+        mode: r.u16()?,
     })
 }

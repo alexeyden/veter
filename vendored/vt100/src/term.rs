@@ -118,8 +118,14 @@ pub struct Attrs {
     bgcolor: Option<crate::Color>,
     intensity: Option<Intensity>,
     italic: Option<bool>,
-    underline: Option<bool>,
+    /// `None` — unchanged; `Some(None)` — `SGR 24`, off; `Some(Some(s))`
+    /// — on, with that shape.
+    underline: Option<Option<crate::UnderlineStyle>>,
     inverse: Option<bool>,
+    blink: Option<bool>,
+    conceal: Option<bool>,
+    strikethrough: Option<bool>,
+    overline: Option<bool>,
 }
 
 impl Attrs {
@@ -143,13 +149,36 @@ impl Attrs {
         self
     }
 
-    pub fn underline(mut self, underline: bool) -> Self {
+    pub fn underline(
+        mut self,
+        underline: Option<crate::UnderlineStyle>,
+    ) -> Self {
         self.underline = Some(underline);
         self
     }
 
     pub fn inverse(mut self, inverse: bool) -> Self {
         self.inverse = Some(inverse);
+        self
+    }
+
+    pub fn blink(mut self, blink: bool) -> Self {
+        self.blink = Some(blink);
+        self
+    }
+
+    pub fn conceal(mut self, conceal: bool) -> Self {
+        self.conceal = Some(conceal);
+        self
+    }
+
+    pub fn strikethrough(mut self, strikethrough: bool) -> Self {
+        self.strikethrough = Some(strikethrough);
+        self
+    }
+
+    pub fn overline(mut self, overline: bool) -> Self {
+        self.overline = Some(overline);
         self
     }
 }
@@ -164,6 +193,10 @@ impl BufWrite for Attrs {
             && self.italic.is_none()
             && self.underline.is_none()
             && self.inverse.is_none()
+            && self.blink.is_none()
+            && self.conceal.is_none()
+            && self.strikethrough.is_none()
+            && self.overline.is_none()
         {
             return;
         }
@@ -251,10 +284,31 @@ impl BufWrite for Attrs {
         }
 
         if let Some(underline) = self.underline {
-            if underline {
-                write_param!(4);
-            } else {
-                write_param!(24);
+            match underline {
+                None => write_param!(24),
+                Some(crate::UnderlineStyle::Single) => write_param!(4),
+                // The rest go out in the T.416 subparameter form, the
+                // only spelling that can name a shape. `21` would do
+                // for Double, but it is also "bold off" on some
+                // terminals, so `4:2` is the safer of the two.
+                Some(style) => {
+                    if first {
+                        first = false;
+                    } else {
+                        buf.push(b';');
+                    }
+                    buf.extend_from_slice(b"4:");
+                    extend_itoa(
+                        buf,
+                        match style {
+                            crate::UnderlineStyle::Single => 1u8,
+                            crate::UnderlineStyle::Double => 2,
+                            crate::UnderlineStyle::Curly => 3,
+                            crate::UnderlineStyle::Dotted => 4,
+                            crate::UnderlineStyle::Dashed => 5,
+                        },
+                    );
+                }
             }
         }
 
@@ -263,6 +317,38 @@ impl BufWrite for Attrs {
                 write_param!(7);
             } else {
                 write_param!(27);
+            }
+        }
+
+        if let Some(blink) = self.blink {
+            if blink {
+                write_param!(5);
+            } else {
+                write_param!(25);
+            }
+        }
+
+        if let Some(conceal) = self.conceal {
+            if conceal {
+                write_param!(8);
+            } else {
+                write_param!(28);
+            }
+        }
+
+        if let Some(strikethrough) = self.strikethrough {
+            if strikethrough {
+                write_param!(9);
+            } else {
+                write_param!(29);
+            }
+        }
+
+        if let Some(overline) = self.overline {
+            if overline {
+                write_param!(53);
+            } else {
+                write_param!(55);
             }
         }
 

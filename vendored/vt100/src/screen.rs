@@ -1,15 +1,53 @@
 use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
 
-const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
-const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
-const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
-const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
-const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_APPLICATION_KEYPAD: u16 = 0b0000_0000_0000_0001;
+const MODE_APPLICATION_CURSOR: u16 = 0b0000_0000_0000_0010;
+const MODE_HIDE_CURSOR: u16 = 0b0000_0000_0000_0100;
+const MODE_ALTERNATE_SCREEN: u16 = 0b0000_0000_0000_1000;
+const MODE_BRACKETED_PASTE: u16 = 0b0000_0000_0001_0000;
 /// DECAWM (`?7`) is on by default and `modes` starts at zero, so the
 /// bit records the *absence* of auto-wrap. Storing it the other way
 /// round would make every existing snapshot decode as "wrap off".
-const MODE_NO_AUTOWRAP: u8 = 0b0010_0000;
+const MODE_NO_AUTOWRAP: u16 = 0b0000_0000_0010_0000;
+/// IRM (`CSI 4 h`), the terminfo `smir` / `rmir` pair. The whole
+/// non-private SM/RM family used to fall through to `unhandled_csi`,
+/// so a program that entered insert mode overwrote the line it meant
+/// to shift.
+const MODE_INSERT: u16 = 0b0000_0000_0100_0000;
+/// LNM (`CSI 20 h`) — LF also does a carriage return.
+const MODE_NEWLINE: u16 = 0b0000_0000_1000_0000;
+/// DECSCNM (`?5`), the whole-screen reverse video terminfo drives
+/// `flash` with.
+const MODE_REVERSE_VIDEO: u16 = 0b0000_0001_0000_0000;
+/// `?12`, cursor blink. Stored the positive way round, so the default
+/// is a steady cursor: xterm blinks by default, but veter never has,
+/// and `cnorm` (`\E[?12l\E[?25h`) turns blinking off at the start of
+/// every ncurses program anyway. `cvvis` (`\E[?12;25h`) is what asks
+/// for it.
+const MODE_CURSOR_BLINK: u16 = 0b0000_0010_0000_0000;
+/// `?1004`, focus reporting: the renderer sends `CSI I` / `CSI O` as
+/// the window gains and loses focus.
+const MODE_FOCUS_EVENT: u16 = 0b0000_0100_0000_0000;
+
+/// The cursor shape a program asked for with DECSCUSR
+/// (`CSI Ps SP q`), the terminfo `Ss` / `Se` pair. vim, neovim, fish
+/// and most shell prompt frameworks switch to [`Bar`](Self::Bar) for
+/// insert mode and back on the way out.
+///
+/// Blinking is *not* part of the shape — DECSCUSR's odd parameters
+/// ask for it and its even ones don't, and both fold into
+/// [`MODE_CURSOR_BLINK`], the same bit `?12` sets.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum CursorShape {
+    /// `CSI 0 SP q`, `CSI 1 SP q`, `CSI 2 SP q`.
+    #[default]
+    Block,
+    /// `CSI 3 SP q`, `CSI 4 SP q`.
+    Underline,
+    /// `CSI 5 SP q`, `CSI 6 SP q`.
+    Bar,
+}
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -76,7 +114,8 @@ pub struct Screen {
     saved_charset: crate::charset::CharsetState,
     alternate_saved_charset: crate::charset::CharsetState,
 
-    modes: u8,
+    modes: u16,
+    cursor_shape: CursorShape,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
 
@@ -105,6 +144,7 @@ impl Screen {
             alternate_saved_charset: crate::charset::CharsetState::default(),
 
             modes: 0,
+            cursor_shape: CursorShape::default(),
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
 
@@ -339,7 +379,8 @@ impl Screen {
         crate::snapshot::encode_charset_state(&mut w, &self.saved_charset);
         crate::snapshot::encode_charset_state(&mut w, &self.alternate_saved_charset);
 
-        w.u8(self.modes);
+        w.u16(self.modes);
+        crate::snapshot::encode_cursor_shape(&mut w, self.cursor_shape);
         crate::snapshot::encode_mouse_mode(&mut w, self.mouse_protocol_mode);
         crate::snapshot::encode_mouse_encoding(&mut w, self.mouse_protocol_encoding);
 
@@ -375,7 +416,8 @@ impl Screen {
         let saved_charset = crate::snapshot::decode_charset_state(&mut r)?;
         let alternate_saved_charset = crate::snapshot::decode_charset_state(&mut r)?;
 
-        let modes = r.u8()?;
+        let modes = r.u16()?;
+        let cursor_shape = crate::snapshot::decode_cursor_shape(&mut r)?;
         let mouse_protocol_mode = crate::snapshot::decode_mouse_mode(&mut r)?;
         let mouse_protocol_encoding = crate::snapshot::decode_mouse_encoding(&mut r)?;
 
@@ -394,6 +436,7 @@ impl Screen {
         self.saved_charset = saved_charset;
         self.alternate_saved_charset = alternate_saved_charset;
         self.modes = modes;
+        self.cursor_shape = cursor_shape;
         self.mouse_protocol_mode = mouse_protocol_mode;
         self.mouse_protocol_encoding = mouse_protocol_encoding;
 
@@ -799,6 +842,47 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Whether IRM (`CSI 4 h`) is on — printed characters shift the
+    /// rest of the row right instead of overwriting it.
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.mode(MODE_INSERT)
+    }
+
+    /// Whether LNM (`CSI 20 h`) is on — LF also does a carriage return.
+    #[must_use]
+    pub fn newline_mode(&self) -> bool {
+        self.mode(MODE_NEWLINE)
+    }
+
+    /// Whether DECSCNM (`?5`) is on: the whole screen renders with
+    /// foreground and background swapped. terminfo's `flash` is a
+    /// hundred milliseconds of this.
+    #[must_use]
+    pub fn reverse_video(&self) -> bool {
+        self.mode(MODE_REVERSE_VIDEO)
+    }
+
+    /// Whether focus reporting (`?1004`) is on, so the renderer should
+    /// send `CSI I` / `CSI O` as its window gains and loses focus.
+    #[must_use]
+    pub fn focus_reporting(&self) -> bool {
+        self.mode(MODE_FOCUS_EVENT)
+    }
+
+    /// The cursor shape last asked for with DECSCUSR (`CSI Ps SP q`).
+    #[must_use]
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+
+    /// Whether the cursor should blink — DECSCUSR's odd parameters and
+    /// `?12h` both ask for it. Off by default.
+    #[must_use]
+    pub fn cursor_blink(&self) -> bool {
+        self.mode(MODE_CURSOR_BLINK)
+    }
+
     /// Returns the currently active [`MouseProtocolMode`].
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -920,15 +1004,15 @@ impl Screen {
         }
     }
 
-    fn set_mode(&mut self, mode: u8) {
+    fn set_mode(&mut self, mode: u16) {
         self.modes |= mode;
     }
 
-    fn clear_mode(&mut self, mode: u8) {
+    fn clear_mode(&mut self, mode: u16) {
         self.modes &= !mode;
     }
 
-    fn mode(&self, mode: u8) -> bool {
+    fn mode(&self, mode: u16) -> bool {
         self.modes & mode != 0
     }
 
@@ -1090,6 +1174,15 @@ impl Screen {
                 }
             }
         } else {
+            // IRM (`CSI 4 h`, terminfo `smir`): shift the rest of the
+            // row right by this character's width instead of
+            // overwriting what is already there. The whole non-private
+            // SM/RM family used to go unhandled, so insert mode drew as
+            // overwrite and the tail of the line was eaten.
+            if self.mode(MODE_INSERT) {
+                self.grid_mut().insert_cells(width);
+            }
+
             if self
                 .grid()
                 .drawing_cell(pos)
@@ -1226,6 +1319,11 @@ impl Screen {
 
     pub(crate) fn lf(&mut self) {
         self.grid_mut().row_inc_scroll(1);
+        // LNM (`CSI 20 h`): LF, VT and FF also carry the cursor back
+        // to column one.
+        if self.mode(MODE_NEWLINE) {
+            self.cr();
+        }
     }
 
     pub(crate) fn vt(&mut self) {
@@ -1299,6 +1397,120 @@ impl Screen {
     // ESC c
     pub(crate) fn ris(&mut self) {
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+    }
+
+    // CSI ! p -- DECSTR, soft terminal reset.
+    //
+    // terminfo's `is2` and `rs2` for xterm-256color both lead with this,
+    // so it is the init string of essentially every ncurses program and
+    // what `tput init` sends. Going unhandled, it left a dead TUI's
+    // scroll region, origin mode, hidden cursor and SGR in place with
+    // nothing short of RIS able to clear them.
+    //
+    // The reset list is the VT510 manual's, which is what xterm, foot and
+    // kitty all implement. Two deliberate readings of it:
+    //
+    // * DECAWM comes back *on*. The manual says reset, but `is2` never
+    //   re-enables it and every ncurses program would lose wrapping;
+    //   real terminals restore their power-on default, which is on.
+    // * The screen is not cleared, the cursor does not move, and the
+    //   alternate screen is not left. DECSTR resets modes, not content.
+    //
+    // Mouse reporting and bracketed paste are likewise untouched: they
+    // postdate the manual, and the program that turned them on is the
+    // one that turns them off.
+    pub(crate) fn decstr(&mut self) {
+        self.clear_mode(MODE_HIDE_CURSOR);
+        self.clear_mode(MODE_INSERT);
+        self.clear_mode(MODE_NEWLINE);
+        self.clear_mode(MODE_NO_AUTOWRAP);
+        self.clear_mode(MODE_APPLICATION_CURSOR);
+        self.clear_mode(MODE_APPLICATION_KEYPAD);
+        self.clear_mode(MODE_REVERSE_VIDEO);
+        self.cursor_shape = CursorShape::default();
+        self.clear_mode(MODE_CURSOR_BLINK);
+        self.attrs = crate::attrs::Attrs::default();
+        self.charset = crate::charset::CharsetState::default();
+        // `set_origin_mode` and `set_scroll_region` both home the
+        // cursor. DECSTR does not move it, so put it back.
+        let pos = self.grid().pos();
+        let rows = self.grid().size().rows;
+        self.grid_mut().set_origin_mode(false);
+        self.grid_mut().set_scroll_region(0, rows - 1);
+        self.grid_mut().set_pos(pos);
+        // "Save cursor state: home position" — the DECSC slot resets
+        // even though the live cursor stays put.
+        let (attrs, charset) = self.saved_sgr_mut();
+        *attrs = crate::attrs::Attrs::default();
+        *charset = crate::charset::CharsetState::default();
+        self.grid_mut().reset_saved_cursor();
+    }
+
+    // CSI h -- SM, and CSI l -- RM. The non-private half of the mode
+    // family; the DEC-private `?` spellings are `decset` / `decrst`.
+    pub(crate) fn sm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.set_mode(MODE_INSERT),
+                [20] => self.set_mode(MODE_NEWLINE),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    pub(crate) fn rm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.clear_mode(MODE_INSERT),
+                [20] => self.clear_mode(MODE_NEWLINE),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    // CSI Ps SP q -- DECSCUSR, cursor style.
+    //
+    // 0 and 1 are both "blinking block": 0 means "the terminal's
+    // default", and a blinking block is what DEC's was.
+    pub(crate) fn decscusr(&mut self, style: u16) {
+        let (shape, blink) = match style {
+            0 | 1 => (CursorShape::Block, true),
+            2 => (CursorShape::Block, false),
+            3 => (CursorShape::Underline, true),
+            4 => (CursorShape::Underline, false),
+            5 => (CursorShape::Bar, true),
+            6 => (CursorShape::Bar, false),
+            // An unknown style is not a reason to change the cursor.
+            _ => return,
+        };
+        self.cursor_shape = shape;
+        if blink {
+            self.set_mode(MODE_CURSOR_BLINK);
+        } else {
+            self.clear_mode(MODE_CURSOR_BLINK);
+        }
+    }
+
+    // CSI I -- CHT, cursor forward tabulation.
+    pub(crate) fn cht(&mut self, count: u16) {
+        for _ in 0..count {
+            self.grid_mut().col_tab();
+        }
+    }
+
+    // CSI Z -- CBT, cursor backward tabulation (terminfo `cbt`).
+    pub(crate) fn cbt(&mut self, count: u16) {
+        for _ in 0..count {
+            self.grid_mut().col_back_tab();
+        }
     }
 
     // csi codes
@@ -1462,11 +1674,19 @@ impl Screen {
         for param in params {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
+                // DECSCNM — terminfo drives `flash` with `?5h … ?5l`.
+                [5] => self.set_mode(MODE_REVERSE_VIDEO),
                 [6] => self.grid_mut().set_origin_mode(true),
                 [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
+                [12] => self.set_mode(MODE_CURSOR_BLINK),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
-                [47] => self.enter_alternate_grid(),
+                // 47 and 1047 differ only in whether leaving clears the
+                // alt grid, which `exit_alternate_grid` does not do for
+                // either; 1048 is DECSC/DECRC under another name.
+                [47 | 1047] => self.enter_alternate_grid(),
+                [1004] => self.set_mode(MODE_FOCUS_EVENT),
+                [1048] => self.decsc(),
                 [1000] => {
                     self.set_mouse_mode(MouseProtocolMode::PressRelease);
                 }
@@ -1503,13 +1723,17 @@ impl Screen {
         for param in params {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
+                [5] => self.clear_mode(MODE_REVERSE_VIDEO),
                 [6] => self.grid_mut().set_origin_mode(false),
                 [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
+                [12] => self.clear_mode(MODE_CURSOR_BLINK),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
-                [47] => {
+                [47 | 1047] => {
                     self.exit_alternate_grid();
                 }
+                [1004] => self.clear_mode(MODE_FOCUS_EVENT),
+                [1048] => self.decrc(),
                 [1000] => {
                     self.clear_mouse_mode(MouseProtocolMode::PressRelease);
                 }
@@ -1590,11 +1814,53 @@ impl Screen {
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
                 [4] => self.attrs.set_underline(true),
+                // `4:n` — the T.416 subparameter form, and the only
+                // spelling that can name an underline *shape*. It used
+                // to match no arm at all, so an nvim diagnostic asking
+                // for a curly underline got no underline whatsoever.
+                [4, style] => self.attrs.set_underline_style(
+                    underline_style_from_subparam(*style),
+                ),
+                // 6 is "rapid blink"; no terminal distinguishes the two
+                // rates, so both land on the same bit.
+                [5 | 6] => self.attrs.set_blink(true),
                 [7] => self.attrs.set_inverse(true),
+                [8] => self.attrs.set_conceal(true),
+                [9] => self.attrs.set_strikethrough(true),
+                [21] => self
+                    .attrs
+                    .set_underline_style(Some(crate::UnderlineStyle::Double)),
                 [22] => self.attrs.set_normal_intensity(),
                 [23] => self.attrs.set_italic(false),
                 [24] => self.attrs.set_underline(false),
+                [25] => self.attrs.set_blink(false),
                 [27] => self.attrs.set_inverse(false),
+                [28] => self.attrs.set_conceal(false),
+                [29] => self.attrs.set_strikethrough(false),
+                [53] => self.attrs.set_overline(true),
+                [55] => self.attrs.set_overline(false),
+                // SGR 58/59 set the underline's *colour*. The colour
+                // itself is not stored — a per-cell `Color` costs four
+                // bytes in a struct that has none to spare, and the
+                // underline is drawn in the text colour — but the
+                // parameters have to be consumed either way: left to
+                // the fallthrough, `58;2;r;g;b` resumed at `2`, which
+                // is SGR "dim", and quietly dimmed the text.
+                [58, _, ..] | [59] => {}
+                [58] => match next_param!() {
+                    [2] => {
+                        let _ = next_param_u8!();
+                        let _ = next_param_u8!();
+                        let _ = next_param_u8!();
+                    }
+                    [5] => {
+                        let _ = next_param_u8!();
+                    }
+                    _ => {
+                        unhandled(self);
+                        return;
+                    }
+                },
                 [n] if (30..=37).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }
@@ -1681,6 +1947,21 @@ impl Screen {
     // CSI r
     pub(crate) fn decstbm(&mut self, (top, bottom): (u16, u16)) {
         self.grid_mut().set_scroll_region(top - 1, bottom - 1);
+    }
+}
+
+/// `4:n` — the underline styles of ITU-T T.416, as spoken by every
+/// terminal that draws more than one. `4:0` is the "no underline"
+/// spelling of `SGR 24`; anything past `4:5` is unnamed, and a plain
+/// underline is the closest honest reading of it.
+fn underline_style_from_subparam(n: u16) -> Option<crate::UnderlineStyle> {
+    match n {
+        0 => None,
+        2 => Some(crate::UnderlineStyle::Double),
+        3 => Some(crate::UnderlineStyle::Curly),
+        4 => Some(crate::UnderlineStyle::Dotted),
+        5 => Some(crate::UnderlineStyle::Dashed),
+        _ => Some(crate::UnderlineStyle::Single),
     }
 }
 
@@ -2561,6 +2842,241 @@ mod xterm_semantics_tests {
         let mut p = Parser::new(24, 80, 0);
         p.process(b"\x1b[?6h\x1b[5;20r");
         assert_eq!(p.screen().cursor_position(), (4, 0));
+    }
+
+    /// HVP (CSI f) is CUP by another name. apt's fancy progress bar
+    /// reserves the bottom row with DECSTBM and then parks its status
+    /// line there with `CSI <rows> ; 0 f`; while HVP went unhandled the
+    /// bar was drawn wherever the cursor happened to be and then
+    /// scrolled up with the text, one smear per redraw.
+    #[test]
+    fn hvp_addresses_the_cursor_like_cup() {
+        let mut p = Parser::new(4, 10, 0);
+        // Region rows 1..3 — the bottom row is reserved.
+        p.process(b"\x1b[1;3r");
+        p.process(b"a\r\nb\r\nc");
+        // Park the status line on the reserved row and come back.
+        p.process(b"\x1b7\x1b[4;0fbar\x1b8");
+        assert_eq!(row(&p, 3), "bar");
+        // Further output scrolls the region only; the bar stays put.
+        p.process(b"\r\nd");
+        assert_eq!(row(&p, 0), "b");
+        assert_eq!(row(&p, 2), "d");
+        assert_eq!(row(&p, 3), "bar", "the status line scrolled away");
+    }
+
+    /// SCOSC / SCORC (CSI s / CSI u), the ANSI.SYS spelling of
+    /// DECSC / DECRC.
+    #[test]
+    fn scosc_and_scorc_save_and_restore_the_cursor() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"\x1b[2;3H\x1b[s\x1b[4;1H\x1b[u");
+        assert_eq!(p.screen().cursor_position(), (1, 2));
+    }
+
+    /// DECSTR is terminfo's `is2` *and* `rs2` for xterm-256color, so it
+    /// opens essentially every ncurses program. Unhandled, a dead TUI's
+    /// scroll region, origin mode, hidden cursor and SGR all outlived
+    /// it, and only RIS could clear them.
+    #[test]
+    fn decstr_resets_the_modes_the_vt510_manual_lists() {
+        let mut p = Parser::new(10, 20, 0);
+        p.process(b"\x1b[3;6r\x1b[?6h\x1b[7m\x1b[?25l\x1b[4h\x1b[?7l\x1b(0");
+        p.process(b"\x1b[!p");
+
+        // Origin mode off, so absolute addressing reaches row 1 again.
+        p.process(b"\x1b[H");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+        assert!(!p.screen().hide_cursor());
+        assert!(!p.screen().insert_mode());
+        // DECAWM comes back on: `is2` never re-enables it, so a reset
+        // that left it off would cost every ncurses program its wrapping.
+        assert!(p.screen().autowrap());
+        p.process(b"q");
+        assert!(!p.screen().cell(0, 0).unwrap().inverse(), "SGR survived");
+        // `\x1b(0` had put G0 on DEC line drawing, where `q` is a
+        // horizontal rule; back on ASCII it is a `q` again.
+        assert_eq!(row(&p, 0), "q", "G0 charset survived");
+    }
+
+    /// DECSTR resets modes, not content: the cursor stays where it is
+    /// and the screen keeps its text.
+    #[test]
+    fn decstr_moves_neither_the_cursor_nor_the_text() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"hello\r\nworld\x1b[!p");
+        assert_eq!(p.screen().cursor_position(), (1, 5));
+        assert_eq!(row(&p, 0), "hello");
+        assert_eq!(row(&p, 1), "world");
+    }
+
+    /// IRM (terminfo `smir`). The whole non-private SM/RM family went
+    /// unhandled, so insert mode drew as overwrite.
+    #[test]
+    fn irm_shifts_the_rest_of_the_row_right() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"abcdef\x1b[1;1H\x1b[4hXY");
+        assert_eq!(row(&p, 0), "XYabcdef");
+        p.process(b"\x1b[4l\x1b[1;1HZ");
+        assert_eq!(row(&p, 0), "ZYabcdef");
+    }
+
+    /// LNM (`CSI 20 h`) — LF also returns to column one.
+    #[test]
+    fn lnm_makes_lf_carry_the_cursor_home() {
+        let mut p = Parser::new(3, 10, 0);
+        p.process(b"\x1b[20habc\nd");
+        assert_eq!(row(&p, 0), "abc");
+        assert_eq!(row(&p, 1), "d");
+    }
+
+    /// CBT (terminfo `cbt`) and CHT walk the eight-column tab stops.
+    #[test]
+    fn cht_and_cbt_walk_the_tab_stops() {
+        let mut p = Parser::new(2, 40, 0);
+        p.process(b"\x1b[3I");
+        assert_eq!(p.screen().cursor_position(), (0, 24));
+        p.process(b"\x1b[2Z");
+        assert_eq!(p.screen().cursor_position(), (0, 8));
+        // Column 0 is a floor, not a wrap.
+        p.process(b"\x1b[9Z");
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+    }
+
+    /// DECSCUSR (terminfo `Ss` / `Se`) — the odd parameters ask for a
+    /// blink, the even ones don't.
+    #[test]
+    fn decscusr_sets_the_cursor_shape_and_blink() {
+        let mut p = Parser::new(2, 10, 0);
+        assert_eq!(p.screen().cursor_shape(), crate::CursorShape::Block);
+        assert!(!p.screen().cursor_blink());
+
+        p.process(b"\x1b[5 q");
+        assert_eq!(p.screen().cursor_shape(), crate::CursorShape::Bar);
+        assert!(p.screen().cursor_blink());
+
+        p.process(b"\x1b[4 q");
+        assert_eq!(p.screen().cursor_shape(), crate::CursorShape::Underline);
+        assert!(!p.screen().cursor_blink());
+
+        // `Se` is `CSI 2 SP q` — back to a steady block.
+        p.process(b"\x1b[2 q");
+        assert_eq!(p.screen().cursor_shape(), crate::CursorShape::Block);
+        assert!(!p.screen().cursor_blink());
+    }
+
+    /// `?12` is the other way to ask for a blink, and `cnorm`
+    /// (`\E[?12l\E[?25h`) is how every ncurses program turns it off.
+    #[test]
+    fn decset_12_drives_the_same_blink_bit() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[?12;25h");
+        assert!(p.screen().cursor_blink());
+        assert!(!p.screen().hide_cursor());
+        p.process(b"\x1b[?12l\x1b[?25h");
+        assert!(!p.screen().cursor_blink());
+    }
+
+    /// The SGR attributes terminfo names and the parser used to drop.
+    #[test]
+    fn the_sgr_attributes_terminfo_emits_all_land() {
+        let mut p = Parser::new(2, 20, 0);
+        p.process(b"\x1b[5;8;9;53mx");
+        let c = p.screen().cell(0, 0).unwrap();
+        assert!(c.blink() && c.conceal() && c.strikethrough() && c.overline());
+
+        p.process(b"\x1b[25;28;29;55my");
+        let c = p.screen().cell(0, 1).unwrap();
+        assert!(
+            !c.blink() && !c.conceal() && !c.strikethrough() && !c.overline()
+        );
+    }
+
+    /// `4:3` is how nvim and every LSP client draw a diagnostic. It
+    /// matched no arm at all, so the underline was lost outright —
+    /// not even a plain one survived.
+    #[test]
+    fn colon_underline_styles_are_applied() {
+        let mut p = Parser::new(2, 20, 0);
+        p.process(b"\x1b[4:3mx\x1b[4:0my\x1b[21mz");
+        let x = p.screen().cell(0, 0).unwrap();
+        assert_eq!(x.underline_style(), Some(crate::UnderlineStyle::Curly));
+        assert!(!p.screen().cell(0, 1).unwrap().underline(), "4:0 is off");
+        assert_eq!(
+            p.screen().cell(0, 2).unwrap().underline_style(),
+            Some(crate::UnderlineStyle::Double),
+        );
+    }
+
+    /// SGR 58 is the underline colour. The colour is not stored, but
+    /// its parameters must still be consumed: left to the fallthrough,
+    /// `58;2;r;g;b` resumed at `2`, which is SGR "dim".
+    #[test]
+    fn sgr_58_does_not_leak_into_the_dim_attribute() {
+        for seq in [
+            b"\x1b[58;2;255;0;0mx".as_ref(),
+            b"\x1b[58:2::255:0:0mx".as_ref(),
+            b"\x1b[58;5;9mx".as_ref(),
+        ] {
+            let mut p = Parser::new(2, 20, 0);
+            p.process(seq);
+            let c = p.screen().cell(0, 0).unwrap();
+            assert!(!c.dim(), "seq {seq:?} dimmed the text");
+            assert_eq!(c.fgcolor(), crate::Color::Default);
+        }
+    }
+
+    /// An attribute the parser doesn't model must not swallow the
+    /// parameters after it.
+    #[test]
+    fn an_unknown_sgr_does_not_eat_the_rest_of_the_sequence() {
+        let mut p = Parser::new(2, 20, 0);
+        p.process(b"\x1b[73;31mx");
+        assert_eq!(p.screen().cell(0, 0).unwrap().fgcolor(), crate::Color::Idx(1));
+    }
+
+    /// DECSCNM, which terminfo drives `flash` with.
+    #[test]
+    fn decscnm_tracks_reverse_video() {
+        let mut p = Parser::new(2, 10, 0);
+        assert!(!p.screen().reverse_video());
+        p.process(b"\x1b[?5h");
+        assert!(p.screen().reverse_video());
+        p.process(b"\x1b[?5l");
+        assert!(!p.screen().reverse_video());
+    }
+
+    /// `?1048` is DECSC/DECRC under another name, and `?1047` shares
+    /// the alternate grid with `?47`.
+    #[test]
+    fn decset_1047_and_1048_are_the_alt_screen_and_saved_cursor() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"\x1b[2;3H\x1b[?1048h\x1b[4;1H\x1b[?1048l");
+        assert_eq!(p.screen().cursor_position(), (1, 2));
+
+        p.process(b"\x1b[?1047h");
+        assert!(p.screen().alternate_screen());
+        p.process(b"\x1b[?1047l");
+        assert!(!p.screen().alternate_screen());
+    }
+
+    /// Every new attribute has to survive the snapshot the daemon
+    /// ships to an attaching renderer.
+    #[test]
+    fn the_new_attributes_and_cursor_shape_round_trip_a_snapshot() {
+        let mut p1 = Parser::new(4, 20, 10);
+        p1.process(b"\x1b[4:3;5;9;53mstyled\x1b[6 q\x1b[?5h\x1b[4h");
+        let mut p2 = Parser::new(4, 20, 10);
+        p2.screen_mut()
+            .restore_from_binary_snapshot(&p1.screen().binary_snapshot())
+            .unwrap();
+        let c = p2.screen().cell(0, 0).unwrap();
+        assert_eq!(c.underline_style(), Some(crate::UnderlineStyle::Curly));
+        assert!(c.blink() && c.strikethrough() && c.overline());
+        assert_eq!(p2.screen().cursor_shape(), crate::CursorShape::Bar);
+        assert!(!p2.screen().cursor_blink());
+        assert!(p2.screen().reverse_video());
+        assert!(p2.screen().insert_mode());
     }
 
     /// IL and DL are ignored with the cursor outside the scroll

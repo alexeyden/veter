@@ -59,9 +59,11 @@ mod screen;
 mod snapshot;
 mod term;
 
-pub use attrs::Color;
-pub use callbacks::Callbacks;
+pub use attrs::{Color, UnderlineStyle};
+pub use callbacks::{Callbacks, DynamicColor};
 pub use cell::Cell;
 pub use parser::Parser;
-pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+pub use screen::{
+    CursorShape, MouseProtocolEncoding, MouseProtocolMode, Screen,
+};
 pub use snapshot::SnapshotError;

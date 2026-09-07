@@ -1,3 +1,5 @@
+use crate::callbacks::DynamicColor;
+
 const BASE64: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const CLIPBOARD_SELECTOR: &[u8] = b"cpqs01234567";
@@ -92,6 +94,11 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 b'E' => self.screen.nel(),
                 b'c' => self.screen.ris(),
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
+                // ST. vte reports the terminator of a string sequence
+                // (OSC, DCS, APC) here once the sequence itself is
+                // dispatched; consuming it keeps a perfectly ordinary
+                // `OSC … ST` from being logged as an unhandled escape.
+                b'\\' => {}
                 _ => {
                     self.callbacks.unhandled_escape(
                         &mut self.screen,
@@ -130,7 +137,15 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'E' => self.screen.cnl(canonicalize_params_1(params, 1)),
                 'F' => self.screen.cpl(canonicalize_params_1(params, 1)),
                 'G' => self.screen.cha(canonicalize_params_1(params, 1)),
-                'H' => self.screen.cup(canonicalize_params_2(params, 1, 1)),
+                // HVP (CSI f) addresses the cursor exactly as CUP
+                // (CSI H) does — apt's fancy progress bar parks its
+                // status line with `CSI <rows> ; 0 f`, and with the
+                // sequence unhandled the bar landed wherever the
+                // cursor already was, then scrolled up with the text.
+                'H' | 'f' => {
+                    self.screen.cup(canonicalize_params_2(params, 1, 1))
+                }
+                'I' => self.screen.cht(canonicalize_params_1(params, 1)),
                 'J' => self
                     .screen
                     .ed(canonicalize_params_1(params, 0), unhandled),
@@ -143,9 +158,19 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'S' => self.screen.su(canonicalize_params_1(params, 1)),
                 'T' => self.screen.sd(canonicalize_params_1(params, 1)),
                 'X' => self.screen.ech(canonicalize_params_1(params, 1)),
+                'Z' => self.screen.cbt(canonicalize_params_1(params, 1)),
+                // SM / RM — the non-private half of the mode family
+                // (IRM, LNM). The `?` spellings are handled below.
+                'h' => self.screen.sm(params, unhandled),
+                'l' => self.screen.rm(params, unhandled),
                 'b' => self.screen.rep(canonicalize_params_1(params, 1)),
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
                 'm' => self.screen.sgr(params, unhandled),
+                // SCOSC / SCORC, the ANSI.SYS spelling of DECSC /
+                // DECRC. Unambiguous here because this parser has no
+                // left/right margins, so CSI s is never DECSLRM.
+                's' => self.screen.decsc(),
+                'u' => self.screen.decrc(),
                 'r' => self.screen.decstbm(canonicalize_params_decstbm(
                     params,
                     self.screen.grid().size(),
@@ -154,25 +179,49 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     let mut params_iter = params.iter();
                     let op =
                         params_iter.next().and_then(|x| x.first().copied());
-                    if op == Some(8) {
-                        let (screen_rows, screen_cols) = self.screen.size();
-                        let rows =
-                            params_iter.next().map_or(screen_rows, |x| {
-                                *x.first().unwrap_or(&screen_rows)
-                            });
-                        let cols =
-                            params_iter.next().map_or(screen_cols, |x| {
-                                *x.first().unwrap_or(&screen_cols)
-                            });
-                        self.callbacks.resize(&mut self.screen, (rows, cols));
-                    } else {
-                        self.callbacks.unhandled_csi(
-                            &mut self.screen,
-                            None,
-                            None,
-                            &params.iter().collect::<Vec<_>>(),
-                            c,
-                        );
+                    match op {
+                        Some(8) => {
+                            let (screen_rows, screen_cols) =
+                                self.screen.size();
+                            let rows =
+                                params_iter.next().map_or(screen_rows, |x| {
+                                    *x.first().unwrap_or(&screen_rows)
+                                });
+                            let cols =
+                                params_iter.next().map_or(screen_cols, |x| {
+                                    *x.first().unwrap_or(&screen_cols)
+                                });
+                            self.callbacks
+                                .resize(&mut self.screen, (rows, cols));
+                        }
+                        // 14 — text area in pixels, 16 — cell size in
+                        // pixels, 18 — text area in cells. The first two
+                        // are the renderer's to answer; 18 the screen
+                        // could answer itself, but all three go out the
+                        // same door so one responder owns the format.
+                        Some(op @ (14 | 16 | 18)) => {
+                            self.callbacks
+                                .report_window_size(&mut self.screen, op);
+                        }
+                        // 22 / 23 — push and pop the window title.
+                        // terminfo's `smcup` and `rmcup` for
+                        // xterm-256color carry these, which is how a
+                        // full-screen program's title survives it.
+                        Some(22) => {
+                            self.callbacks.push_window_title(&mut self.screen);
+                        }
+                        Some(23) => {
+                            self.callbacks.pop_window_title(&mut self.screen);
+                        }
+                        _ => {
+                            self.callbacks.unhandled_csi(
+                                &mut self.screen,
+                                None,
+                                None,
+                                &params.iter().collect::<Vec<_>>(),
+                                c,
+                            );
+                        }
                     }
                 }
                 _ => {
@@ -204,6 +253,14 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     );
                 }
             },
+            // DECSTR, soft reset. terminfo's `is2` / `rs2` lead with
+            // it, so it arrives at the start of essentially every
+            // ncurses program.
+            Some(b'!') if c == 'p' => self.screen.decstr(),
+            // DECSCUSR, cursor style (terminfo `Ss` / `Se`).
+            Some(b' ') if c == 'q' => {
+                self.screen.decscusr(canonicalize_params_1(params, 1));
+            }
             Some(i) => {
                 self.callbacks.unhandled_csi(
                     &mut self.screen,
@@ -252,11 +309,104 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     }
                 }
             }
+            // OSC 4 — palette entries, as `index ; spec` pairs
+            // (terminfo `initc`). `?` in place of a spec is a query.
+            [b"4", rest @ ..] if !rest.is_empty() => {
+                let mut handled = true;
+                for pair in rest.chunks(2) {
+                    match (pair.first().and_then(|p| parse_u8(p)), pair.get(1))
+                    {
+                        (Some(idx), Some(&b"?")) => {
+                            self.callbacks
+                                .query_palette_color(&mut self.screen, idx);
+                        }
+                        (Some(idx), Some(spec)) => {
+                            self.callbacks.set_palette_color(
+                                &mut self.screen,
+                                idx,
+                                spec,
+                            );
+                        }
+                        _ => handled = false,
+                    }
+                }
+                if !handled {
+                    self.callbacks.unhandled_osc(&mut self.screen, params);
+                }
+            }
+            // OSC 104 — reset the whole palette (terminfo `oc`), or
+            // just the named entries.
+            [b"104"] => {
+                self.callbacks.reset_palette_color(&mut self.screen, None);
+            }
+            [b"104", rest @ ..] => {
+                for p in rest {
+                    if let Some(idx) = parse_u8(p) {
+                        self.callbacks
+                            .reset_palette_color(&mut self.screen, Some(idx));
+                    }
+                }
+            }
+            // OSC 10 / 11 / 12 — the dynamic colours. xterm lets one
+            // command carry several, each naming the colour after the
+            // last, so `OSC 10 ; fg ; bg ST` sets both.
+            [sel @ (b"10" | b"11" | b"12"), rest @ ..]
+                if !rest.is_empty() =>
+            {
+                let base = match *sel {
+                    b"10" => 0,
+                    b"11" => 1,
+                    _ => 2,
+                };
+                for (i, spec) in rest.iter().enumerate() {
+                    let Some(which) = dynamic_color(base + i) else {
+                        break;
+                    };
+                    if *spec == b"?" {
+                        self.callbacks
+                            .query_dynamic_color(&mut self.screen, which);
+                    } else {
+                        self.callbacks.set_dynamic_color(
+                            &mut self.screen,
+                            which,
+                            spec,
+                        );
+                    }
+                }
+            }
+            // OSC 110 / 111 / 112 — and their resets (terminfo `Cr`).
+            [b"110"] => self
+                .callbacks
+                .reset_dynamic_color(&mut self.screen, DynamicColor::Foreground),
+            [b"111"] => self
+                .callbacks
+                .reset_dynamic_color(&mut self.screen, DynamicColor::Background),
+            [b"112"] => self
+                .callbacks
+                .reset_dynamic_color(&mut self.screen, DynamicColor::Cursor),
             _ => {
                 self.callbacks.unhandled_osc(&mut self.screen, params);
             }
         }
     }
+}
+
+/// The `n`th dynamic colour counting from OSC 10, for the chained
+/// `OSC 10 ; fg ; bg` form.
+fn dynamic_color(n: usize) -> Option<DynamicColor> {
+    match n {
+        0 => Some(DynamicColor::Foreground),
+        1 => Some(DynamicColor::Background),
+        2 => Some(DynamicColor::Cursor),
+        // 13 and up (pointer foreground, highlight, …) exist but
+        // nothing here can act on them.
+        _ => None,
+    }
+}
+
+/// Parse an OSC parameter as a palette index.
+fn parse_u8(p: &[u8]) -> Option<u8> {
+    std::str::from_utf8(p).ok()?.parse().ok()
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
