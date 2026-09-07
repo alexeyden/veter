@@ -858,6 +858,8 @@ struct App {
     /// so a screen without any costs no wakeups.
     blink_on: bool,
     blink_deadline: Option<Instant>,
+    /// See [`FrameTrace`]. Inert unless `VETER_FRAME_TRACE` is set.
+    trace: FrameTrace,
     /// Most recent left-press recorded in the local-selection branch
     /// (time, target, pixel position). A subsequent press within
     /// `DOUBLE_CLICK_INTERVAL` and `DOUBLE_CLICK_RADIUS_PX` of the
@@ -1206,6 +1208,121 @@ impl PtyPass {
         alive: false,
         backlog: false,
     };
+}
+
+/// Frame and drain instrumentation, on with `VETER_FRAME_TRACE=1`.
+///
+/// veter's PTY drain is serialized behind one render plus one
+/// `swap_buffers` per [`PTY_DRAIN_BUDGET`] slice, so its throughput is
+/// its frame rate. Over ssh, the same 3.9 MiB flood took 1.97s with the
+/// pane in a hidden vmux tab, 11.76s with it visible, and 70.07s with
+/// the whole window switched away — the case with nothing to draw being
+/// far the slowest, which is backwards.
+///
+/// This says where the time goes. Two candidates produce that shape and
+/// want different fixes: blocking in `swap_buffers` on a surface the
+/// compositor is not showing, or waiting in winit for a
+/// `RedrawRequested` the compositor never asks for. The first shows up
+/// as `swap`, the second as `other` — the wall time that is neither
+/// drawing nor draining.
+#[derive(Default)]
+struct FrameTrace {
+    enabled: bool,
+    /// Start of the current reporting window, and the end of the last
+    /// drain pass (for the loop period).
+    since: Option<Instant>,
+    last_pass_end: Option<Instant>,
+    frames: u32,
+    passes: u32,
+    render: Duration,
+    swap: Duration,
+    drain: Duration,
+    other: Duration,
+    bytes: u64,
+    /// Whether the compositor has told us the window is hidden. Traced
+    /// rather than acted on: knowing it arrives at all is half the
+    /// question.
+    occluded: bool,
+}
+
+impl FrameTrace {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("VETER_FRAME_TRACE").is_some_and(|v| v != "0"),
+            ..Self::default()
+        }
+    }
+
+    fn frame(&mut self, render: Duration, swap: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.frames += 1;
+        self.render += render;
+        self.swap += swap;
+    }
+
+    fn pass(&mut self, drain: Duration, bytes: u64) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        // Everything since the previous pass ended that this pass did
+        // not spend draining: the frame, and whatever the event loop
+        // waited on around it.
+        if let Some(prev) = self.last_pass_end {
+            self.other += now.saturating_duration_since(prev).saturating_sub(drain);
+        }
+        self.last_pass_end = Some(now);
+        self.passes += 1;
+        self.drain += drain;
+        self.bytes += bytes;
+    }
+
+    /// Print a line per second of activity, then start a fresh window.
+    /// Silent while nothing is happening, so an idle terminal does not
+    /// scroll the log it is being read from.
+    fn report(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let window = since.elapsed();
+        if window < Duration::from_secs(1) {
+            return;
+        }
+        if self.passes > 0 || self.frames > 0 {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let kib = self.bytes as f64 / 1024.0;
+            // Per-frame and per-pass averages, since the totals are
+            // only readable next to the count they came from.
+            let per_frame = |d: Duration| {
+                if self.frames == 0 { 0.0 } else { ms(d) / f64::from(self.frames) }
+            };
+            eprintln!(
+                "veter: trace {:.2}s: {} frames (render {:.1}ms, swap {:.1}ms each),                  {} drain passes ({:.1}ms, {:.0} KiB), other {:.0}ms, occluded={}",
+                window.as_secs_f64(),
+                self.frames,
+                per_frame(self.render),
+                per_frame(self.swap),
+                self.passes,
+                ms(self.drain),
+                kib,
+                ms(self.other),
+                self.occluded,
+            );
+        }
+        // `other` and `last_pass_end` reset together: the gap across a
+        // reporting boundary belongs to neither window.
+        let occluded = self.occluded;
+        let enabled = self.enabled;
+        *self = Self {
+            enabled,
+            occluded,
+            since: Some(Instant::now()),
+            ..Self::default()
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,6 +2198,7 @@ impl App {
             window_focused: true,
             blink_on: true,
             blink_deadline: None,
+            trace: FrameTrace::new(),
             last_click: None,
             mouse_buttons_held: 0,
             last_motion_report: None,
@@ -4607,6 +4725,7 @@ impl App {
             }
             match rx.try_recv() {
                 Ok(data) => {
+                    self.trace.bytes += data.len() as u64;
                     // The whole pipeline — VSS splitting the chunk,
                     // then PRT → VFT → SES → VGE+vt100 once per run of
                     // bytes between snapshots. One implementation,
@@ -4910,6 +5029,12 @@ impl ApplicationHandler for App {
             // answer has to come from the panel itself.
             WindowEvent::Focused(focused) => {
                 self.report_focus_change(focused);
+            }
+
+            // Traced, not acted on: whether this even arrives is half
+            // of what the trace is trying to establish.
+            WindowEvent::Occluded(occluded) => {
+                self.trace.occluded = occluded;
             }
 
             WindowEvent::CloseRequested => {
@@ -5379,6 +5504,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                let frame_start = Instant::now();
                 // Refresh jump labels to match this frame's scroll/match
                 // state before drawing. Doing it here (rather than in each
                 // key/scroll handler) guarantees the stored `labels` equal
@@ -5533,11 +5659,16 @@ impl ApplicationHandler for App {
                 }
 
                 canvas.flush();
+                // The split point: everything above is ours, the swap
+                // below is the compositor's.
+                let render = frame_start.elapsed();
+                let swap_start = Instant::now();
                 self.gl_surface
                     .as_ref()
                     .unwrap()
                     .swap_buffers(self.gl_context.as_ref().unwrap())
                     .unwrap();
+                self.trace.frame(render, swap_start.elapsed());
             }
 
             _ => {}
@@ -5548,7 +5679,11 @@ impl ApplicationHandler for App {
         // Cleared before the drain, so bytes arriving mid-pass queue a
         // fresh wakeup instead of being stranded in the channel.
         self.pty_wake_pending.store(false, Ordering::Release);
+        let drain_start = Instant::now();
+        let bytes_before = self.trace.bytes;
         let pass = self.process_pty_output();
+        let drained = self.trace.bytes - bytes_before;
+        self.trace.pass(drain_start.elapsed(), drained);
         self.pty_backlog = pass.backlog;
         self.drain_pending_clipboard();
         self.drain_pending_window_title();
@@ -5572,6 +5707,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.trace.report();
+
         // A drain pass is owed: the last one stopped on its time budget
         // so the frame it had produced could be drawn. Asking for it
         // here — after this iteration's redraw, which winit dispatches
