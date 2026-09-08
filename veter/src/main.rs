@@ -1258,23 +1258,85 @@ impl PtyPass {
 /// say, or blocked in `send` because the queue was full and the main
 /// loop would not take it. The first exonerates the render loop; the
 /// second indicts it.
-#[derive(Default)]
+/// A wait is attributed *as it happens*, not when it ends.
+///
+/// The obvious version — add the duration once the call returns —
+/// reported 4988ms of blocking inside a 1.02s window, because a read
+/// that spanned five windows dumped all five seconds into the one it
+/// finished in. So each counter is a pair: the time already accounted
+/// for, and the start of a wait still in progress. `total` adds the
+/// in-progress part up to a given instant, which makes the difference
+/// of two totals exactly the time spent blocked between them —
+/// including a wait that straddles both ends and belongs to neither
+/// alone.
 struct ReaderStats {
-    /// Nanoseconds blocked in `read` on the PTY master.
-    read_blocked: AtomicU64,
-    /// Nanoseconds blocked handing a chunk over — i.e. queue full.
-    send_blocked: AtomicU64,
+    /// The origin both threads measure against, so the reporter can ask
+    /// how long the reader has been blocked *right now* rather than
+    /// only learning about a wait once it is over.
+    epoch: Instant,
+    read_done: AtomicU64,
+    read_since: AtomicU64,
+    send_done: AtomicU64,
+    send_since: AtomicU64,
     chunks: AtomicU64,
 }
 
 impl ReaderStats {
-    /// Totals since startup. The trace differences them per window.
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            read_done: AtomicU64::new(0),
+            read_since: AtomicU64::new(0),
+            send_done: AtomicU64::new(0),
+            send_since: AtomicU64::new(0),
+            chunks: AtomicU64::new(0),
+        }
+    }
+
+    /// Totals as of now. The trace differences them per window.
     fn snapshot(&self) -> (u64, u64, u64) {
+        let now = self.now();
         (
-            self.read_blocked.load(Ordering::Relaxed),
-            self.send_blocked.load(Ordering::Relaxed),
+            Self::total(&self.read_done, &self.read_since, now),
+            Self::total(&self.send_done, &self.send_since, now),
             self.chunks.load(Ordering::Relaxed),
         )
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Time spent blocked up to `now`, a wait still in progress
+    /// included.
+    fn total(done: &AtomicU64, since: &AtomicU64, now: u64) -> u64 {
+        let done = done.load(Ordering::Relaxed);
+        match since.load(Ordering::Relaxed) {
+            // Stored as `start + 1`, so that zero can mean "not
+            // waiting" without colliding with a wait that began at
+            // the epoch itself.
+            0 => done,
+            start => done + now.saturating_sub(start - 1),
+        }
+    }
+
+    /// Run a blocking call with its wait attributed as it elapses.
+    fn timed<T>(
+        &self,
+        done: &AtomicU64,
+        since: &AtomicU64,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let start = self.now();
+        since.store(start + 1, Ordering::Relaxed);
+        let out = f();
+        let end = self.now();
+        // Cleared before the total is added, so a snapshot landing
+        // between the two stores misses this wait rather than counting
+        // it twice; the next snapshot picks it up.
+        since.store(0, Ordering::Relaxed);
+        done.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+        out
     }
 }
 
@@ -2302,7 +2364,7 @@ impl App {
             blink_deadline: None,
             last_frame: None,
             redraw_deadline: None,
-            reader_stats: Arc::new(ReaderStats::default()),
+            reader_stats: Arc::new(ReaderStats::new()),
             trace: FrameTrace::new(),
             last_click: None,
             mouse_buttons_held: 0,
@@ -5115,21 +5177,17 @@ impl ApplicationHandler for App {
                 // loop would not take it. Which one dominates is the
                 // difference between a slow producer and a slow
                 // renderer, and nothing on the main thread can tell.
-                let read_start = Instant::now();
-                let read = file.read(&mut buf);
-                stats.read_blocked.fetch_add(
-                    read_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
+                let read = stats.timed(&stats.read_done, &stats.read_since, || {
+                    file.read(&mut buf)
+                });
                 match read {
                     Ok(0) => break,
                     Ok(n) => {
-                        let send_start = Instant::now();
-                        let sent = tx.send(buf[..n].to_vec());
-                        stats.send_blocked.fetch_add(
-                            send_start.elapsed().as_nanos() as u64,
-                            Ordering::Relaxed,
-                        );
+                        let chunk = buf[..n].to_vec();
+                        let sent =
+                            stats.timed(&stats.send_done, &stats.send_since, || {
+                                tx.send(chunk)
+                            });
                         stats.chunks.fetch_add(1, Ordering::Relaxed);
                         if sent.is_err() {
                             break;
@@ -6551,6 +6609,47 @@ mod image_crop_tests {
         assert!(crop_uploaded_image(&img, Some(rect(0.0, 0.0, f32::INFINITY, 2.0))).is_none());
         // A zero-sized image has nothing to copy either.
         assert!(crop_uploaded_image(&coded_image(0, 0), None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod reader_stats_tests {
+    use super::*;
+
+    /// The property the old counter got wrong: a wait that spans two
+    /// report windows has to land in both, in proportion. Adding the
+    /// duration when the call returned put all of it in whichever
+    /// window it happened to finish in — 4988ms of blocking reported
+    /// inside a 1.02s window.
+    #[test]
+    fn a_wait_is_attributed_as_it_elapses() {
+        let done = AtomicU64::new(500);
+        let since = AtomicU64::new(0);
+
+        // Nothing in progress: only the settled total counts.
+        assert_eq!(ReaderStats::total(&done, &since, 1_000), 500);
+
+        // A wait that began at 800 and has not ended yet.
+        since.store(801, Ordering::Relaxed);
+        assert_eq!(ReaderStats::total(&done, &since, 1_000), 700);
+        assert_eq!(ReaderStats::total(&done, &since, 1_500), 1_200);
+
+        // Which is the point: the difference of two totals is the time
+        // blocked between them, never more.
+        let a = ReaderStats::total(&done, &since, 1_000);
+        let b = ReaderStats::total(&done, &since, 1_500);
+        assert_eq!(b - a, 500);
+    }
+
+    /// A window in which the reader never waited reports zero, rather
+    /// than inheriting the tail of a wait that ended in it.
+    #[test]
+    fn a_settled_counter_does_not_drift() {
+        let done = AtomicU64::new(42);
+        let since = AtomicU64::new(0);
+        let a = ReaderStats::total(&done, &since, 10);
+        let b = ReaderStats::total(&done, &since, 10_000);
+        assert_eq!(b - a, 0);
     }
 }
 
