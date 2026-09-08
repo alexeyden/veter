@@ -282,6 +282,37 @@ impl Theme {
         self.accents()[0]
     }
 
+    /// Whether the ground is lighter than the ink. Several derivations
+    /// have a direction — text over a fill has to move *away* from it,
+    /// and which way that is depends on the theme, not on a constant.
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        self.background.luminance() > self.foreground.luminance()
+    }
+
+    /// The darker of the ground and the ink, and the lighter. Deriving
+    /// a near-black or a near-white from these rather than from
+    /// `background` / `foreground` by name is what makes the results
+    /// hold on a light theme: there the roles are swapped, and
+    /// "lighten the foreground" only reaches a mid grey.
+    #[must_use]
+    fn darkest(&self) -> Rgba {
+        if self.is_light() {
+            self.foreground
+        } else {
+            self.background
+        }
+    }
+
+    #[must_use]
+    fn lightest(&self) -> Rgba {
+        if self.is_light() {
+            self.background
+        } else {
+            self.foreground
+        }
+    }
+
     #[must_use]
     pub fn surface(&self) -> Rgba {
         self.surface
@@ -307,15 +338,17 @@ impl Theme {
 
     /// Text over an accent fill. Derived by contrast rather than by
     /// "always white": a light accent (nord's frost, gruvbox's yellow)
-    /// needs dark text on it, and a dark one needs light.
+    /// needs dark text on it, and a dark one needs light. Both poles
+    /// come from the theme's own extremes, so a light theme — where the
+    /// foreground is the dark one — gets a near-white here rather than
+    /// the mid grey that lightening its foreground would give.
     #[must_use]
     pub fn text_on_accent(&self) -> Rgba {
         self.text_on_accent.unwrap_or_else(|| {
-            let accent = self.accent_primary();
-            if accent.luminance() > 0.55 {
-                self.background.darken(0.35)
+            if self.accent_primary().luminance() > 0.55 {
+                self.darkest().darken(0.35)
             } else {
-                self.foreground.lighten(0.5)
+                self.lightest().lighten(0.5)
             }
         })
     }
@@ -335,9 +368,18 @@ impl Theme {
             .unwrap_or_else(|| self.ansi[1].mix(self.ansi[9], 0.5).darken(0.3))
     }
 
+    /// The label on the warm chip. It has to move away from
+    /// [`Self::warn_fill`], which is a tint of the ground — so on a
+    /// light theme that means darkening the red, not lightening it.
     #[must_use]
     pub fn warn_text(&self) -> Rgba {
-        self.warn_text.unwrap_or_else(|| self.ansi[9].lighten(0.35))
+        self.warn_text.unwrap_or_else(|| {
+            if self.is_light() {
+                self.ansi[1].darken(0.35)
+            } else {
+                self.ansi[9].lighten(0.35)
+            }
+        })
     }
 
     #[must_use]
@@ -417,10 +459,12 @@ pub fn indexed_extended(idx: u8) -> Rgba {
 
 /// Names the built-in table answers to, in the order `veter --help`
 /// and `assets/config.toml` list them.
-pub const BUILTIN_NAMES: [&str; 5] = [
+pub const BUILTIN_NAMES: [&str; 7] = [
     "veter",
     "tokyonight-storm",
+    "tokyonight-day",
     "catppuccin-mocha",
+    "catppuccin-latte",
     "gruvbox-dark",
     "nord",
 ];
@@ -432,7 +476,9 @@ pub fn builtin(name: &str) -> Option<Theme> {
     match name {
         "veter" | "default" => Some(veter()),
         "tokyonight-storm" | "tokyonight" => Some(tokyonight_storm()),
+        "tokyonight-day" => Some(tokyonight_day()),
         "catppuccin-mocha" | "catppuccin" => Some(catppuccin_mocha()),
+        "catppuccin-latte" => Some(catppuccin_latte()),
         "gruvbox-dark" | "gruvbox" => Some(gruvbox_dark()),
         "nord" => Some(nord()),
         _ => None,
@@ -620,6 +666,31 @@ fn tokyonight_storm() -> Theme {
     }
 }
 
+/// folke/tokyonight.nvim, `day` variant — the light one. Palette from
+/// the project's own `extras/kitty/tokyonight_day.conf`.
+///
+/// As in every published light port, `ansi` swaps the roles at the ends
+/// of the table: "black" is a light grey and "white" a dark blue, so a
+/// program that paints color0 as a ground and color7 as ink still comes
+/// out the right way up.
+fn tokyonight_day() -> Theme {
+    Theme {
+        ansi: [
+            c(0xb4b5b9), c(0xf52a65), c(0x587539), c(0x8c6c3e),
+            c(0x2e7de9), c(0x9854f1), c(0x007197), c(0x6172b0),
+            c(0xa1a6c5), c(0xff4774), c(0x5c8524), c(0xa27629),
+            c(0x358aff), c(0xa463ff), c(0x007ea8), c(0x3760bf),
+        ],
+        background: c(0xe1e2e7),
+        foreground: c(0x3760bf),
+        cursor: Some(c(0x3760bf)),
+        selection_bg: Some(c(0xb7c1e3)),
+        selection_fg: Some(c(0x3760bf)),
+        accents: vec![c(0x2e7de9), c(0x9854f1), c(0x007197)],
+        ..derived()
+    }
+}
+
 /// catppuccin, `mocha` flavour. Palette from catppuccin/alacritty.
 fn catppuccin_mocha() -> Theme {
     Theme {
@@ -650,6 +721,30 @@ fn catppuccin_mocha() -> Theme {
         selection_bg: Some(c(0x585b70)),
         selection_fg: None,
         accents: vec![c(0x89b4fa), c(0xcba6f7), c(0x94e2d5)],
+        ..derived()
+    }
+}
+
+/// catppuccin, `latte` flavour — the light one. Palette from
+/// catppuccin/alacritty; see [`tokyonight_day`] on the swapped ends of
+/// `ansi`.
+fn catppuccin_latte() -> Theme {
+    Theme {
+        ansi: [
+            c(0xbcc0cc), c(0xd20f39), c(0x40a02b), c(0xdf8e1d),
+            c(0x1e66f5), c(0xea76cb), c(0x179299), c(0x5c5f77),
+            c(0xacb0be), c(0xd20f39), c(0x40a02b), c(0xdf8e1d),
+            c(0x1e66f5), c(0xea76cb), c(0x179299), c(0x6c6f85),
+        ],
+        background: c(0xeff1f5),
+        foreground: c(0x4c4f69),
+        cursor: Some(c(0xdc8a78)),
+        // `surface2`, not the port's rosewater selection — the same
+        // reason as mocha: a selection that loud swallows the row it
+        // marks when it sits under ordinary shell text.
+        selection_bg: Some(c(0xacb0be)),
+        selection_fg: None,
+        accents: vec![c(0x1e66f5), c(0x8839ef), c(0x179299)],
         ..derived()
     }
 }
@@ -848,11 +943,22 @@ mod tests {
         assert!(t.text_on_accent().luminance() > 0.8);
     }
 
+    /// How far `c` sits from the ground, in the direction of the ink.
+    /// Negative means it went the wrong way — toward the background
+    /// instead of away from it — which is the shape every "does this
+    /// read?" check below wants, and the shape that differs between a
+    /// light theme and a dark one.
+    fn toward_ink(t: &Theme, c: Rgba) -> f32 {
+        let d = c.luminance() - t.background.luminance();
+        if t.is_light() { -d } else { d }
+    }
+
     /// The two match colours are cell *backgrounds* under text that
     /// keeps its own foreground, so each has to stay clear of the
     /// theme's foreground — the bug the derivation is tuned against is
     /// a pastel-yellow scheme highlighting matched text in something as
-    /// light as the text.
+    /// light as the text — while still lifting off the ground enough to
+    /// be seen at all.
     #[test]
     fn the_search_highlights_stay_readable_under_the_foreground() {
         for name in BUILTIN_NAMES {
@@ -863,30 +969,35 @@ mod tests {
                 search_match: None,
                 ..builtin(name).unwrap()
             };
-            let fg = t.foreground.luminance();
             for (what, c) in [
                 ("current", t.search_current_match()),
                 ("other", t.search_match()),
             ] {
                 assert!(
-                    fg - c.luminance() > 0.2,
+                    (t.foreground.luminance() - c.luminance()).abs() > 0.2,
                     "{name}: {what} match is too close to the foreground"
                 );
                 assert!(
-                    c.luminance() > t.background.luminance(),
+                    toward_ink(&t, c) > 0.08,
                     "{name}: {what} match must lift off the background"
                 );
             }
-            // …and from each other, so `n`/`N` shows which one it is on.
+            // …and from each other, so `n`/`N` shows which one it is
+            // on. On a light theme the current match is the *darker* of
+            // the two rather than the lighter; what matters is that
+            // they differ, not which way.
             assert!(
-                t.search_current_match().luminance() - t.search_match().luminance() > 0.05,
+                (t.search_current_match().luminance() - t.search_match().luminance()).abs() > 0.05,
                 "{name}: the two match colours are indistinguishable"
             );
         }
     }
 
     /// A warm chip belongs to the panel it sits on: the fill is a tint
-    /// of the ground, the border and label carry the warning.
+    /// of the ground, with the border and then the label stepping
+    /// further toward the ink. Which way "toward the ink" points is the
+    /// whole reason [`Theme::warn_text`] asks `is_light` — on a light
+    /// theme it darkens the red instead of lightening it.
     #[test]
     fn the_warn_trio_is_a_chip_not_a_block_of_red() {
         for name in BUILTIN_NAMES {
@@ -901,13 +1012,16 @@ mod tests {
                 (t.warn_fill().luminance() - t.surface().luminance()).abs() < 0.15,
                 "{name}: warn fill does not sit at panel weight"
             );
-            assert!(
-                t.warn_border().luminance() > t.warn_fill().luminance(),
-                "{name}: warn border must read against its own fill"
+            let (fill, border, text) = (
+                toward_ink(&t, t.warn_fill()),
+                toward_ink(&t, t.warn_border()),
+                toward_ink(&t, t.warn_text()),
             );
+            assert!(border > fill, "{name}: warn border must read against its own fill");
+            assert!(text > border, "{name}: warn text must read against the border");
             assert!(
-                t.warn_text().luminance() > t.warn_border().luminance(),
-                "{name}: warn text must read against the border"
+                text - fill > 0.25,
+                "{name}: warn text is too close to the fill it sits on"
             );
         }
     }
@@ -920,10 +1034,12 @@ mod tests {
     /// there. Change one on purpose, not by accident.
     #[test]
     fn the_accent_trios_are_the_ones_that_were_chosen() {
-        let want: [(&str, [u32; 3]); 5] = [
+        let want: [(&str, [u32; 3]); 7] = [
             ("veter", [0x56799f, 0x9f5685, 0x9f7c56]),
             ("tokyonight-storm", [0x7aa2f7, 0xbb9af7, 0x7dcfff]),
+            ("tokyonight-day", [0x2e7de9, 0x9854f1, 0x007197]),
             ("catppuccin-mocha", [0x89b4fa, 0xcba6f7, 0x94e2d5]),
+            ("catppuccin-latte", [0x1e66f5, 0x8839ef, 0x179299]),
             ("gruvbox-dark", [0x83a598, 0xd3869b, 0xfabd2f]),
             ("nord", [0x88c0d0, 0xb48ead, 0x81a1c1]),
         ];
@@ -948,6 +1064,22 @@ mod tests {
             "derived accents are bright blue / magenta / cyan"
         );
         assert!(!t.accents().contains(&t.ansi[10]), "ansi bright green");
+    }
+
+    /// Text over an accent fill has to be readable whichever way the
+    /// theme runs. A light theme's foreground is the *dark* colour, so
+    /// deriving the light pole by lightening it — as this did before
+    /// the light themes existed — reaches only a mid grey.
+    #[test]
+    fn text_on_accent_is_readable_on_a_light_theme_too() {
+        for name in BUILTIN_NAMES {
+            let t = Theme {
+                text_on_accent: None,
+                ..builtin(name).unwrap()
+            };
+            let gap = (t.text_on_accent().luminance() - t.accent_primary().luminance()).abs();
+            assert!(gap > 0.35, "{name}: text on the accent barely reads ({gap:.2})");
+        }
     }
 
     #[test]

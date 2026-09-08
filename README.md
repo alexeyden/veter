@@ -59,7 +59,8 @@ A `[theme]` name sets the whole look — the ANSI-16 grid, the terminal's fore/b
 
 ```toml
 [theme]
-name = "tokyonight-storm"   # or catppuccin-mocha, gruvbox-dark, nord, veter
+name = "tokyonight-storm"   # or -day; catppuccin-mocha or -latte;
+                            # gruvbox-dark; nord; veter
 ```
 
 Any other name is looked up as `themes/<name>.toml` beside the config, so any published scheme drops in without a rebuild; a file needs only `ansi`, `background` and `foreground`, and the rest is derived. Individual keys under `[theme]` override the named scheme, and `[search]` overrides what the resolved theme implies for the search panel.

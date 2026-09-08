@@ -25,12 +25,20 @@
 #
 # Built-in names:
 #
-#   veter              the default — the Tango grid and muted blue/olive/violet
-#                      accents veter has always used
+#   veter              the default — the Tango grid and muted blue/plum/amber
+#                      accents
 #   tokyonight-storm   folke/tokyonight.nvim, storm variant
+#   tokyonight-day     the same, light
 #   catppuccin-mocha   catppuccin, mocha flavour
+#   catppuccin-latte   the same, light
 #   gruvbox-dark       morhetz/gruvbox, dark medium
 #   nord               nordtheme/nord
+#
+# Light and dark are handled the same way: the derived chrome keys off
+# whether the background is lighter than the foreground, so a light scheme
+# gets dark text over its accents and a darkened warning label rather than
+# lightened ones. `OSC 11 ; ?` reports the theme background, which is what
+# vim reads to pick `background=light`.
 #
 # A name that is not one of those is looked up as
 # $XDG_CONFIG_HOME/veter/themes/<name>.toml — same schema as the keys below,
