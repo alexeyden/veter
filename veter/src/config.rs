@@ -6,11 +6,17 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Six things are configurable:
+//! Seven things are configurable:
 //!
+//!  * `[theme]` — the colour scheme: the grid palette, the terminal's
+//!    default fore/background, the accents, and veter's own overlay
+//!    chrome. `name` picks one of the built-ins in [`veter::theme`] or
+//!    a user file under `themes/`, and any other key overrides that
+//!    theme's own value. Everything below layers on top of it.
 //!  * `[accent]` — the shared accent palette the host publishes into the
 //!    reserved `host.*` VGE style namespace (see VGE §7.3). vmux and
 //!    other clients render their chrome from it via `host.accent`.
+//!    Unset, it comes from the theme.
 //!  * `[font]` — the primary family and the fallback families tried for
 //!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
@@ -23,142 +29,60 @@
 //!    what priority order.
 //!
 //! This is a binary-local module: nothing here touches the `veter-host`
-//! engine state, so `vsd` (which shares those engines) is unaffected and
-//! keeps its built-in palette.
+//! engine state, so `vsd` (which shares those engines) has no config of
+//! its own. It borrows the *rendering* client's palette instead —
+//! reported in the PRT probe on attach (`doc/portal-extension.md` §10)
+//! — which is what keeps a client started in a detached session on the
+//! same theme as one started under a live renderer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use femtovg::Color;
 use serde::Deserialize;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use veter::hints::{HintConfig, HintKind};
-
-/// Built-in accent palette (muted blue / olive / violet). Slot N maps to
-/// `host.accent.{N+1}`; the contextual `host.accent` rotates through the
-/// list by portal nesting depth.
-const DEFAULT_ACCENT: [(u8, u8, u8); 3] = [
-    (0x56, 0x79, 0x9F), // accent.1 — muted blue
-    (0x85, 0x9F, 0x3D), // accent.2 — olive
-    (0x5A, 0x3C, 0x9E), // accent.3 — violet
-];
+use veter::theme::Theme;
 
 // ---------------------------------------------------------------------------
 // Colors
 // ---------------------------------------------------------------------------
 
-/// A straight (non-premultiplied) 8-bit RGBA color, deserialized from a
-/// `#rrggbb` or `#rrggbbaa` hex string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rgba {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    pub a: u8,
-}
-
-impl Rgba {
-    const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, a: 255 }
-    }
-
-    fn parse(s: &str) -> Result<Self, String> {
-        let hex = s.strip_prefix('#').unwrap_or(s);
-        let byte = |i: usize| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|_| format!("invalid hex color '{s}'"))
-        };
-        match hex.len() {
-            6 => Ok(Self {
-                r: byte(0)?,
-                g: byte(2)?,
-                b: byte(4)?,
-                a: 255,
-            }),
-            8 => Ok(Self {
-                r: byte(0)?,
-                g: byte(2)?,
-                b: byte(4)?,
-                a: byte(6)?,
-            }),
-            _ => Err(format!("color '{s}' must be #rrggbb or #rrggbbaa")),
-        }
-    }
-
-    /// femtovg color for GUI chrome painting.
-    pub fn to_femto(self) -> Color {
-        Color::rgba(self.r, self.g, self.b, self.a)
-    }
-
-    /// VGE protocol color (f32, straight alpha) for the accent palette.
-    pub fn to_command_color(self) -> veter::vge::Color {
-        veter::vge::Color {
-            r: self.r as f32 / 255.0,
-            g: self.g as f32 / 255.0,
-            b: self.b as f32 / 255.0,
-            a: self.a as f32 / 255.0,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Rgba {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Rgba::parse(&s).map_err(serde::de::Error::custom)
-    }
-}
+// The hex-string colour type and its parser live with the themes, since
+// a theme file is written in the same notation as a config key. Re-exported
+// here because `[accent]`, `[search]` and every other colour key in this
+// module is one.
+pub use veter::theme::Rgba;
 
 /// `[accent]` — the ordered accent palette.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct AccentConfig {
     /// Ordered accent palette; slot N maps to `host.accent.{N+1}`.
+    /// Unset (or empty) takes the theme's own accents, so naming a
+    /// theme is enough to re-accent every client's chrome; setting it
+    /// pins the accents across a theme change.
     pub palette: Vec<Rgba>,
 }
 
-impl Default for AccentConfig {
-    fn default() -> Self {
-        Self {
-            palette: DEFAULT_ACCENT
-                .iter()
-                .map(|&(r, g, b)| Rgba::rgb(r, g, b))
-                .collect(),
-        }
-    }
-}
-
-/// `[search]` — search-chrome colors. `accent` is optional and defaults
-/// to the first accent color when unset.
-#[derive(Debug, Clone, Deserialize)]
+/// `[search]` — search-chrome colors. Every key is optional; an unset
+/// one comes from the theme, which is what lets `[theme] name = …`
+/// restyle the whole panel on its own.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SearchColors {
     /// Accent tint for the search panel's chrome (border, caret, chip
-    /// fills). `None` → first accent color, so the panel
-    /// follows `[accent]` unless it is given a colour of its own.
-    /// `bar_bg` is the pre-panel name for the same key.
+    /// fills). `None` → the theme's search accent, which is the first
+    /// accent colour unless the theme pins one of its own. `bar_bg` is
+    /// the pre-panel name for the same key.
     #[serde(alias = "bar_bg")]
     pub accent: Option<Rgba>,
     /// Search-bar text.
-    pub bar_text: Rgba,
+    pub bar_text: Option<Rgba>,
     /// The active match (the one `n`/`N` navigates to).
-    pub current_match: Rgba,
+    pub current_match: Option<Rgba>,
     /// All other (non-current) matches.
     #[serde(rename = "match")]
-    pub match_color: Rgba,
-}
-
-impl Default for SearchColors {
-    fn default() -> Self {
-        Self {
-            accent: None,
-            bar_text: Rgba::rgb(230, 230, 230),
-            current_match: Rgba::rgb(220, 160, 0),
-            match_color: Rgba::rgb(80, 80, 30),
-        }
-    }
+    pub match_color: Option<Rgba>,
 }
 
 /// `[window]` — window-level behavior.
@@ -697,6 +621,11 @@ fn shell_quote(s: &str) -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// The `[theme]` section, kept as a raw table: `name` picks the
+    /// base and every other key overrides one of its fields, so the
+    /// schema is [`veter::theme::Theme`]'s own rather than a second
+    /// copy of it here. Resolved by [`Config::theme`].
+    pub theme: toml::Table,
     pub accent: AccentConfig,
     pub font: FontConfig,
     pub search: SearchColors,
@@ -755,33 +684,46 @@ impl Config {
         }
     }
 
-    /// Accent palette as VGE colors, guaranteed non-empty (an empty
-    /// configured list falls back to the built-in palette).
-    pub fn accent_palette(&self) -> Vec<veter::vge::Color> {
+    /// The resolved colour theme. Cheap enough to call more than once,
+    /// but the GUI resolves it once at startup and hands it to the
+    /// renderer.
+    pub fn theme(&self) -> Theme {
+        veter::theme::resolve(&self.theme, config_path().and_then(|p| p.parent().map(Path::to_path_buf)).as_deref())
+    }
+
+    /// Accent palette, guaranteed non-empty: `[accent] palette` when it
+    /// is set, else the theme's own accents.
+    pub fn accent_palette_rgba(&self, theme: &Theme) -> Vec<Rgba> {
         if self.accent.palette.is_empty() {
-            AccentConfig::default().palette
+            theme.accents()
         } else {
             self.accent.palette.clone()
         }
-        .iter()
-        .map(|c| c.to_command_color())
-        .collect()
     }
 
-    /// First accent color, falling back to the built-in slot 0 when the
-    /// configured palette is empty. The tint host-drawn chrome uses when
-    /// it has no colour of its own.
-    pub fn accent_primary(&self) -> Rgba {
-        self.accent.palette.first().copied().unwrap_or_else(|| {
-            let (r, g, b) = DEFAULT_ACCENT[0];
-            Rgba::rgb(r, g, b)
-        })
+    /// First accent color. The tint host-drawn chrome uses when it has
+    /// no colour of its own.
+    pub fn accent_primary(&self, theme: &Theme) -> Rgba {
+        self.accent_palette_rgba(theme)[0]
     }
 
-    /// Effective search-chrome accent: the configured `[search] accent`,
-    /// else the first accent color, else the built-in accent slot 0.
-    pub fn search_accent(&self) -> Rgba {
-        self.search.accent.unwrap_or_else(|| self.accent_primary())
+    /// Effective search-chrome colours: `[search]` where it is set,
+    /// else the theme's — whose own accent slot follows `[accent]`, so
+    /// pinning one accent restyles the panel with it.
+    pub fn search_colors(&self, theme: &Theme) -> [Rgba; 4] {
+        [
+            self.search
+                .accent
+                .or(theme.search_accent)
+                .unwrap_or_else(|| self.accent_primary(theme)),
+            self.search.bar_text.unwrap_or_else(|| theme.search_text()),
+            self.search
+                .current_match
+                .unwrap_or_else(|| theme.search_current_match()),
+            self.search
+                .match_color
+                .unwrap_or_else(|| theme.search_match()),
+        ]
     }
 
     pub fn key_bindings(&self) -> KeyBindings {
@@ -819,6 +761,62 @@ mod tests {
         assert_eq!(Rgba::parse("ffffff").unwrap(), Rgba::rgb(255, 255, 255));
         assert!(Rgba::parse("#xyz").is_err());
         assert!(Rgba::parse("#12345").is_err());
+    }
+
+    /// A config that predates `[theme]` — and one that names a theme
+    /// but pins nothing — must resolve exactly the colours veter drew
+    /// before themes existed.
+    #[test]
+    fn a_theme_free_config_keeps_the_pre_theme_colours() {
+        let bare: Config = toml::from_str("").unwrap();
+        let theme = veter::theme::resolve(&bare.theme, None);
+        assert_eq!(theme.background, Rgba::rgb(30, 30, 30));
+        assert_eq!(
+            bare.accent_primary(&theme),
+            Rgba::rgb(0x56, 0x79, 0x9f)
+        );
+        assert_eq!(
+            bare.search_colors(&theme),
+            [
+                Rgba::rgb(0x56, 0x79, 0x9f),
+                Rgba::rgb(230, 230, 230),
+                Rgba::rgb(220, 160, 0),
+                Rgba::rgb(80, 80, 30),
+            ]
+        );
+    }
+
+    /// `[accent]` and `[search]` are overrides *over* the theme, not
+    /// beside it: naming a theme re-accents everything, and pinning a
+    /// key holds it across a theme change.
+    #[test]
+    fn accent_and_search_fall_through_to_the_theme() {
+        let themed: Config = toml::from_str("[theme]\nname = \"nord\"\n").unwrap();
+        let theme = veter::theme::resolve(&themed.theme, None);
+        assert_eq!(themed.accent_primary(&theme), Rgba::rgb(0x88, 0xc0, 0xd0));
+        // The search panel follows the theme's accent with it.
+        assert_eq!(themed.search_colors(&theme)[0], Rgba::rgb(0x88, 0xc0, 0xd0));
+
+        let pinned: Config = toml::from_str(
+            "[theme]\nname = \"nord\"\n[accent]\npalette = [\"#ff0000\"]\n[search]\nmatch = \"#010203\"\n",
+        )
+        .unwrap();
+        let theme = veter::theme::resolve(&pinned.theme, None);
+        assert_eq!(pinned.accent_primary(&theme), Rgba::rgb(255, 0, 0));
+        // …and the panel with it, since its accent resolves through
+        // `accent_primary`.
+        assert_eq!(pinned.search_colors(&theme)[0], Rgba::rgb(255, 0, 0));
+        assert_eq!(pinned.search_colors(&theme)[3], Rgba::rgb(1, 2, 3));
+        // The unpinned search keys still come from nord.
+        assert_eq!(pinned.search_colors(&theme)[1], theme.search_text());
+    }
+
+    /// The pre-`[theme]` spelling of the search-panel tint still works.
+    #[test]
+    fn the_bar_bg_alias_survives() {
+        let cfg: Config = toml::from_str("[search]\nbar_bg = \"#0a0b0c\"\n").unwrap();
+        let theme = veter::theme::resolve(&cfg.theme, None);
+        assert_eq!(cfg.search_colors(&theme)[0], Rgba::rgb(10, 11, 12));
     }
 
     #[test]

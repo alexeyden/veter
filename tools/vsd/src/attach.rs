@@ -685,12 +685,14 @@ fn apply_probe(
     }
 }
 
-/// The renderer's accent as a one-slot [`HostThemePalette`], if it
-/// themes `host.*` at all. The probe reports one color — the accent
-/// `host.accent` resolves to at the probing engine's depth — not the
-/// renderer's whole palette, so every depth inside the session
-/// resolves to that same accent while the daemon is the one answering.
-/// A renderer re-seeds its own palette over this on attach.
+/// The renderer's `host.*` palette, if it themes them at all.
+///
+/// The probe reports one *accent* — the one `host.accent` resolves to
+/// at the probing engine's depth — not the renderer's whole accent
+/// list, so every depth inside the session resolves to that same
+/// accent while the daemon is the one answering. The rest of the
+/// palette does not vary with depth, so it comes across whole. A
+/// renderer re-seeds its own palette over both on attach.
 fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostThemePalette> {
     use prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES;
     if prt.vge_features? & FEAT_VGE_HOST_THEMED_STYLES == 0 {
@@ -704,6 +706,9 @@ fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostTheme
             b: f32::from(b) / 255.0,
             a: f32::from(a) / 255.0,
         }],
+        colors: prt
+            .theme_rgba
+            .map(veter_host::vge::HostThemeColors::from_rgba8),
     })
 }
 

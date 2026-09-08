@@ -51,6 +51,21 @@ make uninstall
 
 Override `PREFIX=...` to retarget. `make install-remote-<arch>` cross-compiles a musl build and installs it to `$REMOTE`.
 
+## Configure
+
+`$XDG_CONFIG_HOME/veter/config.toml` (falling back to `~/.config/veter/config.toml`), read once at startup — every setting optional. `assets/config.toml` is a commented copy of every key.
+
+A `[theme]` name sets the whole look — the ANSI-16 grid, the terminal's fore/background and cursor, the accents veter publishes to in-terminal tools, and its own overlay chrome:
+
+```toml
+[theme]
+name = "tokyonight-storm"   # or catppuccin-mocha, gruvbox-dark, nord, veter
+```
+
+Any other name is looked up as `themes/<name>.toml` beside the config, so any published scheme drops in without a rebuild; a file needs only `ansi`, `background` and `foreground`, and the rest is derived. Individual keys under `[theme]`, `[accent]` and `[search]` override whatever the theme resolves to.
+
+Because veter publishes its palette into the reserved `host.*` VGE style namespace and reports it in the PRT probe, `vmux` and `vfm` pick the theme up too — their pane chrome and modals are drawn in the terminal's own surfaces rather than a built-in dark set.
+
 ## Tests
 
 ```sh

@@ -18,8 +18,8 @@ use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 use vge_ui::measure::text_cells;
 use vge_ui::shape::{chrome_corner_radii, rounded_rect_path};
 use vge_ui::theme::{
-    COLOR_ACTIVE_TEXT, COLOR_DIM_TEXT, COLOR_TITLE_TEXT, accent_color, accent_style, darken,
-    surface_style, title_thumb_style,
+    accent_color, accent_style, active_text, darken, dim_text, surface_style, title_text,
+    title_thumb_style,
 };
 
 use crate::entry::{Entry, ListOpts};
@@ -122,7 +122,7 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
             a.x + 1.0,
             a.y + 1.0,
             Align::Left,
-            COLOR_DIM_TEXT,
+            dim_text(),
             false,
             elide(err, a.w as usize - 2),
         ));
@@ -150,11 +150,11 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
             });
         }
         let color = if is_sel {
-            COLOR_ACTIVE_TEXT
+            active_text()
         } else if e.is_dir() {
             accent_text()
         } else {
-            COLOR_TITLE_TEXT
+            title_text()
         };
         let label = if e.is_dir() {
             format!("{}/", elide(&e.name, text_w.saturating_sub(1)))
@@ -169,7 +169,7 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
             a.x + 1.0,
             a.y + 0.5,
             Align::Left,
-            COLOR_DIM_TEXT,
+            dim_text(),
             false,
             "empty".into(),
         ));
@@ -212,7 +212,7 @@ pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
             a.x + a.w * 0.5,
             a.y + a.h * 0.5,
             Align::Center,
-            COLOR_DIM_TEXT,
+            dim_text(),
             false,
             "empty directory".into(),
         ));
@@ -243,7 +243,7 @@ pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
         cmds.push(DrawCmd::FillRectangles {
             fill: Style::Flat(Color {
                 a: 0.18,
-                ..COLOR_TITLE_TEXT
+                ..title_text()
             }),
             rects: vec![Rect {
                 x,
@@ -318,9 +318,9 @@ fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
         y + l.tile_img_h,
         Align::Center,
         if selected {
-            COLOR_ACTIVE_TEXT
+            active_text()
         } else {
-            COLOR_TITLE_TEXT
+            title_text()
         },
         selected,
         elide(&e.name, label_w),
@@ -383,9 +383,9 @@ fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
     // One text baseline, centered when the row is more than a row tall.
     let ty = y + (l.tile_h - 1.0) * 0.5;
     let meta_ink = if selected {
-        COLOR_ACTIVE_TEXT
+        active_text()
     } else {
-        COLOR_DIM_TEXT
+        dim_text()
     };
     // Columns are laid out from the right; the name takes what is left.
     let mut right = x + w - 0.5;
@@ -406,11 +406,11 @@ fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
         elide(&e.name, name_w)
     };
     let ink = if selected {
-        COLOR_ACTIVE_TEXT
+        active_text()
     } else if e.is_dir() {
         accent_text()
     } else {
-        COLOR_TITLE_TEXT
+        title_text()
     };
     cmds.push(text(name_x, ty, Align::Left, ink, selected, label));
     cmds
@@ -514,7 +514,7 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         a.x + a.w - 1.0,
         a.y,
         Align::Right,
-        COLOR_DIM_TEXT,
+        dim_text(),
         false,
         right.clone(),
     ));
@@ -525,10 +525,10 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         (Some(busy), _) => (format!("{busy}…"), accent_text(), true),
         (None, Some((msg, failed))) => (
             msg.to_string(),
-            if failed { COLOR_ERROR } else { COLOR_ACTIVE_TEXT },
+            if failed { COLOR_ERROR } else { active_text() },
             true,
         ),
-        (None, None) => (v.cwd.display().to_string(), COLOR_TITLE_TEXT, false),
+        (None, None) => (v.cwd.display().to_string(), title_text(), false),
     };
     cmds.push(text(
         a.x + 1.0,

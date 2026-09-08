@@ -1255,6 +1255,14 @@ impl PrtEngine {
             // The accent `host.accent` resolves to at this engine's depth,
             // so a client can derive its own shades from it.
             accent_rgba: self.host_palette.contextual_rgba8(self.depth),
+            // The rest of the namespace, for the same reason. Unlike the
+            // accent these do not vary with depth — there is one
+            // terminal background — but they ride the same tail so a
+            // client learns the whole palette from one probe.
+            theme_rgba: self
+                .host_palette
+                .colors
+                .map(crate::vge::HostThemeColors::to_rgba8),
         };
         Ok(pb.encode())
     }
@@ -2120,6 +2128,7 @@ mod tests {
         let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
         crate::vge::HostThemePalette {
             accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+            colors: None,
         }
     }
 
@@ -2163,6 +2172,52 @@ mod tests {
         assert!(vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0);
         // Top-level engine = depth 0 → accent slot 0 (red).
         assert_eq!(accent, Some([255, 0, 0, 255]));
+    }
+
+    /// End of the wire path: a seeded palette reaches the probe body,
+    /// and `ProbeBody::decode` — the same code every client's decoder
+    /// mirrors — reads back the eight colours the host published, at
+    /// every depth. A host with accents only ends the body after the
+    /// accent, and that must still decode.
+    #[test]
+    fn probe_carries_the_theme_colours_to_every_depth() {
+        let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
+        let colors = crate::vge::HostThemeColors {
+            bg: c(0.0, 0.0, 0.0),
+            fg: c(1.0, 1.0, 1.0),
+            surface: c(0.2, 0.2, 0.2),
+            surface_inset: c(0.1, 0.1, 0.1),
+            text: c(0.9, 0.9, 0.9),
+            text_dim: c(0.5, 0.5, 0.5),
+            text_on_accent: c(1.0, 1.0, 1.0),
+            warn: c(1.0, 0.0, 0.0),
+        };
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(crate::vge::HostThemePalette {
+            colors: Some(colors),
+            ..rgb_palette()
+        });
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
+        assert_eq!(decoded.accent_rgba, Some([255, 0, 0, 255]));
+        assert_eq!(decoded.theme_rgba, Some(colors.to_rgba8()));
+
+        // Inside a portal the accent rotates with depth; the theme
+        // colours describe the terminal and do not.
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+        let child = &mut engine.state.current_mut().content_mut("p").unwrap().children;
+        let parsed = dispatch_one(child, CMD_PROBE, 1, &[]);
+        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
+        assert_eq!(decoded.accent_rgba, Some([0, 255, 0, 255]));
+        assert_eq!(decoded.theme_rgba, Some(colors.to_rgba8()));
+
+        // Accents alone: the body simply stops after the accent.
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
+        assert_eq!(decoded.accent_rgba, Some([255, 0, 0, 255]));
+        assert_eq!(decoded.theme_rgba, None);
     }
 
     #[test]

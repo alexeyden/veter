@@ -17,12 +17,76 @@
 #   Ctrl/Alt its case matters ("n" vs "N").
 
 # ---------------------------------------------------------------------------
+# Colour theme
+# ---------------------------------------------------------------------------
+# One name sets the whole look: the 16 ANSI colours, the terminal's default
+# fore/background and cursor, the accents veter publishes to in-terminal
+# tools, and its own overlay chrome (the search panel, the close prompt).
+#
+# Built-in names:
+#
+#   veter              the default — the Tango grid and muted blue/olive/violet
+#                      accents veter has always used
+#   tokyonight-storm   folke/tokyonight.nvim, storm variant
+#   catppuccin-mocha   catppuccin, mocha flavour
+#   gruvbox-dark       morhetz/gruvbox, dark medium
+#   nord               nordtheme/nord
+#
+# A name that is not one of those is looked up as
+# $XDG_CONFIG_HOME/veter/themes/<name>.toml — same schema as the keys below,
+# merged onto the default, so any published scheme can be dropped in without
+# a rebuild. A file only has to give `ansi`, `background` and `foreground`;
+# everything else is derived from those unless it is named.
+#
+# Any key below overrides the named theme's own value.
+[theme]
+# name = "tokyonight-storm"
+#
+# The grid. `ansi` is the 16-entry ANSI table in terminfo order — the eight
+# normal colours, then the eight bright ones. Indices 16-255 are the standard
+# colour cube and greyscale ramp and are not configurable.
+# ansi = [
+#   "#000000", "#cc0000", "#4e9a06", "#c4a000",   # black red green yellow
+#   "#3465a4", "#75507b", "#06989a", "#d3d7cf",   # blue magenta cyan white
+#   "#555753", "#ef2929", "#8ae234", "#fce94f",   # bright …
+#   "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+# ]
+# background = "#1e1e1e"
+# foreground = "#cccccc"
+#
+# `cursor` and the selection pair are optional. Unset, both keep veter's
+# built-in look: the cell drawn in reverse video. Setting only `selection_bg`
+# fills behind the selected cell and leaves each character its own colour.
+# cursor       = "#cccccc"
+# selection_bg = "#264f78"
+# selection_fg = "#ffffff"
+#
+# Chrome. Unset, each is derived from the three required values above —
+# what a dropped-in scheme file relies on. Pin one to take it as given.
+# surface        = "#26262a"   # overlay panel fill
+# surface_inset  = "#1a1a1e"   # a recessed surface inside a panel
+# text           = "#ebebeb"   # primary text on `surface`
+# text_dim       = "#9a9a9a"   # key hints, inactive labels
+# text_on_accent = "#f5f5f5"   # text over an accent fill
+# warn_fill      = "#34282a"   # the Quit button, the `no matches` chip
+# warn_border    = "#964646"
+# warn_text      = "#e88282"
+
+# ---------------------------------------------------------------------------
 # Shared accent palette
 # ---------------------------------------------------------------------------
 # Published into the reserved `host.*` VGE style namespace; vmux and other
 # in-terminal tools draw their chrome (pane outlines, tabs, titles) from it.
 # Slot 1 is `host.accent.1`, and the contextual `host.accent` rotates through
 # the list by portal nesting depth. Any length >= 1.
+#
+# Unset, the accents come from the theme above — so `[theme] name = …` is
+# enough to re-accent every client. Set it to pin them across a theme change.
+#
+# The eight non-accent `host.*` colours (the terminal's ground, its text, the
+# surfaces a modal is built from) come from the theme too; there is no
+# separate section for them, since they describe the terminal rather than a
+# preference of its own.
 [accent]
 # palette = ["#56799f", "#859f3d", "#5a3c9e"]  # muted blue / olive / violet
 
@@ -58,6 +122,8 @@
 # ---------------------------------------------------------------------------
 # Search chrome colors
 # ---------------------------------------------------------------------------
+# Every key is optional and overrides the theme's own value, so a theme
+# change restyles the panel unless you pin something here.
 [search]
 # accent        = "#56799f"   # search-panel chrome: border, caret, chip fills
 #                             # (default: accent slot 1, so the panel follows

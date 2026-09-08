@@ -74,8 +74,8 @@ use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
 use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
 use vge_ui::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
 use vge_ui::theme::{
-    self, COLOR_ACTIVE_TEXT, COLOR_DIM_TEXT, COLOR_SCROLLBAR, COLOR_TITLE_TEXT, accent_style,
-    activity_style, surface_style, title_thumb_style,
+    self, accent_style, active_text, activity_style, dim_text, scrollbar, surface_style,
+    title_text, title_thumb_style,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -1442,7 +1442,7 @@ fn build_tabbar_commands(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: 0.0, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(COLOR_ACTIVE_TEXT),
+            fill: Style::Flat(active_text()),
             font_style: FontStyle(0x01),
             font_scale: 1.0,
             text: format!(" {label} "),
@@ -1497,7 +1497,7 @@ fn build_tabbar_commands(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(COLOR_ACTIVE_TEXT),
+            fill: Style::Flat(active_text()),
             font_style: FontStyle(0x00),
             font_scale: 1.0,
             text: num_text,
@@ -1541,9 +1541,9 @@ fn build_tabbar_commands(
             origin: Point { x: name_x0, y: 0.0 },
             align: Align::Left,
             fill: Style::Flat(if name_lit {
-                COLOR_ACTIVE_TEXT
+                active_text()
             } else {
-                COLOR_DIM_TEXT
+                dim_text()
             }),
             font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
             font_scale: 1.0,
@@ -1649,7 +1649,7 @@ fn build_chrome_commands(
                 y: text_origin_y,
             },
             align: Align::Right,
-            fill: Style::Flat(COLOR_TITLE_TEXT),
+            fill: Style::Flat(title_text()),
             font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
             font_scale: 1.0,
             text: title.to_string(),
@@ -1682,7 +1682,7 @@ fn build_chrome_commands(
         let thumb_y = track_y0 + thumb_norm * available;
 
         cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(COLOR_SCROLLBAR),
+            fill: Style::Flat(scrollbar()),
             rects: vec![Rect {
                 x: track_x,
                 y: thumb_y,
@@ -4481,6 +4481,10 @@ struct ProbeResults {
     /// The accent `host.accent` resolves to at this vmux's depth, when the
     /// host themes `host.*`. Used to derive shades (thumb, surface).
     accent_rgba: Option<[u8; 4]>,
+    /// The rest of the host's `host.*` palette (§10 theme block), which
+    /// is what lets vmux's chrome sit on the terminal's own surfaces
+    /// instead of its built-in dark ones.
+    theme_rgba: Option<[[u8; 4]; 8]>,
     /// VGE probe answer, if any (cell pixel metrics).
     vge: Option<VgeProbeData>,
     /// `Some(name)` when the host answered the SES probe `in_session`.
@@ -4488,10 +4492,13 @@ struct ProbeResults {
 }
 
 /// Parse a PRT ProbeResponse payload. Returns `(host_themed_styles,
-/// accent_rgba)`, or `None` if the payload is not a probe response. A body
-/// too short to contain the trailing `vge_features`/accent fields reads
-/// them as absent per §2.1 (missing trailing fields = zero).
-fn parse_prt_probe(payload: &[u8]) -> Option<(bool, Option<[u8; 4]>)> {
+/// accent_rgba, theme_rgba)`, or `None` if the payload is not a probe
+/// response. A body too short to contain the trailing
+/// `vge_features`/accent/theme fields reads them as absent per §2.1
+/// (missing trailing fields = zero).
+type PrtProbeAnswer = (bool, Option<[u8; 4]>, Option<[[u8; 4]; 8]>);
+
+fn parse_prt_probe(payload: &[u8]) -> Option<PrtProbeAnswer> {
     let mut r = PrtReader::new(payload);
     let _ = r.u8(); // payload protocol_version
     let _ = r.u32(); // payload_length
@@ -4513,15 +4520,22 @@ fn parse_prt_probe(payload: &[u8]) -> Option<(bool, Option<[u8; 4]>)> {
     let vge_features = r.u8().unwrap_or(0); // trailing §10 byte
     let themed = vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0;
     // The accent RGBA follows `vge_features` only when the host themes.
-    let accent = if themed {
-        match (r.u8(), r.u8(), r.u8(), r.u8()) {
-            (Ok(red), Ok(green), Ok(blue), Ok(alpha)) => Some([red, green, blue, alpha]),
-            _ => None,
-        }
-    } else {
-        None
+    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
+        (Ok(red), Ok(green), Ok(blue), Ok(alpha)) => Some([red, green, blue, alpha]),
+        _ => None,
     };
-    Some((themed, accent))
+    let accent = themed.then(&mut quad).flatten();
+    // Then the eight-colour theme block — all of it or none, so a
+    // truncated body never leaves half the palette at a colour the host
+    // did not send.
+    let theme = accent.and_then(|_| {
+        let mut quads = [[0u8; 4]; 8];
+        for slot in &mut quads {
+            *slot = quad()?;
+        }
+        Some(quads)
+    });
+    Some((themed, accent, theme))
 }
 
 /// Parse one decoded VGE response payload, returning probe metrics if
@@ -4566,6 +4580,7 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
         prt_ok: false,
         host_themed_styles: false,
         accent_rgba: None,
+        theme_rgba: None,
         vge: None,
         session_name: None,
     };
@@ -4590,10 +4605,11 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
         }
 
         for payload in prt_apc.feed(&buf[..n]).into_payloads() {
-            if let Some((themed, accent)) = parse_prt_probe(&payload) {
+            if let Some((themed, accent, theme)) = parse_prt_probe(&payload) {
                 res.prt_ok = true;
                 res.host_themed_styles = themed;
                 res.accent_rgba = accent;
+                res.theme_rgba = theme;
             }
         }
         for payload in vge_apc.feed(&buf[..n]).payloads {
@@ -4815,6 +4831,12 @@ fn main() -> Result<()> {
         theme::set_host_accent(theme::unpack(
             probe.accent_rgba.map(u32::from_be_bytes).unwrap_or(0),
         ));
+    }
+    // And the rest of its palette, so surfaces and text belong to the
+    // terminal rather than to vmux's own dark scheme. Separate from the
+    // accent: a host may publish one and not the other.
+    if let Some(quads) = probe.theme_rgba {
+        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
     }
 
     tty.enter_alt_screen()?;

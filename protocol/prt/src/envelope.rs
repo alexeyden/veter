@@ -10,7 +10,8 @@ use crate::frame::*;
 /// the §10 VGE-integration capability bits. The body length is the
 /// source of truth, so omitting it (`None`) is equivalent to advertising
 /// "VGE-in-portal not supported" — clients reading a shorter body MUST
-/// treat missing trailing fields as zero.
+/// treat missing trailing fields as zero. `accent_rgba` and `theme_rgba`
+/// follow it on the same terms.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProbeBody {
@@ -30,6 +31,13 @@ pub struct ProbeBody {
     /// it references by `StyleRef`. Encoded only when `Some`, and only
     /// meaningful when the themed bit is set in `vge_features`.
     pub accent_rgba: Option<[u8; 4]>,
+    /// §10 — the eight non-accent `host.*` colours (VGE §7.3), in the
+    /// order `veter_host::vge::HostThemeColors::IDS` lists them, each a
+    /// straight RGBA8 quad. Lets a client shade its chrome from the same
+    /// surface and text colours it references by `StyleRef`, the way
+    /// `accent_rgba` does for the accent. Encoded only when `Some`, and
+    /// only reachable when `accent_rgba` is too.
+    pub theme_rgba: Option<[[u8; 4]; 8]>,
 }
 
 impl ProbeBody {
@@ -51,15 +59,24 @@ impl ProbeBody {
                 for b in rgba {
                     w.u8(b);
                 }
+                // Likewise positional: the theme block can only follow
+                // an accent, never stand in for one.
+                if let Some(theme) = self.theme_rgba {
+                    for quad in theme {
+                        for b in quad {
+                            w.u8(b);
+                        }
+                    }
+                }
             }
         }
         w.buf
     }
 
-    /// Inverse of [`Self::encode`]. `vge_features` and `accent_rgba`
-    /// are positional tail fields, so a body that stops early decodes
-    /// with them `None` rather than failing — which is exactly how a
-    /// host that predates them replies.
+    /// Inverse of [`Self::encode`]. `vge_features`, `accent_rgba` and
+    /// `theme_rgba` are positional tail fields, so a body that stops
+    /// early decodes with them `None` rather than failing — which is
+    /// exactly how a host that predates them replies.
     pub fn decode(body: &[u8]) -> Result<Self, crate::codec::DecodeError> {
         let mut r = Reader::new(body);
         let protocol_version = r.u16()?;
@@ -71,11 +88,30 @@ impl ProbeBody {
         let features = r.u8()?;
         let max_nesting_depth = r.u8()?;
         let vge_features = r.u8().ok();
+        let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
+            _ => None,
+        };
         let accent_rgba = if vge_features.is_some() {
-            match (r.u8(), r.u8(), r.u8(), r.u8()) {
-                (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
-                _ => None,
+            quad()
+        } else {
+            None
+        };
+        // All eight or none: a partial block would leave some ids at a
+        // colour the host never sent.
+        let theme_rgba = if accent_rgba.is_some() {
+            let mut quads = [[0u8; 4]; 8];
+            let mut all = true;
+            for slot in &mut quads {
+                match quad() {
+                    Some(q) => *slot = q,
+                    None => {
+                        all = false;
+                        break;
+                    }
+                }
             }
+            all.then_some(quads)
         } else {
             None
         };
@@ -90,6 +126,7 @@ impl ProbeBody {
             max_nesting_depth,
             vge_features,
             accent_rgba,
+            theme_rgba,
         })
     }
 }
@@ -276,6 +313,7 @@ mod tests {
             max_nesting_depth: 8,
             vge_features: None,
             accent_rgba: None,
+            theme_rgba: None,
         };
         assert_eq!(pb.encode().len(), 24);
 
@@ -294,6 +332,25 @@ mod tests {
         };
         assert_eq!(pb3.encode().len(), 29);
 
+        // With VGE byte + accent + the eight theme colours: 29 + 32 = 61.
+        let pb5 = ProbeBody {
+            vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
+            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
+            theme_rgba: Some([[1, 2, 3, 4]; 8]),
+            ..pb
+        };
+        assert_eq!(pb5.encode().len(), 61);
+
+        // A theme block with no accent has no slot to sit in and is
+        // dropped, the same way an accent with no vge_features is.
+        let pb6 = ProbeBody {
+            vge_features: Some(FEAT_VGE_IN_PORTAL),
+            accent_rgba: None,
+            theme_rgba: Some([[1, 2, 3, 4]; 8]),
+            ..pb
+        };
+        assert_eq!(pb6.encode().len(), 25);
+
         // accent_rgba without vge_features cannot be encoded (no gap):
         // it is silently dropped, length stays at the 24-byte prefix.
         let pb4 = ProbeBody {
@@ -302,6 +359,57 @@ mod tests {
             ..pb
         };
         assert_eq!(pb4.encode().len(), 24);
+    }
+
+    /// The tail fields are positional, so what a decoder must survive
+    /// is a body that stops anywhere: at the prefix (a host that
+    /// predates VGE integration), after the VGE byte, after the accent,
+    /// or mid-way through the theme block.
+    #[test]
+    fn probe_body_round_trips_and_tolerates_truncation() {
+        let full = ProbeBody {
+            protocol_version: 1,
+            max_portals: 64,
+            max_portal_cells_w: 1024,
+            max_portal_cells_h: 512,
+            max_scrollback_lines: 100_000,
+            max_write_bytes: 1 << 20,
+            features: 0xFF,
+            max_nesting_depth: 8,
+            vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
+            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
+            theme_rgba: Some(std::array::from_fn(|i| [i as u8, 2, 3, 4])),
+        };
+        let bytes = full.encode();
+        let back = ProbeBody::decode(&bytes).unwrap();
+        assert_eq!(back.protocol_version, full.protocol_version);
+        assert_eq!(back.max_write_bytes, full.max_write_bytes);
+        assert_eq!(back.vge_features, full.vge_features);
+        assert_eq!(back.accent_rgba, full.accent_rgba);
+        assert_eq!(back.theme_rgba, full.theme_rgba);
+
+        // Truncated to just before the theme block: accent survives,
+        // theme is absent rather than an error.
+        let back = ProbeBody::decode(&bytes[..29]).unwrap();
+        assert_eq!(back.accent_rgba, full.accent_rgba);
+        assert_eq!(back.theme_rgba, None);
+
+        // Half a theme block is no theme block — all eight or none.
+        let back = ProbeBody::decode(&bytes[..45]).unwrap();
+        assert_eq!(back.accent_rgba, full.accent_rgba);
+        assert_eq!(back.theme_rgba, None);
+
+        // A pre-VGE host's 24-byte body.
+        let back = ProbeBody::decode(&bytes[..24]).unwrap();
+        assert_eq!(back.vge_features, None);
+        assert_eq!(back.accent_rgba, None);
+        assert_eq!(back.theme_rgba, None);
+
+        // A longer body than this client knows about is tolerated by
+        // skipping the excess (§2.1).
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[0xAA; 6]);
+        assert_eq!(ProbeBody::decode(&longer).unwrap().theme_rgba, full.theme_rgba);
     }
 
     #[test]

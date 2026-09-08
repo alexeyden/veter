@@ -6,6 +6,7 @@ use femtovg::{
 };
 
 use crate::prt;
+use crate::theme::{Rgba, Theme};
 use crate::vge;
 use imgref::{Img, ImgRef};
 use parley::{
@@ -180,57 +181,18 @@ pub fn selection_range_from_abs(
     })
 }
 
-// ANSI 256-color palette
-fn ansi_color(idx: u8) -> Color {
-    match idx {
-        0 => Color::rgb(0, 0, 0),
-        1 => Color::rgb(204, 0, 0),
-        2 => Color::rgb(78, 154, 6),
-        3 => Color::rgb(196, 160, 0),
-        4 => Color::rgb(52, 101, 164),
-        5 => Color::rgb(117, 80, 123),
-        6 => Color::rgb(6, 152, 154),
-        7 => Color::rgb(211, 215, 207),
-        8 => Color::rgb(85, 87, 83),
-        9 => Color::rgb(239, 41, 41),
-        10 => Color::rgb(138, 226, 52),
-        11 => Color::rgb(252, 233, 79),
-        12 => Color::rgb(114, 159, 207),
-        13 => Color::rgb(173, 127, 168),
-        14 => Color::rgb(52, 226, 226),
-        15 => Color::rgb(238, 238, 236),
-        16..=231 => {
-            let idx = idx - 16;
-            let ri = idx / 36;
-            let gi = (idx / 6) % 6;
-            let bi = idx % 6;
-            let r = if ri == 0 { 0 } else { ri * 40 + 55 };
-            let g = if gi == 0 { 0 } else { gi * 40 + 55 };
-            let b = if bi == 0 { 0 } else { bi * 40 + 55 };
-            Color::rgb(r, g, b)
-        }
-        232..=255 => {
-            let v = (idx - 232) * 10 + 8;
-            Color::rgb(v, v, v)
-        }
-    }
-}
-
-/// Terminal default background. Also the "selected" foreground for VGE
-/// text (`draw_vge_text_selected`), which reverse-videos against the
-/// text's own colour the way a selected cell does.
+/// Terminal default background, in the built-in theme. The window's
+/// ground before a renderer exists, and the "selected" foreground for
+/// VGE text (`draw_vge_text_selected`), which reverse-videos against
+/// the text's own colour the way a selected cell does.
+///
+/// A themed veter reads [`Palette::bg`] instead; this is the value a
+/// `[theme]`-free config resolves to, kept as a `const` for the paths
+/// that have no palette to ask.
 pub const DEFAULT_BG: Color = Color {
     r: 30.0 / 255.0,
     g: 30.0 / 255.0,
     b: 30.0 / 255.0,
-    a: 1.0,
-};
-
-/// Terminal default foreground, before any OSC 10 override.
-const DEFAULT_FG: Color = Color {
-    r: 204.0 / 255.0,
-    g: 204.0 / 255.0,
-    b: 204.0 / 255.0,
     a: 1.0,
 };
 
@@ -240,8 +202,45 @@ const DEFAULT_FG: Color = Color {
 /// is an override over the built-in value, so `OSC 104` / `OSC 110`
 /// and friends reset by clearing rather than by remembering a copy of
 /// the defaults.
-#[derive(Clone)]
+/// The theme colours a [`Palette`] resolves against, flattened out of
+/// [`Theme`] so the whole palette stays plain `Copy` data — the render
+/// pass clones it once per frame, and a `Theme` in there would put a
+/// heap allocation on that path.
+#[derive(Clone, Copy)]
+struct PaletteBase {
+    ansi: [Color; 16],
+    fg: Color,
+    bg: Color,
+    cursor: Option<Color>,
+    selection_bg: Option<Color>,
+    selection_fg: Option<Color>,
+}
+
+impl PaletteBase {
+    fn from_theme(theme: &Theme) -> Self {
+        Self {
+            ansi: theme.ansi.map(Rgba::to_femto),
+            fg: theme.foreground.to_femto(),
+            bg: theme.background.to_femto(),
+            cursor: theme.cursor.map(Rgba::to_femto),
+            selection_bg: theme.selection_bg.map(Rgba::to_femto),
+            selection_fg: theme.selection_fg.map(Rgba::to_femto),
+        }
+    }
+
+    fn indexed(&self, i: u8) -> Color {
+        match i {
+            0..=15 => self.ansi[i as usize],
+            _ => crate::theme::indexed_extended(i).to_femto(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Palette {
+    /// The user's theme, as the base every override below sits on and
+    /// what a reset falls back to.
+    base: PaletteBase,
     indexed: [Option<Color>; 256],
     default_fg: Option<Color>,
     default_bg: Option<Color>,
@@ -250,36 +249,58 @@ pub struct Palette {
 
 impl Default for Palette {
     fn default() -> Self {
+        Self::with_theme(&Theme::default())
+    }
+}
+
+impl Palette {
+    /// A palette over `theme`. The theme is the *base*: an `OSC 4 / 10
+    /// / 11 / 12` from inside the terminal overrides an entry, and
+    /// `OSC 104 / 110 / 111 / 112` drops the override — putting the
+    /// theme's colour back, not a hardcoded one.
+    #[must_use]
+    pub fn with_theme(theme: &Theme) -> Self {
         Self {
+            base: PaletteBase::from_theme(theme),
             indexed: [None; 256],
             default_fg: None,
             default_bg: None,
             cursor: None,
         }
     }
-}
 
-impl Palette {
     #[must_use]
     pub fn indexed(&self, i: u8) -> Color {
-        self.indexed[i as usize].unwrap_or_else(|| ansi_color(i))
+        self.indexed[i as usize].unwrap_or_else(|| self.base.indexed(i))
     }
 
     #[must_use]
     pub fn fg(&self) -> Color {
-        self.default_fg.unwrap_or(DEFAULT_FG)
+        self.default_fg.unwrap_or(self.base.fg)
     }
 
     #[must_use]
     pub fn bg(&self) -> Color {
-        self.default_bg.unwrap_or(DEFAULT_BG)
+        self.default_bg.unwrap_or(self.base.bg)
     }
 
-    /// The cursor colour a program asked for with `OSC 12`, or `None`
+    /// The theme's selection colours, if it sets any: `(background,
+    /// foreground)`, either of which may be `None` to leave that half
+    /// of the cell alone. `None` for the whole thing means the built-in
+    /// reverse-video selection.
+    #[must_use]
+    pub fn selection(&self) -> Option<(Option<Color>, Option<Color>)> {
+        match (self.base.selection_bg, self.base.selection_fg) {
+            (None, None) => None,
+            pair => Some(pair),
+        }
+    }
+
+    /// The cursor colour, from `OSC 12` or from the theme, or `None`
     /// to keep the built-in look (the cell drawn in reverse video).
     #[must_use]
     pub fn cursor(&self) -> Option<Color> {
-        self.cursor
+        self.cursor.or(self.base.cursor)
     }
 
     pub fn set_indexed(&mut self, i: u8, rgb: (u8, u8, u8)) {
@@ -319,7 +340,7 @@ impl Palette {
         rgb8(match which {
             vt100::DynamicColor::Foreground => self.fg(),
             vt100::DynamicColor::Background => self.bg(),
-            vt100::DynamicColor::Cursor => self.cursor.unwrap_or_else(|| self.fg()),
+            vt100::DynamicColor::Cursor => self.cursor().unwrap_or_else(|| self.fg()),
         })
     }
 
@@ -446,11 +467,28 @@ fn resolve_cell_colors(
         vt100::Color::Rgb(r, g, b) => Color::rgb(r, g, b),
     };
 
+    // A themed selection paints its own colours; a theme that names
+    // none keeps the built-in look, where selecting a cell is one more
+    // inversion of it. Setting only `selection_bg` fills behind the
+    // cell and leaves the character its own colour, which is what the
+    // schemes that publish a single selection colour mean.
+    let themed_selection = is_selected.then(|| palette.selection()).flatten();
+
     // DECSCNM (`?5`) reverses the whole screen, cell colours included —
     // it is what terminfo's `flash` blinks the window with. It stacks
     // with the per-cell inversions rather than overriding them.
-    if cell.inverse() ^ is_selected ^ reverse_video {
+    let invert = cell.inverse() ^ reverse_video ^ (is_selected && themed_selection.is_none());
+    if invert {
         std::mem::swap(&mut fg, &mut bg);
+    }
+
+    if let Some((sel_bg, sel_fg)) = themed_selection {
+        if let Some(c) = sel_bg {
+            bg = c;
+        }
+        if let Some(c) = sel_fg {
+            fg = c;
+        }
     }
 
     // The block cursor. Without an `OSC 12` colour it is the cell in
@@ -1656,6 +1694,12 @@ pub struct TerminalRenderer {
     /// `[accent]`.
     selection_accent: Color,
 
+    /// The user's theme. Backs `palette` (the grid) and the chrome
+    /// accessors below (the search panel and the close prompt), so
+    /// every colour veter paints of its own comes from one place. The
+    /// built-in default until `set_theme`.
+    theme: Theme,
+
     /// The colour table, as OSC 4 / 10 / 11 / 12 have left it.
     pub palette: Palette,
 
@@ -1766,6 +1810,7 @@ impl TerminalRenderer {
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
             selection_accent: Color::rgb(0x56, 0x79, 0x9f),
+            theme: Theme::default(),
             palette: Palette::default(),
             blink_phase: true,
             blink_seen: false,
@@ -1858,6 +1903,54 @@ impl TerminalRenderer {
             index,
             cell,
         ))
+    }
+
+    /// Adopt the user's theme: it becomes the grid palette's base (see
+    /// [`Palette::with_theme`]) and the source of every chrome colour
+    /// below. Called once at startup, before `set_search_colors` and
+    /// `set_selection_accent` layer the `[search]` / `[accent]`
+    /// sections over the values it implies.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.palette = Palette::with_theme(&theme);
+        self.search_accent = theme.search_accent().to_femto();
+        self.search_bar_text = theme.search_text().to_femto();
+        self.search_current_match = theme.search_current_match().to_femto();
+        self.search_match = theme.search_match().to_femto();
+        self.selection_accent = theme.accent_primary().to_femto();
+        self.theme = theme;
+    }
+
+    /// Background of an overlay panel — the search panel, the close
+    /// prompt.
+    pub fn panel_bg(&self) -> Color {
+        self.theme.surface().to_femto()
+    }
+
+    /// A recessed surface inside a panel: the query field, and a chip
+    /// that is switched off.
+    pub fn panel_inset_bg(&self) -> Color {
+        self.theme.surface_inset().to_femto()
+    }
+
+    /// Primary text on [`Self::panel_bg`].
+    pub fn panel_text(&self) -> Color {
+        self.theme.text().to_femto()
+    }
+
+    /// Text on an accent-filled chip or button.
+    pub fn on_accent_text(&self) -> Color {
+        self.theme.text_on_accent().to_femto()
+    }
+
+    /// The warm trio — fill, outline, text — for the answer that gets
+    /// you nothing: the prompt's Quit button, the search panel's
+    /// `no matches`.
+    pub fn warn_colors(&self) -> (Color, Color, Color) {
+        (
+            self.theme.warn_fill().to_femto(),
+            self.theme.warn_border().to_femto(),
+            self.theme.warn_text().to_femto(),
+        )
     }
 
     pub fn set_selection_accent(&mut self, accent: Color) {
@@ -2060,6 +2153,10 @@ impl TerminalRenderer {
 
         let layout = self.layout_vge_text(text, x_px, align, font_style, scale);
         let extent = layout.extent();
+        // The colour a selected span's glyphs are redrawn in: the
+        // terminal's own background, so VGE text reverse-videos against
+        // the same ground a selected grid cell does — theme included.
+        let ground = self.palette.bg();
         self.draw_run(canvas, &layout, y_px, scale, font_style, color);
 
         if let Some((start, end)) = selected
@@ -2076,7 +2173,7 @@ impl TerminalRenderer {
 
                 canvas.save();
                 canvas.intersect_scissor(x0, top, x1 - x0, height);
-                self.draw_run(canvas, &layout, y_px, scale, font_style, DEFAULT_BG);
+                self.draw_run(canvas, &layout, y_px, scale, font_style, ground);
                 canvas.restore();
             }
         }
@@ -2947,19 +3044,90 @@ mod palette_tests {
         p
     }
 
+    fn base(i: u8) -> (u8, u8, u8) {
+        let c = Theme::default().indexed(i);
+        (c.r, c.g, c.b)
+    }
+
     #[test]
     fn osc_4_overrides_one_entry_and_104_puts_it_back() {
         let mut pal = Palette::default();
-        assert_eq!(pal.indexed_rgb(1), rgb8(ansi_color(1)));
+        assert_eq!(pal.indexed_rgb(1), base(1));
         pal.set_indexed(1, (1, 2, 3));
         assert_eq!(pal.indexed_rgb(1), (1, 2, 3));
         pal.reset_indexed(Some(1));
-        assert_eq!(pal.indexed_rgb(1), rgb8(ansi_color(1)));
+        assert_eq!(pal.indexed_rgb(1), base(1));
 
         pal.set_indexed(1, (1, 2, 3));
         pal.set_indexed(2, (4, 5, 6));
         pal.reset_indexed(None);
-        assert_eq!(pal.indexed_rgb(2), rgb8(ansi_color(2)));
+        assert_eq!(pal.indexed_rgb(2), base(2));
+    }
+
+    /// The theme is the *base*, not another override: `OSC 104` puts
+    /// back what the user configured, not what veter shipped with. A
+    /// themed terminal whose reset dropped to Tango would be a
+    /// different terminal after any program that resets the palette on
+    /// exit.
+    #[test]
+    fn a_reset_falls_back_to_the_theme_not_to_the_built_in_palette() {
+        let nord = crate::theme::builtin("nord").unwrap();
+        let mut pal = Palette::with_theme(&nord);
+        assert_eq!(pal.indexed_rgb(1), (0xbf, 0x61, 0x6a));
+        pal.set_indexed(1, (1, 2, 3));
+        pal.reset_indexed(Some(1));
+        assert_eq!(pal.indexed_rgb(1), (0xbf, 0x61, 0x6a));
+
+        // The same for the dynamic trio. `OSC 11 ; ?` answering the
+        // theme background is what tells vim which colourscheme half to
+        // pick, so it must survive an `OSC 111`.
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Background),
+            (0x2e, 0x34, 0x40)
+        );
+        pal.set_dynamic(vt100::DynamicColor::Background, (9, 9, 9));
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Background), (9, 9, 9));
+        pal.reset_dynamic(vt100::DynamicColor::Background);
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Background),
+            (0x2e, 0x34, 0x40)
+        );
+        // nord names a cursor colour, so the cursor reports it rather
+        // than the foreground it would otherwise be drawn against.
+        assert_eq!(
+            pal.dynamic_rgb(vt100::DynamicColor::Cursor),
+            (0xd8, 0xde, 0xe9)
+        );
+    }
+
+    /// A theme that names a selection colour paints it; one that does
+    /// not keeps the reverse-video selection veter has always drawn.
+    /// Both stack with `SGR 7` the same way — selecting inverted text
+    /// must not cancel the inversion out.
+    #[test]
+    fn a_themed_selection_paints_instead_of_inverting() {
+        let plain = cell_after(b"x");
+        let cell = plain.screen().cell(0, 0).unwrap();
+
+        let pal = Palette::default();
+        let (fg, bg) = resolve_cell_colors(cell, false, true, &pal, false);
+        assert_eq!((rgb8(fg), rgb8(bg)), (rgb8(pal.bg()), rgb8(pal.fg())));
+
+        let nord = crate::theme::builtin("nord").unwrap();
+        let pal = Palette::with_theme(&nord);
+        let (fg, bg) = resolve_cell_colors(cell, false, true, &pal, false);
+        // Only `selection_bg` is set, so the glyph keeps its own colour.
+        assert_eq!(rgb8(bg), (0x43, 0x4c, 0x5e));
+        assert_eq!(rgb8(fg), rgb8(pal.fg()));
+
+        // Under `SGR 7` the cell is already inverted; a themed
+        // selection replaces the background of whatever is there rather
+        // than un-inverting it.
+        let inverted = cell_after(b"\x1b[7mx");
+        let cell = inverted.screen().cell(0, 0).unwrap();
+        let (fg, bg) = resolve_cell_colors(cell, false, true, &pal, false);
+        assert_eq!(rgb8(bg), (0x43, 0x4c, 0x5e));
+        assert_eq!(rgb8(fg), rgb8(pal.bg()));
     }
 
     /// An `OSC 11 ; ?` before anything sets it must report the real
@@ -2967,28 +3135,25 @@ mod palette_tests {
     /// picks a light or a dark colourscheme.
     #[test]
     fn the_dynamic_colours_report_the_defaults_until_they_are_set() {
+        let theme = Theme::default();
+        let (fg, bg) = (
+            (theme.foreground.r, theme.foreground.g, theme.foreground.b),
+            (theme.background.r, theme.background.g, theme.background.b),
+        );
+        // `DEFAULT_BG` is the pre-renderer stand-in for the same value
+        // and must not drift from it.
+        assert_eq!(rgb8(DEFAULT_BG), bg);
+
         let mut pal = Palette::default();
-        assert_eq!(
-            pal.dynamic_rgb(vt100::DynamicColor::Background),
-            rgb8(DEFAULT_BG),
-        );
-        assert_eq!(
-            pal.dynamic_rgb(vt100::DynamicColor::Foreground),
-            rgb8(DEFAULT_FG),
-        );
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Background), bg);
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Foreground), fg);
         // With no cursor colour of its own, the cursor reports the
         // foreground it is drawn against.
-        assert_eq!(
-            pal.dynamic_rgb(vt100::DynamicColor::Cursor),
-            rgb8(DEFAULT_FG),
-        );
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Cursor), fg);
         pal.set_dynamic(vt100::DynamicColor::Cursor, (9, 9, 9));
         assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Cursor), (9, 9, 9));
         pal.reset_dynamic(vt100::DynamicColor::Cursor);
-        assert_eq!(
-            pal.dynamic_rgb(vt100::DynamicColor::Cursor),
-            rgb8(DEFAULT_FG),
-        );
+        assert_eq!(pal.dynamic_rgb(vt100::DynamicColor::Cursor), fg);
     }
 
     #[test]

@@ -1643,11 +1643,12 @@ impl Drop for TermGuard {
     }
 }
 
-/// Query the terminal's themed accent with a PRT probe (portal-extension
-/// §2.1 / §10), so vfm's chrome tracks veter's theme and, inside a vmux
-/// pane, that pane's nesting depth. Best-effort: a terminal that does not
-/// speak PRT simply leaves vfm on its built-in accent.
-fn probe_host_accent(timeout: Duration) -> Option<Color> {
+/// Query the terminal's themed palette with a PRT probe
+/// (portal-extension §2.1 / §10), so vfm's chrome tracks veter's theme
+/// and, inside a vmux pane, that pane's nesting depth. Best-effort: a
+/// terminal that does not speak PRT simply leaves vfm on its built-in
+/// colours.
+fn probe_host_theme(timeout: Duration) -> Option<(Color, Option<[[u8; 4]; 8]>)> {
     use prt_protocol::frame::MARKER_T2C;
 
     let env = prt_protocol::encode::build_envelope(&[(prt_protocol::command::Command::Probe, 0)]);
@@ -1669,16 +1670,18 @@ fn probe_host_accent(timeout: Duration) -> Option<Color> {
             return None;
         }
         if let Some(payload) = apc.feed(&buf[..n]).into_payloads().next() {
-            return parse_prt_accent(&payload);
+            return parse_prt_theme(&payload);
         }
     }
 }
 
-/// Pull the themed accent out of a PRT ProbeResponse payload. The accent
-/// RGBA8 follows the `vge_features` byte (§10) only when the host sets
+/// Pull the themed palette out of a PRT ProbeResponse payload: the
+/// accent, and the eight-colour theme block behind it. Both follow the
+/// `vge_features` byte (§10) and are present only when the host sets
 /// `FEAT_VGE_HOST_THEMED_STYLES`; a short body (older host) reads the
-/// trailing fields as absent and yields `None`.
-fn parse_prt_accent(payload: &[u8]) -> Option<Color> {
+/// trailing fields as absent, and yields `None` for the accent or the
+/// block respectively.
+fn parse_prt_theme(payload: &[u8]) -> Option<(Color, Option<[[u8; 4]; 8]>)> {
     use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, RSP_PROBE};
 
     let mut r = prt_protocol::Reader::new(payload);
@@ -1701,13 +1704,35 @@ fn parse_prt_accent(payload: &[u8]) -> Option<Color> {
     if vge_features & FEAT_VGE_HOST_THEMED_STYLES == 0 {
         return None;
     }
-    let (red, green, blue, alpha) = (r.u8().ok()?, r.u8().ok()?, r.u8().ok()?, r.u8().ok()?);
-    Some(Color {
-        r: red as f32 / 255.0,
-        g: green as f32 / 255.0,
-        b: blue as f32 / 255.0,
-        a: alpha as f32 / 255.0,
-    })
+    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
+        _ => None,
+    };
+    let [red, green, blue, alpha] = quad()?;
+    // All eight or none — half a palette is worse than none of it.
+    let theme = {
+        let mut quads = [[0u8; 4]; 8];
+        let mut all = true;
+        for slot in &mut quads {
+            match quad() {
+                Some(q) => *slot = q,
+                None => {
+                    all = false;
+                    break;
+                }
+            }
+        }
+        all.then_some(quads)
+    };
+    Some((
+        Color {
+            r: red as f32 / 255.0,
+            g: green as f32 / 255.0,
+            b: blue as f32 / 255.0,
+            a: alpha as f32 / 255.0,
+        },
+        theme,
+    ))
 }
 
 fn term_size() -> (u32, u32) {
@@ -1777,10 +1802,17 @@ fn main() -> Result<()> {
     ]))?;
     out.flush()?;
 
-    if let Some(rgba) = args.accent {
-        theme::set_cli_accent(theme::unpack(rgba));
-    } else if let Some(accent) = probe_host_accent(PROBE_TIMEOUT) {
-        theme::set_host_accent(accent);
+    // The CLI accent overrides the host's, but never its surfaces and
+    // text — those describe the terminal vfm is drawing on, not which
+    // colour its chrome should be.
+    let host = probe_host_theme(PROBE_TIMEOUT);
+    match (args.accent, host) {
+        (Some(rgba), _) => theme::set_cli_accent(theme::unpack(rgba)),
+        (None, Some((accent, _))) => theme::set_host_accent(accent),
+        (None, None) => {}
+    }
+    if let Some((_, Some(quads))) = host {
+        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
     }
 
     let config = match args.config {

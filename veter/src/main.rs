@@ -66,17 +66,21 @@ fn window_title_for(title: &str) -> String {
     }
 }
 
-/// Host accent palette published into the reserved `host.*` VGE style
-/// namespace (`doc/vector-graphics-extension.md` §7.3). Slot N maps to
-/// `host.accent.{N+1}`; the contextual `host.accent` rotates through
-/// these by portal nesting depth, so a top-level vmux, a vmux nested
-/// inside it, and one nested again render their chrome in slots 0/1/2.
-/// The concrete colors come from the user's config (`[accent]`), which
-/// defaults to the built-in blue/olive/violet triple in `config.rs`.
-fn host_accent_palette(config: &config::Config) -> vge::HostThemePalette {
-    vge::HostThemePalette {
-        accents: config.accent_palette(),
-    }
+/// The host palette published into the reserved `host.*` VGE style
+/// namespace (`doc/vector-graphics-extension.md` §7.3).
+///
+/// Accent slot N maps to `host.accent.{N+1}`; the contextual
+/// `host.accent` rotates through them by portal nesting depth, so a
+/// top-level vmux, a vmux nested inside it, and one nested again render
+/// their chrome in slots 0/1/2. The rest of the namespace — the ground,
+/// the text, the surfaces a modal is built from — does not rotate;
+/// there is one terminal behind every portal, and a client's chrome
+/// should belong to it.
+///
+/// The colours come from the resolved theme, with `[accent] palette`
+/// overriding its accents when the user pins some.
+fn host_palette(config: &config::Config, theme: &veter::theme::Theme) -> vge::HostThemePalette {
+    theme.host_palette(config.accent_palette_rgba(theme))
 }
 
 /// Run a user-defined selection command (`config.selection_commands`) on
@@ -930,6 +934,13 @@ struct App {
     /// search-chrome colors, host key chords, selection commands).
     /// Missing file / parse error → built-in defaults; see `config.rs`.
     config: config::Config,
+    /// The colour theme resolved from `[theme]` once at startup —
+    /// built-in name, user file under `themes/`, and the section's own
+    /// per-key overrides, all folded together. The renderer holds its
+    /// own copy (it is what backs the grid palette and the chrome); this
+    /// one is for the paths that resolve a colour before the renderer
+    /// exists, or without borrowing it.
+    theme: veter::theme::Theme,
     /// Compiled key chord → action tables, derived from `config.keys`.
     keys: config::KeyBindings,
     /// What hint mode looks for, resolved from `[hints]` once at
@@ -1499,37 +1510,6 @@ impl FrameTrace {
 // comes from the user (`[accent]`, or `[search] accent` for the search
 // panel), which is what makes both follow a palette change.
 
-/// Background of an overlay panel.
-fn panel_bg() -> Color {
-    Color::rgb(38, 38, 42)
-}
-
-/// A recessed surface inside a panel: the query field, and a chip that
-/// is switched off.
-fn panel_inset_bg() -> Color {
-    Color::rgb(26, 26, 30)
-}
-
-/// Primary text on [`panel_bg`].
-fn panel_text() -> Color {
-    Color::rgb(235, 235, 235)
-}
-
-/// Text on an accent-filled chip or button.
-fn on_accent_text() -> Color {
-    Color::rgb(245, 245, 245)
-}
-
-/// The warm trio — fill, outline, text — for the answer that gets you
-/// nothing: the prompt's Quit button, the search panel's `no matches`.
-fn warn_colors() -> (Color, Color, Color) {
-    (
-        Color::rgb(52, 40, 42),
-        Color::rgb(150, 70, 70),
-        Color::rgb(232, 130, 130),
-    )
-}
-
 /// Blend `color` toward white by `amount` (`0.0`..=`1.0`).
 fn lighten(color: Color, amount: f32) -> Color {
     Color::rgbaf(
@@ -1594,6 +1574,12 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let ascent = tr.ascent();
     let accent = tr.search_accent();
     let text_color = tr.search_bar_text();
+    // The panel's own surfaces, from the theme (`renderer::TerminalRenderer`
+    // chrome accessors). Read once here so the borrow of `tr` never
+    // overlaps the draw calls below.
+    let panel_bg = tr.panel_bg();
+    let panel_inset_bg = tr.panel_inset_bg();
+    let on_accent_text = tr.on_accent_text();
 
     // Sized in cells, like the close prompt, so the panel keeps its
     // proportions across font sizes and HiDPI scales.
@@ -1622,14 +1608,14 @@ fn draw_search_bar<T: femtovg::Renderer>(
             } else {
                 format!("{}/{}", search.current + 1, search.matches.len())
             },
-            fill: mix(panel_bg(), accent, 0.3),
+            fill: mix(panel_bg, accent, 0.3),
             border: None,
             // The counter is drawn in the current-match colour, so the
             // number and the highlight it points at agree on screen.
             text: tr.search_current_match(),
         });
     } else if hints_mode || !search.query.is_empty() {
-        let (fill, border, text) = warn_colors();
+        let (fill, border, text) = tr.warn_colors();
         chips.push(Chip {
             label: if hints_mode { "no hints" } else { "no matches" }.to_string(),
             fill,
@@ -1645,7 +1631,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
         chips.push(if search.case_insensitive {
             Chip {
                 label: "Aa".to_string(),
-                fill: panel_inset_bg(),
+                fill: panel_inset_bg,
                 border: Some(fade(text_color, 0.22)),
                 text: fade(text_color, 0.5),
             }
@@ -1654,7 +1640,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
                 label: "Aa".to_string(),
                 fill: accent,
                 border: None,
-                text: on_accent_text(),
+                text: on_accent_text,
             }
         });
     }
@@ -1747,7 +1733,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
 
     let mut panel = femtovg::Path::new();
     panel.rounded_rect(panel_x, panel_y, panel_w, panel_h, radius);
-    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg()));
+    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg));
     let mut border = femtovg::Paint::color(accent);
     border.set_line_width(2.0);
     canvas.stroke_path(&panel, &border);
@@ -1759,7 +1745,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
     if !hints_mode {
         let mut field = femtovg::Path::new();
         field.rounded_rect(field_x, row_y, field_w, chip_h, chip_radius);
-        canvas.fill_path(&field, &femtovg::Paint::color(panel_inset_bg()));
+        canvas.fill_path(&field, &femtovg::Paint::color(panel_inset_bg));
     }
 
     let inner_x = field_x + cell_w * 0.5;
@@ -2121,6 +2107,11 @@ fn draw_close_prompt<T: femtovg::Renderer>(
         tr.ascent(),
     );
 
+    let panel_bg = tr.panel_bg();
+    let panel_text = tr.panel_text();
+    let on_accent_text = tr.on_accent_text();
+    let (warn_fill, warn_border, warn_text) = tr.warn_colors();
+
     // Scrim: dims the terminal behind the panel without hiding it, so
     // the user can still read what they are about to close.
     let mut scrim = femtovg::Path::new();
@@ -2131,7 +2122,7 @@ fn draw_close_prompt<T: femtovg::Renderer>(
     let radius = tr.cell_height * 0.5;
     let mut panel = femtovg::Path::new();
     panel.rounded_rect(px, py, pw, ph, radius);
-    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg()));
+    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg));
     let mut border = femtovg::Paint::color(accent);
     border.set_line_width(2.0);
     canvas.stroke_path(&panel, &border);
@@ -2141,7 +2132,7 @@ fn draw_close_prompt<T: femtovg::Renderer>(
         layout.title_center_x,
         layout.title_baseline_y,
         CLOSE_PROMPT_TITLE,
-        panel_text(),
+        panel_text,
         vge::command::Align::Center,
         vge::command::FontStyle::default(),
         1.0,
@@ -2158,18 +2149,13 @@ fn draw_close_prompt<T: femtovg::Renderer>(
         let hot = hover == Some(button);
         let mut path = femtovg::Path::new();
         path.rounded_rect(bx, by, bw, bh, radius * 0.6);
-        let (warn_fill, warn_border, warn_text) = warn_colors();
         let (fill, text_color) = match button {
             PromptButton::Cancel => (
                 if hot { lighten(accent, 0.25) } else { accent },
-                on_accent_text(),
+                on_accent_text,
             ),
             PromptButton::Quit => (
-                if hot {
-                    Color::rgb(92, 44, 44)
-                } else {
-                    warn_fill
-                },
+                if hot { lighten(warn_fill, 0.12) } else { warn_fill },
                 warn_text,
             ),
         };
@@ -2335,7 +2321,9 @@ impl App {
     ) -> Self {
         let keys = config.key_bindings();
         let hint_config = config.hint_config();
+        let theme = config.theme();
         Self {
+            theme,
             window: None,
             gl_surface: None,
             gl_context: None,
@@ -5076,15 +5064,20 @@ impl ApplicationHandler for App {
                 fallback: self.config.font.fallback.clone(),
             },
         );
-        // Apply configured search-chrome colors (the panel's accent
-        // tint falls back to accent slot 0 when unset).
+        // The theme first: it is the base for the grid palette and for
+        // every chrome colour. `[search]` and `[accent]` then layer
+        // over what it implies — both resolve theme-first, so this is
+        // a no-op unless the user pinned something.
+        term_renderer.set_theme(self.theme.clone());
+        let [search_accent, search_text, current_match, other_match] =
+            self.config.search_colors(&self.theme);
         term_renderer.set_search_colors(
-            self.config.search_accent().to_femto(),
-            self.config.search.bar_text.to_femto(),
-            self.config.search.current_match.to_femto(),
-            self.config.search.match_color.to_femto(),
+            search_accent.to_femto(),
+            search_text.to_femto(),
+            current_match.to_femto(),
+            other_match.to_femto(),
         );
-        term_renderer.set_selection_accent(self.config.accent_primary().to_femto());
+        term_renderer.set_selection_accent(self.config.accent_primary(&self.theme).to_femto());
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
         // VGE engine: needs cell pixel dimensions and HiDPI scale factor.
@@ -5098,7 +5091,7 @@ impl ApplicationHandler for App {
         // engine's reserved `host.*` namespace (depth 0). vmux and other
         // clients reference `host.accent` instead of hardcoding colors;
         // per-portal engines get their own depth-keyed copy on creation.
-        vge_engine.seed_host_styles(host_accent_palette(&self.config), 0);
+        vge_engine.seed_host_styles(host_palette(&self.config, &self.theme), 0);
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -5126,7 +5119,7 @@ impl ApplicationHandler for App {
         // Same palette as the top-level VGE engine, inherited by every
         // per-portal VGE engine PRT spawns; each portal keys its
         // contextual `host.accent` on its own nesting depth.
-        prt_engine.set_host_palette(host_accent_palette(&self.config));
+        prt_engine.set_host_palette(host_palette(&self.config, &self.theme));
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a
@@ -5725,7 +5718,7 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
-                let accent = self.config.accent_primary().to_femto();
+                let accent = self.config.accent_primary(&self.theme).to_femto();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
                 // The window's ground is the terminal's background, so

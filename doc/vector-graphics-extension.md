@@ -852,10 +852,34 @@ Reserved ids defined in v0:
 | `host.accent.1` | Explicit accent slot 1 (does not rotate with depth).          |
 | `host.accent.2` | Explicit accent slot 2.                                       |
 | `host.accent.3` | Explicit accent slot 3.                                       |
+| `host.bg`       | The terminal's default background — the ground a client's own chrome sits on. |
+| `host.fg`       | The terminal's default foreground.                            |
+| `host.surface`  | Fill for an overlay panel or modal, as the host paints its own. |
+| `host.surface.inset` | A recessed surface inside such a panel: an input field, a switched-off segment. |
+| `host.text`     | Primary text over `host.surface`.                             |
+| `host.text.dim` | Secondary text: key hints, inactive labels.                   |
+| `host.text.on_accent` | Text over an accent fill — a selected row, an active tab. |
+| `host.warn`     | The warm tone for a destructive answer or an error line.       |
 
 A host with fewer configured accents than slots populates only the slots
 it has; `host.accent` always resolves (it wraps around the available
 slots).
+
+The accents and the eight colours after them are **independent**: a host
+may publish accents alone, which is what a host that predates the second
+group does. A client MUST treat a missing id the way it treats an
+unthemed host — by falling back to its own colour for that one thing —
+rather than assuming the whole namespace is absent.
+
+Unlike `host.accent`, none of the eight rotate with nesting depth: there
+is one terminal behind every portal, and a client's modal should belong
+to it. Depth is a signal about *which pane you are in*, which is what
+the accent carries.
+
+A host publishing these SHOULD also report their concrete values in the
+PRT probe (portal-extension.md §10) so a client can derive shades — a
+translucent modal ground, a scrollbar thumb — that a `StyleRef` alone
+cannot express.
 
 ### 7.4 DrawText (0x20)
 

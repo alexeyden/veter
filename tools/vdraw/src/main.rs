@@ -1229,6 +1229,7 @@ mod tests {
             max_nesting_depth: 8,
             vge_features,
             accent_rgba: accent,
+            theme_rgba: None,
         }
         .encode();
         let mut frames = Vec::new();

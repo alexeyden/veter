@@ -1210,6 +1210,33 @@ engine answers the probe of the client running inside it, the reported
 accent already matches that client's depth — no client-side depth
 arithmetic is needed.
 
+A host that also publishes the non-accent half of the namespace (VGE
+§7.3) appends its eight colors after the accent, in this order:
+
+```
+u8 ×4  host.bg
+u8 ×4  host.fg
+u8 ×4  host.surface
+u8 ×4  host.surface.inset
+u8 ×4  host.text
+u8 ×4  host.text.dim
+u8 ×4  host.text.on_accent
+u8 ×4  host.warn                // 32 bytes, each a straight RGBA8 quad
+```
+
+These 32 bytes follow the accent and are, like it, positional: a host
+that publishes no such colors simply ends the body after the accent,
+and one that publishes no accent cannot emit them at all. **A client
+MUST treat the block as all-or-nothing** — a body that stops part-way
+through it carries no theme colors, since a half-decoded block would
+leave some ids at a color the host never sent.
+
+None of the eight vary with nesting depth, so unlike the accent the
+same values reach every portal in the tree. A client uses them for what
+a `StyleRef` cannot express: a modal ground at partial opacity, a
+scrollbar thumb derived from `host.fg`, a shade between `host.surface`
+and `host.bg`.
+
 **VGE inside a portal.** When `vge_in_portal` is set, every portal
 owns a private VGE engine that operates in the portal's cell
 coordinate space:

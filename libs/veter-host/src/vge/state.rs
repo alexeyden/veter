@@ -523,15 +523,113 @@ struct PendingUpload {
     pinned: bool,
 }
 
-/// Host-provided accent palette seeded into the reserved `host.*`
-/// style namespace (`doc/vector-graphics-extension.md` §7.3). An empty
+/// The eight non-accent `host.*` colours a host publishes alongside its
+/// accents (`doc/vector-graphics-extension.md` §7.3): the terminal's own
+/// ground and text, plus the surface/text/warn group a client's chrome
+/// needs so its modals belong to the same palette as the terminal
+/// behind them. Unlike the accents these do not rotate with nesting
+/// depth — there is only one terminal background.
+///
+/// The field order is the order they are encoded in the PRT probe
+/// (`doc/portal-extension.md` §10); do not reorder without changing
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostThemeColors {
+    /// `host.bg` — the terminal's default background.
+    pub bg: command::Color,
+    /// `host.fg` — the terminal's default foreground.
+    pub fg: command::Color,
+    /// `host.surface` — an overlay panel's fill.
+    pub surface: command::Color,
+    /// `host.surface.inset` — a recessed surface inside a panel.
+    pub surface_inset: command::Color,
+    /// `host.text` — primary text over `host.surface`.
+    pub text: command::Color,
+    /// `host.text.dim` — secondary text: hints, inactive labels.
+    pub text_dim: command::Color,
+    /// `host.text.on_accent` — text over an accent fill.
+    pub text_on_accent: command::Color,
+    /// `host.warn` — the warm tone for a destructive answer.
+    pub warn: command::Color,
+}
+
+impl HostThemeColors {
+    /// The reserved style ids, in this struct's field order.
+    pub const IDS: [&'static str; 8] = [
+        "host.bg",
+        "host.fg",
+        "host.surface",
+        "host.surface.inset",
+        "host.text",
+        "host.text.dim",
+        "host.text.on_accent",
+        "host.warn",
+    ];
+
+    /// The colours in `IDS` order, for encoding and for seeding.
+    pub fn as_array(&self) -> [command::Color; 8] {
+        [
+            self.bg,
+            self.fg,
+            self.surface,
+            self.surface_inset,
+            self.text,
+            self.text_dim,
+            self.text_on_accent,
+            self.warn,
+        ]
+    }
+
+    /// Inverse of [`Self::as_array`] — how the probe decoder rebuilds
+    /// what a renderer reported.
+    pub fn from_array(c: [command::Color; 8]) -> Self {
+        Self {
+            bg: c[0],
+            fg: c[1],
+            surface: c[2],
+            surface_inset: c[3],
+            text: c[4],
+            text_dim: c[5],
+            text_on_accent: c[6],
+            warn: c[7],
+        }
+    }
+
+    /// The eight as straight RGBA8 quads, the shape the probe reports.
+    pub fn to_rgba8(self) -> [[u8; 4]; 8] {
+        let q = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
+        self.as_array().map(|c| [q(c.r), q(c.g), q(c.b), q(c.a)])
+    }
+
+    /// Rebuild from the probe's straight RGBA8 quads.
+    pub fn from_rgba8(quads: [[u8; 4]; 8]) -> Self {
+        Self::from_array(quads.map(|[r, g, b, a]| command::Color {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: f32::from(a) / 255.0,
+        }))
+    }
+}
+
+/// Host-provided palette seeded into the reserved `host.*` style
+/// namespace (`doc/vector-graphics-extension.md` §7.3). An empty
 /// palette means host-themed styles are disabled: nothing is injected
 /// and the PRT probe does not advertise `FEAT_VGE_HOST_THEMED_STYLES`.
+///
+/// "Empty" is about the accents alone. They are the part a client
+/// cannot do without — every chrome element keys off one — and the part
+/// that predates the rest, so a host that publishes accents but no
+/// [`HostThemeColors`] still themes styles, and a client that knows
+/// only about accents sees exactly what it saw before.
 #[derive(Debug, Clone, Default)]
 pub struct HostThemePalette {
     /// Ordered accent slots. `host.accent.{n}` resolves to `accents[n-1]`;
     /// the contextual `host.accent` resolves to `accents[depth % len]`.
     pub accents: Vec<command::Color>,
+    /// The rest of the namespace. `None` when the host publishes only
+    /// accents — a client then falls back to its own chrome colours.
+    pub colors: Option<HostThemeColors>,
 }
 
 impl HostThemePalette {
@@ -558,11 +656,16 @@ impl HostThemePalette {
         if self.accents.is_empty() {
             return Vec::new();
         }
-        let mut out = Vec::with_capacity(self.accents.len() + 1);
+        let mut out = Vec::with_capacity(self.accents.len() + 9);
         let idx = (depth as usize) % self.accents.len();
         out.push(("host.accent".to_string(), ConcreteStyle::Flat(self.accents[idx])));
         for (i, c) in self.accents.iter().enumerate() {
             out.push((format!("host.accent.{}", i + 1), ConcreteStyle::Flat(*c)));
+        }
+        if let Some(colors) = &self.colors {
+            for (id, c) in HostThemeColors::IDS.iter().zip(colors.as_array()) {
+                out.push(((*id).to_string(), ConcreteStyle::Flat(c)));
+            }
         }
         out
     }
@@ -2499,6 +2602,7 @@ mod tests {
         let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
         HostThemePalette {
             accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+            colors: None,
         }
     }
 
@@ -2568,6 +2672,84 @@ mod tests {
         // Depth 1 → slot 1 (green), same as before the restore.
         assert!((flat_g(&engine.state.shared.styles, "host.accent") - 1.0).abs() < 1e-3);
         assert!(engine.state.shared.styles.contains_key("host.accent.3"));
+    }
+
+    /// The eight non-accent ids ride the same seed, so everything that
+    /// re-applies the accents — RIS, DECSTR, a snapshot restore —
+    /// re-applies these too, and none of them rotate with depth.
+    #[test]
+    fn seed_host_styles_publishes_the_theme_colours_too() {
+        let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
+        let palette = HostThemePalette {
+            colors: Some(HostThemeColors {
+                bg: c(0.1, 0.0, 0.0),
+                fg: c(0.2, 0.0, 0.0),
+                surface: c(0.3, 0.0, 0.0),
+                surface_inset: c(0.4, 0.0, 0.0),
+                text: c(0.5, 0.0, 0.0),
+                text_dim: c(0.6, 0.0, 0.0),
+                text_on_accent: c(0.7, 0.0, 0.0),
+                warn: c(0.8, 0.0, 0.0),
+            }),
+            ..palette_rgb()
+        };
+        let flat_r = |styles: &HashMap<String, ConcreteStyle>, id: &str| match styles
+            .get(id)
+            .unwrap_or_else(|| panic!("missing {id}"))
+        {
+            ConcreteStyle::Flat(c) => c.r,
+            _ => panic!("{id} not flat"),
+        };
+
+        for depth in [0, 1, 2] {
+            let mut engine = VgeEngine::new((9, 20), 1.0);
+            engine.seed_host_styles(palette.clone(), depth);
+            for (i, id) in HostThemeColors::IDS.iter().enumerate() {
+                let want = 0.1 * (i + 1) as f32;
+                assert!(
+                    (flat_r(&engine.state.shared.styles, id) - want).abs() < 1e-3,
+                    "{id} at depth {depth}"
+                );
+            }
+            // RIS wipes the table; these come back with the accents.
+            engine.process_pty_chunk(b"\x1bc");
+            assert!(
+                (flat_r(&engine.state.shared.styles, "host.surface") - 0.3).abs() < 1e-3
+            );
+        }
+    }
+
+    /// A host that publishes accents and no theme colours themes
+    /// styles all the same — the accent is the half a client cannot do
+    /// without, and the rest is additive.
+    #[test]
+    fn accents_without_theme_colours_still_seed() {
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(palette_rgb(), 0);
+        assert!(engine.state.shared.styles.contains_key("host.accent"));
+        for id in HostThemeColors::IDS {
+            assert!(!engine.state.shared.styles.contains_key(id), "{id}");
+        }
+    }
+
+    /// The probe's wire order and the id list must not drift apart —
+    /// they are two views of the same eight colours.
+    #[test]
+    fn theme_colours_round_trip_through_the_probe_encoding() {
+        let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
+        let colors = HostThemeColors {
+            bg: c(1.0, 0.0, 0.0),
+            fg: c(0.0, 1.0, 0.0),
+            surface: c(0.0, 0.0, 1.0),
+            surface_inset: c(1.0, 1.0, 0.0),
+            text: c(0.0, 1.0, 1.0),
+            text_dim: c(1.0, 0.0, 1.0),
+            text_on_accent: c(1.0, 1.0, 1.0),
+            warn: c(0.5, 0.5, 0.5),
+        };
+        let back = HostThemeColors::from_rgba8(colors.to_rgba8());
+        assert_eq!(back.to_rgba8(), colors.to_rgba8());
+        assert_eq!(HostThemeColors::IDS.len(), colors.as_array().len());
     }
 
     #[test]

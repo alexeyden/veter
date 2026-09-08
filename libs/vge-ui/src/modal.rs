@@ -24,8 +24,8 @@ use crate::measure::{prefix_cells, text_cells};
 use crate::picker::Picker;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
 use crate::theme::{
-    COLOR_ACTIVE_TEXT, COLOR_DIM_TEXT, COLOR_MODAL_TEXT, COLOR_SCROLLBAR, accent_color,
-    accent_style, surface_style, title_thumb_style,
+    accent_color, accent_style, active_text, dim_text, modal_text, scrollbar, surface_style,
+    title_thumb_style,
 };
 
 /// Half-width of the text caret bar, in cells.
@@ -70,7 +70,7 @@ fn open_chrome(box_w: f32, box_h: f32, title: &str, rx: f32, ry: f32) -> Vec<Dra
                 y: 0.0,
             },
             align: Align::Center,
-            fill: Style::Flat(COLOR_MODAL_TEXT),
+            fill: Style::Flat(modal_text()),
             font_style: FontStyle(0x01),
             font_scale: 1.0,
             text: title.into(),
@@ -130,7 +130,7 @@ pub fn prompt_element(
             y: 2.0,
         },
         align: Align::Center,
-        fill: Style::Flat(COLOR_MODAL_TEXT),
+        fill: Style::Flat(modal_text()),
         font_style: FontStyle(0x00),
         font_scale: 1.0,
         text: line.into(),
@@ -217,7 +217,7 @@ pub fn picker_element<P>(
     cmds.push(DrawCmd::DrawText {
         origin: Point { x: 1.0, y: 1.0 },
         align: Align::Left,
-        fill: Style::Flat(COLOR_MODAL_TEXT),
+        fill: Style::Flat(modal_text()),
         font_style: FontStyle(0x00),
         font_scale: 1.0,
         text: input_line,
@@ -249,9 +249,9 @@ pub fn picker_element<P>(
             origin: Point { x: 1.5, y },
             align: Align::Left,
             fill: Style::Flat(if selected {
-                COLOR_ACTIVE_TEXT
+                active_text()
             } else {
-                COLOR_MODAL_TEXT
+                modal_text()
             }),
             font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
             font_scale: 1.0,
@@ -264,7 +264,7 @@ pub fn picker_element<P>(
                     y,
                 },
                 align: Align::Right,
-                fill: Style::Flat(COLOR_DIM_TEXT),
+                fill: Style::Flat(dim_text()),
                 font_style: FontStyle(0x00),
                 font_scale: 1.0,
                 text: it.hint.clone(),
@@ -283,7 +283,7 @@ pub fn picker_element<P>(
                 thumb_max * scroll as f32 / max_scroll as f32
             };
         cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(COLOR_SCROLLBAR),
+            fill: Style::Flat(scrollbar()),
             rects: vec![Rect {
                 x: box_w - 0.7,
                 y: 2.0,
@@ -452,7 +452,7 @@ impl ScrollModal {
                         y: 0.0,
                     },
                     align: Align::Center,
-                    fill: Style::Flat(COLOR_MODAL_TEXT),
+                    fill: Style::Flat(modal_text()),
                     font_style: FontStyle(0x01),
                     font_scale: 1.0,
                     text: title,
@@ -508,7 +508,7 @@ impl ScrollModal {
                     y: 1.0 + i as f32,
                 },
                 align: Align::Left,
-                fill: Style::Flat(COLOR_MODAL_TEXT),
+                fill: Style::Flat(modal_text()),
                 font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
                 font_scale: 1.0,
                 text: line.clone(),
@@ -536,7 +536,7 @@ impl ScrollModal {
             elements.push(CreateElementBody {
                 id: ids.track.into(),
                 commands: vec![DrawCmd::FillRectangles {
-                    fill: Style::Flat(COLOR_SCROLLBAR),
+                    fill: Style::Flat(scrollbar()),
                     rects: vec![Rect {
                         x: box_w - 1.0,
                         y: 2.0,

@@ -41,6 +41,11 @@ pub const COLOR_BRAND: Color = Color {
 /// can sit over arbitrary shell text. Tinted slightly toward
 /// [`COLOR_BRAND`] so it reads as part of the same palette instead of
 /// looking like a leftover from another design.
+///
+/// The `COLOR_*` constants are the *untethered* look — what a client
+/// paints on a terminal that publishes no `host.*` theme. Read them
+/// through the accessors below ([`modal_bg`] and friends), which
+/// prefer the host's palette when there is one.
 pub const COLOR_MODAL_BG: Color = Color {
     r: 0.09,
     g: 0.06,
@@ -81,6 +86,52 @@ pub const COLOR_SCROLLBAR: Color = Color {
     a: 0.35,
 };
 
+/// How opaque a modal's ground is over the shell text behind it. The
+/// host publishes an opaque surface — it paints its own panels on the
+/// terminal background — so a client that adopts it re-applies this.
+const MODAL_ALPHA: f32 = 0.96;
+
+/// Opacity of the scrollbar thumb, which is [`host_fg`] at a fraction
+/// rather than a colour of its own.
+const SCROLLBAR_ALPHA: f32 = 0.35;
+
+/// The non-accent half of the host's `host.*` palette (VGE §7.3), in
+/// the order the PRT probe reports it — see
+/// `veter_host::vge::HostThemeColors::IDS`.
+#[derive(Debug, Clone, Copy)]
+pub struct HostColors {
+    pub bg: Color,
+    pub fg: Color,
+    pub surface: Color,
+    pub surface_inset: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub text_on_accent: Color,
+    pub warn: Color,
+}
+
+impl HostColors {
+    /// Rebuild from the eight straight-RGBA8 quads the probe carries.
+    pub fn from_rgba8(quads: [[u8; 4]; 8]) -> Self {
+        let c = |[r, g, b, a]: [u8; 4]| Color {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: f32::from(a) / 255.0,
+        };
+        Self {
+            bg: c(quads[0]),
+            fg: c(quads[1]),
+            surface: c(quads[2]),
+            surface_inset: c(quads[3]),
+            text: c(quads[4]),
+            text_dim: c(quads[5]),
+            text_on_accent: c(quads[6]),
+            warn: c(quads[7]),
+        }
+    }
+}
+
 /// Opacity of the translucent accent used behind title text and
 /// selected rows.
 const THUMB_ALPHA: f32 = 0.35;
@@ -96,6 +147,13 @@ static HOST_THEMED: AtomicBool = AtomicBool::new(false);
 
 static CLI_RGBA: AtomicU32 = AtomicU32::new(0);
 static CLI_SET: AtomicBool = AtomicBool::new(false);
+
+/// The host's non-accent palette, packed `0xRRGGBBAA` in
+/// [`HostColors`] field order. Valid only when `HOST_COLORS_SET` is
+/// set; a host that themes accents but publishes no colours leaves the
+/// client on the `COLOR_*` constants.
+static HOST_COLORS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static HOST_COLORS_SET: AtomicBool = AtomicBool::new(false);
 
 /// Pack a color into `0xRRGGBBAA`.
 pub fn pack(c: Color) -> u32 {
@@ -131,6 +189,115 @@ pub fn set_host_accent(c: Color) {
 /// True once [`set_host_accent`] has been called.
 pub fn host_themed() -> bool {
     HOST_THEMED.load(Ordering::Relaxed)
+}
+
+/// Adopt the rest of the host's palette (from the PRT probe's theme
+/// block). Every accessor below then paints in the terminal's own
+/// colours instead of this crate's built-in dark chrome — which is
+/// what keeps a client's modal from looking like a hole punched in a
+/// light or a warm-toned terminal.
+///
+/// Independent of [`set_host_accent`]: a host may publish accents and
+/// nothing else, and the accent is the half a client cannot do
+/// without.
+pub fn set_host_theme(c: HostColors) {
+    let packed = [
+        c.bg,
+        c.fg,
+        c.surface,
+        c.surface_inset,
+        c.text,
+        c.text_dim,
+        c.text_on_accent,
+        c.warn,
+    ];
+    for (slot, color) in HOST_COLORS.iter().zip(packed) {
+        slot.store(pack(color), Ordering::Relaxed);
+    }
+    HOST_COLORS_SET.store(true, Ordering::Relaxed);
+}
+
+/// One slot of the host palette, or `None` when the host published
+/// none. Indices follow [`HostColors`]'s field order.
+fn host_color(i: usize) -> Option<Color> {
+    HOST_COLORS_SET
+        .load(Ordering::Relaxed)
+        .then(|| unpack(HOST_COLORS[i].load(Ordering::Relaxed)))
+}
+
+/// The terminal's default background, when the host publishes it.
+/// A client with a ground of its own to fill wants this; one drawing
+/// over the shell should stay transparent instead.
+pub fn host_bg() -> Option<Color> {
+    host_color(0)
+}
+
+/// The terminal's default foreground, when the host publishes it.
+pub fn host_fg() -> Option<Color> {
+    host_color(1)
+}
+
+/// Ground for a modal or dialog: the host's panel surface at
+/// [`MODAL_ALPHA`], else the accent-tinted [`COLOR_MODAL_BG`].
+pub fn modal_bg() -> Color {
+    match host_color(2) {
+        Some(c) => Color {
+            a: MODAL_ALPHA,
+            ..c
+        },
+        None => tinted_modal_bg(),
+    }
+}
+
+/// A recessed surface inside a modal — an input field, an unselected
+/// segment. The host's, else the modal ground darkened.
+pub fn inset_bg() -> Color {
+    match host_color(3) {
+        Some(c) => Color {
+            a: MODAL_ALPHA,
+            ..c
+        },
+        None => darken(modal_bg(), 0.35),
+    }
+}
+
+/// Primary text over [`modal_bg`].
+pub fn modal_text() -> Color {
+    host_color(4).unwrap_or(COLOR_MODAL_TEXT)
+}
+
+/// Primary chrome text over a surface fill — pane titles, tab labels.
+/// The same colour as [`modal_text`] under a host theme; the built-in
+/// pair are two slightly different whites.
+pub fn title_text() -> Color {
+    host_color(4).unwrap_or(COLOR_TITLE_TEXT)
+}
+
+/// Dimmed secondary text — picker hints, inactive tab labels.
+pub fn dim_text() -> Color {
+    host_color(5).unwrap_or(COLOR_DIM_TEXT)
+}
+
+/// Foreground over an accent fill — selected picker rows, active tabs.
+pub fn active_text() -> Color {
+    host_color(6).unwrap_or(COLOR_ACTIVE_TEXT)
+}
+
+/// The warm tone for a destructive answer or an error line.
+pub fn warn_color() -> Option<Color> {
+    host_color(7)
+}
+
+/// Scrollbar thumb: the terminal's foreground at [`SCROLLBAR_ALPHA`],
+/// so it reads against whatever the track is drawn over.
+pub fn scrollbar() -> Color {
+    match host_fg() {
+        Some(c) => Color {
+            a: SCROLLBAR_ALPHA,
+            ..c
+        },
+        None => COLOR_SCROLLBAR,
+    }
 }
 
 /// Force a concrete accent, overriding both the host's and the brand's.
@@ -172,22 +339,31 @@ pub fn title_thumb_style() -> Style {
     })
 }
 
-/// Dark accent-tinted surface for modal/dialog backgrounds. Scaled
-/// toward black so light foreground text stays legible over arbitrary
-/// shell content. Falls back to [`COLOR_MODAL_BG`] when no accent has
-/// been themed, preserving the untinted look.
+/// Surface fill for modal/dialog backgrounds.
+///
+/// The host's own panel surface when it publishes one — a modal then
+/// belongs to the same palette as the terminal behind it. Otherwise the
+/// accent scaled toward black, so light foreground text stays legible
+/// over arbitrary shell content, and [`COLOR_MODAL_BG`] untinted when
+/// there is no accent either.
 pub fn surface_style() -> Style {
+    Style::Flat(modal_bg())
+}
+
+/// The accent-tinted fallback ground, for a terminal that publishes no
+/// `host.*` colours.
+fn tinted_modal_bg() -> Color {
     if CLI_SET.load(Ordering::Relaxed) || HOST_THEMED.load(Ordering::Relaxed) {
         let c = accent_color();
         const K: f32 = 0.20;
-        Style::Flat(Color {
+        Color {
             r: c.r * K,
             g: c.g * K,
             b: c.b * K,
-            a: 0.96,
-        })
+            a: MODAL_ALPHA,
+        }
     } else {
-        Style::Flat(COLOR_MODAL_BG)
+        COLOR_MODAL_BG
     }
 }
 

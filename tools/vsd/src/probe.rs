@@ -72,6 +72,11 @@ pub struct PrtProbeData {
     /// client that probes while nothing is attached still gets a
     /// themed accent instead of falling back to its brand color.
     pub accent_rgba: Option<[u8; 4]>,
+    /// The rest of the renderer's `host.*` palette (VGE §7.3), in
+    /// `HostThemeColors::IDS` order, adopted for the same reason: a
+    /// client started in a detached session should not have to fall
+    /// back to its own dark chrome on a light terminal.
+    pub theme_rgba: Option<[[u8; 4]; 8]>,
 }
 
 /// Outcome of one probe round.
@@ -263,10 +268,20 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
     // Positional tail fields (§10): a host that predates either stops
     // the body early, which reads back as `None` rather than an error.
     let vge_features = r.u8().ok();
-    let accent_rgba = match (vge_features, r.u8(), r.u8(), r.u8(), r.u8()) {
-        (Some(_), Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
+    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
         _ => None,
     };
+    let accent_rgba = vge_features.and_then(|_| quad());
+    // All eight or none — a partial block would leave some ids at a
+    // colour the renderer never sent.
+    let theme_rgba = accent_rgba.and_then(|_| {
+        let mut quads = [[0u8; 4]; 8];
+        for slot in &mut quads {
+            *slot = quad()?;
+        }
+        Some(quads)
+    });
     Some(PrtProbeData {
         protocol_version,
         max_portals,
@@ -278,6 +293,7 @@ fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
         max_nesting_depth,
         vge_features,
         accent_rgba,
+        theme_rgba,
     })
 }
 
@@ -495,6 +511,7 @@ mod tests {
             max_nesting_depth: 8,
             vge_features: None,
             accent_rgba: None,
+            theme_rgba: None,
         };
         let mut frames = Vec::new();
         append_frame(&mut frames, RSP_PROBE, 1, &body.encode());
