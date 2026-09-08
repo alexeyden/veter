@@ -64,11 +64,16 @@
 # `text_on_accent` and the search-panel tint are *derived from* the accent —
 # set a dark one and text over it turns light to match.
 #
+# Slot 2 is the one you see most: everything launched inside vmux is one level
+# in, so that is the accent on screen all day. Keep it close to slot 1 in
+# weight, and away from green — green is perceptually the brightest hue, so it
+# reads louder than a blue of the same nominal saturation.
+#
 # The eight non-accent `host.*` colours (the terminal's ground, its text, the
 # surfaces a modal is built from) come from the keys below and from
 # `background`/`foreground`; they describe the terminal, so there is nothing
 # per-client to set.
-# accents = ["#56799f", "#859f3d", "#5a3c9e"]   # muted blue / olive / violet
+# accents = ["#56799f", "#9f5685", "#9f7c56"]   # muted blue / plum / amber
 #
 # `cursor` and the selection pair are optional. Unset, both keep veter's
 # built-in look: the cell drawn in reverse video. Setting only `selection_bg`

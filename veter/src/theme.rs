@@ -257,12 +257,19 @@ impl Theme {
     }
 
     /// The accent palette, guaranteed non-empty: an unset `accents`
-    /// derives blue / green / magenta from the bright half of `ansi`,
-    /// which is the trio a scheme's own chrome tends to use.
+    /// derives blue / magenta / cyan from the bright half of `ansi`.
+    ///
+    /// Deliberately not the green. Slot 2 is the accent a program one
+    /// level in gets — anything launched inside a multiplexer, which is
+    /// to say nearly everything — so it is the one on screen most of
+    /// the time, and green is both the odd hue out against the cool
+    /// palettes most schemes have and perceptually the brightest, so it
+    /// reads louder than slot 1 at the same nominal saturation. Blue,
+    /// magenta and cyan stay near one another in weight.
     #[must_use]
     pub fn accents(&self) -> Vec<Rgba> {
         if self.accents.is_empty() {
-            vec![self.ansi[12], self.ansi[10], self.ansi[13]]
+            vec![self.ansi[12], self.ansi[13], self.ansi[14]]
         } else {
             self.accents.clone()
         }
@@ -532,6 +539,14 @@ const fn c(hex: u32) -> Rgba {
 /// derived field is spelled out, so this reproduces exactly what veter
 /// painted before themes existed. The grid is the Tango palette the
 /// renderer used to hardcode.
+///
+/// The exception is accent slots 2 and 3, which were an olive and a
+/// violet: the olive was both the odd hue out against the blue and,
+/// being green, perceptually brighter than it (0.55 against 0.45), so
+/// a pane one level in shouted. The trio is now blue / plum / amber —
+/// the blue's own hue rotated, at its own weight, so the three read as
+/// a set. See [`Theme::accents`] for why slot 2 is the one that
+/// matters.
 fn veter() -> Theme {
     Theme {
         ansi: [
@@ -557,7 +572,7 @@ fn veter() -> Theme {
         cursor: None,
         selection_bg: None,
         selection_fg: None,
-        accents: vec![c(0x56799f), c(0x859f3d), c(0x5a3c9e)],
+        accents: vec![c(0x56799f), c(0x9f5685), c(0x9f7c56)],
         surface: Some(c(0x26262a)),
         surface_inset: Some(c(0x1a1a1e)),
         text: Some(c(0xebebeb)),
@@ -600,7 +615,7 @@ fn tokyonight_storm() -> Theme {
         cursor: Some(c(0xc0caf5)),
         selection_bg: Some(c(0x2e3c64)),
         selection_fg: Some(c(0xc0caf5)),
-        accents: vec![c(0x7aa2f7), c(0x9ece6a), c(0xbb9af7)],
+        accents: vec![c(0x7aa2f7), c(0xbb9af7), c(0x7dcfff)],
         ..derived()
     }
 }
@@ -634,14 +649,15 @@ fn catppuccin_mocha() -> Theme {
         // near-white fill there swallows the row it highlights.
         selection_bg: Some(c(0x585b70)),
         selection_fg: None,
-        accents: vec![c(0x89b4fa), c(0xa6e3a1), c(0xcba6f7)],
+        accents: vec![c(0x89b4fa), c(0xcba6f7), c(0x94e2d5)],
         ..derived()
     }
 }
 
 /// morhetz/gruvbox, dark medium. Palette from the project's own
-/// `colors/gruvbox.vim`; the accents are the bright trio, which reads
-/// better as chrome on `dark0` than the neutral one.
+/// `colors/gruvbox.vim`; the accents are its bright aqua, pink and
+/// yellow, which read better as chrome on `dark0` than the neutral
+/// ones.
 fn gruvbox_dark() -> Theme {
     Theme {
         ansi: [
@@ -667,7 +683,7 @@ fn gruvbox_dark() -> Theme {
         cursor: Some(c(0xebdbb2)),
         selection_bg: Some(c(0x504945)),
         selection_fg: None,
-        accents: vec![c(0x83a598), c(0xb8bb26), c(0xd3869b)],
+        accents: vec![c(0x83a598), c(0xd3869b), c(0xfabd2f)],
         ..derived()
     }
 }
@@ -700,7 +716,7 @@ fn nord() -> Theme {
         cursor: Some(c(0xd8dee9)),
         selection_bg: Some(c(0x434c5e)),
         selection_fg: None,
-        accents: vec![c(0x88c0d0), c(0xa3be8c), c(0xb48ead)],
+        accents: vec![c(0x88c0d0), c(0xb48ead), c(0x81a1c1)],
         ..derived()
     }
 }
@@ -752,8 +768,10 @@ mod tests {
         assert!(Rgba::parse("#gggggg").is_err());
     }
 
-    /// The whole point of the default theme: veter with no `[theme]`
-    /// section paints what it painted before this module existed.
+    /// The point of the default theme: veter with no `[theme]` section
+    /// paints what it painted before this module existed. The one
+    /// deliberate exception is accent slots 2 and 3 — see
+    /// [`the_accent_trios_are_the_ones_that_were_chosen`].
     #[test]
     fn the_default_theme_is_the_pre_theme_look() {
         let t = Theme::default();
@@ -892,6 +910,44 @@ mod tests {
                 "{name}: warn text must read against the border"
             );
         }
+    }
+
+    /// Slot 2 is the accent a program one level in gets — anything
+    /// launched inside vmux — so it is the one on screen most of the
+    /// time. These trios are a judgement rather than a formula, so pin
+    /// them: each is drawn from its own scheme's published colours,
+    /// weighted to sit near slot 1, and none of them puts a green
+    /// there. Change one on purpose, not by accident.
+    #[test]
+    fn the_accent_trios_are_the_ones_that_were_chosen() {
+        let want: [(&str, [u32; 3]); 5] = [
+            ("veter", [0x56799f, 0x9f5685, 0x9f7c56]),
+            ("tokyonight-storm", [0x7aa2f7, 0xbb9af7, 0x7dcfff]),
+            ("catppuccin-mocha", [0x89b4fa, 0xcba6f7, 0x94e2d5]),
+            ("gruvbox-dark", [0x83a598, 0xd3869b, 0xfabd2f]),
+            ("nord", [0x88c0d0, 0xb48ead, 0x81a1c1]),
+        ];
+        for (name, hexes) in want {
+            let got = builtin(name).unwrap().accents();
+            assert_eq!(got, hexes.map(c).to_vec(), "{name}");
+        }
+    }
+
+    /// The same rule for a dropped-in scheme file, which names no
+    /// accents of its own: the derivation must not hand slot 2 the
+    /// palette's green.
+    #[test]
+    fn the_derived_accents_skip_the_green() {
+        let t = Theme {
+            accents: Vec::new(),
+            ..builtin("nord").unwrap()
+        };
+        assert_eq!(
+            t.accents(),
+            vec![t.ansi[12], t.ansi[13], t.ansi[14]],
+            "derived accents are bright blue / magenta / cyan"
+        );
+        assert!(!t.accents().contains(&t.ansi[10]), "ansi bright green");
     }
 
     #[test]
