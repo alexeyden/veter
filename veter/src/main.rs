@@ -5662,6 +5662,19 @@ impl ApplicationHandler for App {
                 // The split point: everything above is ours, the swap
                 // below is the compositor's.
                 let render = frame_start.elapsed();
+                // Tell winit we are about to present. On Wayland this
+                // is what schedules the frame callback, and winit then
+                // throttles `RedrawRequested` to it — which is the
+                // whole mechanism kitty spells `request_frame_render`.
+                // Without it winit hands us redraws freely, we swap,
+                // and EGL blocks waiting for a callback nobody asked
+                // for: measured at 4.7s per frame with the window on
+                // another workspace, against 1.6ms to draw it. Since
+                // the drain runs one slice per frame, that is the
+                // terminal's whole I/O rate.
+                if let Some(w) = &self.window {
+                    w.pre_present_notify();
+                }
                 let swap_start = Instant::now();
                 self.gl_surface
                     .as_ref()
