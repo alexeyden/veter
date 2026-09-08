@@ -8,7 +8,7 @@ use config::{HostAction, SearchAction, SelectionAction};
 
 use std::io::Read;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -894,6 +894,8 @@ struct App {
     /// [`FRAME_MIN_INTERVAL`].
     last_frame: Option<Instant>,
     redraw_deadline: Option<Instant>,
+    /// Shared with the PTY reader thread. See [`ReaderStats`].
+    reader_stats: Arc<ReaderStats>,
     /// See [`FrameTrace`]. Inert unless `VETER_FRAME_TRACE` is set.
     trace: FrameTrace,
     /// Most recent left-press recorded in the local-selection branch
@@ -1246,6 +1248,36 @@ impl PtyPass {
     };
 }
 
+/// Reader-thread accounting, shared with [`FrameTrace`].
+///
+/// The main loop's own counters cannot answer the question the trace is
+/// now stuck on. A drain pass that ends under its budget stopped on an
+/// empty queue, so it was waiting for data — but "waiting for data" has
+/// two very different causes, and only the reader thread can tell them
+/// apart: it was blocked in `read` because the child had nothing to
+/// say, or blocked in `send` because the queue was full and the main
+/// loop would not take it. The first exonerates the render loop; the
+/// second indicts it.
+#[derive(Default)]
+struct ReaderStats {
+    /// Nanoseconds blocked in `read` on the PTY master.
+    read_blocked: AtomicU64,
+    /// Nanoseconds blocked handing a chunk over — i.e. queue full.
+    send_blocked: AtomicU64,
+    chunks: AtomicU64,
+}
+
+impl ReaderStats {
+    /// Totals since startup. The trace differences them per window.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.read_blocked.load(Ordering::Relaxed),
+            self.send_blocked.load(Ordering::Relaxed),
+            self.chunks.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Frame and drain instrumentation, on with `VETER_FRAME_TRACE=1`.
 ///
 /// veter's PTY drain is serialized behind one render plus one
@@ -1275,6 +1307,15 @@ struct FrameTrace {
     drain: Duration,
     other: Duration,
     bytes: u64,
+    /// Passes that stopped on [`PTY_DRAIN_BUDGET`] with bytes still
+    /// queued, against ones that stopped because the queue was empty.
+    /// The split says whether the drain is the bottleneck or is idle
+    /// waiting for someone else.
+    budget_stops: u32,
+    dry_stops: u32,
+    /// Reader-thread totals at the start of the window, differenced on
+    /// report.
+    reader_at_start: Option<(u64, u64, u64)>,
     /// Whether the compositor has told us the window is hidden. Traced
     /// rather than acted on: knowing it arrives at all is half the
     /// question.
@@ -1298,9 +1339,14 @@ impl FrameTrace {
         self.swap += swap;
     }
 
-    fn pass(&mut self, drain: Duration, bytes: u64) {
+    fn pass(&mut self, drain: Duration, bytes: u64, on_budget: bool) {
         if !self.enabled {
             return;
+        }
+        if on_budget {
+            self.budget_stops += 1;
+        } else {
+            self.dry_stops += 1;
         }
         let now = Instant::now();
         // Everything since the previous pass ended that this pass did
@@ -1318,9 +1364,12 @@ impl FrameTrace {
     /// Print a line per second of activity, then start a fresh window.
     /// Silent while nothing is happening, so an idle terminal does not
     /// scroll the log it is being read from.
-    fn report(&mut self) {
+    fn report(&mut self, reader: Option<(u64, u64, u64)>) {
         if !self.enabled {
             return;
+        }
+        if self.reader_at_start.is_none() {
+            self.reader_at_start = reader;
         }
         let since = *self.since.get_or_insert_with(Instant::now);
         let window = since.elapsed();
@@ -1335,8 +1384,19 @@ impl FrameTrace {
             let per_frame = |d: Duration| {
                 if self.frames == 0 { 0.0 } else { ms(d) / f64::from(self.frames) }
             };
+            // Reader-thread time is a delta over the window, and the
+            // thread does not exist before `resumed`.
+            let (read_ms, send_ms, chunks) =
+                match (self.reader_at_start, reader) {
+                    (Some(a), Some(b)) => (
+                        b.0.saturating_sub(a.0) as f64 / 1e6,
+                        b.1.saturating_sub(a.1) as f64 / 1e6,
+                        b.2.saturating_sub(a.2),
+                    ),
+                    _ => (0.0, 0.0, 0),
+                };
             eprintln!(
-                "veter: trace {:.2}s: {} frames (render {:.1}ms, swap {:.1}ms each),                  {} drain passes ({:.1}ms, {:.0} KiB), other {:.0}ms, occluded={}",
+                "veter: trace {:.2}s: {} frames (render {:.1}ms, swap {:.1}ms each), {} drain passes ({:.1}ms, {:.0} KiB; {} on budget, {} queue-dry), other {:.0}ms, reader {} chunks (read-blocked {:.0}ms, send-blocked {:.0}ms), occluded={}",
                 window.as_secs_f64(),
                 self.frames,
                 per_frame(self.render),
@@ -1344,7 +1404,12 @@ impl FrameTrace {
                 self.passes,
                 ms(self.drain),
                 kib,
+                self.budget_stops,
+                self.dry_stops,
                 ms(self.other),
+                chunks,
+                read_ms,
+                send_ms,
                 self.occluded,
             );
         }
@@ -1356,6 +1421,7 @@ impl FrameTrace {
             enabled,
             occluded,
             since: Some(Instant::now()),
+            reader_at_start: reader,
             ..Self::default()
         };
     }
@@ -2236,6 +2302,7 @@ impl App {
             blink_deadline: None,
             last_frame: None,
             redraw_deadline: None,
+            reader_stats: Arc::new(ReaderStats::default()),
             trace: FrameTrace::new(),
             last_click: None,
             mouse_buttons_held: 0,
@@ -5033,6 +5100,7 @@ impl ApplicationHandler for App {
         let proxy = self.proxy.clone();
         let wake_pending = self.pty_wake_pending.clone();
 
+        let stats = self.reader_stats.clone();
         std::thread::spawn(move || {
             let mut file = std::fs::File::from(reader_fd);
             // Sized for the flood, not the keystroke: a client uploading
@@ -5041,10 +5109,29 @@ impl ApplicationHandler for App {
             // wakeup per 4 KiB. Short reads still return short.
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                match file.read(&mut buf) {
+                // The two places this thread can wait, timed apart:
+                // in `read` because the child had nothing to say, or
+                // in `send` because the queue was full and the main
+                // loop would not take it. Which one dominates is the
+                // difference between a slow producer and a slow
+                // renderer, and nothing on the main thread can tell.
+                let read_start = Instant::now();
+                let read = file.read(&mut buf);
+                stats.read_blocked.fetch_add(
+                    read_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                match read {
                     Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        let send_start = Instant::now();
+                        let sent = tx.send(buf[..n].to_vec());
+                        stats.send_blocked.fetch_add(
+                            send_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        stats.chunks.fetch_add(1, Ordering::Relaxed);
+                        if sent.is_err() {
                             break;
                         }
                         // One outstanding wakeup at a time; the data is
@@ -5758,7 +5845,7 @@ impl ApplicationHandler for App {
         let bytes_before = self.trace.bytes;
         let pass = self.process_pty_output();
         let drained = self.trace.bytes - bytes_before;
-        self.trace.pass(drain_start.elapsed(), drained);
+        self.trace.pass(drain_start.elapsed(), drained, pass.backlog);
         self.pty_backlog = pass.backlog;
         self.drain_pending_clipboard();
         self.drain_pending_window_title();
@@ -5780,7 +5867,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.trace.report();
+        self.trace.report(Some(self.reader_stats.snapshot()));
 
         // A drain pass is owed: the last one stopped on its time budget
         // so the frame it had produced could be drawn. Asking for it
