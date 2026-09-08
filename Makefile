@@ -65,7 +65,7 @@ RELEASE_DIR := $(TARGET_DIR)/release
 BINS := $(addprefix $(RELEASE_DIR)/,$(PACKAGES))
 
 .PHONY: all build install uninstall clean help install-desktop install-icon install-hook \
-        install-config dist-clean install-dist-maybe \
+        install-config reset-config dist-clean install-dist-maybe \
         dist-aarch64-build dist-aarch64-tarxz dist-aarch64-deb \
         dist-aarch64-manifest install-remote-aarch64 \
         dist-amd64-build dist-amd64-tarxz dist-amd64-deb \
@@ -80,6 +80,8 @@ help:
 	@echo "                      + skeleton config into \$$CONFIGDIR (if absent)"
 	@echo "                      + the vplace script and the Claude Code hook"
 	@echo "  uninstall           remove installed binaries and desktop entry"
+	@echo "  reset-config        overwrite the live configs with the current"
+	@echo "                      skeletons, keeping a timestamped backup of each"
 	@echo "  clean               cargo clean"
 	@echo
 	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vplay/vdraw/vfm/vsend/vrecv/vsd"
@@ -212,6 +214,35 @@ install-config:
 	    $(INSTALL) -m 0644 "$(VFM_EXAMPLE_CONFIG_SRC)" "$(VFM_USER_CONFIG_DST)"; \
 	    echo "    vfm config.toml -> $(VFM_USER_CONFIG_DST)"; \
 	fi
+
+# Replace the live configs with the current skeletons.
+#
+# `install-config` deliberately never overwrites an existing config, so
+# there is otherwise no way to pick up new keys after the schema moves —
+# and a config that predates a rename fails silently, since nothing
+# rejects a section veter no longer reads. This is the blunt fix: no
+# merge, the old file is set aside whole and the skeleton copied over.
+#
+# Both configs are reset together, the way `install-config` installs
+# them together. The backup is timestamped rather than a single `.bak`
+# so a second run cannot bury the first one's copy of your real config
+# under a copy of the skeleton.
+reset-config:
+	@ts=$$(date +%Y%m%d-%H%M%S); \
+	$(INSTALL) -d "$(CONFIGDIR)"; \
+	if [ -f "$(USER_CONFIG_DST)" ]; then \
+	    cp -p "$(USER_CONFIG_DST)" "$(USER_CONFIG_DST).bak.$$ts"; \
+	    echo "    saved $(USER_CONFIG_DST).bak.$$ts"; \
+	fi; \
+	$(INSTALL) -m 0644 "$(EXAMPLE_CONFIG_SRC)" "$(USER_CONFIG_DST)"; \
+	echo "    config.toml -> $(USER_CONFIG_DST)"; \
+	$(INSTALL) -d "$(VFM_CONFIGDIR)"; \
+	if [ -f "$(VFM_USER_CONFIG_DST)" ]; then \
+	    cp -p "$(VFM_USER_CONFIG_DST)" "$(VFM_USER_CONFIG_DST).bak.$$ts"; \
+	    echo "    saved $(VFM_USER_CONFIG_DST).bak.$$ts"; \
+	fi; \
+	$(INSTALL) -m 0644 "$(VFM_EXAMPLE_CONFIG_SRC)" "$(VFM_USER_CONFIG_DST)"; \
+	echo "    vfm config.toml -> $(VFM_USER_CONFIG_DST)"
 
 uninstall:
 	@for pkg in $(PACKAGES); do \
