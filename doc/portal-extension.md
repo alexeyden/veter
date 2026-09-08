@@ -787,7 +787,9 @@ is hidden. The host has no portal-level rate-limit knob in v1.
 ## 8. Portal events (host → client)
 
 All events carry a `string id` first, identifying the source portal.
-Event bodies are described below.
+Event bodies are described below. The one exception is
+`HostThemeChanged` (§8.13), which belongs to the terminal rather than
+to any pane and carries an empty id.
 
 **Attribution under forking (§6.9).** A buffer with two views could
 name either in an event; the rule is that an event is attributed to the
@@ -1061,6 +1063,50 @@ this as the exit signal, not just an offset update.
 Clients that do not implement scrollback (or do not wish to follow
 the gesture) MUST ignore the event without error.
 
+### 8.13 HostThemeChanged (0x8E)
+
+```
+string id            ; empty — the host itself, not a portal
+u8 accent_r
+u8 accent_g
+u8 accent_b
+u8 accent_a          ; straight RGBA8 that `host.accent` resolves to
+                     ; for the engine that emitted this
+[u8 r, g, b, a] × 8  ; optional — the eight `host.*` theme colours,
+                     ; in the order §10 lists them
+```
+
+The host's `host.*` palette (VGE §7.3) has changed. Emitted only when
+the `host_theme_events` bit is set (§10).
+
+Elements the client drew with `StyleRef("host.*")` need no action: the
+host re-resolves those itself at render time, which is what §7.3's
+style table is for. This event exists for what a `StyleRef` cannot
+express — an accent darkened for a secondary marker, a translucent
+wash behind a title — which a client computes from the concrete values
+it read at probe time and bakes into commands the host has already
+stored. Those cannot be re-resolved by anyone but the client, so it is
+told, and redraws them.
+
+The accent is the one *this* engine's depth resolves to, so a client
+never does depth arithmetic — the same rule as the probe (§10). The
+eight theme colours do not vary with depth and are carried whole. The
+block is all-or-nothing: a body that stops after the accent carries no
+theme colours, exactly as in the probe.
+
+The id is empty because a theme belongs to the terminal, not to a
+pane. A client that dispatches events by portal id must not treat the
+empty id as an unknown portal.
+
+**Delivery.** The event reaches every level: the host's own client, and
+each portal's inner program by way of that portal's engine (whose
+outbound stream the parent relays as `RawReply`, §8.1). Each level gets
+the accent for its own depth.
+
+A host whose palette cannot change after startup never emits this and
+need not set the bit; a client that does not see the bit may assume
+the palette from its probe is the one it keeps.
+
 ## 9. Focus and cursor rendering
 
 ### 9.1 SetFocus (0x0A)
@@ -1176,6 +1222,8 @@ response (§2.1):
 bit 0  vge_in_portal           // host runs a per-portal VGE engine
 bit 1  host_themed_styles       // host pre-populates the reserved
                                 // `host.*` VGE style namespace
+bit 2  host_theme_events        // host emits HostThemeChanged (§8.13)
+                                // when that palette changes
 ```
 
 Clients that read a probe response shorter than the field offset

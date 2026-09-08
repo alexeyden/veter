@@ -148,6 +148,55 @@ pub fn raw_reply_body(id: &str, data: &[u8]) -> Vec<u8> {
     w.buf
 }
 
+/// Body for an `EVT_HOST_THEME_CHANGED` event (§8.13). `id` is empty
+/// for the host itself; `colors` is the same all-or-nothing eight-quad
+/// block the probe carries, absent when the host publishes accents
+/// only.
+pub fn host_theme_changed_body(
+    id: &str,
+    accent: [u8; 4],
+    colors: Option<[[u8; 4]; 8]>,
+) -> Vec<u8> {
+    let mut w = Writer::with_capacity(1 + id.len() + 4 + 32);
+    w.str(id);
+    for b in accent {
+        w.u8(b);
+    }
+    if let Some(quads) = colors {
+        for quad in quads {
+            for b in quad {
+                w.u8(b);
+            }
+        }
+    }
+    w.buf
+}
+
+/// Inverse of [`host_theme_changed_body`], for clients. Returns the
+/// portal id (empty for the host), the accent, and the theme block if
+/// the body carried a whole one.
+pub fn parse_host_theme_changed(
+    body: &[u8],
+) -> Result<(String, [u8; 4], Option<[[u8; 4]; 8]>), crate::codec::DecodeError> {
+    let mut r = Reader::new(body);
+    let id = r.string()?.to_string();
+    let accent = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+    let mut quads = [[0u8; 4]; 8];
+    let mut all = true;
+    'outer: for slot in &mut quads {
+        for b in slot.iter_mut() {
+            match r.u8() {
+                Ok(v) => *b = v,
+                Err(_) => {
+                    all = false;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Ok((id, accent, all.then_some(quads)))
+}
+
 pub fn bell_body(id: &str) -> Vec<u8> {
     let mut w = Writer::with_capacity(1 + id.len());
     w.str(id);
@@ -410,6 +459,36 @@ mod tests {
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0xAA; 6]);
         assert_eq!(ProbeBody::decode(&longer).unwrap().theme_rgba, full.theme_rgba);
+    }
+
+    /// The theme block is the same all-or-nothing tail the probe
+    /// carries, so the event has to survive the same truncations — a
+    /// host that publishes accents only ends the body after the accent.
+    #[test]
+    fn host_theme_changed_body_round_trips() {
+        let accent = [0x12, 0x34, 0x56, 0xFF];
+        let colors: [[u8; 4]; 8] = std::array::from_fn(|i| [i as u8, 2, 3, 4]);
+
+        let body = host_theme_changed_body("", accent, Some(colors));
+        let (id, got_accent, got_colors) = parse_host_theme_changed(&body).unwrap();
+        assert_eq!(id, "", "the host itself names no portal");
+        assert_eq!(got_accent, accent);
+        assert_eq!(got_colors, Some(colors));
+
+        // Accents only.
+        let body = host_theme_changed_body("", accent, None);
+        let (_, got_accent, got_colors) = parse_host_theme_changed(&body).unwrap();
+        assert_eq!(got_accent, accent);
+        assert_eq!(got_colors, None);
+
+        // Half a block is no block.
+        let mut half = host_theme_changed_body("", accent, Some(colors));
+        half.truncate(half.len() - 9);
+        assert_eq!(parse_host_theme_changed(&half).unwrap().2, None);
+
+        // A body too short even for the accent is an error, not a
+        // silently zeroed colour.
+        assert!(parse_host_theme_changed(&[0]).is_err());
     }
 
     #[test]

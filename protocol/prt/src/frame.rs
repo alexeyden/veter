@@ -59,6 +59,24 @@ pub const EVT_PORTAL_SCROLL_DELTA: u8 = 0x8C;
 /// the client's stored offset. `offset == 0` is the canonical request
 /// to drop scroll mode and return to live.
 pub const EVT_PORTAL_SCROLL_SET: u8 = 0x8D;
+/// The host's `host.*` theme changed (§7.3 of the VGE spec): a client
+/// that derived shades of its own from the old palette should recompute
+/// and redraw them. Body is `string id`, the accent RGBA, and
+/// optionally the eight theme colours — the same tail the probe carries
+/// (§10), so one decoder serves both.
+///
+/// Unlike every other §8 event this one names no portal: a theme
+/// belongs to the terminal, not to a pane. The `id` is empty, which is
+/// what "the host itself" is spelled as. It is delivered at every level
+/// — the top-level client and each portal's inner program — because
+/// each derives from the accent its own depth resolves to.
+///
+/// Elements drawn with `StyleRef("host.*")` need no client action; the
+/// host re-resolves those itself (VGE §7.3). The event exists for what
+/// a `StyleRef` cannot express — a locally darkened accent, a
+/// translucent wash — which is otherwise baked into commands the host
+/// has already stored.
+pub const EVT_HOST_THEME_CHANGED: u8 = 0x8E;
 
 // §4.1 error codes
 pub const ERR_UNKNOWN_COMMAND: u16 = 0x0001;
@@ -85,6 +103,11 @@ pub const FEAT_EMIT_ACTIVITY_EVENTS: u8 = 1 << 7;
 // §10 trailing capability bits (after `max_nesting_depth`).
 pub const FEAT_VGE_IN_PORTAL: u8 = 1 << 0;
 pub const FEAT_VGE_HOST_THEMED_STYLES: u8 = 1 << 1;
+/// The host emits [`EVT_HOST_THEME_CHANGED`] when its palette changes.
+/// A client that does not see this bit can assume the palette it read
+/// from the probe is the one it will have for the session — which is
+/// what every client assumed before the bit existed.
+pub const FEAT_VGE_HOST_THEME_EVENTS: u8 = 1 << 2;
 
 // §5.2 anchor mode discriminants
 pub const ANCHOR_LIVE: u8 = 0;

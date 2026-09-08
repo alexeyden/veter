@@ -19,7 +19,8 @@ use prt_protocol::command::{
 };
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
-    cursor_visibility_change_body, err_body, icon_name_change_body, mouse_mode_change_body,
+    cursor_visibility_change_body, err_body, host_theme_changed_body, icon_name_change_body,
+    mouse_mode_change_body,
     portal_activity_body, portal_evicted_body, portal_scroll_delta_body, portal_scroll_set_body,
     raw_reply_body, resize_notify_body, title_change_body, working_dir_change_body,
     wrap_t2c_envelope, ProbeBody,
@@ -466,11 +467,56 @@ impl PrtEngine {
         self.vft_hooks = hooks;
     }
 
-    /// Set the host accent palette seeded into per-portal VGE engines
-    /// spawned in this scope. Called once on the top-level engine after
-    /// construction; inherited by every child engine thereafter.
+    /// Set the host palette seeded into the reserved `host.*` VGE style
+    /// namespace (§7.3) in this scope and every scope below it.
+    ///
+    /// Unlike [`Self::set_metrics`], this reaches *existing* portals
+    /// rather than only ones spawned afterwards. It has to: a session
+    /// that outlives its renderer gets a fresh palette on every attach
+    /// (`vsd`'s attach path), and a portal left on the palette it was
+    /// created with would keep resolving `host.accent` to the colour of
+    /// whichever renderer happened to attach first — visibly, since a
+    /// `StyleRef` is resolved at render time against whatever the table
+    /// holds.
+    ///
+    /// Each level is re-seeded at its own depth, so the contextual
+    /// accent still rotates with nesting, and each level emits
+    /// [`EVT_HOST_THEME_CHANGED`] to whoever is listening there: the
+    /// top-level client for this engine, and each portal's inner
+    /// program for the engines below. That event is for what a
+    /// `StyleRef` cannot express — a client's locally derived shades,
+    /// already baked into commands the host has stored.
     pub fn set_host_palette(&mut self, palette: crate::vge::HostThemePalette) {
         self.host_palette = palette;
+        self.apply_host_palette();
+    }
+
+    /// Re-seed this scope's portals from `self.host_palette` and
+    /// announce the change, recursing into each portal's own engine.
+    fn apply_host_palette(&mut self) {
+        let palette = self.host_palette.clone();
+        let depth = self.depth;
+        // Both sets, for the same reason `set_portal_auto_reply` walks
+        // both: a portal suspended on the other screen comes back when
+        // the inner program swaps buffers (§5.4), and it must come back
+        // themed.
+        let sets = [Some(&mut self.state.main), self.state.alt.as_mut()];
+        for set in sets.into_iter().flatten() {
+            for content in set.contents.values_mut() {
+                content.vge.seed_host_styles(palette.clone(), depth + 1);
+                content.children.set_host_palette(palette.clone());
+            }
+        }
+        if let Some(accent) = palette.contextual_rgba8(depth) {
+            self.emit_event(
+                EVT_HOST_THEME_CHANGED,
+                host_theme_changed_body(
+                    "",
+                    accent,
+                    palette.colors.map(crate::vge::HostThemeColors::to_rgba8),
+                ),
+            );
+        }
     }
 
     /// Update the cell pixel dimensions and scale factor this engine
@@ -1249,7 +1295,10 @@ impl PrtEngine {
                 if self.host_palette.is_empty() {
                     f
                 } else {
-                    f | FEAT_VGE_HOST_THEMED_STYLES
+                    // The change event only means anything to a client
+                    // that got a palette in the first place, so it
+                    // rides the same condition.
+                    f | FEAT_VGE_HOST_THEMED_STYLES | FEAT_VGE_HOST_THEME_EVENTS
                 }
             }),
             // The accent `host.accent` resolves to at this engine's depth,
@@ -2218,6 +2267,91 @@ mod tests {
         let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
         assert_eq!(decoded.accent_rgba, Some([255, 0, 0, 255]));
         assert_eq!(decoded.theme_rgba, None);
+    }
+
+    /// A palette set after portals exist must reach them — this is
+    /// what a `vsd` reattach with a different theme does, and a portal
+    /// left on its creation-time seed would resolve `host.accent` to
+    /// whichever renderer attached first.
+    #[test]
+    fn a_later_palette_reaches_existing_portals() {
+        let mut engine = PrtEngine::new();
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+        // Created before any palette: nothing themed yet.
+        assert!(
+            !engine
+                .state
+                .current()
+                .content("p")
+                .unwrap()
+                .vge
+                .state
+                .shared
+                .styles
+                .contains_key("host.accent")
+        );
+
+        engine.set_host_palette(rgb_palette());
+        // Depth-1 portal → slot 1 (green), as if it had been created
+        // after the palette arrived.
+        assert_eq!(
+            portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),
+            (0.0, 1.0, 0.0),
+        );
+
+        // And a second palette replaces the first rather than being
+        // ignored.
+        let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
+        engine.set_host_palette(crate::vge::HostThemePalette {
+            accents: vec![c(0.0, 0.0, 1.0), c(1.0, 1.0, 0.0)],
+            colors: None,
+        });
+        assert_eq!(
+            portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),
+            (1.0, 1.0, 0.0),
+        );
+    }
+
+    /// …and the client is told, so it can recompute the shades it
+    /// derived itself — the ones already baked into elements the host
+    /// holds, which no re-seed can reach.
+    #[test]
+    fn a_palette_change_announces_itself() {
+        let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
+        let colors = crate::vge::HostThemeColors {
+            bg: c(0.0, 0.0, 0.0),
+            fg: c(1.0, 1.0, 1.0),
+            surface: c(0.2, 0.2, 0.2),
+            surface_inset: c(0.1, 0.1, 0.1),
+            text: c(0.9, 0.9, 0.9),
+            text_dim: c(0.5, 0.5, 0.5),
+            text_on_accent: c(1.0, 1.0, 1.0),
+            warn: c(1.0, 0.0, 0.0),
+        };
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(crate::vge::HostThemePalette {
+            colors: Some(colors),
+            ..rgb_palette()
+        });
+        engine.flush_pending_events();
+        let frames = decode_all_response_frames(&engine.take_responses());
+        assert_eq!(event_count(&frames, EVT_HOST_THEME_CHANGED), 1);
+
+        let ev = first_event(&frames, EVT_HOST_THEME_CHANGED).unwrap();
+        let (id, accent, got) =
+            prt_protocol::envelope::parse_host_theme_changed(&ev.body).unwrap();
+        // The host itself, not a portal — the one §8 event that names
+        // none.
+        assert_eq!(id, "");
+        // Depth 0 → accent slot 0 (red), the same value the probe
+        // would report to this client.
+        assert_eq!(accent, [255, 0, 0, 255]);
+        assert_eq!(got, Some(colors.to_rgba8()));
+
+        // The probe advertises that the event exists.
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        let (vge_features, _) = probe_vge_features_and_accent(&parsed.body);
+        assert!(vge_features & FEAT_VGE_HOST_THEME_EVENTS != 0);
     }
 
     #[test]
