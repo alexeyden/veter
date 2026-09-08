@@ -81,7 +81,12 @@
 # the list by portal nesting depth. Any length >= 1.
 #
 # Unset, the accents come from the theme above — so `[theme] name = …` is
-# enough to re-accent every client. Set it to pin them across a theme change.
+# enough to re-accent every client. Set it to pin them across a theme change;
+# it beats the theme's own `accents` key too.
+#
+# The accent is not only published: `text_on_accent` and the search-panel tint
+# are derived from it, so pinning one carries those with it — a dark accent
+# gets light text over it even on a theme whose own accent is light.
 #
 # The eight non-accent `host.*` colours (the terminal's ground, its text, the
 # surfaces a modal is built from) come from the theme too; there is no

@@ -77,10 +77,10 @@ fn window_title_for(title: &str) -> String {
 /// there is one terminal behind every portal, and a client's chrome
 /// should belong to it.
 ///
-/// The colours come from the resolved theme, with `[accent] palette`
-/// overriding its accents when the user pins some.
-fn host_palette(config: &config::Config, theme: &veter::theme::Theme) -> vge::HostThemePalette {
-    theme.host_palette(config.accent_palette_rgba(theme))
+/// The colours come from the resolved theme, whose accents already
+/// carry any `[accent] palette` the user pinned (`Config::theme`).
+fn host_palette(theme: &veter::theme::Theme) -> vge::HostThemePalette {
+    theme.host_palette(theme.accents())
 }
 
 /// Run a user-defined selection command (`config.selection_commands`) on
@@ -5077,7 +5077,7 @@ impl ApplicationHandler for App {
             current_match.to_femto(),
             other_match.to_femto(),
         );
-        term_renderer.set_selection_accent(self.config.accent_primary(&self.theme).to_femto());
+        term_renderer.set_selection_accent(self.theme.accent_primary().to_femto());
         let (term_cols, term_rows) = term_renderer.terminal_size(size.width, size.height);
 
         // VGE engine: needs cell pixel dimensions and HiDPI scale factor.
@@ -5091,7 +5091,7 @@ impl ApplicationHandler for App {
         // engine's reserved `host.*` namespace (depth 0). vmux and other
         // clients reference `host.accent` instead of hardcoding colors;
         // per-portal engines get their own depth-keyed copy on creation.
-        vge_engine.seed_host_styles(host_palette(&self.config, &self.theme), 0);
+        vge_engine.seed_host_styles(host_palette(&self.theme), 0);
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -5119,7 +5119,7 @@ impl ApplicationHandler for App {
         // Same palette as the top-level VGE engine, inherited by every
         // per-portal VGE engine PRT spawns; each portal keys its
         // contextual `host.accent` on its own nesting depth.
-        prt_engine.set_host_palette(host_palette(&self.config, &self.theme));
+        prt_engine.set_host_palette(host_palette(&self.theme));
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a
@@ -5718,7 +5718,7 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
-                let accent = self.config.accent_primary(&self.theme).to_femto();
+                let accent = self.theme.accent_primary().to_femto();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
                 // The window's ground is the terminal's background, so

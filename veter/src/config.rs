@@ -684,38 +684,34 @@ impl Config {
         }
     }
 
-    /// The resolved colour theme. Cheap enough to call more than once,
-    /// but the GUI resolves it once at startup and hands it to the
-    /// renderer.
+    /// The resolved colour theme, with `[accent] palette` folded in.
+    ///
+    /// Folding rather than consulting the two separately is what keeps
+    /// the theme self-consistent: several of its fields are *derived
+    /// from the accent* — `text_on_accent` picks light or dark by the
+    /// accent's luminance, `search_accent` defaults to it — and those
+    /// have to follow the accent actually painted, not the one the
+    /// named theme shipped with. Pinning a dark accent over a
+    /// light-accented theme would otherwise leave near-black text on
+    /// it.
+    ///
+    /// So `[accent] palette` beats `[theme] accents`, and everything
+    /// downstream reads the accents off the theme alone.
     pub fn theme(&self) -> Theme {
-        veter::theme::resolve(&self.theme, config_path().and_then(|p| p.parent().map(Path::to_path_buf)).as_deref())
-    }
-
-    /// Accent palette, guaranteed non-empty: `[accent] palette` when it
-    /// is set, else the theme's own accents.
-    pub fn accent_palette_rgba(&self, theme: &Theme) -> Vec<Rgba> {
-        if self.accent.palette.is_empty() {
-            theme.accents()
-        } else {
-            self.accent.palette.clone()
+        let dir = config_path().and_then(|p| p.parent().map(Path::to_path_buf));
+        let mut theme = veter::theme::resolve(&self.theme, dir.as_deref());
+        if !self.accent.palette.is_empty() {
+            theme.accents = self.accent.palette.clone();
         }
-    }
-
-    /// First accent color. The tint host-drawn chrome uses when it has
-    /// no colour of its own.
-    pub fn accent_primary(&self, theme: &Theme) -> Rgba {
-        self.accent_palette_rgba(theme)[0]
+        theme
     }
 
     /// Effective search-chrome colours: `[search]` where it is set,
-    /// else the theme's — whose own accent slot follows `[accent]`, so
-    /// pinning one accent restyles the panel with it.
+    /// else the theme's — whose accent slot already follows `[accent]`,
+    /// so pinning an accent restyles the panel with it.
     pub fn search_colors(&self, theme: &Theme) -> [Rgba; 4] {
         [
-            self.search
-                .accent
-                .or(theme.search_accent)
-                .unwrap_or_else(|| self.accent_primary(theme)),
+            self.search.accent.unwrap_or_else(|| theme.search_accent()),
             self.search.bar_text.unwrap_or_else(|| theme.search_text()),
             self.search
                 .current_match
@@ -769,12 +765,9 @@ mod tests {
     #[test]
     fn a_theme_free_config_keeps_the_pre_theme_colours() {
         let bare: Config = toml::from_str("").unwrap();
-        let theme = veter::theme::resolve(&bare.theme, None);
+        let theme = bare.theme();
         assert_eq!(theme.background, Rgba::rgb(30, 30, 30));
-        assert_eq!(
-            bare.accent_primary(&theme),
-            Rgba::rgb(0x56, 0x79, 0x9f)
-        );
+        assert_eq!(theme.accent_primary(), Rgba::rgb(0x56, 0x79, 0x9f));
         assert_eq!(
             bare.search_colors(&theme),
             [
@@ -792,8 +785,8 @@ mod tests {
     #[test]
     fn accent_and_search_fall_through_to_the_theme() {
         let themed: Config = toml::from_str("[theme]\nname = \"nord\"\n").unwrap();
-        let theme = veter::theme::resolve(&themed.theme, None);
-        assert_eq!(themed.accent_primary(&theme), Rgba::rgb(0x88, 0xc0, 0xd0));
+        let theme = themed.theme();
+        assert_eq!(theme.accent_primary(), Rgba::rgb(0x88, 0xc0, 0xd0));
         // The search panel follows the theme's accent with it.
         assert_eq!(themed.search_colors(&theme)[0], Rgba::rgb(0x88, 0xc0, 0xd0));
 
@@ -801,21 +794,46 @@ mod tests {
             "[theme]\nname = \"nord\"\n[accent]\npalette = [\"#ff0000\"]\n[search]\nmatch = \"#010203\"\n",
         )
         .unwrap();
-        let theme = veter::theme::resolve(&pinned.theme, None);
-        assert_eq!(pinned.accent_primary(&theme), Rgba::rgb(255, 0, 0));
+        let theme = pinned.theme();
+        assert_eq!(theme.accent_primary(), Rgba::rgb(255, 0, 0));
         // …and the panel with it, since its accent resolves through
-        // `accent_primary`.
+        // the theme's own accent slot.
         assert_eq!(pinned.search_colors(&theme)[0], Rgba::rgb(255, 0, 0));
         assert_eq!(pinned.search_colors(&theme)[3], Rgba::rgb(1, 2, 3));
         // The unpinned search keys still come from nord.
         assert_eq!(pinned.search_colors(&theme)[1], theme.search_text());
+        // `[accent]` beats the theme's own `accents` key, not just a
+        // named theme's built-in list.
+        let both: Config = toml::from_str(
+            "[theme]\naccents = [\"#00ff00\"]\n[accent]\npalette = [\"#ff0000\"]\n",
+        )
+        .unwrap();
+        assert_eq!(both.theme().accent_primary(), Rgba::rgb(255, 0, 0));
+    }
+
+    /// The accent is not just published — several theme fields are
+    /// *derived from* it. Pinning one of the opposite lightness has to
+    /// carry those with it, or a client paints near-black text on a
+    /// dark accent fill.
+    #[test]
+    fn a_pinned_accent_carries_the_fields_derived_from_it() {
+        // nord's accent is a light frost blue, so text over it is dark.
+        let light: Config = toml::from_str("[theme]\nname = \"nord\"\n").unwrap();
+        assert!(light.theme().text_on_accent().luminance() < 0.25);
+
+        // Pinning a dark accent must flip it to light text.
+        let dark: Config = toml::from_str(
+            "[theme]\nname = \"nord\"\n[accent]\npalette = [\"#2a2f6e\"]\n",
+        )
+        .unwrap();
+        assert!(dark.theme().text_on_accent().luminance() > 0.8);
     }
 
     /// The pre-`[theme]` spelling of the search-panel tint still works.
     #[test]
     fn the_bar_bg_alias_survives() {
         let cfg: Config = toml::from_str("[search]\nbar_bg = \"#0a0b0c\"\n").unwrap();
-        let theme = veter::theme::resolve(&cfg.theme, None);
+        let theme = cfg.theme();
         assert_eq!(cfg.search_colors(&theme)[0], Rgba::rgb(10, 11, 12));
     }
 

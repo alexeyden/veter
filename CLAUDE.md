@@ -135,7 +135,7 @@ It reaches three places:
 - **veter's own chrome** — the search panel and the close prompt read `TerminalRenderer::panel_bg` / `panel_text` / `warn_colors` and friends, which are theme lookups.
 - **In-terminal clients** — the theme becomes a `veter_host::vge::HostThemePalette`, seeded into the reserved `host.*` VGE style namespace (`doc/vector-graphics-extension.md` §7.3) and reported in the PRT probe (`doc/portal-extension.md` §10). Accents rotate with portal nesting depth; the eight surface/text colours do not — there is one terminal behind every portal. `vge-ui::theme` adopts them (`set_host_theme`), so `vmux` and `vfm` chrome sits on the terminal's own surfaces. `vsd` adopts them from the attaching renderer's probe, so a client started in a detached session gets the same palette.
 
-`[accent]` and `[search]` in the config are *overrides over the theme*, not siblings of it: unset keys fall through, so naming a theme re-accents every client, and pinning one holds it across a theme change.
+`[accent]` and `[search]` in the config are *overrides over the theme*, not siblings of it: unset keys fall through, so naming a theme re-accents every client, and pinning one holds it across a theme change. `[accent] palette` is folded into the theme by `Config::theme` rather than consulted beside it, because several theme fields are *derived from* the accent (`text_on_accent` picks light or dark by its luminance; `search_accent` defaults to it) and those have to follow the accent actually painted — otherwise pinning a dark accent over a light-accented theme leaves near-black text on it.
 
 ## Input never crosses PRT
 
