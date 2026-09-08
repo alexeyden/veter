@@ -3895,6 +3895,19 @@ impl State {
     }
 
     /// Re-emit only the chrome for one specific pane (e.g. after rename).
+    /// Re-emit every visible pane's chrome and the tab bar. Layout is
+    /// untouched; this is for when the *colours* changed underneath a
+    /// drawing that is otherwise still correct — see the
+    /// `EVT_HOST_THEME_CHANGED` handler.
+    fn repaint_all_chrome(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for id in self.active_pane_ids() {
+            out.extend(self.render_one_chrome(&id));
+        }
+        out.extend(self.render_tabbar());
+        out
+    }
+
     fn render_one_chrome(&mut self, pane_id: &str) -> Vec<u8> {
         // Only the active tab's panes have visible chrome. A pane in a
         // background tab can still trigger this path — a late
@@ -5221,6 +5234,9 @@ fn handle_stdin_chunk(
     // Set when a background pane reported activity, so the tab bar is
     // re-rendered once after the frame loop.
     let mut activity_dirty = false;
+    // Set by `EVT_HOST_THEME_CHANGED`: every colour we derived
+    // ourselves is stale and the whole chrome has to be re-emitted.
+    let mut theme_dirty = false;
 
     // PRT host frames: scan for RawReply events (forward to the matching
     // pane's PTY) and Ok responses to our scroll commands (carry the
@@ -5340,6 +5356,30 @@ fn handle_stdin_chunk(
                 if !id.is_empty() && state.panes.contains_key(&id) {
                     let _ = apply_scroll_set(state, &id, offset);
                 }
+            } else if ft == prt_protocol::frame::EVT_HOST_THEME_CHANGED {
+                // §8.13. The palette changed under us — in practice a
+                // renderer with a different theme attached to the
+                // session this vmux has been running in all along.
+                //
+                // Chrome drawn as `StyleRef("host.*")` needs nothing:
+                // the host re-resolves those against its own table. What
+                // needs redoing is every shade derived from the concrete
+                // accent read at probe time — the activity marker, the
+                // title thumb, the modal ground — which is a literal
+                // inside commands the host has already stored, and which
+                // therefore nobody but us can update.
+                //
+                // A `--accent` on the command line still wins: it is
+                // checked ahead of the host's in `theme::accent_color`.
+                if let Ok((_, accent, colors)) =
+                    prt_protocol::envelope::parse_host_theme_changed(body)
+                {
+                    theme::set_host_accent(theme::unpack(u32::from_be_bytes(accent)));
+                    if let Some(quads) = colors {
+                        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
+                    }
+                    theme_dirty = true;
+                }
             } else if ft == prt_protocol::frame::RSP_OK
                 && body.len() >= 4
             {
@@ -5371,6 +5411,17 @@ fn handle_stdin_chunk(
             env.extend(state.render_one_chrome(id));
         }
         env.extend(state.render_tabbar());
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
+
+    // A theme change invalidates colours rather than layout, so the
+    // whole chrome is re-emitted from the values just adopted. Done
+    // after the title/activity flush so a single pass carries both when
+    // an attach coincides with either.
+    if theme_dirty {
+        let env = state.repaint_all_chrome();
         if !env.is_empty() {
             write_all_stdout(&env)?;
         }

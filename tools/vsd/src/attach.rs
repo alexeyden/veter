@@ -299,7 +299,7 @@ fn handler_main(
     // dropped.
     let outcome = probe::run(&stdin_fd, &stdout_fd, PROBE_TIMEOUT)
         .with_context(|| "running upstream probe")?;
-    apply_probe(&engines, &master_writer_fd, &outcome);
+    let theme_event = apply_probe(&engines, &master_writer_fd, &outcome);
     // Every write to the inner PTY master from this thread goes
     // through the same lock the worker takes; see
     // `EngineState::master_write`.
@@ -307,6 +307,13 @@ fn handler_main(
         let guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         guard.master_write_lock()
     };
+    // Ahead of the typeahead: the client should know what palette it is
+    // on before it acts on anything the user typed during the attach.
+    if !theme_event.is_empty() {
+        let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
+        write_all_raw(master_writer_fd.as_raw_fd(), &theme_event)
+            .with_context(|| "announcing the renderer's theme")?;
+    }
     if !outcome.typeahead.is_empty() {
         let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
         write_all_raw(master_writer_fd.as_raw_fd(), &outcome.typeahead)
@@ -653,11 +660,14 @@ fn winsize_main(
 /// its redraw bytes arrive before the snapshot is serialized, so the
 /// snapshot reflects the renderer's actual grid (modulo whatever
 /// races the inner program loses to our `engines.lock()`).
+/// Returns bytes the caller must write to the inner PTY master — the
+/// theme announcement, when the attaching renderer brought a palette.
+/// Empty otherwise.
 fn apply_probe(
     engines: &Arc<Mutex<EngineState>>,
     master_writer_fd: &OwnedFd,
     outcome: &probe::ProbeOutcome,
-) {
+) -> Vec<u8> {
     let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ws) = outcome.winsize {
@@ -673,15 +683,120 @@ fn apply_probe(
         guard.vge.set_dimensions(cell_px, vge.scale_factor);
         guard.prt.set_metrics(cell_px, vge.scale_factor);
     }
-    if let Some(palette) = outcome.prt.and_then(accent_palette) {
-        // §7.3 — the daemon paints nothing, so it has no palette of
-        // its own; it borrows the attached renderer's, the same way it
-        // borrows its cell metrics, and keeps it after a detach so a
-        // client started in a detached session still gets a themed
-        // accent. Existing portals keep the seed they were spawned
-        // with, as with `set_metrics`.
-        guard.vge.seed_host_styles(palette.clone(), 0);
-        guard.prt.set_host_palette(palette);
+    let Some(palette) = outcome.prt.and_then(accent_palette) else {
+        return Vec::new();
+    };
+    // §7.3 — the daemon paints nothing, so it has no palette of its
+    // own; it borrows the attached renderer's, the same way it borrows
+    // its cell metrics, and keeps it after a detach so a client started
+    // in a detached session still gets a themed accent.
+    guard.vge.seed_host_styles(palette.clone(), 0);
+    guard.prt.set_host_palette(palette.clone());
+
+    // Announce it to the session's client (§8.13).
+    //
+    // This has to be written from here rather than left to the worker,
+    // and it is the one piece of PRT output the daemon emits while a
+    // renderer is attached. The suppression it steps around exists
+    // because the renderer runs the same commands off the forwarded
+    // chunk and answers them itself — a rule about *replies*, which
+    // carry a request id that would then be answered twice. An
+    // unsolicited event answers nothing, and the renderer emits none of
+    // these: its palette is set once at startup, before the session's
+    // client exists, so nothing on its side ever changes.
+    //
+    // Which is also why the client needs telling at all. Reattaching
+    // does not change any palette — it swaps in a renderer that may
+    // have a *different* one, and the client is a long-lived process
+    // still holding the colours it read from whichever renderer it
+    // probed first.
+    theme_announcement(&palette)
+}
+
+/// One `HostThemeChanged` event (§8.13) as a host→client envelope, for
+/// the session's client to read off its own stdin. Empty when the
+/// palette has no accent to report, since the event's whole payload is
+/// the palette.
+fn theme_announcement(palette: &veter_host::vge::HostThemePalette) -> Vec<u8> {
+    // Depth 0: the session's client is the top-level one.
+    let Some(accent) = palette.contextual_rgba8(0) else {
+        return Vec::new();
+    };
+    let body = prt_protocol::envelope::host_theme_changed_body(
+        "",
+        accent,
+        palette.colors.map(veter_host::vge::HostThemeColors::to_rgba8),
+    );
+    let mut frames = Vec::new();
+    prt_protocol::envelope::append_frame(
+        &mut frames,
+        prt_protocol::frame::EVT_HOST_THEME_CHANGED,
+        0,
+        &body,
+    );
+    prt_protocol::envelope::wrap_t2c_envelope(&frames)
+}
+
+#[cfg(test)]
+mod theme_announcement_tests {
+    use super::*;
+    use prt_protocol::frame::{EVT_HOST_THEME_CHANGED, MARKER_T2C};
+
+    fn color(r: f32, g: f32, b: f32) -> vge_protocol::command::Color {
+        vge_protocol::command::Color { r, g, b, a: 1.0 }
+    }
+
+    /// What the session's client actually reads off its stdin: a
+    /// well-formed t2c envelope carrying the event, decodable by the
+    /// same parser every other host→client frame goes through.
+    #[test]
+    fn the_announcement_decodes_as_a_host_theme_changed_event() {
+        let colors = veter_host::vge::HostThemeColors {
+            bg: color(0.0, 0.0, 0.0),
+            fg: color(1.0, 1.0, 1.0),
+            surface: color(0.2, 0.2, 0.2),
+            surface_inset: color(0.1, 0.1, 0.1),
+            text: color(0.9, 0.9, 0.9),
+            text_dim: color(0.5, 0.5, 0.5),
+            text_on_accent: color(1.0, 1.0, 1.0),
+            warn: color(1.0, 0.0, 0.0),
+        };
+        let palette = veter_host::vge::HostThemePalette {
+            accents: vec![color(1.0, 0.0, 0.0)],
+            colors: Some(colors),
+        };
+
+        let bytes = theme_announcement(&palette);
+        let mut apc = prt_protocol::apc::ApcStream::with_marker(*MARKER_T2C);
+        let payload = apc
+            .feed(&bytes)
+            .into_payloads()
+            .next()
+            .expect("one envelope");
+
+        let mut r = prt_protocol::codec::Reader::new(&payload);
+        let _version = r.u8().unwrap();
+        let _payload_len = r.u32().unwrap();
+        assert_eq!(r.u8().unwrap(), EVT_HOST_THEME_CHANGED);
+        let _rid = r.u32().unwrap();
+        let body_len = r.u32().unwrap() as usize;
+        let body = r.take(body_len).unwrap();
+
+        let (id, accent, got) =
+            prt_protocol::envelope::parse_host_theme_changed(body).unwrap();
+        assert_eq!(id, "", "the host itself names no portal");
+        assert_eq!(accent, [255, 0, 0, 255]);
+        assert_eq!(got, Some(colors.to_rgba8()));
+        assert!(r.at_end(), "exactly one frame");
+    }
+
+    /// A renderer that themes nothing leaves the client on its own
+    /// colours rather than being told about a palette that isn't there.
+    #[test]
+    fn an_empty_palette_announces_nothing() {
+        assert!(
+            theme_announcement(&veter_host::vge::HostThemePalette::default()).is_empty()
+        );
     }
 }
 
