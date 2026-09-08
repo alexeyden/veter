@@ -6,21 +6,18 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Seven things are configurable:
+//! Six things are configurable:
 //!
-//!  * `[theme]` — the colour scheme: the grid palette, the terminal's
-//!    default fore/background, the accents, and veter's own overlay
+//!  * `[theme]` — every colour: the grid palette, the terminal's
+//!    default fore/background, the accents published into the reserved
+//!    `host.*` VGE style namespace (VGE §7.3), and veter's own overlay
 //!    chrome. `name` picks one of the built-ins in [`veter::theme`] or
 //!    a user file under `themes/`, and any other key overrides that
-//!    theme's own value. Everything below layers on top of it.
-//!  * `[accent]` — the shared accent palette the host publishes into the
-//!    reserved `host.*` VGE style namespace (see VGE §7.3). vmux and
-//!    other clients render their chrome from it via `host.accent`.
-//!    Unset, it comes from the theme.
+//!    theme's own value.
 //!  * `[font]` — the primary family and the fallback families tried for
 //!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
-//!    highlights).
+//!    highlights), each key overriding the theme's own.
 //!  * `[keys]` — the host-intercepted key chords (search, scroll,
 //!    overlay, hints, copy, paste, save-image) and the in-overlay modal
 //!    keys.
@@ -49,20 +46,9 @@ use veter::theme::Theme;
 
 // The hex-string colour type and its parser live with the themes, since
 // a theme file is written in the same notation as a config key. Re-exported
-// here because `[accent]`, `[search]` and every other colour key in this
+// here because `[theme]`, `[search]` and every other colour key in this
 // module is one.
 pub use veter::theme::Rgba;
-
-/// `[accent]` — the ordered accent palette.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct AccentConfig {
-    /// Ordered accent palette; slot N maps to `host.accent.{N+1}`.
-    /// Unset (or empty) takes the theme's own accents, so naming a
-    /// theme is enough to re-accent every client's chrome; setting it
-    /// pins the accents across a theme change.
-    pub palette: Vec<Rgba>,
-}
 
 /// `[search]` — search-chrome colors. Every key is optional; an unset
 /// one comes from the theme, which is what lets `[theme] name = …`
@@ -626,7 +612,6 @@ pub struct Config {
     /// schema is [`veter::theme::Theme`]'s own rather than a second
     /// copy of it here. Resolved by [`Config::theme`].
     pub theme: toml::Table,
-    pub accent: AccentConfig,
     pub font: FontConfig,
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
@@ -684,31 +669,24 @@ impl Config {
         }
     }
 
-    /// The resolved colour theme, with `[accent] palette` folded in.
+    /// The resolved colour theme — the one place the accents are
+    /// decided.
     ///
-    /// Folding rather than consulting the two separately is what keeps
-    /// the theme self-consistent: several of its fields are *derived
-    /// from the accent* — `text_on_accent` picks light or dark by the
-    /// accent's luminance, `search_accent` defaults to it — and those
-    /// have to follow the accent actually painted, not the one the
-    /// named theme shipped with. Pinning a dark accent over a
-    /// light-accented theme would otherwise leave near-black text on
-    /// it.
-    ///
-    /// So `[accent] palette` beats `[theme] accents`, and everything
-    /// downstream reads the accents off the theme alone.
+    /// They live on the theme rather than in a section beside it
+    /// because several of its fields are *derived from* the accent:
+    /// `text_on_accent` picks light or dark by the accent's luminance,
+    /// and `search_accent` defaults to it. A section that overwrote the
+    /// accents from outside would leave those derived from the accent
+    /// the named theme shipped with, so setting a dark accent over a
+    /// light-accented theme would put near-black text on it.
     pub fn theme(&self) -> Theme {
         let dir = config_path().and_then(|p| p.parent().map(Path::to_path_buf));
-        let mut theme = veter::theme::resolve(&self.theme, dir.as_deref());
-        if !self.accent.palette.is_empty() {
-            theme.accents = self.accent.palette.clone();
-        }
-        theme
+        veter::theme::resolve(&self.theme, dir.as_deref())
     }
 
     /// Effective search-chrome colours: `[search]` where it is set,
-    /// else the theme's — whose accent slot already follows `[accent]`,
-    /// so pinning an accent restyles the panel with it.
+    /// else the theme's — whose search accent defaults to `[theme]
+    /// accents`, so setting an accent restyles the panel with it.
     pub fn search_colors(&self, theme: &Theme) -> [Rgba; 4] {
         [
             self.search.accent.unwrap_or_else(|| theme.search_accent()),
@@ -779,11 +757,12 @@ mod tests {
         );
     }
 
-    /// `[accent]` and `[search]` are overrides *over* the theme, not
-    /// beside it: naming a theme re-accents everything, and pinning a
-    /// key holds it across a theme change.
+    /// `[search]` is an override *over* the theme, not beside it, and
+    /// the accents live on the theme itself: naming a theme re-accents
+    /// every client, and setting `accents` holds them across a theme
+    /// change.
     #[test]
-    fn accent_and_search_fall_through_to_the_theme() {
+    fn the_search_chrome_falls_through_to_the_theme() {
         let themed: Config = toml::from_str("[theme]\nname = \"nord\"\n").unwrap();
         let theme = themed.theme();
         assert_eq!(theme.accent_primary(), Rgba::rgb(0x88, 0xc0, 0xd0));
@@ -791,7 +770,7 @@ mod tests {
         assert_eq!(themed.search_colors(&theme)[0], Rgba::rgb(0x88, 0xc0, 0xd0));
 
         let pinned: Config = toml::from_str(
-            "[theme]\nname = \"nord\"\n[accent]\npalette = [\"#ff0000\"]\n[search]\nmatch = \"#010203\"\n",
+            "[theme]\nname = \"nord\"\naccents = [\"#ff0000\"]\n[search]\nmatch = \"#010203\"\n",
         )
         .unwrap();
         let theme = pinned.theme();
@@ -802,17 +781,10 @@ mod tests {
         assert_eq!(pinned.search_colors(&theme)[3], Rgba::rgb(1, 2, 3));
         // The unpinned search keys still come from nord.
         assert_eq!(pinned.search_colors(&theme)[1], theme.search_text());
-        // `[accent]` beats the theme's own `accents` key, not just a
-        // named theme's built-in list.
-        let both: Config = toml::from_str(
-            "[theme]\naccents = [\"#00ff00\"]\n[accent]\npalette = [\"#ff0000\"]\n",
-        )
-        .unwrap();
-        assert_eq!(both.theme().accent_primary(), Rgba::rgb(255, 0, 0));
     }
 
     /// The accent is not just published — several theme fields are
-    /// *derived from* it. Pinning one of the opposite lightness has to
+    /// *derived from* it. Setting one of the opposite lightness has to
     /// carry those with it, or a client paints near-black text on a
     /// dark accent fill.
     #[test]
@@ -821,11 +793,9 @@ mod tests {
         let light: Config = toml::from_str("[theme]\nname = \"nord\"\n").unwrap();
         assert!(light.theme().text_on_accent().luminance() < 0.25);
 
-        // Pinning a dark accent must flip it to light text.
-        let dark: Config = toml::from_str(
-            "[theme]\nname = \"nord\"\n[accent]\npalette = [\"#2a2f6e\"]\n",
-        )
-        .unwrap();
+        // A dark accent must flip it to light text.
+        let dark: Config =
+            toml::from_str("[theme]\nname = \"nord\"\naccents = [\"#2a2f6e\"]\n").unwrap();
         assert!(dark.theme().text_on_accent().luminance() > 0.8);
     }
 

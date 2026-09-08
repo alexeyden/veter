@@ -62,7 +62,7 @@ A `[theme]` name sets the whole look — the ANSI-16 grid, the terminal's fore/b
 name = "tokyonight-storm"   # or catppuccin-mocha, gruvbox-dark, nord, veter
 ```
 
-Any other name is looked up as `themes/<name>.toml` beside the config, so any published scheme drops in without a rebuild; a file needs only `ansi`, `background` and `foreground`, and the rest is derived. Individual keys under `[theme]`, `[accent]` and `[search]` override whatever the theme resolves to.
+Any other name is looked up as `themes/<name>.toml` beside the config, so any published scheme drops in without a rebuild; a file needs only `ansi`, `background` and `foreground`, and the rest is derived. Individual keys under `[theme]` override the named scheme, and `[search]` overrides what the resolved theme implies for the search panel.
 
 Because veter publishes its palette into the reserved `host.*` VGE style namespace and reports it in the PRT probe, `vmux` and `vfm` pick the theme up too — their pane chrome and modals are drawn in the terminal's own surfaces rather than a built-in dark set.
 

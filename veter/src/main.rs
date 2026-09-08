@@ -77,8 +77,8 @@ fn window_title_for(title: &str) -> String {
 /// there is one terminal behind every portal, and a client's chrome
 /// should belong to it.
 ///
-/// The colours come from the resolved theme, whose accents already
-/// carry any `[accent] palette` the user pinned (`Config::theme`).
+/// The colours come from the resolved theme (`Config::theme`), which
+/// is where the accents are decided.
 fn host_palette(theme: &veter::theme::Theme) -> vge::HostThemePalette {
     theme.host_palette(theme.accents())
 }
@@ -1507,7 +1507,7 @@ impl FrameTrace {
 // The host draws two overlays of its own — the search panel and the
 // close-confirmation prompt — and they share a look: a dark rounded
 // panel with a 2px accent border, holding rounded chips. Only the accent
-// comes from the user (`[accent]`, or `[search] accent` for the search
+// comes from the user (`[theme] accents`, or `[search] accent` for the search
 // panel), which is what makes both follow a palette change.
 
 /// Blend `color` toward white by `amount` (`0.0`..=`1.0`).
@@ -1553,7 +1553,7 @@ struct Chip {
 /// Styled like the close-confirmation prompt: a dark rounded panel with
 /// an accent border, holding a recessed query field with its caret, the
 /// match counter and case chips, and a dim key hint. Every tint derives
-/// from `TerminalRenderer::search_accent` (the first `[accent]` slot
+/// from `TerminalRenderer::search_accent` (the theme's first accent
 /// unless `[search] accent` overrides it), so re-palettting veter
 /// restyles the panel with it.
 ///
@@ -5065,9 +5065,9 @@ impl ApplicationHandler for App {
             },
         );
         // The theme first: it is the base for the grid palette and for
-        // every chrome colour. `[search]` and `[accent]` then layer
-        // over what it implies — both resolve theme-first, so this is
-        // a no-op unless the user pinned something.
+        // every chrome colour. `[search]` then layers over what it
+        // implies — it resolves theme-first, so this is a no-op unless
+        // the user set one of its keys.
         term_renderer.set_theme(self.theme.clone());
         let [search_accent, search_text, current_match, other_match] =
             self.config.search_colors(&self.theme);

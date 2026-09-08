@@ -54,6 +54,22 @@
 # background = "#1e1e1e"
 # foreground = "#cccccc"
 #
+# The accents. Published into the reserved `host.*` VGE style namespace, where
+# vmux and the other in-terminal tools draw their chrome (pane outlines, tabs,
+# titles) from them: slot 1 is `host.accent.1`, and the contextual
+# `host.accent` rotates through the list by portal nesting depth. Any length
+# >= 1; unset, blue/green/magenta are taken from `ansi`.
+#
+# They are a field of the theme rather than a section of their own because
+# `text_on_accent` and the search-panel tint are *derived from* the accent —
+# set a dark one and text over it turns light to match.
+#
+# The eight non-accent `host.*` colours (the terminal's ground, its text, the
+# surfaces a modal is built from) come from the keys below and from
+# `background`/`foreground`; they describe the terminal, so there is nothing
+# per-client to set.
+# accents = ["#56799f", "#859f3d", "#5a3c9e"]   # muted blue / olive / violet
+#
 # `cursor` and the selection pair are optional. Unset, both keep veter's
 # built-in look: the cell drawn in reverse video. Setting only `selection_bg`
 # fills behind the selected cell and leaves each character its own colour.
@@ -71,29 +87,6 @@
 # warn_fill      = "#34282a"   # the Quit button, the `no matches` chip
 # warn_border    = "#964646"
 # warn_text      = "#e88282"
-
-# ---------------------------------------------------------------------------
-# Shared accent palette
-# ---------------------------------------------------------------------------
-# Published into the reserved `host.*` VGE style namespace; vmux and other
-# in-terminal tools draw their chrome (pane outlines, tabs, titles) from it.
-# Slot 1 is `host.accent.1`, and the contextual `host.accent` rotates through
-# the list by portal nesting depth. Any length >= 1.
-#
-# Unset, the accents come from the theme above — so `[theme] name = …` is
-# enough to re-accent every client. Set it to pin them across a theme change;
-# it beats the theme's own `accents` key too.
-#
-# The accent is not only published: `text_on_accent` and the search-panel tint
-# are derived from it, so pinning one carries those with it — a dark accent
-# gets light text over it even on a theme whose own accent is light.
-#
-# The eight non-accent `host.*` colours (the terminal's ground, its text, the
-# surfaces a modal is built from) come from the theme too; there is no
-# separate section for them, since they describe the terminal rather than a
-# preference of its own.
-[accent]
-# palette = ["#56799f", "#859f3d", "#5a3c9e"]  # muted blue / olive / violet
 
 # ---------------------------------------------------------------------------
 # Fonts

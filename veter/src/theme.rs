@@ -364,8 +364,7 @@ impl Theme {
 
     /// The theme as the host palette published into the reserved
     /// `host.*` VGE style namespace (VGE §7.3) and reported in the PRT
-    /// probe (`doc/portal-extension.md` §10). `accents` is passed in
-    /// already resolved, since `[accent] palette` may override it.
+    /// probe (`doc/portal-extension.md` §10).
     #[must_use]
     pub fn host_palette(&self, accents: Vec<Rgba>) -> veter_host::vge::HostThemePalette {
         veter_host::vge::HostThemePalette {

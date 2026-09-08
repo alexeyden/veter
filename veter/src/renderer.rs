@@ -1691,7 +1691,7 @@ pub struct TerminalRenderer {
     search_match: Color,
     /// Outline colour for a selected VGE image. Defaults to the
     /// built-in accent slot 0; `set_selection_accent` overrides it from
-    /// `[accent]`.
+    /// the theme's first accent.
     selection_accent: Color,
 
     /// The user's theme. Backs `palette` (the grid) and the chrome
@@ -1908,8 +1908,8 @@ impl TerminalRenderer {
     /// Adopt the user's theme: it becomes the grid palette's base (see
     /// [`Palette::with_theme`]) and the source of every chrome colour
     /// below. Called once at startup, before `set_search_colors` and
-    /// `set_selection_accent` layer the `[search]` / `[accent]`
-    /// sections over the values it implies.
+    /// `set_selection_accent` layer the `[search]` section and the
+    /// theme's own accent over the values it implies.
     pub fn set_theme(&mut self, theme: Theme) {
         self.palette = Palette::with_theme(&theme);
         self.search_accent = theme.search_accent().to_femto();
@@ -1979,7 +1979,7 @@ impl TerminalRenderer {
 
     /// Accent tint for the search panel's chrome — its border, the caret
     /// and the chip fills (`draw_search_bar`). Defaults to the first
-    /// `[accent]` slot, so a palette change restyles the panel;
+    /// theme accent, so a palette change restyles the panel;
     /// `[search] accent` overrides it.
     pub fn search_accent(&self) -> Color {
         self.search_accent
