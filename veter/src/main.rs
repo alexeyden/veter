@@ -785,6 +785,37 @@ fn whole_line_marker(
 /// cursor stay in one phase. xterm's default is the same half-second.
 const BLINK_PERIOD: Duration = Duration::from_millis(500);
 
+/// When an output-driven frame may be asked for, given when the last
+/// one finished: `None` to ask now, `Some(due)` to come back then.
+///
+/// Separate from [`App::request_output_redraw`] so the rule can be
+/// tested without a window.
+fn deferred_frame_deadline(
+    last_frame: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    let due = last_frame?.checked_add(FRAME_MIN_INTERVAL)?;
+    (due > now).then_some(due)
+}
+
+/// Floor on the interval between two frames asked for on account of PTY
+/// output.
+///
+/// Draining and repainting are separate cadences, and several drain
+/// passes may share one frame. They used to be one: the drain requested
+/// a redraw at the end of every pass, so the next pass could not start
+/// until that frame had been dispatched — 35-80ms of waiting per pass
+/// with the window visible, against 0.6ms with it away, for the same
+/// bytes and the same 130ms of actual draining.
+///
+/// kitty draws this line as `repaint_delay` (10ms) against
+/// `input_delay` (3ms); konsole as its 10ms and 40ms bulk timers. The
+/// value here is kitty's, and like kitty this paces only
+/// output-driven frames: a keystroke still redraws immediately, since
+/// latency to the thing the user just did is worth more than a
+/// coalesced frame.
+const FRAME_MIN_INTERVAL: Duration = Duration::from_millis(10);
+
 struct App {
     // Terminal state (dropped first — no GL dependency)
     parser: Option<vt100::Parser<clipboard::HostCallbacks>>,
@@ -858,6 +889,11 @@ struct App {
     /// so a screen without any costs no wakeups.
     blink_on: bool,
     blink_deadline: Option<Instant>,
+    /// When the last frame finished presenting, and when the next
+    /// output-driven one is due if it had to be deferred. See
+    /// [`FRAME_MIN_INTERVAL`].
+    last_frame: Option<Instant>,
+    redraw_deadline: Option<Instant>,
     /// See [`FrameTrace`]. Inert unless `VETER_FRAME_TRACE` is set.
     trace: FrameTrace,
     /// Most recent left-press recorded in the local-selection branch
@@ -2198,6 +2234,8 @@ impl App {
             window_focused: true,
             blink_on: true,
             blink_deadline: None,
+            last_frame: None,
+            redraw_deadline: None,
             trace: FrameTrace::new(),
             last_click: None,
             mouse_buttons_held: 0,
@@ -4640,6 +4678,28 @@ impl App {
         }
     }
 
+    /// Ask for a frame on account of PTY output, no sooner than
+    /// [`FRAME_MIN_INTERVAL`] after the last one.
+    ///
+    /// Deferred requests are not dropped: `about_to_wait` schedules the
+    /// wakeup, alongside the blink and autoscroll deadlines, so the
+    /// output still lands within the interval.
+    fn request_output_redraw(&mut self) {
+        match deferred_frame_deadline(self.last_frame, Instant::now()) {
+            None => {
+                self.redraw_deadline = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Keep whichever pending deadline is earliest.
+            Some(due) => {
+                self.redraw_deadline =
+                    Some(self.redraw_deadline.map_or(due, |d| d.min(due)));
+            }
+        }
+    }
+
     /// Tell a `?1004` client that the window gained or lost focus.
     ///
     /// Host level only: PRT carries display direction, never input
@@ -5682,6 +5742,8 @@ impl ApplicationHandler for App {
                     .swap_buffers(self.gl_context.as_ref().unwrap())
                     .unwrap();
                 self.trace.frame(render, swap_start.elapsed());
+                self.last_frame = Some(Instant::now());
+                self.redraw_deadline = None;
             }
 
             _ => {}
@@ -5711,9 +5773,7 @@ impl ApplicationHandler for App {
         // the head so the highlight follows the content under the cursor.
         // No-op when no drag is active.
         self.update_selection_head();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_output_redraw();
         if !pass.alive {
             event_loop.exit();
         }
@@ -5758,10 +5818,25 @@ impl ApplicationHandler for App {
             self.maybe_arm_autoscroll();
         }
 
-        let next = match (self.autoscroll_deadline, self.blink_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        // An output-driven frame that `request_output_redraw` held back
+        // to keep inside `FRAME_MIN_INTERVAL`.
+        if let Some(deadline) = self.redraw_deadline
+            && now >= deadline
+        {
+            self.redraw_deadline = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
+        let next = [
+            self.autoscroll_deadline,
+            self.blink_deadline,
+            self.redraw_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match next {
             Some(d) => event_loop.set_control_flow(ControlFlow::WaitUntil(d)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -6389,6 +6464,44 @@ mod image_crop_tests {
         assert!(crop_uploaded_image(&img, Some(rect(0.0, 0.0, f32::INFINITY, 2.0))).is_none());
         // A zero-sized image has nothing to copy either.
         assert!(crop_uploaded_image(&coded_image(0, 0), None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod frame_pacing_tests {
+    use super::*;
+
+    /// The drain asks for a frame after every pass; the pacing is what
+    /// stops each of those passes waiting on one. Before it, a visible
+    /// window spent 35-80ms per pass waiting where an occluded one
+    /// spent 0.6ms, for the same bytes.
+    #[test]
+    fn output_frames_are_spaced_but_never_dropped() {
+        let now = Instant::now();
+        // Nothing drawn yet: draw immediately.
+        assert_eq!(deferred_frame_deadline(None, now), None);
+
+        // Just drew: come back when the interval is up, not never.
+        let last = now - FRAME_MIN_INTERVAL / 2;
+        assert_eq!(
+            deferred_frame_deadline(Some(last), now),
+            Some(last + FRAME_MIN_INTERVAL),
+        );
+
+        // The interval has passed: draw immediately.
+        let last = now - FRAME_MIN_INTERVAL * 2;
+        assert_eq!(deferred_frame_deadline(Some(last), now), None);
+    }
+
+    /// Exactly on the boundary counts as due, so a steady stream paces
+    /// at the interval instead of one tick behind it.
+    #[test]
+    fn the_boundary_itself_is_due() {
+        let now = Instant::now();
+        assert_eq!(
+            deferred_frame_deadline(Some(now - FRAME_MIN_INTERVAL), now),
+            None,
+        );
     }
 }
 
