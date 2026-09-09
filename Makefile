@@ -1,4 +1,4 @@
-# Build and install veter, vcat, vplay, vdraw, vfm, and vmux. Mirrors what
+# Build and install veter, vcat, vplay, vdraw, vfm, vmd, and vmux. Mirrors what
 # install.sh used to do — `make install` builds the binaries in release
 # mode and drops them into $(BINDIR), plus a desktop entry into $(APPDIR).
 #
@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vplay vdraw vfm vmux vproto vsend vrecv vsd vssh
+PACKAGES := veter vcat vplay vdraw vfm vmd vmux vproto vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 
 # Scripts, which have no cargo build of their own but ship beside the
@@ -84,7 +84,7 @@ help:
 	@echo "                      skeletons, keeping a timestamped backup of each"
 	@echo "  clean               cargo clean"
 	@echo
-	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vplay/vdraw/vfm/vsend/vrecv/vsd"
+	@echo "  dist-<arch>-build       cross-compile vmux/vcat/vplay/vdraw/vfm/vmd/vsend/vrecv/vsd"
 	@echo "                          for <arch>-unknown-linux-musl (static, rust-lld)"
 	@echo "  dist-<arch>-tarxz       bundle the above into a .tar.xz under dist/"
 	@echo "  dist-<arch>-manifest    write a sha256-stamped manifest beside the tarball"
@@ -286,7 +286,7 @@ clean:
 
 # ---- musl-static distribution of client-side tools ------------------
 #
-# Cross-builds vmux, vcat, vplay, vdraw, vfm, vsend, vrecv, vsd for the musl-static
+# Cross-builds vmux, vcat, vplay, vdraw, vfm, vmd, vsend, vrecv, vsd for the musl-static
 # targets enumerated in DIST_ARCHES, using rust-lld (which ships with
 # rustup-installed rustc, so no host toolchain prereq beyond
 # `rustup target add`). The resulting binaries are fully static — no
@@ -294,7 +294,7 @@ clean:
 # into either a .tar.xz or a .deb. Per-arch targets are emitted by the
 # DIST_ARCH_RULES macro below.
 
-DIST_TOOLS := vmux vcat vplay vdraw vfm vproto vsend vrecv vsd
+DIST_TOOLS := vmux vcat vplay vdraw vfm vmd vproto vsend vrecv vsd
 DIST_VERSION ?= 0.1.7
 
 # vfm builds separately, with `--no-default-features`. Its
@@ -386,6 +386,7 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    '  vplay   interactive image/video viewer (VGE; needs ffmpeg)' \
 	    '  vdraw   block-diagram editor (VGE; .excalidraw)' \
 	    '  vfm     file browser with picture previews (VGE; ffmpeg for video thumbs)' \
+	    '  vmd     markdown viewer (VGE; real headings, inline pictures)' \
 	    '  vproto  speak VGE/PRT/SES from a script (JSON in, JSON out)' \
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
@@ -436,7 +437,7 @@ dist-$(3)-deb: dist-$(3)-build
 	    'Maintainer: $$(DIST_MAINTAINER)' \
 	    'Description: Remote-side tools for the Veter terminal emulator' \
 	    ' Statically-linked $(4) binaries for vmux, vcat, vplay, vdraw,' \
-	    ' vfm, vsend, vrecv, and vsd. All but vsd talk PRT/VGE/VFT to a' \
+	    ' vfm, vmd, vsend, vrecv, and vsd. All but vsd talk PRT/VGE/VFT to a' \
 	    ' Veter-aware terminal (or to vmux running inside one); vsd is' \
 	    ' a persistent session daemon that owns inner PTYs across renderer' \
 	    ' attach/detach cycles (see doc/session-manager.md). The binaries' \

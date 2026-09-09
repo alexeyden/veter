@@ -61,5 +61,5 @@
 # lowercase extensions without the dot.
 # [open.ext]
 # pdf  = { command = "zathura %",         terminal = false }
-# md   = { command = "glow -p %",         terminal = true  }
+# md   = { command = "vmd %",             terminal = true  }
 # html = { command = "xdg-open %",        terminal = false }

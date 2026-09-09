@@ -1,0 +1,26 @@
+[package]
+name = "vmd"
+version = "0.1.0"
+edition = "2024"
+description = "Markdown viewer for VGE-aware terminals — real headings, inline pictures, code plates and tables drawn as vector graphics."
+
+[dependencies]
+veter-version = { path = "../../libs/veter-version" }
+vge-protocol = { path = "../../protocol/vge" }
+vge-render = { path = "../../libs/vge-render" }
+vge-ui = { path = "../../libs/vge-ui" }
+prt-protocol = { path = "../../protocol/prt" }
+anyhow = "1"
+nix = { version = "0.29", features = ["term", "poll", "signal"] }
+libc = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd", "html"] }
+unicode-width = "0.2.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+
+[dev-dependencies]
+# The session test runs the real binary on a real pty and replays what
+# it wrote through the real host engine, so the seam being covered —
+# the probe handshake, and whether a host actually accepts the elements
+# vmd creates — is exercised on both sides.
+veter-host = { path = "../../libs/veter-host" }
+vt100 = { path = "../../vendored/vt100" }

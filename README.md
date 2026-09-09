@@ -22,14 +22,15 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vplay` | Interactive image and video viewer for VGE-aware terminals. |
 | `vdraw` | Interactive block-diagram editor; draws with VGE, stores `.excalidraw` documents. |
 | `vfm` | File browser with picture previews: ranger-style column navigation and a Dolphin-style thumbnail icon grid for the current directory, plus copy/move/delete/rename, in-app previews, and config-driven file opening (`~/.config/vfm/config.toml`). |
+| `vmd` | Markdown viewer: headings drawn at their real size, code on recessed plates, tables, pictures inline, plus search, an outline jump, link following and text zoom. |
 | `vsend`, `vrecv` | Upload a local file to / pull a host-side file back from a VFT-aware terminal. |
 | `vsd` | Persistent session daemon — holds session state across renderer disconnects. |
 | `vssh` | SSH wrapper that keeps the veter tools fresh on remote hosts. |
 | `vproto` | Speak VGE/PRT/SES from a script: JSON commands in, JSON responses out. `vproto schema` prints the command shapes. |
 | `vplace` | Place an image into a pane from outside its foreground program, anchored to a marker line that doubles as the caption. |
 | `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
-| `vge-render` | Shared client-side image-rendering + raw-TTY / probe helpers (used by `vcat`, `vplay`, `vdraw`, `vfm`). |
-| `vge-ui` | Shared client-side widget toolkit: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing (used by `vmux`, `vfm`). |
+| `vge-render` | Shared client-side image-rendering + raw-TTY / probe helpers (used by `vcat`, `vplay`, `vdraw`, `vfm`, `vmd`). |
+| `vge-ui` | Shared client-side widget toolkit: accent theme, chrome paths, line editor, filterable picker, modal builders, key/mouse input parsing (used by `vmux`, `vfm`, `vmd`). |
 | `vt100` | Vendored fork of the `vt100` parser (adds `clear_scrollback`, resize helpers, scrollback-line tracking, and binary snapshot/restore). |
 | `breakout`, `spinner` | VGE demos. |
 
@@ -45,7 +46,7 @@ cargo run -p veter
 ## Install
 
 ```sh
-make install      # veter + vcat, vplay, vdraw, vfm, vmux, vsend, vrecv, vsd, vssh to $PREFIX/bin (default ~/.local) plus a desktop entry
+make install      # veter + vcat, vplay, vdraw, vfm, vmd, vmux, vsend, vrecv, vsd, vssh to $PREFIX/bin (default ~/.local) plus a desktop entry
 make uninstall
 ```
 
@@ -67,7 +68,7 @@ Any other name is looked up as `themes/<name>.toml` beside the config, so any pu
 
 `make install` writes the config only when there isn't one, so your edits survive re-installs; `make reset-config` overwrites it with the current skeleton, keeping a timestamped backup. Worth running after a schema change — a config naming a section veter no longer reads fails silently.
 
-Because veter publishes its palette into the reserved `host.*` VGE style namespace and reports it in the PRT probe, `vmux` and `vfm` pick the theme up too — their pane chrome and modals are drawn in the terminal's own surfaces rather than a built-in dark set.
+Because veter publishes its palette into the reserved `host.*` VGE style namespace and reports it in the PRT probe, `vmux`, `vfm` and `vmd` pick the theme up too — their pane chrome and modals are drawn in the terminal's own surfaces rather than a built-in dark set.
 
 ## Tests
 
