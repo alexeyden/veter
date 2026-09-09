@@ -39,9 +39,10 @@ const ARCHIVE_EXTS: &[&str] = &[
 /// Extensions we are confident are text, so a preview can read them
 /// without sniffing. Anything else is sniffed for NUL bytes on demand.
 const TEXT_EXTS: &[&str] = &[
-    "txt", "md", "rs", "toml", "json", "yaml", "yml", "c", "h", "cpp", "hpp", "cc", "py", "sh",
-    "zsh", "bash", "js", "ts", "tsx", "jsx", "go", "java", "rb", "pl", "lua", "vim", "css", "html",
-    "xml", "ini", "conf", "cfg", "log", "csv", "tex", "sql", "make", "mk", "cmake", "excalidraw",
+    "txt", "md", "markdown", "mdown", "mkd", "mdwn", "rs", "toml", "json", "yaml", "yml", "c", "h",
+    "cpp", "hpp", "cc", "py", "sh", "zsh", "bash", "js", "ts", "tsx", "jsx", "go", "java", "rb",
+    "pl", "lua", "vim", "css", "html", "xml", "ini", "conf", "cfg", "log", "csv", "tex", "sql",
+    "make", "mk", "cmake", "excalidraw",
 ];
 
 #[derive(Debug, Clone)]

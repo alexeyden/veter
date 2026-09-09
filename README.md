@@ -21,7 +21,7 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vcat` | Display images inside a VGE-aware terminal. |
 | `vplay` | Interactive image and video viewer for VGE-aware terminals. |
 | `vdraw` | Interactive block-diagram editor; draws with VGE, stores `.excalidraw` documents. |
-| `vfm` | File browser with picture previews: ranger-style column navigation and a Dolphin-style thumbnail icon grid for the current directory, plus copy/move/delete/rename, in-app previews, and config-driven file opening (`~/.config/vfm/config.toml`). |
+| `vfm` | File browser with picture previews: ranger-style column navigation and a Dolphin-style thumbnail icon grid for the current directory, plus copy/move/delete/rename, in-app previews, and config-driven file opening (`~/.config/vfm/config.toml`; pictures open in `vplay`, markdown in `vmd`). |
 | `vmd` | Markdown viewer: headings drawn at their real size, code on recessed plates, tables, pictures inline, plus search, an outline jump, link following and text zoom. |
 | `vsend`, `vrecv` | Upload a local file to / pull a host-side file back from a VFT-aware terminal. |
 | `vsd` | Persistent session daemon — holds session state across renderer disconnects. |

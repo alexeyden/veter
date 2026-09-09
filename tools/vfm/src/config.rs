@@ -9,8 +9,15 @@
 //! The only thing configured today is *opening*: which program handles a
 //! file, and whether it runs in this terminal (an editor, vplay) or
 //! detached (a GUI app like xdg-open). Resolution for a file is
-//! `[open.ext].<ext>` → `[open].<media>` → a media built-in →
-//! `[open].default` → the `xdg-open` fallback.
+//! `[open.ext].<ext>` → `[open].<media>` → an extension built-in → a
+//! media built-in → `[open].default` → the `xdg-open` fallback.
+//!
+//! Both user levels sit ahead of both built-in ones, rather than
+//! interleaving by specificity. A built-in must never quietly outrank
+//! something the user wrote: somebody whose config says
+//! `[open] text = { command = "hx %" }` means every text file,
+//! markdown included, and would not expect vfm to route `.md`
+//! somewhere else on their behalf.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +118,7 @@ impl Config {
         };
         let rule = by_ext
             .or_else(|| by_media.clone())
+            .or_else(|| entry.ext().and_then(|e| builtin_ext(&e)))
             .or_else(|| builtin_media(media))
             .or_else(|| self.open.default.clone())
             .unwrap_or_else(builtin_default);
@@ -140,6 +148,26 @@ pub fn config_path() -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME").filter(|s| !s.is_empty())?;
     Some(PathBuf::from(home).join(".config").join("vfm").join("config.toml"))
+}
+
+/// The extensions [`builtin_ext`] hands to `vmd`. Mirrors `vmd`'s own
+/// `MARKDOWN_EXT`; the two are separate binaries with no shared crate
+/// between them, so the list is duplicated rather than imported.
+const MARKDOWN_EXTS: &[&str] = &["md", "markdown", "mdown", "mkd", "mdwn"];
+
+/// Built-in handler for a specific extension, where the media category
+/// is too coarse to pick the right tool.
+///
+/// Markdown is text, so without this it would open in `$EDITOR` along
+/// with every `.rs` and `.toml` — but veter ships a viewer that draws
+/// it with real headings and inline pictures, and reading a README is
+/// what you usually want from a file browser. Editing it is still one
+/// `[open.ext]` line away.
+fn builtin_ext(ext: &str) -> Option<OpenRule> {
+    MARKDOWN_EXTS.contains(&ext).then(|| OpenRule {
+        command: "vmd %".into(),
+        terminal: true,
+    })
 }
 
 /// Built-in handler for the media types veter has native tools for.
@@ -253,6 +281,38 @@ mod tests {
         let bin = c.resolve(&entry("blob.bin")).unwrap();
         assert_eq!(bin.command, "xdg-open '/files/blob.bin'");
         assert!(!bin.terminal);
+    }
+
+    #[test]
+    fn markdown_opens_in_vmd_by_default() {
+        let c = Config::default();
+        for name in ["README.md", "NOTES.MARKDOWN", "a.mkd", "b.mdown", "c.mdwn"] {
+            let r = c.resolve(&entry(name)).unwrap();
+            assert_eq!(r.command, format!("vmd '/files/{name}'"), "{name}");
+            assert!(r.terminal, "{name} — vmd takes over the terminal");
+        }
+        // Only markdown; other text files still go to the editor.
+        let other = c.resolve(&entry("a.rs")).unwrap().command;
+        assert!(!other.starts_with("vmd"), "{other}");
+    }
+
+    #[test]
+    fn a_user_rule_still_outranks_the_markdown_built_in() {
+        // Both user levels beat a built-in — see the module comment.
+        let by_ext = cfg(r#"[open.ext]
+            md = { command = "glow -p %", terminal = true }
+        "#);
+        assert_eq!(
+            by_ext.resolve(&entry("r.md")).unwrap().command,
+            "glow -p '/files/r.md'"
+        );
+        let by_media = cfg(r#"[open]
+            text = { command = "hx %", terminal = true }
+        "#);
+        assert_eq!(
+            by_media.resolve(&entry("r.md")).unwrap().command,
+            "hx '/files/r.md'"
+        );
     }
 
     #[test]

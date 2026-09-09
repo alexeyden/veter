@@ -35,11 +35,21 @@
 #
 # Resolution order for a file:  [open.ext].<extension>
 #                             → [open].<media category>
+#                             → a built-in for that extension
 #                             → a built-in for that category
 #                             → [open].default
 #                             → xdg-open (detached).
 #
-# The built-in defaults (used when a category is left unset) are:
+# Note that *both* of your levels come before *either* built-in one: a
+# built-in never quietly outranks something you wrote here. Setting
+# `text` below, for instance, takes markdown back off vmd along with
+# every other text file.
+#
+# The built-in defaults (used when nothing above them matches) are:
+#
+#   [open.ext]
+#   # .md, .markdown, .mdown, .mkd, .mdwn
+#   md    = { command = "vmd %", terminal = true }
 #
 #   [open]
 #   image = { command = "vplay %", terminal = true }
@@ -61,5 +71,5 @@
 # lowercase extensions without the dot.
 # [open.ext]
 # pdf  = { command = "zathura %",         terminal = false }
-# md   = { command = "vmd %",             terminal = true  }
+# md   = { command = "$EDITOR %",         terminal = true  }   # edit rather than read
 # html = { command = "xdg-open %",        terminal = false }
