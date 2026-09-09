@@ -232,16 +232,24 @@
 # do the right thing for both: see the `o` example below.
 #
 # Bare letters are case-sensitive: "o" is the o key, "O" is Shift+o. Chords
-# with modifiers work too (e.g. "Ctrl+O"). There are no defaults — nothing
-# runs unless you add entries here.
+# with modifiers work too (e.g. "Ctrl+O"). Where two entries claim the same
+# key the first one in the file wins, silently — so the alternates below are
+# replacements for the entry above them, not additions to it.
 #
-# [[selection_commands]]
-# key = "o"                                  # open a path/URL with the default app
-# command = 'xdg-open "$VETER_SELECTION"'
-#
+# The three below are active out of the box. They only fire while a *fresh*
+# selection is up, so they cost nothing the rest of the time; comment one out
+# if you would rather the key always reached the shell.
+
+# Open a path or URL with the default application.
+[[selection_commands]]
+key = "o"
+description = "open with the default app"  # optional, ignored at runtime
+command = 'xdg-open "$VETER_SELECTION"'
+
 # The same key, branching on what hint mode recognised: edit a file, open
 # everything else. `path` and `file` hints keep their `:line:col` suffix,
 # which is exactly what `$EDITOR +line file` wants — hence the split.
+# Replaces the plain `o` above; comment that one out if you use this.
 # [[selection_commands]]
 # key = "o"
 # description = "open URLs, edit paths"
@@ -252,23 +260,23 @@
 #   *)         xdg-open "$1" ;;
 # esac
 # '''
-#
-# Select a directory name in `ls` output and press C to cd into it.
-# [[selection_commands]]
-# key = "C"
-# description = "cd into the selection"      # optional, ignored at runtime
-# input = "cd %q\n"
-#
-# Type the selection into the shell without running it, ready to edit.
-# [[selection_commands]]
-# key = "Ctrl+Alt+V"
-# input = "%"
-#
+
 # Edit the selection in vim, then run the edited text as a command in $SHELL.
 # Opens a veter window (vim needs a terminal); on save & quit the edited
 # command runs there, and the window closes when it finishes. $VETER_EXE is
 # the running veter binary (so it works regardless of PATH). Needs vim.
+[[selection_commands]]
+key = "e"
+description = "edit in vim, then run"      # optional, ignored at runtime
+command = 'export VETER_EDIT=$(mktemp); printf "%s" "$VETER_SELECTION" > "$VETER_EDIT"; "${VETER_EXE:-veter}" -e "$SHELL" -c "vim \"\$VETER_EDIT\" && \"\$SHELL\" \"\$VETER_EDIT\""; rm -f "$VETER_EDIT"'
+
+# Select a directory name in `ls` output and press C to cd into it.
+[[selection_commands]]
+key = "C"
+description = "cd into the selection"      # optional, ignored at runtime
+input = "cd %q\n"
+
+# Type the selection into the shell without running it, ready to edit.
 # [[selection_commands]]
-# key = "e"
-# description = "edit in vim, then run"      # optional, ignored at runtime
-# command = 'export VETER_EDIT=$(mktemp); printf "%s" "$VETER_SELECTION" > "$VETER_EDIT"; "${VETER_EXE:-veter}" -e "$SHELL" -c "vim \"\$VETER_EDIT\" && \"\$SHELL\" \"\$VETER_EDIT\""; rm -f "$VETER_EDIT"'
+# key = "Ctrl+Alt+V"
+# input = "%"

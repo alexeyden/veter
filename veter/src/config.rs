@@ -807,6 +807,41 @@ mod tests {
         assert_eq!(cfg.search_colors(&theme)[0], Rgba::rgb(10, 11, 12));
     }
 
+    /// The example config ships to every new install (`make install`
+    /// writes it when none exists, `make reset-config` overwrites).
+    /// It used to be commented out end to end, so nothing in it could
+    /// be wrong; it now carries live `[[selection_commands]]`, and a
+    /// typo in those would reach users silently.
+    #[test]
+    fn the_shipped_example_config_parses_and_binds() {
+        let text = include_str!("../../assets/config.toml");
+        let cfg: Config = toml::from_str(text).expect("assets/config.toml parses");
+
+        let keys: Vec<&str> = cfg
+            .selection_commands
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, ["o", "e", "C"]);
+
+        // Every chord binds: `KeyBindings::build` drops an entry whose
+        // chord does not parse, so a count short of the entries means
+        // one of them is unreachable.
+        let bindings = KeyBindings::build(&cfg.keys, &cfg.selection_commands);
+        assert_eq!(
+            bindings.selection.len(),
+            cfg.selection_commands.len(),
+            "a selection chord in the example config failed to parse"
+        );
+
+        // Two entries on one key would leave the second dead — the
+        // lookup takes the first match.
+        let mut seen: Vec<&str> = keys.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), keys.len(), "duplicate key in the example config");
+    }
+
     #[test]
     fn font_section_is_optional_and_partial() {
         // A config predating the section keeps the built-in symbol
