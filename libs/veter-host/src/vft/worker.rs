@@ -360,13 +360,17 @@ fn apply_mtime(path: &PathBuf, mtime_secs: i64) {
         let Some(c) = path.to_str().and_then(|s| CString::new(s).ok()) else {
             return;
         };
+        // `time_t` is not named here for the same reason as in vfm's
+        // `local_stamp`: it is deprecated on musl, where 1.2 widened it
+        // to 64 bits and the libc crate will follow. Inferring the cast
+        // target from `timeval`'s own field tracks that change.
         let tv = [
             libc::timeval {
-                tv_sec: mtime_secs as libc::time_t,
+                tv_sec: mtime_secs as _,
                 tv_usec: 0,
             },
             libc::timeval {
-                tv_sec: mtime_secs as libc::time_t,
+                tv_sec: mtime_secs as _,
                 tv_usec: 0,
             },
         ];

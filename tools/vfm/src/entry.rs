@@ -122,7 +122,12 @@ pub fn local_stamp(t: SystemTime) -> String {
     let Ok(since) = t.duration_since(SystemTime::UNIX_EPOCH) else {
         return "—".into();
     };
-    let secs = since.as_secs() as libc::time_t;
+    // The width of `time_t` is deliberately not named. It is deprecated
+    // on musl — 1.2 widened it to 64 bits and the libc crate will follow
+    // — and there is no alias to move to, so the cast target comes from
+    // `localtime_r`'s own signature and tracks whatever the platform
+    // settles on.
+    let secs = since.as_secs() as _;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: `localtime_r` fills the caller's `tm` — no shared state and
     // no allocation, unlike `localtime`. A null return means the time is
@@ -393,6 +398,15 @@ mod tests {
             ..entry("b.txt", false, 0)
         };
         assert!(later.mtime_label().starts_with("2026-"), "{}", later.mtime_label());
+    }
+
+    #[test]
+    fn a_time_the_clock_cannot_place_reads_as_dashes() {
+        // The documented fallback, which nothing pinned before: a
+        // pre-epoch mtime (a broken link's placeholder, a filesystem
+        // reporting something odd) must not format as a date.
+        let ancient = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(local_stamp(ancient), "—");
     }
 
     #[test]
