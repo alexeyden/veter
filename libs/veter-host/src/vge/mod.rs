@@ -154,6 +154,35 @@ mod tests {
         );
     }
 
+    /// The kitty keyboard protocol's query, answered from the screen's
+    /// own flag stack rather than from a fixed capability string — the
+    /// spec asks for what is in effect, and what is in effect is
+    /// whatever the program pushed.
+    #[test]
+    fn the_keyboard_flags_query_is_answered_from_the_screen() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[?u", None);
+        assert_eq!(engine.take_responses(), b"\x1b[?0u".to_vec());
+
+        // Push the flag, and the answer follows it.
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[>1u\x1b[?u", None);
+        assert_eq!(engine.take_responses(), b"\x1b[?1u".to_vec());
+
+        // Pop, and it follows back down.
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[<u\x1b[?u", None);
+        assert_eq!(engine.take_responses(), b"\x1b[?0u".to_vec());
+    }
+
+    /// A flag nothing in the renderer encodes is refused rather than
+    /// stored: a program told "yes" to event reporting would wait for
+    /// reports that never come.
+    #[test]
+    fn unsupported_keyboard_flags_are_never_reported_back() {
+        let (mut engine, mut parser) = engine_and_parser();
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[>31u\x1b[?u", None);
+        assert_eq!(engine.take_responses(), b"\x1b[?1u".to_vec());
+    }
+
     /// DECXCPR gets its own reply, carrying the DEC-private `?` back
     /// so a sender that asked the private form can tell it apart.
     #[test]

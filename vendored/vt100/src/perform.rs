@@ -253,6 +253,20 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     );
                 }
             },
+            // The kitty keyboard protocol's stack operations. All three
+            // share the `u` final byte with SCORC (`CSI u`), which is
+            // why they are reached only through a private prefix —
+            // parameterless `CSI u` above stays DECRC.
+            Some(b'>') if c == 'u' => {
+                self.screen.kbd_push(canonicalize_params_1(params, 0));
+            }
+            Some(b'<') if c == 'u' => {
+                self.screen.kbd_pop(canonicalize_params_1(params, 1));
+            }
+            Some(b'=') if c == 'u' => {
+                let (flags, mode) = canonicalize_params_2(params, 0, 1);
+                self.screen.kbd_set(flags, mode);
+            }
             // DECSTR, soft reset. terminfo's `is2` / `rs2` lead with
             // it, so it arrives at the start of essentially every
             // ncurses program.

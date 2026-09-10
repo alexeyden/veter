@@ -2342,6 +2342,88 @@ struct MousePos {
 /// stay separate; keep them in step. It takes one coordinate pair
 /// rather than a `MousePos` because by then the client has already
 /// resolved which space the portal wants.
+/// The kitty keyboard protocol's "disambiguate escape codes" flag —
+/// bit 0 of the progressive-enhancement set, and the only one veter
+/// encodes (the vt100 fork masks the rest off on the way in, so a
+/// program is never told yes for a report that never comes).
+const KITTY_KBD_DISAMBIGUATE: u8 = 0b0000_0001;
+
+/// The protocol's modifier parameter: 1 + the modifier bits, where
+/// shift is 1, alt 2, ctrl 4 and super 8. A parameter of 1 therefore
+/// means "no modifiers", which is also its default when the field is
+/// left out entirely.
+fn kitty_modifier_param(mods: ModifiersState) -> u32 {
+    let mut bits = 0;
+    if mods.shift_key() {
+        bits |= 0b1;
+    }
+    if mods.alt_key() {
+        bits |= 0b10;
+    }
+    if mods.control_key() {
+        bits |= 0b100;
+    }
+    if mods.super_key() {
+        bits |= 0b1000;
+    }
+    1 + bits
+}
+
+/// `CSI <codepoint> ; <modifiers> u`, with the modifier field dropped
+/// when there are none — which is what makes a plain Esc `CSI 27 u`.
+fn kitty_csi_u(codepoint: u32, mods: ModifiersState) -> Vec<u8> {
+    match kitty_modifier_param(mods) {
+        1 => format!("\x1b[{codepoint}u").into_bytes(),
+        m => format!("\x1b[{codepoint};{m}u").into_bytes(),
+    }
+}
+
+/// Encode a key under the "disambiguate escape codes" flag.
+///
+/// `None` means the flag leaves this key on its legacy encoding and the
+/// caller should carry on as before. The flag's scope is Esc plus the
+/// `alt+key`, `ctrl+key`, `ctrl+alt+key` and `shift+alt+key` chords —
+/// exactly the ones whose legacy forms are ambiguous, because they are
+/// an ESC prefix or a C0 byte. Plain text, Enter, Tab, Backspace and
+/// the cursor and function keys keep the bytes they always had; they
+/// are unambiguous already, and re-encoding them is what the *other*
+/// flags are for.
+///
+/// Esc is the whole point: as `CSI 27 u` it is a complete sequence, so
+/// nothing downstream has to start a timer to find out whether more is
+/// coming.
+fn encode_kitty_disambiguated(
+    key: &Key,
+    mods: ModifiersState,
+) -> Option<Vec<u8>> {
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return Some(kitty_csi_u(27, mods));
+    }
+    // Shift alone never makes a legacy encoding ambiguous — that is
+    // just a capital letter — so it only counts here alongside alt.
+    if !(mods.control_key() || mods.alt_key()) {
+        return None;
+    }
+    let codepoint = match key {
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                // A multi-character logical key (dead-key composition)
+                // has no single codepoint to name.
+                return None;
+            }
+            // The protocol names the *unshifted* key and reports shift
+            // separately, so ctrl+shift+a is codepoint 97 with shift in
+            // the modifier field rather than codepoint 65.
+            u32::from(c.to_ascii_lowercase())
+        }
+        Key::Named(NamedKey::Space) => 32,
+        _ => return None,
+    };
+    Some(kitty_csi_u(codepoint, mods))
+}
+
 fn encode_mouse_report(
     mode: vt100::MouseProtocolMode,
     encoding: vt100::MouseProtocolEncoding,
@@ -3042,21 +3124,37 @@ impl App {
     /// portal is focused, in which case its inner vt. Same lookup
     /// pattern as DECCKM in `handle_key_input`.
     fn focused_vt_bracketed_paste(&self) -> bool {
-        self.prt
+        self.with_focused_screen(vt100::Screen::bracketed_paste, false)
+    }
+
+    /// Read something off the screen of whatever program currently has
+    /// focus: the focused *leaf* portal's vt when a portal owns focus,
+    /// otherwise the host's own parser.
+    ///
+    /// This is the screen whose modes decide how a keystroke is
+    /// *encoded* — DECCKM for the arrows, bracketed paste for a paste,
+    /// the kitty keyboard flags for Esc. Input never crosses PRT, so
+    /// the bytes go straight to that program's pty and have to be in
+    /// its dialect; a multiplexer in between only forwards them.
+    fn with_focused_screen<T>(
+        &self,
+        read: impl Fn(&vt100::Screen) -> T,
+        absent: T,
+    ) -> T {
+        if let Some(prt) = self.prt.as_ref()
+            && let Some(content) = prt.state.focused_content()
+        {
+            return read(content.vt.screen());
+        }
+        self.parser
             .as_ref()
-            .and_then(|p| {
-                p.state
-                    .focus_chain()
-                    .first()
-                    .and_then(|id| p.state.current().content(*id))
-                    .map(|content| content.vt.screen().bracketed_paste())
-            })
-            .unwrap_or_else(|| {
-                self.parser
-                    .as_ref()
-                    .map(|p| p.screen().bracketed_paste())
-                    .unwrap_or(false)
-            })
+            .map(|p| read(p.screen()))
+            .unwrap_or(absent)
+    }
+
+    /// The kitty keyboard protocol flags the focused program pushed.
+    fn focused_keyboard_flags(&self) -> u8 {
+        self.with_focused_screen(vt100::Screen::keyboard_flags, 0)
     }
 
     /// Hit-test the cursor against the portal tree to decide which
@@ -4335,6 +4433,20 @@ impl App {
             return;
         }
 
+        // The kitty keyboard protocol, when the focused program asked
+        // for it with `CSI > 1 u`. It comes before the legacy Ctrl and
+        // Alt blocks because it *replaces* them for the chords it
+        // covers; everything it returns `None` for falls through to
+        // them unchanged.
+        if self.focused_keyboard_flags() & KITTY_KBD_DISAMBIGUATE != 0
+            && let Some(bytes) =
+                encode_kitty_disambiguated(&event.logical_key, self.modifiers)
+        {
+            trace_keyboard_send(&bytes);
+            let _ = pty.write_all(&bytes);
+            return;
+        }
+
         // Ctrl+key
         if self.modifiers.control_key() {
             match &event.logical_key {
@@ -4376,22 +4488,8 @@ impl App {
         // unless a portal owns focus, in which case it's that portal's
         // vt — that's how a vmux child keeps its inner DECCKM separate
         // from the host's.
-        let app_cursor = self
-            .prt
-            .as_ref()
-            .and_then(|p| {
-                p.state
-                    .focus_chain()
-                    .first()
-                    .and_then(|id| p.state.current().content(*id))
-                    .map(|content| content.vt.screen().application_cursor())
-            })
-            .unwrap_or_else(|| {
-                self.parser
-                    .as_ref()
-                    .map(|p| p.screen().application_cursor())
-                    .unwrap_or(false)
-            });
+        let app_cursor =
+            self.with_focused_screen(vt100::Screen::application_cursor, false);
 
         // Named keys
         let bytes: Option<&[u8]> = match &event.logical_key {
@@ -6215,6 +6313,92 @@ fn trace_keyboard_send(bytes: &[u8]) {
     }
     line.push_str("|\n");
     let _ = file.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod kitty_keyboard_tests {
+    use super::*;
+
+    fn enc(key: Key, mods: ModifiersState) -> Option<String> {
+        encode_kitty_disambiguated(&key, mods)
+            .map(|b| String::from_utf8(b).unwrap())
+    }
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The key the flag exists for. As `CSI 27 u` it is a complete
+    /// sequence, so no reader downstream has to start a timer to find
+    /// out whether more is coming — which is the whole point.
+    #[test]
+    fn esc_is_a_complete_sequence() {
+        assert_eq!(
+            enc(Key::Named(NamedKey::Escape), ModifiersState::empty()).as_deref(),
+            Some("\x1b[27u")
+        );
+    }
+
+    #[test]
+    fn modifiers_are_one_plus_their_bits() {
+        assert_eq!(enc(ch("a"), ModifiersState::CONTROL).as_deref(), Some("\x1b[97;5u"));
+        assert_eq!(enc(ch("a"), ModifiersState::ALT).as_deref(), Some("\x1b[97;3u"));
+        assert_eq!(
+            enc(ch("a"), ModifiersState::CONTROL | ModifiersState::ALT).as_deref(),
+            Some("\x1b[97;7u")
+        );
+        assert_eq!(
+            enc(ch("A"), ModifiersState::SHIFT | ModifiersState::ALT).as_deref(),
+            Some("\x1b[97;4u"),
+            "shift is reported in the modifier field, not in the codepoint"
+        );
+    }
+
+    /// vmux's default prefix, which is why vmux has to match this
+    /// spelling or lose its prefix key inside any program that turns
+    /// the protocol on.
+    #[test]
+    fn ctrl_space_is_the_space_codepoint() {
+        assert_eq!(
+            enc(Key::Named(NamedKey::Space), ModifiersState::CONTROL).as_deref(),
+            Some("\x1b[32;5u")
+        );
+    }
+
+    /// Everything flag 1 does not cover keeps its legacy bytes: those
+    /// encodings are unambiguous already, and re-spelling them is what
+    /// the other four flags are for. Returning `None` is what lets the
+    /// caller fall through to the table it always used.
+    #[test]
+    fn unambiguous_keys_keep_their_legacy_encodings() {
+        for key in [
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::Backspace),
+            Key::Named(NamedKey::ArrowUp),
+            Key::Named(NamedKey::F1),
+            Key::Named(NamedKey::Space),
+            ch("a"),
+        ] {
+            assert_eq!(enc(key.clone(), ModifiersState::empty()), None, "{key:?}");
+        }
+        // Shift alone is just a capital letter, not an ambiguity.
+        assert_eq!(enc(ch("A"), ModifiersState::SHIFT), None);
+        // And a bare modifier press is nothing at all.
+        assert_eq!(enc(Key::Named(NamedKey::Control), ModifiersState::CONTROL), None);
+    }
+
+    /// Ctrl+[ and Esc share a byte in the legacy encoding; under the
+    /// protocol they stop colliding, which is the disambiguation the
+    /// flag is named for.
+    #[test]
+    fn ctrl_bracket_stops_colliding_with_esc() {
+        assert_eq!(enc(ch("["), ModifiersState::CONTROL).as_deref(), Some("\x1b[91;5u"));
+        assert_eq!(
+            enc(Key::Named(NamedKey::Escape), ModifiersState::empty()).as_deref(),
+            Some("\x1b[27u")
+        );
+    }
 }
 
 #[cfg(test)]

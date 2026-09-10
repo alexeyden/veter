@@ -186,6 +186,38 @@ impl PrtState {
             }
         }
     }
+
+    /// The content of the focused *leaf* portal — the same descent
+    /// [`focus_chain`](Self::focus_chain) makes, stopping at the
+    /// innermost portal that owns focus. `None` when this scope's own
+    /// host is the focused leaf.
+    ///
+    /// This is the screen whose modes decide how a keystroke is
+    /// *encoded*: DECCKM picks `SS3 A` over `CSI A` for the arrows, and
+    /// the kitty keyboard flags pick `CSI 27 u` over a bare `ESC`.
+    /// Input never crosses PRT — the bytes go straight to the innermost
+    /// program's pty — so they have to be in that program's dialect and
+    /// not in the dialect of whatever holds its portal. Taking the
+    /// first element of the chain instead reads the mode off the
+    /// multiplexer in a nested setup, which is the level that merely
+    /// forwards the bytes.
+    #[must_use]
+    pub fn focused_content(&self) -> Option<&PortalContent> {
+        let mut cur = self;
+        let mut leaf = None;
+        loop {
+            match &cur.focus {
+                FocusKind::Host => return leaf,
+                FocusKind::Portal(id) => match cur.current().content(id.as_str()) {
+                    Some(c) => {
+                        leaf = Some(c);
+                        cur = &c.children.state;
+                    }
+                    None => return leaf,
+                },
+            }
+        }
+    }
 }
 
 impl Default for PrtState {

@@ -17,6 +17,9 @@
 /// match — see [`Screen::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v5: the per-screen kitty keyboard flag stacks, so a session that
+///   reattaches keeps encoding keys the way the running program asked
+///   for rather than falling back to the legacy forms.
 /// - v4: `Attrs::mode` widened to `u16` (underline styles, blink,
 ///   conceal, strikethrough, overline), plus the DECSCUSR cursor
 ///   shape and the widened `Screen::modes` word.
@@ -26,7 +29,7 @@
 ///   PRT objects survive a restore without the engines carrying their
 ///   own copy of the line origin.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 5;
 
 /// Error returned when a `Screen` binary snapshot cannot be decoded:
 /// wrong kind version, truncated payload, or otherwise malformed.
@@ -257,6 +260,19 @@ pub(crate) fn decode_mouse_mode(r: &mut Reader) -> Result<crate::screen::MousePr
         4 => crate::screen::MouseProtocolMode::AnyMotion,
         _ => return Err(SnapshotError::bad_payload("unknown mouse mode tag")),
     })
+}
+
+pub(crate) fn encode_keyboard_stack(w: &mut Writer, s: &crate::screen::KeyboardStack) {
+    // One flag byte per stack entry, length-prefixed by `bytes`.
+    w.bytes(s.entries());
+}
+
+pub(crate) fn decode_keyboard_stack(
+    r: &mut Reader,
+) -> Result<crate::screen::KeyboardStack, SnapshotError> {
+    let entries = r.bytes()?.to_vec();
+    crate::screen::KeyboardStack::from_entries(entries)
+        .ok_or_else(|| SnapshotError::bad_payload("keyboard stack too deep"))
 }
 
 pub(crate) fn encode_mouse_encoding(w: &mut Writer, e: crate::screen::MouseProtocolEncoding) {

@@ -1053,6 +1053,19 @@ impl VgeEngine {
                     self.answer_query(&reply);
                 }
             }
+            KeyboardFlagsQuery => {
+                // Same rule as DECRQM: the answer is the screen's, so
+                // without one there is nothing honest to say. The flags
+                // come back through the mask the screen applied when
+                // they were pushed, so this reports what the terminal
+                // will actually encode and not what was asked for.
+                if let Some(screen) = screen {
+                    let reply = crate::query::keyboard_flags_report(
+                        screen.keyboard_flags(),
+                    );
+                    self.answer_query(&reply);
+                }
+            }
         }
     }
 

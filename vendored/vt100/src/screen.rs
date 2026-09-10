@@ -30,6 +30,112 @@ const MODE_CURSOR_BLINK: u16 = 0b0000_0010_0000_0000;
 /// the window gains and loses focus.
 const MODE_FOCUS_EVENT: u16 = 0b0000_0100_0000_0000;
 
+/// The kitty keyboard protocol's progressive-enhancement flags and the
+/// stack a program pushes them onto
+/// (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/>).
+///
+/// Only the value matters to this crate — the encoding of keys is the
+/// renderer's job, and input never reaches the parser. What lives here
+/// is the state a program *sets*, so that whoever encodes keystrokes on
+/// its behalf can read back what it asked for, and so that `CSI ? u` can
+/// be answered.
+///
+/// The current value is the top of the stack; an empty stack means no
+/// flags, which is also what the spec says a pop past the bottom leaves
+/// behind. Screens keep independent stacks (spec: "The main and
+/// alternate screens in the terminal emulator must maintain their own,
+/// independent, keyboard mode stacks"), so a full-screen program that
+/// exits without popping cannot leave its flags on the shell.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KeyboardStack {
+    stack: Vec<u8>,
+}
+
+/// Depth cap. The spec asks terminals to bound the stack "to prevent
+/// Denial-of-Service attacks" and to evict the oldest entry on
+/// overflow, but names no number; kitty itself keeps far fewer than
+/// this in practice — nesting deeper than a handful means a program is
+/// pushing without popping.
+const KEYBOARD_STACK_MAX: usize = 16;
+
+/// The progressive-enhancement flags this terminal actually honours.
+///
+/// Only bit 0, "disambiguate escape codes" — the one that makes Esc
+/// arrive as `CSI 27 u` rather than as a bare `ESC` that nobody
+/// downstream can tell from the start of a sequence. The other four
+/// (event types, alternate keys, all keys as escape codes, associated
+/// text) are not encoded by the renderer, so they are masked off on the
+/// way in: a program told "yes" to a flag nothing implements waits for
+/// reports that never come, and `CSI ? u` is specified to answer with
+/// what is in effect rather than with what was asked for.
+///
+/// The mask lives here, in the screen that stores the flags, so the
+/// invariant is local — [`Screen::keyboard_flags`] can never return a
+/// bit this terminal does not honour.
+const KEYBOARD_FLAGS_SUPPORTED: u8 = 0b0000_0001;
+
+/// Narrow a `CSI u` flags parameter to the flags this terminal
+/// honours. Masking before the narrowing is what makes it lossless:
+/// every supported flag lives inside a byte, so a parameter naming
+/// something bigger simply names nothing supported.
+fn supported_kbd_flags(flags: u16) -> u8 {
+    u8::try_from(flags & u16::from(KEYBOARD_FLAGS_SUPPORTED)).unwrap_or(0)
+}
+
+impl KeyboardStack {
+    /// The stack bottom-first, for the snapshot codec.
+    pub(crate) fn entries(&self) -> &[u8] {
+        &self.stack
+    }
+
+    /// Rebuild from a snapshot. `None` if the payload claims a deeper
+    /// stack than this build allows — a corrupt or hostile snapshot,
+    /// not a version skew, since the depth cap is not part of the wire
+    /// format.
+    pub(crate) fn from_entries(stack: Vec<u8>) -> Option<Self> {
+        (stack.len() <= KEYBOARD_STACK_MAX).then_some(Self { stack })
+    }
+
+    fn flags(&self) -> u8 {
+        self.stack.last().copied().unwrap_or(0)
+    }
+
+    /// `CSI > flags u`.
+    fn push(&mut self, flags: u8) {
+        if self.stack.len() == KEYBOARD_STACK_MAX {
+            self.stack.remove(0);
+        }
+        self.stack.push(flags);
+    }
+
+    /// `CSI < number u`. Emptying the stack resets the flags, which
+    /// falls out of `flags()` rather than needing a case of its own.
+    fn pop(&mut self, n: u16) {
+        let n = usize::from(n).min(self.stack.len());
+        self.stack.truncate(self.stack.len() - n);
+    }
+
+    /// `CSI = flags ; mode u`, where mode 1 replaces the current value,
+    /// 2 sets the given bits and 3 clears them. An unknown mode is
+    /// ignored rather than guessed at.
+    fn set(&mut self, flags: u8, mode: u16) {
+        let current = self.flags();
+        let next = match mode {
+            1 => flags,
+            2 => current | flags,
+            3 => current & !flags,
+            _ => return,
+        };
+        match self.stack.last_mut() {
+            Some(top) => *top = next,
+            // Setting with nothing pushed still has to stick: the
+            // bottom of the stack is where a program that never pushes
+            // lives.
+            None => self.stack.push(next),
+        }
+    }
+}
+
 /// The cursor shape a program asked for with DECSCUSR
 /// (`CSI Ps SP q`), the terminfo `Ss` / `Se` pair. vim, neovim, fish
 /// and most shell prompt frameworks switch to [`Bar`](Self::Bar) for
@@ -119,6 +225,12 @@ pub struct Screen {
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
 
+    /// Per-screen kitty keyboard stacks, selected by
+    /// [`MODE_ALTERNATE_SCREEN`] exactly as `saved_attrs` /
+    /// `alternate_saved_attrs` are.
+    keyboard: KeyboardStack,
+    alternate_keyboard: KeyboardStack,
+
     // Last graphic character committed to the grid, used by REP (CSI Ps b).
     // Stored post-charset-translation so re-emitting it is idempotent.
     last_char: Option<char>,
@@ -147,6 +259,9 @@ impl Screen {
             cursor_shape: CursorShape::default(),
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+
+            keyboard: KeyboardStack::default(),
+            alternate_keyboard: KeyboardStack::default(),
 
             last_char: None,
         }
@@ -383,6 +498,8 @@ impl Screen {
         crate::snapshot::encode_cursor_shape(&mut w, self.cursor_shape);
         crate::snapshot::encode_mouse_mode(&mut w, self.mouse_protocol_mode);
         crate::snapshot::encode_mouse_encoding(&mut w, self.mouse_protocol_encoding);
+        crate::snapshot::encode_keyboard_stack(&mut w, &self.keyboard);
+        crate::snapshot::encode_keyboard_stack(&mut w, &self.alternate_keyboard);
 
         buf
     }
@@ -420,6 +537,8 @@ impl Screen {
         let cursor_shape = crate::snapshot::decode_cursor_shape(&mut r)?;
         let mouse_protocol_mode = crate::snapshot::decode_mouse_mode(&mut r)?;
         let mouse_protocol_encoding = crate::snapshot::decode_mouse_encoding(&mut r)?;
+        let keyboard = crate::snapshot::decode_keyboard_stack(&mut r)?;
+        let alternate_keyboard = crate::snapshot::decode_keyboard_stack(&mut r)?;
 
         if !r.at_end() {
             return Err(crate::snapshot::SnapshotError::bad_payload(
@@ -439,6 +558,8 @@ impl Screen {
         self.cursor_shape = cursor_shape;
         self.mouse_protocol_mode = mouse_protocol_mode;
         self.mouse_protocol_encoding = mouse_protocol_encoding;
+        self.keyboard = keyboard;
+        self.alternate_keyboard = alternate_keyboard;
 
         Ok(())
     }
@@ -878,6 +999,50 @@ impl Screen {
     #[must_use]
     pub fn focus_reporting(&self) -> bool {
         self.mode(MODE_FOCUS_EVENT)
+    }
+
+    /// The kitty keyboard protocol flags in effect on the screen that
+    /// is currently showing.
+    ///
+    /// Whoever encodes keystrokes for the program on this screen reads
+    /// them here: `0` means the legacy encodings, and bit 0
+    /// ("disambiguate escape codes") is what makes Esc arrive as
+    /// `CSI 27 u` instead of a bare `ESC` that nobody can tell from the
+    /// start of a sequence.
+    #[must_use]
+    pub fn keyboard_flags(&self) -> u8 {
+        self.keyboard_stack().flags()
+    }
+
+    fn keyboard_stack(&self) -> &KeyboardStack {
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            &self.alternate_keyboard
+        } else {
+            &self.keyboard
+        }
+    }
+
+    fn keyboard_stack_mut(&mut self) -> &mut KeyboardStack {
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            &mut self.alternate_keyboard
+        } else {
+            &mut self.keyboard
+        }
+    }
+
+    // CSI > flags u -- push the kitty keyboard flags.
+    pub(crate) fn kbd_push(&mut self, flags: u16) {
+        self.keyboard_stack_mut().push(supported_kbd_flags(flags));
+    }
+
+    // CSI < number u -- pop them.
+    pub(crate) fn kbd_pop(&mut self, n: u16) {
+        self.keyboard_stack_mut().pop(n);
+    }
+
+    // CSI = flags ; mode u -- set them in place.
+    pub(crate) fn kbd_set(&mut self, flags: u16, mode: u16) {
+        self.keyboard_stack_mut().set(supported_kbd_flags(flags), mode);
     }
 
     /// The cursor shape last asked for with DECSCUSR (`CSI Ps SP q`).
@@ -2985,6 +3150,125 @@ mod xterm_semantics_tests {
         assert!(!p.screen().hide_cursor());
         p.process(b"\x1b[?12l\x1b[?25h");
         assert!(!p.screen().cursor_blink());
+    }
+
+    // --- kitty keyboard protocol (progressive enhancement) ---------
+
+    // The stack semantics are exercised on `KeyboardStack` directly:
+    // only one flag bit is supported, so a `Screen` cannot tell two
+    // pushed values apart, and the masking is its own test below.
+
+    #[test]
+    fn kbd_push_and_pop_are_a_stack() {
+        let mut s = super::KeyboardStack::default();
+        assert_eq!(s.flags(), 0);
+        s.push(1);
+        s.push(15);
+        assert_eq!(s.flags(), 15);
+        s.pop(1);
+        assert_eq!(s.flags(), 1);
+        s.pop(1);
+        assert_eq!(s.flags(), 0);
+    }
+
+    #[test]
+    fn kbd_pop_past_the_bottom_resets_rather_than_underflowing() {
+        let mut s = super::KeyboardStack::default();
+        s.push(1);
+        s.pop(99);
+        assert_eq!(s.flags(), 0);
+        // And it is still usable afterwards.
+        s.push(3);
+        assert_eq!(s.flags(), 3);
+    }
+
+    #[test]
+    fn kbd_set_modes_replace_or_and_clear() {
+        let mut s = super::KeyboardStack::default();
+        // Mode 1 replaces wholesale, and sticks with nothing pushed —
+        // a program that never pushes still has a current value.
+        s.set(5, 1);
+        assert_eq!(s.flags(), 5);
+        s.set(2, 2); // set the given bits
+        assert_eq!(s.flags(), 7);
+        s.set(4, 3); // clear the given bits
+        assert_eq!(s.flags(), 3);
+        s.set(1, 1);
+        assert_eq!(s.flags(), 1);
+        // An unknown mode is ignored, not guessed at.
+        s.set(15, 9);
+        assert_eq!(s.flags(), 1);
+    }
+
+    #[test]
+    fn kbd_stack_is_bounded_and_evicts_the_oldest() {
+        let mut s = super::KeyboardStack::default();
+        for _ in 0..(super::KEYBOARD_STACK_MAX + 8) {
+            s.push(1);
+        }
+        assert_eq!(s.entries().len(), super::KEYBOARD_STACK_MAX);
+        // Popping the cap's worth reaches the bottom rather than an
+        // unbounded pile of pushes.
+        s.pop(super::KEYBOARD_STACK_MAX as u16);
+        assert_eq!(s.flags(), 0);
+    }
+
+    /// A flag the renderer does not encode is refused on the way in,
+    /// so `CSI ? u` can never answer with a capability nothing behind
+    /// it implements.
+    #[test]
+    fn kbd_unsupported_flags_are_masked_off() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[>31u");
+        assert_eq!(p.screen().keyboard_flags(), super::KEYBOARD_FLAGS_SUPPORTED);
+        p.process(b"\x1b[<u\x1b[=30u");
+        assert_eq!(p.screen().keyboard_flags(), 0);
+    }
+
+    /// The spec requires independent stacks per screen, which is what
+    /// keeps a full-screen program that exits without popping from
+    /// leaving its flags on the shell.
+    #[test]
+    fn kbd_stacks_are_per_screen() {
+        let mut p = Parser::new(2, 10, 0);
+        p.process(b"\x1b[>1u");
+        p.process(b"\x1b[?1049h"); // into the alt screen
+        assert_eq!(p.screen().keyboard_flags(), 0, "alt does not inherit");
+        p.process(b"\x1b[?1049l");
+        assert_eq!(p.screen().keyboard_flags(), 1, "main kept its own");
+
+        // And the other direction: pushing on the alt screen and
+        // leaving without popping must not reach the shell.
+        let mut q = Parser::new(2, 10, 0);
+        q.process(b"\x1b[?1049h\x1b[>1u\x1b[?1049l");
+        assert_eq!(q.screen().keyboard_flags(), 0);
+    }
+
+    /// `CSI u` with no parameters and no private prefix is SCORC, and
+    /// has to stay SCORC.
+    #[test]
+    fn bare_csi_u_is_still_scorc() {
+        let mut p = Parser::new(4, 10, 0);
+        p.process(b"\x1b[3;5H\x1b[s"); // park and save
+        p.process(b"\x1b[1;1H");
+        p.process(b"\x1b[u"); // restore
+        assert_eq!(p.screen().cursor_position(), (2, 4));
+        assert_eq!(p.screen().keyboard_flags(), 0, "SCORC touched no flags");
+    }
+
+    #[test]
+    fn kbd_flags_survive_a_snapshot_round_trip() {
+        let mut p = Parser::new(2, 10, 0);
+        // Flags on the alt screen only, so the round trip has to carry
+        // the stack that is *not* the one showing.
+        p.process(b"\x1b[?1049h\x1b[>1u\x1b[?1049l");
+        let snap = p.screen().binary_snapshot();
+
+        let mut q = Parser::new(2, 10, 0);
+        q.screen_mut().restore_from_binary_snapshot(&snap).unwrap();
+        assert_eq!(q.screen().keyboard_flags(), 0, "main was never pushed");
+        q.process(b"\x1b[?1049h");
+        assert_eq!(q.screen().keyboard_flags(), 1, "the alt stack came too");
     }
 
     /// The SGR attributes terminfo names and the parser used to drop.

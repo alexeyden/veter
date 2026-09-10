@@ -53,7 +53,7 @@ Host-side engine state (the vt100 grids and all five engines) lives in **`libs/v
 | Crate | Role |
 |---|---|
 | `protocol/*` — `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire format only: APC stream parser, primitive codec, command/response/event framing, encoders. No state, no rendering. Host and clients both depend on these. VGE/PRT/SES carry optional default-off `serde` and `schemars` features so `vproto` can read the same types as JSON and generate their schema; nothing else enables them. |
-| `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the `scroll_committed` counter the PRT activity heuristic watches, `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot — and the SGR-Pixels mouse encoding, DECSET 1016). The screen model the host and every portal use. The sequence coverage is measured against `infocmp xterm-256color` — terminfo is the set of sequences real programs emit — so anything in that entry should either be implemented or be a deliberate omission with a comment saying so. |
+| `vendored/vt100` | Local fork of the vt100 parser (adds `clear_scrollback`, xterm-style push/pull vertical resize, `binary_snapshot`/`restore_from_binary_snapshot` for VSS, the per-screen kitty keyboard protocol flag stack the key encoder reads, the `scroll_committed` counter the PRT activity heuristic watches, `top_of_live_screen` — the absolute scrollback line index VGE elements and Scrollback portals anchor to, maintained by the grid itself and carried in its snapshot — and the SGR-Pixels mouse encoding, DECSET 1016). The screen model the host and every portal use. The sequence coverage is measured against `infocmp xterm-256color` — terminfo is the set of sequences real programs emit — so anything in that entry should either be implemented or be a deliberate omission with a comment saying so. |
 | `libs/veter-host` | GUI-free host engines: the host vt100 plus the PRT (`src/prt/`), VGE (`src/vge/`), VFT (`src/vft/`), SES (`src/ses/`), and VSS (`src/vss/`) engines. Links no GUI toolkit at all — the two desktop affordances VFT needs (native file picker, open-after-finalize) are the `vft::DesktopHooks` trait, which `veter` implements and `vsd` leaves at its `HeadlessHooks` default. Consumed by both `veter` and `vsd`. |
 | `veter` | The GUI terminal (winit + glutin + femtovg + parley + swash). Owns the `veter-host` engines and their rendering. |
 | `libs/veter-version` | The commit every binary was built from. A build script resolves the short sha and commit date at compile time and re-runs when `HEAD` moves; `long_version()` formats the `--version` line each binary prints. Exists because every crate here is `0.1.0` and stays `0.1.0`, so the crate version cannot answer "are these two machines running the same build?" — which is the question that comes up when a bug reproduces on one end of an SSH hop and not the other. No `.git` (a tarball build) reports `unknown` rather than failing. |
@@ -100,10 +100,14 @@ not obvious from the sequence:
   — and routes what it cannot answer alone to a `vt100::Callbacks`
   method.
 - **`veter-host::query`** owns the *format* of every reply that names
-  the terminal: DA1, DA2, XTVERSION, DECRQM, the XTWINOPS size reports
-  and the OSC colour reports. Two engines emit them (VGE at host level,
-  PRT inside a portal) and they must not disagree about what terminal
-  this is.
+  the terminal: DA1, DA2, XTVERSION, DECRQM, the kitty keyboard flags
+  (`CSI ? u`), the XTWINOPS size reports and the OSC colour reports.
+  Two engines emit them (VGE at host level, PRT inside a portal) and
+  they must not disagree about what terminal this is. The keyboard
+  flags are the one whose answer is *per screen* rather than per
+  terminal — it reports what the asking program pushed, through the
+  mask of what veter actually encodes — so it is read back off the
+  vt100 like DECRQM rather than being a constant.
 - **The renderer** answers what only it knows — cell pixel metrics, the
   palette, the default fore/background — through `HostCallbacks`, which
   queues a `TerminalRequest` for `App::drain_terminal_requests` rather
@@ -143,6 +147,16 @@ A session outlives renderers, so the palette a client probed can go stale: reatt
 ## Input never crosses PRT
 
 PRT carries display direction only. Keystrokes/mouse go from the host's PTY straight to the inner program's PTY master FD — `WritePortal` is not an input channel. `SetFocus` is purely a rendering hint. This is the contract every multiplexer client (including `vmux`) is built on; do not invent input-over-PRT shortcuts.
+
+A consequence worth knowing when touching the key encoder: because the
+bytes go straight to the innermost program's pty, **veter encodes them
+in that program's dialect**, not in the multiplexer's. `App::with_focused_screen`
+resolves the focused *leaf* portal (`PrtState::focused_content`) and
+reads DECCKM, bracketed paste and the kitty keyboard flags off it; a
+multiplexer in between only forwards. That is why `vmux` has to
+recognise its own prefix chord in both spellings — a pane running a
+program that enabled `CSI u` encodings stops delivering `Ctrl+Space` as
+a byte at all (`prefix_csi_u` / `prefix_chord_at`).
 
 ## Sessions (vsd)
 

@@ -2218,6 +2218,113 @@ fn prefix_byte() -> u8 {
     PREFIX_BYTE.load(Ordering::Relaxed)
 }
 
+/// The prefix chord as the kitty keyboard protocol spells it:
+/// `(codepoint, modifier parameter)`.
+///
+/// Every prefix veter can express is a C0 control byte, and C0 controls
+/// are exactly what the protocol's "disambiguate escape codes" flag
+/// replaces — so as soon as the focused pane runs a program that
+/// enabled it, the prefix stops arriving as a byte at all. Matching
+/// only the byte form would lose the prefix key in precisely the
+/// programs most likely to want a multiplexer around them.
+///
+/// `None` for the two prefixes whose chord depends on the keyboard
+/// layout (`Ctrl+^`, `Ctrl+_`): there is no single codepoint to name,
+/// and guessing one would match a chord the user never pressed. Those
+/// keep the byte spelling alone.
+fn prefix_csi_u() -> Option<(u32, u32)> {
+    /// 1 + ctrl's bit (0b100).
+    const CTRL: u32 = 5;
+    let cp = match prefix_byte() {
+        0x00 => 32, // Ctrl+Space
+        b @ 0x01..=0x1a => u32::from(b) + 96, // Ctrl+a … Ctrl+z
+        // Under the protocol these stop colliding with Esc, Tab and
+        // friends — that collision is what it exists to remove.
+        0x1b => u32::from(b'['),
+        0x1c => u32::from(b'\\'),
+        0x1d => u32::from(b']'),
+        _ => return None,
+    };
+    Some((cp, CTRL))
+}
+
+/// Parse a `CSI <codepoint> ; <modifiers> u` at the head of `bytes`,
+/// returning the codepoint, the modifier parameter — 1, "no
+/// modifiers", when the field is absent — and the bytes consumed.
+///
+/// Deliberately narrow: only the two plain numeric forms, no
+/// sub-parameters and no private prefix, so `CSI u` (SCORC) and the
+/// protocol's own `CSI > 1 u` stack operations can never be read as a
+/// keypress. The scan is bounded because it runs on every ESC in the
+/// keystroke stream.
+fn parse_csi_u(bytes: &[u8]) -> Option<(u32, u32, usize)> {
+    /// Longest body worth looking at: two decimal parameters and the
+    /// separator. Anything longer is not a key we encode.
+    const MAX_BODY: usize = 12;
+    let rest = bytes.strip_prefix(b"\x1b[")?;
+    let mut end = 0;
+    while end < rest.len()
+        && end < MAX_BODY
+        && (rest[end].is_ascii_digit() || rest[end] == b';')
+    {
+        end += 1;
+    }
+    if rest.get(end) != Some(&b'u') {
+        return None;
+    }
+    let mut parts = rest[..end].split(|&b| b == b';');
+    let codepoint = csi_u_number(parts.next()?)?;
+    let modifiers = match parts.next() {
+        Some(p) => csi_u_number(p)?,
+        None => 1,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((codepoint, modifiers, 2 + end + 1))
+}
+
+fn csi_u_number(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Whether a `CSI u` sequence at the head of `bytes` is the prefix
+/// chord, and how long it is.
+fn prefix_chord_at(bytes: &[u8]) -> Option<usize> {
+    let (codepoint, modifiers, len) = parse_csi_u(bytes)?;
+    (prefix_csi_u() == Some((codepoint, modifiers))).then_some(len)
+}
+
+/// The length of the complete CSI (`ESC [ … final`) or SS3 (`ESC O X`)
+/// sequence at the head of `bytes`, or `None` when it is truncated.
+///
+/// `Mode::Prefix` needs the real extent rather than a fixed three
+/// bytes. That was right only while every chord reaching it was
+/// `ESC [ X`: a pane whose program enabled the kitty keyboard protocol
+/// sends `CSI <codepoint> ; <modifiers> u` instead, which is seven
+/// bytes for `Ctrl+Space`, and consuming three of them left `2;5u` to
+/// be typed at the pane. Modified arrows (`ESC [ 1 ; 5 A`) had the same
+/// shape of problem for longer.
+///
+/// CSI parameter and intermediate bytes are all below `0x40`, so the
+/// first byte in `0x40..=0x7E` is the final one.
+fn escape_sequence_len(bytes: &[u8]) -> Option<usize> {
+    match bytes.get(1)? {
+        b'[' => {
+            let end = bytes
+                .get(2..)?
+                .iter()
+                .position(|&c| (0x40..=0x7e).contains(&c))?;
+            Some(2 + end + 1)
+        }
+        b'O' => (bytes.len() >= 3).then_some(3),
+        _ => None,
+    }
+}
+
 /// Human-readable name for the current prefix key (e.g. `Ctrl+Space`,
 /// `Ctrl+A`). Used in the help modal so it reflects `--prefix`.
 fn prefix_name() -> String {
@@ -6098,11 +6205,51 @@ fn wheel_scroll(state: &mut State, pane_id: &str, delta: i64) -> Result<()> {
 
 /// Drive the input state machine for a chunk of user keystrokes.
 fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
+    /// What a modal handler is handed in place of a `CSI 27 u`.
+    const LONE_ESC: &[u8] = &[0x1b];
+
     let mut idx = 0;
     while idx < bytes.len() {
         let b = bytes[idx];
+        // `CSI 27 u` is Esc, once the focused pane's program has
+        // enabled the kitty keyboard protocol — veter encodes for that
+        // program, and the pane stays the focused leaf even while one
+        // of vmux's own modals is up. The modals read Esc as a byte, so
+        // hand them the one they know and consume the whole sequence:
+        // `Mode::ConfirmQuit` would otherwise act on the ESC and leave
+        // `[27u` behind to be typed at the pane.
+        //
+        // `Mode::Normal` is excluded because there the sequence belongs
+        // to the pane and passes through untouched, and `Mode::Prefix`
+        // does its own, wider, escape-sequence handling.
+        let esc_len = if b == 0x1b
+            && !matches!(state.mode, Mode::Normal | Mode::Prefix)
+        {
+            match parse_csi_u(&bytes[idx..]) {
+                Some((27, 1, len)) => Some(len),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let key: &[u8] = if esc_len.is_some() {
+            LONE_ESC
+        } else {
+            &bytes[idx..]
+        };
         match &state.mode {
             Mode::Normal => {
+                // The prefix chord, in whichever spelling the focused
+                // pane's program made veter use — the `CSI u` form
+                // first, since it starts with ESC and would otherwise
+                // be forwarded as ordinary input.
+                if b == 0x1b
+                    && let Some(len) = prefix_chord_at(&bytes[idx..])
+                {
+                    state.mode = Mode::Prefix;
+                    idx += len;
+                    continue;
+                }
                 if b == prefix_byte() {
                     state.mode = Mode::Prefix;
                     idx += 1;
@@ -6128,10 +6275,15 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 // Forward the entire residual chunk to the focused pane
                 // up to the next prefix byte. This keeps multi-byte
                 // sequences (CSI, UTF-8) intact.
-                let stop = bytes[idx..]
-                    .iter()
-                    .position(|c| *c == prefix_byte())
-                    .map(|p| idx + p)
+                // Stop at the next prefix chord in either spelling,
+                // so one that lands mid-chunk is still ours rather
+                // than being typed at the pane.
+                let stop = (idx..bytes.len())
+                    .find(|&i| {
+                        bytes[i] == prefix_byte()
+                            || (bytes[i] == 0x1b
+                                && prefix_chord_at(&bytes[i..]).is_some())
+                    })
                     .unwrap_or(bytes.len());
                 // Typing in a mirror view reaches the shared shell:
                 // `pty_mut` follows the peer link, so both views are
@@ -6144,24 +6296,42 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 idx = stop;
             }
             Mode::Prefix => {
-                // Arrow keys arrive as 3-byte sequences (`ESC [ X` in
-                // normal cursor mode, `ESC O X` in DECCKM application
-                // mode), so peek ahead and consume the whole sequence
-                // when prefix-arrow is in flight. If the trailing
-                // bytes haven't landed in this read yet, fall through
-                // to the single-byte path — the lone ESC is silently
-                // dropped, which is preferable to leaking partial
-                // CSI bytes to the focused pane.
+                // An escape sequence after the prefix is consumed
+                // whole, whatever it turns out to be — leaving any of
+                // it behind types the remainder at the focused pane.
+                // If it hasn't all landed in this read yet, fall
+                // through to the single-byte path below: the lone ESC
+                // is silently dropped, which is preferable to leaking
+                // partial CSI bytes.
                 if b == 0x1b
-                    && idx + 2 < bytes.len()
-                    && (bytes[idx + 1] == b'[' || bytes[idx + 1] == b'O')
+                    && let Some(len) = escape_sequence_len(&bytes[idx..])
                 {
-                    let env = handle_prefix_arrow(state, bytes[idx + 2])?;
+                    let seq = &bytes[idx..idx + len];
                     state.mode = Mode::Normal;
-                    if !env.is_empty() {
-                        write_all_stdout(&env)?;
+                    if prefix_chord_at(seq).is_some() {
+                        // Double-tap, in the spelling this pane asked
+                        // for: the program enabled `CSI u` encodings,
+                        // so it wants the chord back that way and not
+                        // as the legacy control byte.
+                        let focus_id = state.focus().to_string();
+                        if let Some(pty) = state.pty_mut(&focus_id) {
+                            pty.enqueue(seq);
+                        }
+                    } else if len == 3
+                        && matches!(seq[2], b'A'..=b'D')
+                    {
+                        // `prefix + <arrow>`, in either the CSI or the
+                        // DECCKM SS3 spelling.
+                        let env = handle_prefix_arrow(state, seq[2])?;
+                        if !env.is_empty() {
+                            write_all_stdout(&env)?;
+                        }
                     }
-                    idx += 3;
+                    // Anything else — Esc as `CSI 27 u`, a modified
+                    // arrow, a chord with no binding — just cancels the
+                    // prefix, which is what the byte path's own
+                    // fallback does.
+                    idx += len;
                     continue;
                 }
                 let env = handle_prefix_command(state, b)?;
@@ -6171,39 +6341,39 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 idx += 1;
             }
             Mode::Rename { .. } => {
-                let (consumed, env) = handle_rename_input(state, &bytes[idx..])?;
+                let (consumed, env) = handle_rename_input(state, key)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += consumed.max(1);
+                idx += esc_len.unwrap_or(consumed.max(1));
             }
             Mode::Help { .. } => {
                 let env = handle_help_byte(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += 1;
+                idx += esc_len.unwrap_or(1);
             }
             Mode::ConfirmQuit => {
                 let env = handle_confirm_byte(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += 1;
+                idx += esc_len.unwrap_or(1);
             }
             Mode::Resize { .. } => {
                 let env = handle_resize_byte(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += 1;
+                idx += esc_len.unwrap_or(1);
             }
             Mode::Picker(_) => {
-                let (consumed, env) = handle_picker_input(state, &bytes[idx..])?;
+                let (consumed, env) = handle_picker_input(state, key)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
                 }
-                idx += consumed.max(1);
+                idx += esc_len.unwrap_or(consumed.max(1));
             }
         }
     }
@@ -6789,6 +6959,81 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the prefix chord in its kitty-protocol spelling -----------
+
+    #[test]
+    fn csi_u_parses_both_parameter_forms() {
+        assert_eq!(parse_csi_u(b"\x1b[27u"), Some((27, 1, 5)));
+        assert_eq!(parse_csi_u(b"\x1b[32;5u"), Some((32, 5, 7)));
+        // Trailing bytes are not consumed.
+        assert_eq!(parse_csi_u(b"\x1b[27uabc"), Some((27, 1, 5)));
+    }
+
+    /// The narrowness matters: SCORC and the protocol's own stack
+    /// operations share the `u` final byte, and reading either as a
+    /// keypress would swallow bytes that belong to the pane.
+    #[test]
+    fn csi_u_refuses_everything_that_is_not_a_key() {
+        for input in [
+            b"\x1b[u".as_ref(),      // SCORC — no parameters
+            b"\x1b[>1u".as_ref(),    // push flags
+            b"\x1b[<u".as_ref(),     // pop flags
+            b"\x1b[=1;2u".as_ref(),  // set flags
+            b"\x1b[27;1;2u".as_ref(), // a third parameter
+            b"\x1b[27".as_ref(),     // truncated
+            b"\x1b[27;5".as_ref(),   // truncated before the final
+            b"\x1b[A".as_ref(),      // an ordinary arrow
+        ] {
+            assert!(parse_csi_u(input).is_none(), "parsed {input:?}");
+        }
+    }
+
+    /// A runaway scan on every ESC in the keystroke stream would be a
+    /// cost paid on ordinary typing, so the body length is bounded.
+    #[test]
+    fn csi_u_scan_is_bounded() {
+        let mut long = b"\x1b[".to_vec();
+        long.extend(std::iter::repeat_n(b'1', 4096));
+        long.push(b'u');
+        assert!(parse_csi_u(&long).is_none());
+    }
+
+    /// The regression behind `^[[27u2;5u` on screen: `Mode::Prefix`
+    /// consumed a fixed three bytes, so `CSI 32;5 u` lost its first
+    /// three and the pane was typed the remaining `2;5u`.
+    #[test]
+    fn escape_sequence_extent_covers_more_than_three_bytes() {
+        assert_eq!(escape_sequence_len(b"\x1b[A"), Some(3));
+        assert_eq!(escape_sequence_len(b"\x1bOA"), Some(3));
+        assert_eq!(escape_sequence_len(b"\x1b[32;5u"), Some(7));
+        assert_eq!(escape_sequence_len(b"\x1b[27u"), Some(5));
+        assert_eq!(escape_sequence_len(b"\x1b[1;5A"), Some(6));
+        // Trailing bytes belong to whatever comes next.
+        assert_eq!(escape_sequence_len(b"\x1b[32;5uxy"), Some(7));
+        // Truncated: the caller falls back to dropping the lone ESC
+        // rather than guessing at an extent.
+        assert_eq!(escape_sequence_len(b"\x1b[32;5"), None);
+        assert_eq!(escape_sequence_len(b"\x1b["), None);
+        assert_eq!(escape_sequence_len(b"\x1b"), None);
+    }
+
+    #[test]
+    fn the_prefix_chord_is_recognised_in_the_csi_u_spelling() {
+        PREFIX_BYTE.store(0x00, Ordering::Relaxed); // Ctrl+Space
+        assert_eq!(prefix_csi_u(), Some((32, 5)));
+        assert_eq!(prefix_chord_at(b"\x1b[32;5u"), Some(7));
+        // A different chord is not ours; it goes to the pane.
+        assert_eq!(prefix_chord_at(b"\x1b[98;5u"), None);
+        // Esc is emphatically not the prefix.
+        assert_eq!(prefix_chord_at(b"\x1b[27u"), None);
+
+        PREFIX_BYTE.store(0x02, Ordering::Relaxed); // Ctrl+B
+        assert_eq!(prefix_csi_u(), Some((98, 5)));
+        assert_eq!(prefix_chord_at(b"\x1b[98;5u"), Some(7));
+        assert_eq!(prefix_chord_at(b"\x1b[32;5u"), None);
+        PREFIX_BYTE.store(0x00, Ordering::Relaxed);
+    }
 
     /// An `OutQueue` over a pipe whose reader we keep, so a flush can
     /// be made to drain exactly as far as we want.

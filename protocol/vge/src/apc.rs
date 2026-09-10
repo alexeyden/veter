@@ -76,6 +76,16 @@ pub enum TerminalEvent {
     /// or as "not recognised" for a mode the screen doesn't track —
     /// which is still an answer, and still unblocks the sender.
     ModeQuery { private: bool, mode: u16 },
+    /// `ESC [ ? u` — the kitty keyboard protocol's "which progressive
+    /// enhancement flags are in effect?". Answered from the vt100's own
+    /// per-screen flag stack, which is where the `CSI > … u` pushes
+    /// that set them landed.
+    ///
+    /// The bare `ESC [ u` spelling is *not* this: with no parameters
+    /// and no private prefix it is SCORC, the ANSI.SYS cursor restore,
+    /// which is why the match below is on the `?` and not on the final
+    /// byte alone.
+    KeyboardFlagsQuery,
 }
 
 /// Cap on CSI body length we'll buffer for matching. Long sequences
@@ -119,6 +129,13 @@ fn query_event(params: &[u8], final_byte: u8) -> Option<TerminalEvent> {
             let mode: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
             Some(TerminalEvent::ModeQuery { private, mode })
         }
+        // The kitty keyboard flags query `CSI ? u`. The private prefix
+        // carries the whole distinction from SCORC (`CSI u`), so an
+        // empty parameter string must not match here.
+        b'u' => match params {
+            b"?" => Some(TerminalEvent::KeyboardFlagsQuery),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -991,6 +1008,31 @@ mod tests {
         for input in [b"\x1b[>q".as_ref(), b"\x1b[>0q".as_ref()] {
             let (events, _) = events_of(input);
             assert_eq!(events, vec![TerminalEvent::XtVersion]);
+        }
+    }
+
+    #[test]
+    fn keyboard_flags_query_is_observed() {
+        let (events, pass) = events_of(b"\x1b[?u");
+        assert_eq!(events, vec![TerminalEvent::KeyboardFlagsQuery]);
+        assert_eq!(pass, b"\x1b[?u", "the query still reaches the vt100");
+    }
+
+    /// `CSI u` is SCORC, the ANSI.SYS cursor restore, and it is common:
+    /// matching it as the keyboard query would answer a cursor restore
+    /// with an escape sequence the program reads as keystrokes. The
+    /// stack operations are not queries either — the vt100 applies
+    /// those and there is nothing to reply to.
+    #[test]
+    fn scorc_and_the_stack_operations_are_not_the_query() {
+        for input in [
+            b"\x1b[u".as_ref(),   // SCORC
+            b"\x1b[>1u".as_ref(), // push
+            b"\x1b[<u".as_ref(),  // pop
+            b"\x1b[=1;2u".as_ref(), // set
+        ] {
+            let (events, _) = events_of(input);
+            assert!(events.is_empty(), "matched {input:?} as a query");
         }
     }
 

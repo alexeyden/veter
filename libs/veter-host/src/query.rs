@@ -162,6 +162,20 @@ pub fn dynamic_color_report(
     format!("\x1b]{code};{}\x1b\\", rgb_spec(r, g, b)).into_bytes()
 }
 
+/// Answer the kitty keyboard protocol's `CSI ? u` query:
+/// `CSI ? <flags> u`.
+///
+/// The flags are whatever the querying program's own screen currently
+/// has pushed (`vt100::Screen::keyboard_flags`), so the reply describes
+/// that screen and not the terminal's opinion of itself. A terminal
+/// that implements only part of the protocol reports only the part it
+/// actually honours — which is why this reads the stack back rather
+/// than echoing what was asked for.
+#[must_use]
+pub fn keyboard_flags_report(flags: u8) -> Vec<u8> {
+    format!("\x1b[?{flags}u").into_bytes()
+}
+
 /// Answer an `OSC 4 ; <index> ; ?` palette query.
 #[must_use]
 pub fn palette_color_report(index: u8, (r, g, b): (u8, u8, u8)) -> Vec<u8> {
