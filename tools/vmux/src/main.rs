@@ -87,25 +87,65 @@ fn user_shell() -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-/// How long the loop waits on an idle poll before deciding that an ESC
-/// held by the APC parsers was a keypress rather than the first byte of
-/// an envelope — the same trade-off tmux spells `escape-time`, and for
-/// the same reason it defaults to 500 ms there.
+/// How long bytes held back by the APC parsers wait before the loop
+/// decides they were keystrokes rather than the opening of an envelope
+/// split across reads — the trade-off tmux spells `escape-time`.
 ///
-/// It is a guess either way, and the wrong guess costs differently in
-/// each direction. Too long and Esc lags in whatever the focused pane
-/// is running. Too short and an envelope split at its opening ESC gets
-/// its ESC delivered early; the parser recovers the envelope itself
-/// (see `flush_pending_esc`), but the stray ESC still reaches the pane,
+/// It is a guess either way, and an asymmetric one. Too long and Esc
+/// lags in whatever the focused pane is running, compounding through
+/// nesting (`vmux → ssh → vsd → vmux` stacks three of these windows).
+/// Too short and an envelope split at its opening ESC has that ESC
+/// delivered early: `flush_pending_esc` still reassembles the envelope,
+/// so nothing is lost on the wire, but the stray ESC reaches the pane,
 /// where a program may take it for a cancel.
 ///
-/// Splits like that are not rare, and are not only a slow-link
-/// phenomenon: the host's pty writer (`veter/src/pty.rs`) hands the
-/// kernel as much as the buffer will take and blocks on the rest until
-/// we drain it, so any envelope can arrive in two pieces separated by
-/// however long our own loop takes to come back around. Under load that
-/// is well past 50 ms, which is what this used to be.
-const ESCAPE_TIME_MS: u16 = 300;
+/// 40 ms, where this was 300, because the gap it has to outwait is
+/// smaller than it looked. The host's pty writer (`veter/src/pty.rs`)
+/// is a blocking thread on the master, and a short `write(2)` there
+/// happens only when the buffer is full — so the tail of a split
+/// envelope is already sitting in a blocked write and lands as soon as
+/// we drain, one loop iteration later. What made 300 ms look necessary
+/// was arming the decision off a *fully idle* poll: with any pane
+/// producing output or any byte queued toward stdout, the flush never
+/// ran at all and the true wait was unbounded rather than 300 ms. It is
+/// a deadline now, so the number means what it says.
+///
+/// The case that genuinely wants longer is a network hop, where a split
+/// envelope's tail can be a round trip behind its head. That is what
+/// `VMUX_ESCAPE_TIME_MS` is for.
+const ESCAPE_TIME_MS: u64 = 40;
+
+/// Poll interval when no parser is holding anything back.
+///
+/// Nothing in the loop is *driven* by the tick, but it is not free to
+/// drop either: the SIGWINCH handler sets a flag the top of the loop
+/// drains (`SaFlags::empty()`, so a signal landing during `poll` does
+/// return EINTR), and a signal landing in the window between that
+/// check and entering `poll` is only noticed on the next wakeup. This
+/// bounds that race, and is the same 300 ms the escape-time used to
+/// impose on it as a side effect.
+const IDLE_TICK_MS: u16 = 300;
+
+/// `VMUX_ESCAPE_TIME_MS` overrides [`ESCAPE_TIME_MS`]. `0` decides a
+/// held Esc on the very next pass, which is right on a local host and
+/// wrong at the far end of a slow link.
+fn escape_time() -> Duration {
+    let ms = std::env::var("VMUX_ESCAPE_TIME_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(ESCAPE_TIME_MS);
+    Duration::from_millis(ms)
+}
+
+/// Whether any of the three parsers is sitting on bytes that belong to
+/// the focused pane if no follow-up byte arrives.
+fn apc_holding(
+    prt: &PrtApcStream,
+    vge: &VgeApcStream,
+    ses: &SesApcStream,
+) -> bool {
+    prt.has_deferred_bytes() || vge.has_deferred_bytes() || ses.has_deferred_bytes()
+}
 
 // Debug logging — VMUX_LOG=/path enables byte-level tracing of all four
 // directions: user keystrokes, bytes forwarded to a pane PTY, bytes read
@@ -4878,6 +4918,15 @@ fn main() -> Result<()> {
     // probe response) so they never leak into the keystroke stream.
     let mut ses_apc = SesApcStream::with_marker(*SES_MARKER_H2C);
     let mut rd_buf = [0u8; 8192];
+    // The escape-time window, armed the moment a parser starts holding
+    // bytes back and disarmed once it has let them all go. It is a
+    // deadline rather than "a poll that returned nothing" because the
+    // two are not the same question: with a pane producing output, or
+    // stdout backpressured, or any other fd hot, a fully idle poll
+    // never happens, and a held Esc used to wait for a globally quiet
+    // moment instead of for this window.
+    let escape_time = escape_time();
+    let mut esc_deadline: Option<Instant> = None;
 
     while !state.quit {
         if WINCH_FLAG.swap(false, Ordering::SeqCst) || state.needs_resize_check {
@@ -4980,11 +5029,20 @@ fn main() -> Result<()> {
             fds.push(PollFd::new(pane_borroweds[i], ev));
         }
 
-        let n = match poll(&mut fds, PollTimeout::from(ESCAPE_TIME_MS)) {
-            Ok(n) => n,
+        // Wake for the escape-time window while one is running, so a
+        // held Esc is decided on time however busy the other fds are.
+        let timeout = match esc_deadline {
+            Some(deadline) => u16::try_from(
+                deadline.saturating_duration_since(Instant::now()).as_millis(),
+            )
+            .unwrap_or(u16::MAX),
+            None => IDLE_TICK_MS,
+        };
+        match poll(&mut fds, PollTimeout::from(timeout)) {
+            Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("poll: {e}")),
-        };
+        }
 
         // Drain whatever the host is now ready to accept.
         if let Some(idx) = stdout_idx {
@@ -4994,24 +5052,8 @@ fn main() -> Result<()> {
             }
         }
 
-        if n == 0 {
-            // Poll idle: nothing arrived for the full 50ms window, so any
-            // ESC byte still buffered in the APC parsers' EscPending state
-            // is unambiguously a lone keystroke (e.g. dismiss-modal). Push
-            // it through so the input handler can act on it without
-            // waiting for a follow-up byte that's never coming.
-            let prt_flushed = prt_apc.flush_pending_esc();
-            let mut after_vge = vge_apc.feed(&prt_flushed).passthrough;
-            after_vge.extend(vge_apc.flush_pending_esc());
-            let mut pending = ses_apc.feed(&after_vge).passthrough;
-            pending.extend(ses_apc.flush_pending_esc());
-            if !pending.is_empty() {
-                process_user_input(&mut state, &pending)?;
-            }
-            continue;
-        }
-
         // Stdin: host responses + user keystrokes.
+        let mut fed_parsers = false;
         let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
         if stdin_revents.contains(PollFlags::POLLIN) {
             match read_stdin_nb(&mut rd_buf)? {
@@ -5020,6 +5062,7 @@ fn main() -> Result<()> {
                     break;
                 }
                 Some(n) => {
+                    fed_parsers = true;
                     dlog("stdin", &rd_buf[..n]);
                     trace_vmux_stdin(&rd_buf[..n]);
                     handle_stdin_chunk(
@@ -5032,6 +5075,41 @@ fn main() -> Result<()> {
                 }
                 // EAGAIN: POLLIN raced a drain; nothing to read this round.
                 None => {}
+            }
+        }
+
+        // Arm, keep, or drop the escape-time window. Bytes that just
+        // arrived restart it: they are evidence that the rest of a
+        // split envelope is on its way, so the window measures quiet
+        // rather than the age of the first held byte.
+        esc_deadline = if apc_holding(&prt_apc, &vge_apc, &ses_apc) {
+            match esc_deadline {
+                Some(deadline) if !fed_parsers => Some(deadline),
+                _ => Some(Instant::now() + escape_time),
+            }
+        } else {
+            None
+        };
+
+        // The window elapsed with nothing arriving to complete the
+        // sequence, so what is held was typed. Release it down the same
+        // parser chain a real read goes through — an envelope whose
+        // tail turns up late is still recovered from what stays behind.
+        if esc_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let prt_flushed = prt_apc.flush_pending_esc();
+            let mut after_vge = vge_apc.feed(&prt_flushed).passthrough;
+            after_vge.extend(vge_apc.flush_pending_esc());
+            let mut to_pane = ses_apc.feed(&after_vge).passthrough;
+            to_pane.extend(ses_apc.flush_pending_esc());
+            // A flush out of `ApcPrefix` releases the ESC and keeps the
+            // `_`, so the window runs again for whatever is still held.
+            esc_deadline = apc_holding(&prt_apc, &vge_apc, &ses_apc)
+                .then(|| Instant::now() + escape_time);
+            if !to_pane.is_empty() {
+                process_user_input(&mut state, &to_pane)?;
+                // Input handling can close a pane, and the fd table the
+                // loop below walks was built before the poll.
+                continue;
             }
         }
 

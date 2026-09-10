@@ -956,19 +956,37 @@ fn splice_input(
     // inserted as literal keystrokes.
     let mut vss_filter =
         vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
-    // Bounded poll timeout so a lone Esc keystroke that lands in
-    // `vss_filter`'s `EscPending` state still reaches the inner PTY
-    // when no follow-up byte arrives — same idea as the terminfo
-    // `ESCDELAY` (default 100 ms) used by curses apps to disambiguate
-    // a bare Esc from the start of a multi-byte escape sequence.
-    let esc_timeout_ms = 50u16;
+    // The escape-time window for bytes `vss_filter` holds back: a lone
+    // Esc landing in its `EscPending` state has to reach the inner PTY
+    // when no follow-up byte arrives, or vim never sees the mode
+    // switch. Same trade-off as vmux's `ESCAPE_TIME_MS`, and as the
+    // terminfo `ESCDELAY` curses apps use — ncurses documents 1000 ms
+    // there, which nobody actually waits any more.
+    //
+    // This window sits in series with the renderer's, so it is the
+    // smaller of the two: what it has to outwait is a straggling
+    // snapshot ack split across reads on a local pty, not a network
+    // gap. Tracked as a deadline rather than "a poll that saw no
+    // stdin", so an attach that is holding nothing costs no wakeups.
+    const ESCAPE_TIME: Duration = Duration::from_millis(25);
+    const IDLE_TICK_MS: u16 = 1000;
+    let mut esc_deadline: Option<std::time::Instant> = None;
     loop {
         let mut fds = [
             PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
             PollFd::new(shutdown_read.as_fd(), PollFlags::POLLIN),
             PollFd::new(ipc_fd, PollFlags::POLLIN),
         ];
-        match poll(&mut fds, PollTimeout::from(esc_timeout_ms)) {
+        let timeout = match esc_deadline {
+            Some(deadline) => u16::try_from(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u16::MAX),
+            None => IDLE_TICK_MS,
+        };
+        match poll(&mut fds, PollTimeout::from(timeout)) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("splice poll: {e}")),
@@ -997,17 +1015,25 @@ fn splice_input(
 
         let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
         if !stdin_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
-            // No input this tick. Flush a held lone Esc so vim et al.
-            // see the mode-switch keystroke at all.
-            let flushed = vss_filter.flush_pending_esc();
-            if !flushed.is_empty() {
-                let out = scanner.feed(&flushed);
-                if !out.forward.is_empty() {
-                    write_master(&out.forward)
-                        .with_context(|| "writing flushed Esc to inner PTY")?;
-                }
-                if out.detach {
-                    return Ok(());
+            // No input this pass. Once the window has elapsed, what is
+            // held was typed: release it so vim et al. see the
+            // mode-switch keystroke at all. A flush out of `ApcPrefix`
+            // lets the ESC go and keeps the `_`, so the window may have
+            // to run again for the rest.
+            if esc_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                let flushed = vss_filter.flush_pending_esc();
+                esc_deadline = vss_filter
+                    .has_deferred_bytes()
+                    .then(|| std::time::Instant::now() + ESCAPE_TIME);
+                if !flushed.is_empty() {
+                    let out = scanner.feed(&flushed);
+                    if !out.forward.is_empty() {
+                        write_master(&out.forward)
+                            .with_context(|| "writing flushed Esc to inner PTY")?;
+                    }
+                    if out.detach {
+                        return Ok(());
+                    }
                 }
             }
             continue;
@@ -1032,6 +1058,11 @@ fn splice_input(
         // Filter out any renderer-side VSS envelopes; what's left is
         // user keystrokes destined for the inner shell.
         let vss_out = vss_filter.feed(&buf[..n]);
+        // Bytes that just arrived restart the window: they are evidence
+        // that the rest of a split envelope is on its way.
+        esc_deadline = vss_filter
+            .has_deferred_bytes()
+            .then(|| std::time::Instant::now() + ESCAPE_TIME);
         // `vss_out.payloads` carries any late SnapshotAccepted /
         // Rejected bodies. The verdict this attach turns on was
         // already taken before the splice started; these are dropped.
