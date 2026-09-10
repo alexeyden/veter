@@ -342,6 +342,25 @@ impl ApcStream {
                 self.state = State::EscFlushed;
                 vec![ESC]
             }
+            State::ApcPrefix => {
+                // `ESC _` in hand and the marker still short. The same
+                // call as `EscPending`, one byte later: release the ESC
+                // and hand the rest to `RecoverPrefix`, so a marker
+                // that turns up late still reassembles the envelope.
+                // The `_` itself waits for the next idle window — by
+                // which point two windows have passed with no marker,
+                // which is as much evidence as this parser can get that
+                // nobody is sending one.
+                //
+                // Without this arm a typed `Esc _` is swallowed
+                // outright until three more bytes arrive. It was nearly
+                // unreachable while the escape-time was short enough
+                // that the ESC always flushed before the `_` landed,
+                // and reachable by ordinary typing once it wasn't.
+                self.recover_flushed = None;
+                self.state = State::RecoverPrefix;
+                vec![ESC]
+            }
             State::RecoverPrefix => {
                 let mut out = Vec::new();
                 let already = match self.recover_flushed {
@@ -356,6 +375,21 @@ impl ApcStream {
                 out
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Whether [`ApcStream::flush_pending_esc`] has anything to hand
+    /// over — the parser is sitting on bytes that belong downstream if
+    /// no follow-up byte arrives.
+    ///
+    /// Callers arm their escape-time timer on this rather than on "a
+    /// poll returned nothing", so the wait is bounded by the timer
+    /// instead of by the next quiet moment on an unrelated fd.
+    pub fn has_deferred_bytes(&self) -> bool {
+        match self.state {
+            State::EscPending | State::ApcPrefix => true,
+            State::RecoverPrefix => self.recover_flushed != Some(self.marker_len),
+            _ => false,
         }
     }
 

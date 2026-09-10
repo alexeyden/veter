@@ -405,6 +405,25 @@ impl ApcStream {
                 self.state = State::EscFlushed;
                 vec![ESC]
             }
+            State::ApcPrefix => {
+                // `ESC _` in hand and the marker still short. The same
+                // call as `EscPending`, one byte later: release the ESC
+                // and hand the rest to `RecoverPrefix`, so a marker
+                // that turns up late still reassembles the envelope.
+                // The `_` itself waits for the next idle window — by
+                // which point two windows have passed with no marker,
+                // which is as much evidence as this parser can get that
+                // nobody is sending one.
+                //
+                // Without this arm a typed `Esc _` is swallowed
+                // outright until three more bytes arrive. It was nearly
+                // unreachable while the escape-time was short enough
+                // that the ESC always flushed before the `_` landed,
+                // and reachable by ordinary typing once it wasn't.
+                self.recover_flushed = None;
+                self.state = State::RecoverPrefix;
+                vec![ESC]
+            }
             State::RecoverPrefix => {
                 let mut out = Vec::new();
                 let already = match self.recover_flushed {
@@ -419,6 +438,21 @@ impl ApcStream {
                 out
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Whether [`ApcStream::flush_pending_esc`] has anything to hand
+    /// over — the parser is sitting on bytes that belong downstream if
+    /// no follow-up byte arrives.
+    ///
+    /// Callers arm their escape-time timer on this rather than on "a
+    /// poll returned nothing", so the wait is bounded by the timer
+    /// instead of by the next quiet moment on an unrelated fd.
+    pub fn has_deferred_bytes(&self) -> bool {
+        match self.state {
+            State::EscPending | State::ApcPrefix => true,
+            State::RecoverPrefix => self.recover_flushed != Some(self.marker_len),
+            _ => false,
         }
     }
 
@@ -1351,6 +1385,77 @@ mod tests {
             "envelope leaked as input: {:?}",
             String::from_utf8_lossy(&out.passthrough)
         );
+    }
+
+    /// Esc, then `_`, both landing before any idle window elapses —
+    /// two ordinary keystrokes at a rate a person types at. The pair
+    /// reaches `ApcPrefix`, which used to have no flush arm at all, so
+    /// both bytes sat there until three more arrived. Raising the
+    /// escape-time is what made this reachable: with a short one the
+    /// ESC flushed before the `_` landed and the recover path carried
+    /// it, which is why the bug hid behind the fix for the split.
+    #[test]
+    fn typed_esc_underscore_is_not_swallowed() {
+        let mut s = ApcStream::new();
+        assert!(s.feed(&[ESC]).passthrough.is_empty());
+        assert!(s.feed(b"_").passthrough.is_empty());
+        // One window: the ESC, as for any deferred lone Esc.
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+        // A second with still no marker: the `_` follows it.
+        assert_eq!(s.flush_pending_esc(), vec![APC_OPEN]);
+        assert_eq!(s.flush_pending_esc(), Vec::<u8>::new());
+    }
+
+    /// The same flush, but the bytes really were an envelope whose
+    /// marker was late. Releasing the ESC out of `ApcPrefix` must not
+    /// cost the envelope — `RecoverPrefix` picks it up exactly as it
+    /// does for a flush out of `EscPending`.
+    #[test]
+    fn a_split_envelope_survives_a_flush_from_apc_prefix() {
+        let env = split_test_envelope();
+        let mut s = ApcStream::new();
+
+        assert!(s.feed(&env[..2]).passthrough.is_empty()); // `ESC _`
+        assert_eq!(s.flush_pending_esc(), vec![ESC]);
+
+        let out = s.feed(&env[2..]);
+        assert_eq!(out.payloads().count(), 1, "envelope lost after the flush");
+        assert!(
+            out.passthrough.is_empty(),
+            "envelope leaked as input: {:?}",
+            String::from_utf8_lossy(&out.passthrough)
+        );
+    }
+
+    /// What a caller arms its escape-time timer on: true exactly when
+    /// a flush would hand something over, so the timer starts when
+    /// bytes are first held and stops once they are all released.
+    #[test]
+    fn has_deferred_bytes_tracks_what_a_flush_would_release() {
+        let mut s = ApcStream::new();
+        assert!(!s.has_deferred_bytes(), "idle");
+
+        s.feed(&[ESC]);
+        assert!(s.has_deferred_bytes(), "lone ESC");
+        s.feed(b"_");
+        assert!(s.has_deferred_bytes(), "ESC _");
+        s.flush_pending_esc();
+        assert!(s.has_deferred_bytes(), "the `_` is still owed");
+        s.flush_pending_esc();
+        assert!(!s.has_deferred_bytes(), "everything released");
+
+        // A marker byte arriving mid-recovery is owed again.
+        s.feed(b"P");
+        assert!(s.has_deferred_bytes(), "marker byte held");
+        s.flush_pending_esc();
+        assert!(!s.has_deferred_bytes());
+
+        // Mid-envelope is not a deferral: those bytes are payload, and
+        // no timer should be waiting on them.
+        let mut s = ApcStream::new();
+        let env = split_test_envelope();
+        s.feed(&env[..env.len() - 1]);
+        assert!(!s.has_deferred_bytes(), "mid-envelope");
     }
 
     /// Someone else's envelope, split the same way, running through a
