@@ -935,8 +935,37 @@ fn scan_colors(t: &[u8], push: &mut impl FnMut(usize, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::extract_indexed_text;
+    use crate::search::{extract_indexed_text, extract_indexed_window};
     use vt100::Parser;
+
+    /// Hint mode scans one viewport rather than the whole buffer, so a
+    /// windowed scan has to agree with a full one about the rows the
+    /// window covers — including a URL the window's top edge cut in
+    /// half, which is what the wrap-chain extension is for.
+    #[test]
+    fn a_windowed_scan_agrees_with_a_full_one() {
+        // cols=20, 2-row screen: everything but the last two rows is
+        // scrollback, and the long URL wraps.
+        let mut p = Parser::new(2, 20, 100);
+        p.process(
+            b"see https://example.com/a/very/long/path/x for /etc/hosts\r\nand 8ac3f1e9b2\r\ndone",
+        );
+        let top = p.screen().top_of_live_screen();
+        let cfg = HintConfig::all();
+        let full = find_hints(&extract_indexed_text(p.screen(), top), &cfg);
+        // A one-line window over the middle of the wrapped URL.
+        let idx = extract_indexed_window(p.screen(), top, 1, 1);
+        let windowed = find_hints(&idx, &cfg);
+        let url = full
+            .iter()
+            .find(|h| h.kind == HintKind::Url)
+            .expect("the full scan finds the URL");
+        assert_eq!(
+            windowed.iter().find(|h| h.kind == HintKind::Url),
+            Some(url),
+            "the same URL, at the same coords, from half a viewport"
+        );
+    }
 
     /// Index one screen's worth of text, then run every detector over it
     /// in the default order.
@@ -959,7 +988,7 @@ mod tests {
         let rows = 24;
         let mut p = Parser::new(rows, cols, 100);
         p.process(text.replace('\n', "\r\n").as_bytes());
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         find_hints(&idx, cfg)
             .into_iter()
             .map(|h| (h.kind, span_text(&idx, h.span)))
@@ -1068,7 +1097,7 @@ mod tests {
         let url = "https://example.com/very/long/path/that/wraps";
         let mut p = Parser::new(24, 20, 100);
         p.process(url.as_bytes());
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let only_urls = HintConfig {
             kinds: vec![HintKind::Url],
             ..Default::default()

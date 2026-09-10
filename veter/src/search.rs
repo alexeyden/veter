@@ -18,8 +18,6 @@
 //!   a soft-wrapped row, where they are content the next row continues
 //!   from (see [`IndexedRow::wrapped`]).
 
-use vt100::Callbacks;
-
 /// Per-row indexed text + byte→col map. Built once per search
 /// session (cached on [`crate::SearchState`]) and re-queried per
 /// keystroke via [`find_matches`]; rebuilt only when the target
@@ -85,59 +83,133 @@ impl MatchSpan {
     }
 }
 
-/// Walk every row currently in `parser`'s buffer (scrollback + live
-/// screen) and return a per-row index. Restores the parser's
-/// scrollback position before returning.
+/// Walk every row currently in `screen`'s buffer (scrollback + live
+/// screen) and return a per-row index.
 ///
-/// `top_of_live_screen` is the engine-tracked anchor for `parser`
+/// `top_of_live_screen` is the engine-tracked anchor for `screen`
 /// (host: `prt.top_of_live_screen()`; portal:
 /// `portal.children.top_of_live_screen()`), same convention as
 /// `extract_text_from_parser` in main.rs.
-pub fn extract_indexed_text<CB: Callbacks>(
-    parser: &mut vt100::Parser<CB>,
+pub fn extract_indexed_text(screen: &vt100::Screen, top_of_live_screen: i64) -> TextIndex {
+    let (rows, _) = screen.size();
+    let fill = screen.scrollback_fill();
+    extract_lines(
+        screen,
+        top_of_live_screen,
+        top_of_live_screen - fill as i64,
+        top_of_live_screen + rows as i64 - 1,
+    )
+}
+
+/// How far [`extract_indexed_window`] will chase a soft-wrap chain past
+/// the range it was asked for. One logical line can in principle wrap
+/// over the whole buffer, and indexing all of it would give back
+/// exactly the cost the windowed scan exists to avoid.
+const WRAP_CHAIN_LIMIT: usize = 256;
+
+/// Index the lines `first..=last` only, extended outward over a
+/// soft-wrap chain either end lands inside.
+///
+/// Hint mode's labels describe what is on screen and nothing else, so
+/// it indexes one viewport rather than the whole buffer — which is what
+/// makes rescanning on every scroll step affordable. The extension is
+/// not optional: [`crate::hints`] joins a wrap chain into one logical
+/// line before scanning, so a URL cut by the viewport edge has to
+/// arrive whole or it is detected as something else, or not at all.
+pub fn extract_indexed_window(
+    screen: &vt100::Screen,
     top_of_live_screen: i64,
+    first: i64,
+    last: i64,
 ) -> TextIndex {
-    let (rows, cols) = parser.screen().size();
-    let saved = parser.screen().scrollback();
-
-    // Probe scrollback fill via the cap trick (mirrors main.rs:1887-1890):
-    // set to MAX, observe the clamped value. This temporarily moves
-    // the view, which the per-line walk below overwrites anyway —
-    // single restore at the very end is enough.
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let scrollback_fill = parser.screen().scrollback();
-
-    let first_line = top_of_live_screen - scrollback_fill as i64;
-    let last_line = top_of_live_screen + rows as i64 - 1;
-
-    let mut indexed = Vec::with_capacity(scrollback_fill + rows as usize);
-
-    for line in first_line..=last_line {
-        let target_scrollback = (top_of_live_screen - line).max(0) as usize;
-        parser.screen_mut().set_scrollback(target_scrollback);
-        let actual = parser.screen().scrollback() as i64;
-        let viewport_top = top_of_live_screen - actual;
-        let row_in_view = line - viewport_top;
-        if row_in_view < 0 || row_in_view >= rows as i64 {
-            continue;
-        }
-        let row = row_in_view as u16;
-        indexed.push(index_row(parser.screen(), row, cols, line));
+    let (rows, _) = screen.size();
+    let fill = screen.scrollback_fill();
+    let oldest = top_of_live_screen - fill as i64;
+    let newest = top_of_live_screen + rows as i64 - 1;
+    if newest < oldest || last < first {
+        return TextIndex { rows: Vec::new() };
     }
+    let mut first = first.clamp(oldest, newest);
+    let mut last = last.clamp(oldest, newest);
+    let wrapped_at = |line: i64| {
+        locate_line(top_of_live_screen, fill, rows, line)
+            .is_some_and(|(offset, row)| screen.row_wrapped_at(offset, row))
+    };
+    // Back to the head of the chain `first` sits in: the row above is
+    // part of it exactly when that row wraps into this one.
+    for _ in 0..WRAP_CHAIN_LIMIT {
+        if first <= oldest || !wrapped_at(first - 1) {
+            break;
+        }
+        first -= 1;
+    }
+    // Forward to the tail of the chain `last` sits in.
+    for _ in 0..WRAP_CHAIN_LIMIT {
+        if last >= newest || !wrapped_at(last) {
+            break;
+        }
+        last += 1;
+    }
+    extract_lines(screen, top_of_live_screen, first, last)
+}
 
-    parser.screen_mut().set_scrollback(saved);
+/// Index every line in `first..=last` that is still in the buffer.
+///
+/// Rows are read at an explicit view offset rather than by moving the
+/// grid's own scroll position: a portal buffer can be shared by two
+/// views at different offsets (`portal-extension.md` §6.9) and its grid
+/// stays live, so nothing here may move it. Reading a row as a slice
+/// also costs one visible-row walk per *row* instead of one per cell —
+/// the same reason `RowDamage::from_screen` does it that way.
+fn extract_lines(
+    screen: &vt100::Screen,
+    top_of_live_screen: i64,
+    first: i64,
+    last: i64,
+) -> TextIndex {
+    let (rows, cols) = screen.size();
+    let fill = screen.scrollback_fill();
+    let mut indexed = Vec::with_capacity((last - first + 1).max(0) as usize);
+    for line in first..=last {
+        let Some((offset, row)) = locate_line(top_of_live_screen, fill, rows, line) else {
+            continue;
+        };
+        indexed.push(index_row(screen, offset, row, cols, line));
+    }
     TextIndex { rows: indexed }
 }
 
-fn index_row(screen: &vt100::Screen, row: u16, cols: u16, line: i64) -> IndexedRow {
-    let wrapped = screen.row_wrapped(row);
+/// View offset + visible row that absolute line `line` sits at, or
+/// `None` when it has fallen out of the buffer. A line older than the
+/// scrollback fill clamps to the oldest offset and lands on a negative
+/// row, which is how it reports "gone".
+fn locate_line(
+    top_of_live_screen: i64,
+    fill: usize,
+    rows: u16,
+    line: i64,
+) -> Option<(usize, u16)> {
+    let offset = (top_of_live_screen - line).clamp(0, fill as i64);
+    let row = line - (top_of_live_screen - offset);
+    (row >= 0 && row < rows as i64).then_some((offset as usize, row as u16))
+}
+
+fn index_row(
+    screen: &vt100::Screen,
+    offset: usize,
+    row: u16,
+    cols: u16,
+    line: i64,
+) -> IndexedRow {
+    let wrapped = screen.row_wrapped_at(offset, row);
+    let cells = screen.visible_row_cells_at(offset, row);
     let mut text = String::with_capacity(cols as usize);
     let mut text_lower: Vec<u8> = Vec::with_capacity(cols as usize);
     let mut byte_to_col: Vec<u16> = Vec::with_capacity(cols as usize + 1);
 
     let mut col: u16 = 0;
     while col < cols {
-        let Some(cell) = screen.cell(row, col) else { break };
+        let Some(cell) = cells.get(usize::from(col)) else { break };
         if cell.is_wide_continuation() {
             // Belongs to the previous wide cell; its bytes were
             // already emitted there.
@@ -240,7 +312,7 @@ mod tests {
     #[test]
     fn extract_indexes_live_screen() {
         let mut p = parse(b"hello world\r\nrust", 4, 20);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         // 4 rows total; trailing-empty rows trim to "" and stay.
         assert_eq!(idx.rows.len(), 4);
         assert_eq!(idx.rows[0].text, "hello world");
@@ -257,7 +329,7 @@ mod tests {
         // 12 chars into a 5-column screen: rows 0 and 1 wrap, row 2 ends
         // the chain.
         let mut p = parse(b"abcdefghijkl", 4, 5);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         assert_eq!(idx.rows[0].text, "abcde");
         assert!(idx.rows[0].wrapped);
         assert!(idx.rows[1].wrapped);
@@ -268,7 +340,7 @@ mod tests {
     #[test]
     fn byte_to_col_sentinel_is_text_len() {
         let mut p = parse(b"abc", 2, 10);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let row = &idx.rows[0];
         assert_eq!(row.text, "abc");
         // 3 byte entries + 1 sentinel.
@@ -280,7 +352,7 @@ mod tests {
     #[test]
     fn find_substring_case_sensitive() {
         let mut p = parse(b"Hello hello HELLO", 2, 20);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let m = find_matches(&idx, "hello", false);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].line, 0);
@@ -291,7 +363,7 @@ mod tests {
     #[test]
     fn find_substring_case_insensitive() {
         let mut p = parse(b"Hello hello HELLO", 2, 20);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let m = find_matches(&idx, "hello", true);
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].col_start, 0);
@@ -303,7 +375,7 @@ mod tests {
     fn matches_dont_cross_rows() {
         // "foobar" split across two physical rows shouldn't match.
         let mut p = parse(b"foo\r\nbar", 3, 5);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         assert!(find_matches(&idx, "foobar", true).is_empty());
         assert_eq!(find_matches(&idx, "foo", true).len(), 1);
         assert_eq!(find_matches(&idx, "bar", true).len(), 1);
@@ -312,7 +384,7 @@ mod tests {
     #[test]
     fn empty_query_returns_no_matches() {
         let mut p = parse(b"anything", 2, 10);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         assert!(find_matches(&idx, "", true).is_empty());
     }
 
@@ -324,7 +396,7 @@ mod tests {
     #[test]
     fn find_phrase_with_spaces() {
         let mut p = parse(b"the quick brown fox\r\nthe quick red fox", 3, 30);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let m = find_matches(&idx, "quick brown", true);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].line, 0);
@@ -336,12 +408,69 @@ mod tests {
         assert_eq!(find_matches(&idx, "fox ", true).len(), 0);
     }
 
+    /// The scrollback part of the buffer is indexed at absolute line
+    /// coords, without moving the grid's own scroll position — a
+    /// shared portal buffer must stay live while a search reads it.
+    #[test]
+    fn extract_reads_history_without_moving_the_grid() {
+        // 6 lines through a 2-row screen: 4 fall into scrollback, and
+        // `top_of_live_screen` is 4.
+        let mut p = parse(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5", 2, 10);
+        let top = p.screen().top_of_live_screen();
+        assert_eq!(top, 4);
+        let idx = extract_indexed_text(p.screen(), top);
+        let texts: Vec<&str> = idx.rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["l0", "l1", "l2", "l3", "l4", "l5"]);
+        assert_eq!(idx.rows[0].line, 0);
+        assert_eq!(idx.rows[5].line, 5);
+        assert_eq!(p.screen().scrollback(), 0, "the grid must not have moved");
+    }
+
+    /// Hint mode indexes one viewport, so a window has to hold exactly
+    /// the lines asked for — that is the whole saving.
+    #[test]
+    fn window_indexes_only_the_lines_asked_for() {
+        let mut p = parse(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5", 2, 10);
+        let top = p.screen().top_of_live_screen();
+        let idx = extract_indexed_window(p.screen(), top, 2, 3);
+        let texts: Vec<&str> = idx.rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["l2", "l3"]);
+        assert_eq!(idx.rows[0].line, 2);
+    }
+
+    /// A window that cuts a soft-wrap chain reaches out to both of its
+    /// ends: `hints` joins the chain before scanning, so half a URL
+    /// would be detected as something else, or not at all.
+    #[test]
+    fn window_extends_over_a_wrap_chain() {
+        // cols=4, so "abcdefghij" wraps over rows 0..2, then "tail".
+        let mut p = parse(b"abcdefghij\r\ntail", 2, 4);
+        let top = p.screen().top_of_live_screen();
+        // Ask for the middle row of the chain alone.
+        let idx = extract_indexed_window(p.screen(), top, 1, 1);
+        let texts: Vec<&str> = idx.rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["abcd", "efgh", "ij"]);
+        // The row after the chain is not dragged in with it.
+        assert!(!idx.rows.last().unwrap().wrapped);
+    }
+
+    /// A window clamps to what the buffer holds rather than indexing
+    /// lines that have been evicted or not yet written.
+    #[test]
+    fn window_clamps_to_the_buffer() {
+        let mut p = parse(b"l0\r\nl1\r\nl2", 2, 10);
+        let top = p.screen().top_of_live_screen();
+        let idx = extract_indexed_window(p.screen(), top, -50, 50);
+        let texts: Vec<&str> = idx.rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["l0", "l1", "l2"]);
+    }
+
     #[test]
     fn wide_char_col_accounting() {
         // "あい" — two wide chars, each occupies 2 cells. "あ" is 3
         // bytes in UTF-8. Match on "い" should report col 2..4.
         let mut p = parse("あい".as_bytes(), 2, 10);
-        let idx = extract_indexed_text(&mut p, 0);
+        let idx = extract_indexed_text(p.screen(), 0);
         let m = find_matches(&idx, "い", false);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].col_start, 2);

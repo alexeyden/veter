@@ -314,6 +314,22 @@ fn portal_path_exists(prt: &prt::PrtEngine, path: &[String]) -> bool {
     true
 }
 
+/// Shared borrow of the leaf portal's buffer at `path`. The read-only
+/// twin of [`resolve_portal_target_mut`], for callers that only look at
+/// the grid — search-index extraction reads history through
+/// `visible_row_cells_at` rather than by moving the scroll position, so
+/// it has no reason to ask for an exclusive borrow.
+fn resolve_portal_content<'a>(
+    prt: &'a prt::PrtEngine,
+    path: &[String],
+) -> Option<&'a prt::PortalContent> {
+    let mut set = prt.state.current();
+    for id in &path[..path.len().checked_sub(1)?] {
+        set = set.content(id.as_str())?.children.state.current();
+    }
+    set.content(path[path.len() - 1].as_str())
+}
+
 fn descend_portal_set_mut<'a>(
     set: &'a mut prt::PortalSet,
     path: &[String],
@@ -1008,6 +1024,69 @@ impl OverlayMode {
     }
 }
 
+/// What [`SearchState::cache`] covers — the other half of the mode
+/// split, and what tells a scroll whether the index it is about to read
+/// still describes the screen.
+///
+/// A whole-buffer index is in absolute line coords, so scrolling never
+/// stales it; only PTY output does. A window is one viewport's worth of
+/// rows, so a scroll of even one line does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheScope {
+    WholeBuffer,
+    /// Inclusive first and last *requested* line. The index itself may
+    /// reach past both ends — `search::extract_indexed_window` chases a
+    /// soft-wrap chain out of the window — so this is the ask, not the
+    /// extent, and comparing it against the current viewport is what
+    /// decides whether a rescan is owed.
+    Window((i64, i64)),
+}
+
+/// The cached text index plus what it was built from.
+///
+/// One struct rather than three fields on [`SearchState`] because the
+/// three only mean anything together: `scope` says which rows `text`
+/// covers, and `content` what the leaf held while it was extracted.
+struct SearchIndex {
+    text: search::TextIndex,
+    scope: CacheScope,
+    content: LeafFingerprint,
+}
+
+/// Cheap fingerprint of a leaf's content, taken to decide whether a PTY
+/// tick actually invalidated the index.
+///
+/// A tick is not evidence that the *search target* changed: scrolling a
+/// portal is a client round trip (`SetPortalScrollback`), and a
+/// multiplexer redrawing its own chrome writes to the host grid — yet
+/// either would drop an index that costs ~12ms to rebuild over a filled
+/// 5000-line pane. Hashing the live screen costs ~50us and answers
+/// exactly the question being asked.
+///
+/// The live screen is enough on its own because scrollback rows are
+/// immutable once pushed: new content always passes through the live
+/// screen first, and output that pushed rows past the top moves
+/// `top_of_live_screen`. The two scalars catch what row hashes cannot —
+/// scrollback eviction and `3J` move `fill`, and a resize changes the
+/// grid dimensions, which `RowDamage::changed_rows` reports as "these
+/// two are not comparable" rather than as an equal count.
+struct LeafFingerprint {
+    top: i64,
+    fill: usize,
+    /// Live-screen row hashes, taken at view offset 0 so the user's own
+    /// scroll position is never mistaken for new output.
+    live: prt::portal::RowDamage,
+}
+
+impl LeafFingerprint {
+    /// True when `prev` was taken over the same content.
+    fn matches(&self, prev: &Self) -> bool {
+        self.top == prev.top
+            && self.fill == prev.fill
+            && self.live.changed_rows(&prev.live) == Some(0)
+    }
+}
+
 /// One scrollback-search session, owned by `App::search`.
 ///
 /// The session captures `target_path` at open time so focus changes
@@ -1027,16 +1106,18 @@ struct SearchState {
     /// Sub-mode: `true` = typing query, `false` = navigation (n/N).
     editing: bool,
     /// Portal id chain to the target leaf parser at open time. Empty
-    /// = host vt100. Resolved to a `&mut Screen` via
-    /// `with_target_leaf_screen_mut`.
+    /// = host vt100. Resolved to a leaf buffer via
+    /// `resolve_portal_content`, and to a viewport via
+    /// `App::target_viewport`.
     target_path: Vec<String>,
     /// Scrollback offset of the target parser when search opened.
     /// Restored on Esc if the user never committed (Enter) a match.
     saved_scrollback: usize,
     /// Lazily-built per-row text index for the target parser. `None`
-    /// after a PTY-output invalidation; rebuilt on the next
-    /// `recompute_matches` call.
-    cache: Option<search::TextIndex>,
+    /// after an invalidation — output that actually changed the target,
+    /// or a scroll that moved the view out from under a windowed
+    /// index; rebuilt on the next `recompute_matches` call.
+    cache: Option<SearchIndex>,
     /// Matches for the current `(query, case_insensitive)` against
     /// `cache`. Recomputed whenever query/case changes.
     matches: Vec<search::MatchSpan>,
@@ -2414,39 +2495,6 @@ impl App {
         }
     }
 
-    /// Apply `op` to the focused-leaf parser's `Screen`. Walks
-    /// `PrtState::focus_chain()` to the deepest portal whose own focus
-    /// is `Host`; that portal's vt is the focused leaf. An empty chain
-    /// means the host vt100 is the focused leaf. The closure takes
-    /// `&mut Screen` (callback-agnostic) so the same helper works for
-    /// both host and portal parsers. Returns `None` if state isn't
-    /// ready or a chain id no longer resolves.
-    fn with_focused_leaf_screen_mut<R>(
-        &mut self,
-        op: impl FnOnce(&mut vt100::Screen) -> R,
-    ) -> Option<R> {
-        let path = self.focused_leaf_path();
-        self.with_target_leaf_screen_mut(&path, op)
-    }
-
-    /// Like [`with_focused_leaf_screen_mut`], but the target leaf is
-    /// named explicitly by `path` instead of resolved from current
-    /// focus. Used by search sessions that captured the path at open
-    /// time (so focus changes during search don't redirect the target).
-    fn with_target_leaf_screen_mut<R>(
-        &mut self,
-        path: &[String],
-        op: impl FnOnce(&mut vt100::Screen) -> R,
-    ) -> Option<R> {
-        if path.is_empty() {
-            let parser = self.parser.as_mut()?;
-            return Some(op(parser.screen_mut()));
-        }
-        let prt = self.prt.as_mut()?;
-        let portal = resolve_portal_target_mut(prt, path)?;
-        Some(op(portal.vt.screen_mut()))
-    }
-
     /// Snapshot the focus chain as an owned `Vec<String>` so callers
     /// can drop the borrow on `self.prt` before doing further mutation.
     fn focused_leaf_path(&self) -> Vec<String> {
@@ -2456,42 +2504,104 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Rebuild the search text index against the target parser
-    /// named by the current `SearchState::target_path`. Returns None
-    /// if state is missing or the path no longer resolves; in that
-    /// case the caller leaves `cache` as None and `matches` empty.
-    fn rebuild_search_index(&mut self) -> Option<search::TextIndex> {
-        let path = self.search.as_ref()?.target_path.clone();
-        if path.is_empty() {
-            let top = self.prt.as_ref()?.top_of_live_screen();
-            let parser = self.parser.as_mut()?;
-            return Some(search::extract_indexed_text(parser, top));
+    /// Rebuild the search text index against the target parser named by
+    /// the current `SearchState::target_path`, returning it alongside
+    /// the viewport it was built for. Returns None if state is missing
+    /// or the path no longer resolves; in that case the caller leaves
+    /// `cache` as None and `matches` empty.
+    ///
+    /// The scope is the mode's: a typed query is answered from the whole
+    /// buffer (the match counter and `n`/`N` are about every match, not
+    /// the visible ones), while hint mode indexes one viewport — its
+    /// labels never describe anything off screen, and a full-buffer
+    /// rescan per scroll step costs tens of milliseconds on a filled
+    /// 5000-line pane.
+    fn rebuild_search_index(&self) -> Option<SearchIndex> {
+        let search = self.search.as_ref()?;
+        let path = search.target_path.as_slice();
+        let content = self.leaf_fingerprint(path)?;
+        let (screen, top) = self.target_screen(path)?;
+        match search.mode {
+            OverlayMode::Query => Some(SearchIndex {
+                text: search::extract_indexed_text(screen, top),
+                scope: CacheScope::WholeBuffer,
+                content,
+            }),
+            OverlayMode::Hints { .. } => {
+                let viewport_top = top - self.target_view_offset(path)? as i64;
+                let rows = screen.size().0;
+                let window = (viewport_top, viewport_top + rows as i64 - 1);
+                Some(SearchIndex {
+                    text: search::extract_indexed_window(screen, top, window.0, window.1),
+                    scope: CacheScope::Window(window),
+                    content,
+                })
+            }
         }
-        let prt = self.prt.as_mut()?;
-        let portal = resolve_portal_target_mut(prt, &path)?;
-        let top = portal.children.top_of_live_screen();
-        Some(search::extract_indexed_text(&mut portal.vt, top))
     }
 
-    /// `top_of_live_screen` of the engine that owns the target leaf
-    /// parser at `path`. Host parser: top-level `prt.top_of_live_screen()`.
-    /// Portal parser: the *containing* portal's `children` sub-engine —
-    /// i.e. `portal.children.top_of_live_screen()`, matching the
+    /// The leaf buffer at `path` and its `top_of_live_screen` — the two
+    /// halves of "where in the target's history am I reading". Shared by
+    /// everything that reads the grid: the index rebuild and the
+    /// fingerprint that decides whether one is owed.
+    ///
+    /// The anchor comes from the engine that *owns* the leaf. Host
+    /// parser: top-level `prt.top_of_live_screen()`. Portal parser: the
+    /// containing portal's `children` sub-engine, matching the
     /// convention documented on `extract_text_from_parser`.
-    fn target_top_of_live_screen(&self, path: &[String]) -> Option<i64> {
-        let prt = self.prt.as_ref()?;
+    fn target_screen(&self, path: &[String]) -> Option<(&vt100::Screen, i64)> {
         if path.is_empty() {
-            return Some(prt.top_of_live_screen());
+            return Some((
+                self.parser.as_ref()?.screen(),
+                self.prt.as_ref()?.top_of_live_screen(),
+            ));
         }
-        let mut current_set = prt.state.current();
+        let content = resolve_portal_content(self.prt.as_ref()?, path)?;
+        Some((content.vt.screen(), content.children.top_of_live_screen()))
+    }
+
+    /// `top_of_live_screen` of the engine that owns the leaf at `path`.
+    fn target_top_of_live_screen(&self, path: &[String]) -> Option<i64> {
+        self.target_screen(path).map(|(_, top)| top)
+    }
+
+    /// How far the leaf at `path` is scrolled back, in the units the
+    /// renderer projects with.
+    ///
+    /// The host parser owns its offset (`Screen::scrollback`), but a
+    /// portal's belongs to the *view* (`Portal::view_offset`, see
+    /// `cmd_set_portal_scrollback`): the buffer stays live so two forked
+    /// views can sit at different positions over it, and the render path
+    /// reads through `cell_at(view_offset, ..)`. Asking the portal's own
+    /// vt100 therefore always answers 0 — which is what pinned every
+    /// viewport calculation in the overlay to the bottom of a pane no
+    /// matter where the user had scrolled it.
+    fn target_view_offset(&self, path: &[String]) -> Option<usize> {
+        if path.is_empty() {
+            return Some(self.parser.as_ref()?.screen().scrollback());
+        }
+        let prt = self.prt.as_ref()?;
+        let mut set = prt.state.current();
         for id in &path[..path.len() - 1] {
-            let content = current_set.content(id.as_str())?;
-            current_set = content.children.state.current();
+            set = set.content(id.as_str())?.children.state.current();
         }
-        let last = path[path.len() - 1].as_str();
-        current_set
-            .content(last)
-            .map(|c| c.children.top_of_live_screen())
+        set.portals
+            .get(path[path.len() - 1].as_str())
+            .map(|p| p.view_offset as usize)
+    }
+
+    /// Rows and columns of the leaf at `path`.
+    fn target_size(&self, path: &[String]) -> Option<(u16, u16)> {
+        self.target_screen(path).map(|(screen, _)| screen.size())
+    }
+
+    /// Viewport geometry of the search target: the absolute line at the
+    /// top of the visible rows, plus that leaf's `(rows, cols)`.
+    fn target_viewport(&self, path: &[String]) -> Option<(i64, u16, u16)> {
+        let top = self.target_top_of_live_screen(path)?;
+        let (rows, cols) = self.target_size(path)?;
+        let offset = self.target_view_offset(path)?;
+        Some((top - offset as i64, rows, cols))
     }
 
     /// Set `search.current` to the first match that falls within the
@@ -2506,14 +2616,10 @@ impl App {
         if is_empty {
             return false;
         }
-        let Some(top) = self.target_top_of_live_screen(&path) else { return false };
-        let Some((rows, scrollback)) = self
-            .with_target_leaf_screen_mut(&path, |s| (s.size().0 as i64, s.scrollback() as i64))
-        else {
+        let Some((viewport_top, rows, _)) = self.target_viewport(&path) else {
             return false;
         };
-        let viewport_top = top - scrollback;
-        let viewport_bot = viewport_top + rows;
+        let viewport_bot = viewport_top + rows as i64;
         let Some(search) = self.search.as_mut() else { return false };
         for (i, m) in search.matches.iter().enumerate() {
             if m.line >= viewport_top && m.line < viewport_bot {
@@ -2535,9 +2641,7 @@ impl App {
         let m = search.matches[search.current];
         let path = search.target_path.clone();
         let Some(top) = self.target_top_of_live_screen(&path) else { return };
-        let rows = self
-            .with_target_leaf_screen_mut(&path, |s| s.size().0 as i64)
-            .unwrap_or(0);
+        let rows = self.target_size(&path).map_or(0, |(r, _)| r as i64);
         let target = (top - m.line + rows / 2).max(0) as usize;
         self.set_target_scrollback(&path, target);
     }
@@ -2568,22 +2672,49 @@ impl App {
         }
     }
 
+    /// Scroll the leaf at `path` by `lines`, positive = back into
+    /// history.
+    ///
+    /// Relative, not read-the-offset-and-set-it: a portal's offset is
+    /// owned by its client, so a locally computed absolute target is
+    /// stale for as long as the round trip takes — two wheel ticks in
+    /// one frame would both start from the offset the client last
+    /// confirmed, and the second would ask for the position the first
+    /// already asked for. `EVT_PORTAL_SCROLL_DELTA` leaves the addition
+    /// to the side that owns the number, and enters the client's scroll
+    /// mode on the way (`vmux`'s `wheel_scroll`).
+    fn scroll_target_by_lines(&mut self, path: &[String], lines: isize) {
+        if lines == 0 {
+            return;
+        }
+        if path.is_empty() {
+            if let Some(parser) = &mut self.parser {
+                let current = parser.screen().scrollback() as isize;
+                parser.screen_mut().set_scrollback((current + lines).max(0) as usize);
+            }
+            return;
+        }
+        let delta = lines.clamp(i32::MIN as isize, i32::MAX as isize) as i32;
+        if let (Some(prt), Some(pty)) = (self.prt.as_mut(), self.pty.as_ref())
+            && prt.emit_scroll_delta_for_path(path, delta)
+        {
+            prt.flush_pending_events();
+            let bytes = prt.take_responses();
+            if !bytes.is_empty() {
+                let _ = pty.write_all(&bytes);
+            }
+        }
+    }
+
     /// Adjust the search-target parser's scrollback by `pages` *pages*
     /// (one page = the parser's visible rows). Positive = back into
     /// history, negative = toward live. No-op when no search session
-    /// is active. Routed through [`Self::set_target_scrollback`] so a
-    /// portal-target session stays in sync with the portal's client.
+    /// is active.
     fn search_scroll_by_pages(&mut self, pages: isize) {
         let Some(search) = self.search.as_ref() else { return };
         let path = search.target_path.clone();
-        let Some((rows, current)) = self.with_target_leaf_screen_mut(&path, |s| {
-            (s.size().0 as usize, s.scrollback())
-        }) else {
-            return;
-        };
-        let signed = current as isize + pages * rows as isize;
-        let target = signed.max(0) as usize;
-        self.set_target_scrollback(&path, target);
+        let Some((rows, _)) = self.target_size(&path) else { return };
+        self.scroll_target_by_lines(&path, pages * rows as isize);
     }
 
     /// Adjust the search-target parser's scrollback by raw `lines`.
@@ -2592,31 +2723,73 @@ impl App {
     fn search_scroll_by_lines(&mut self, lines: isize) {
         let Some(search) = self.search.as_ref() else { return };
         let path = search.target_path.clone();
-        let Some(current) =
-            self.with_target_leaf_screen_mut(&path, |s| s.scrollback())
-        else {
-            return;
-        };
-        let signed = current as isize + lines;
-        let target = signed.max(0) as usize;
-        self.set_target_scrollback(&path, target);
+        self.scroll_target_by_lines(&path, lines);
     }
 
-    /// Drop the cached search index. Called after a PTY-output tick
-    /// so the next `recompute_search_matches` rebuilds against the
-    /// updated parser state. Conservative — invalidates even if the
-    /// target parser was untouched this tick, since re-extracting
-    /// at typical scrollback sizes is sub-ms. No-op when no search
-    /// session is active.
+    /// Drop the cached search index if this PTY tick actually changed
+    /// the target, so the next `recompute_search_matches` rebuilds
+    /// against the new state. No-op when no search session is active,
+    /// and — the case worth having — when the tick was somebody else's:
+    /// a client answering our own scroll request, or a multiplexer
+    /// repainting chrome on the host grid while the session targets one
+    /// of its panes. See [`LeafFingerprint`].
     fn invalidate_search_cache(&mut self) {
+        let Some(search) = self.search.as_ref() else { return };
+        let fresh = self.leaf_fingerprint(search.target_path.as_slice());
+        let unchanged = match (&fresh, search.cache.as_ref()) {
+            (Some(fresh), Some(cache)) => fresh.matches(&cache.content),
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
         if let Some(search) = self.search.as_mut() {
             search.cache = None;
         }
         // Recompute eagerly so the match list (and `current`) reflect
         // any new lines without waiting for the next keystroke.
-        if self.search.is_some() {
-            self.recompute_search_matches();
+        self.recompute_search_matches();
+    }
+
+    /// Fingerprint the leaf at `path` — the live screen's row hashes
+    /// plus the two anchors that place it in the buffer.
+    fn leaf_fingerprint(&self, path: &[String]) -> Option<LeafFingerprint> {
+        let (screen, top) = self.target_screen(path)?;
+        Some(LeafFingerprint {
+            top,
+            fill: screen.scrollback_fill(),
+            live: prt::portal::RowDamage::from_screen_at(screen, 0),
+        })
+    }
+
+    /// Rescan when the viewport has moved out from under a windowed
+    /// index. No-op for a whole-buffer one, and for a window that still
+    /// covers the rows on screen — so a still screen costs one
+    /// comparison per frame.
+    ///
+    /// Hint mode indexes one viewport (see [`Self::rebuild_search_index`]),
+    /// and a scroll changes no bytes, so nothing in the PTY path
+    /// invalidates it: without this, scrolling would leave the labels
+    /// describing rows that have left the screen. Called once per frame
+    /// ahead of [`Self::recompute_labels`], which is where every other
+    /// "make the overlay agree with what is about to be drawn" step
+    /// already lives.
+    fn sync_search_index_to_viewport(&mut self) {
+        let Some(search) = self.search.as_ref() else { return };
+        let Some(CacheScope::Window(window)) = search.cache.as_ref().map(|c| c.scope) else {
+            return;
+        };
+        let path = search.target_path.as_slice();
+        let Some((viewport_top, rows, _)) = self.target_viewport(path) else {
+            return;
+        };
+        if window == (viewport_top, viewport_top + rows as i64 - 1) {
+            return;
         }
+        if let Some(search) = self.search.as_mut() {
+            search.cache = None;
+        }
+        self.recompute_search_matches();
     }
 
     /// Recompute `SearchState::matches` against the cached (or freshly
@@ -2630,9 +2803,9 @@ impl App {
             return;
         }
         if self.search.as_ref().unwrap().cache.is_none() {
-            let idx = self.rebuild_search_index();
+            let rebuilt = self.rebuild_search_index();
             if let Some(search) = self.search.as_mut() {
-                search.cache = idx;
+                search.cache = rebuilt;
             }
         }
         // Produce the match list against an immutable borrow, so hint
@@ -2641,11 +2814,11 @@ impl App {
         let (matches, kinds) = match (&search.mode, &search.cache) {
             (_, None) => (Vec::new(), Vec::new()),
             (OverlayMode::Query, Some(idx)) => (
-                search::find_matches(idx, &search.query, search.case_insensitive),
+                search::find_matches(&idx.text, &search.query, search.case_insensitive),
                 Vec::new(),
             ),
             (OverlayMode::Hints { .. }, Some(idx)) => {
-                hints::find_hints(idx, &self.hint_config)
+                hints::find_hints(&idx.text, &self.hint_config)
                     .into_iter()
                     .map(|h| (h.span, h.kind))
                     .unzip()
@@ -2687,8 +2860,7 @@ impl App {
                     SelectionTarget::Host => Vec::new(),
                     SelectionTarget::Portal(p) => p.clone(),
                 };
-                let cols =
-                    self.with_target_leaf_screen_mut(&path, |s| s.size().1).unwrap_or(0);
+                let cols = self.target_size(&path).map_or(0, |(_, c)| c);
                 let anchor_col = if next_col + 1 < cols { next_col + 1 } else { next_col };
                 // The whole-line marker rides along while expanding, so
                 // the shortcut past the remaining words stays in view.
@@ -2725,17 +2897,10 @@ impl App {
             clear(self);
             return;
         }
-        let Some(top) = self.target_top_of_live_screen(&path) else {
+        let Some((viewport_top, rows, cols)) = self.target_viewport(&path) else {
             clear(self);
             return;
         };
-        let Some((rows, cols, scrollback)) = self
-            .with_target_leaf_screen_mut(&path, |s| (s.size().0, s.size().1, s.scrollback()))
-        else {
-            clear(self);
-            return;
-        };
-        let viewport_top = top - scrollback as i64;
 
         let hints_mode = self
             .search
@@ -2747,7 +2912,7 @@ impl App {
             let mut line_row: std::collections::HashMap<i64, usize> =
                 std::collections::HashMap::new();
             if let Some(cache) = &search.cache {
-                for (i, r) in cache.rows.iter().enumerate() {
+                for (i, r) in cache.text.rows.iter().enumerate() {
                     line_row.insert(r.line, i);
                 }
             }
@@ -2783,7 +2948,7 @@ impl App {
                 // is exactly such a query-refining key, so exclude it.
                 if let Some(cache) = &search.cache
                     && let Some(&ri) = line_row.get(&m.line)
-                    && let Some(c) = char_at_col(&cache.rows[ri], m.col_end)
+                    && let Some(c) = char_at_col(&cache.text.rows[ri], m.col_end)
                 {
                     let c = if search.case_insensitive {
                         c.to_ascii_lowercase()
@@ -2869,24 +3034,7 @@ impl App {
     /// Current scrollback offset of the focused-leaf parser; 0 if no
     /// state is loaded or a chain id no longer resolves.
     fn focused_leaf_scrollback(&self) -> usize {
-        let Some(prt) = self.prt.as_ref() else { return 0 };
-        let chain = prt.state.focus_chain();
-        if chain.is_empty() {
-            return self
-                .parser
-                .as_ref()
-                .map(|p| p.screen().scrollback())
-                .unwrap_or(0);
-        }
-        let mut current_set = prt.state.current();
-        for id in &chain[..chain.len() - 1] {
-            let Some(content) = current_set.content(*id) else { return 0 };
-            current_set = content.children.state.current();
-        }
-        current_set
-            .portals
-            .get(chain[chain.len() - 1])
-            .map(|p| p.view_offset as usize)
+        self.target_view_offset(&self.focused_leaf_path())
             .unwrap_or(0)
     }
 
@@ -4001,10 +4149,8 @@ impl App {
         // in sync with its client's stored offset.
         if host_action == Some(HostAction::ScrollPageUp) {
             let path = self.focused_leaf_path();
-            if let Some((rows, current)) = self
-                .with_target_leaf_screen_mut(&path, |s| (s.size().0 as usize, s.scrollback()))
-            {
-                self.set_target_scrollback(&path, current + rows);
+            if let Some((rows, _)) = self.target_size(&path) {
+                self.scroll_target_by_lines(&path, rows as isize);
             }
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -4013,10 +4159,8 @@ impl App {
         }
         if host_action == Some(HostAction::ScrollPageDown) {
             let path = self.focused_leaf_path();
-            if let Some((rows, current)) = self
-                .with_target_leaf_screen_mut(&path, |s| (s.size().0 as usize, s.scrollback()))
-            {
-                self.set_target_scrollback(&path, current.saturating_sub(rows));
+            if let Some((rows, _)) = self.target_size(&path) {
+                self.scroll_target_by_lines(&path, -(rows as isize));
             }
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -4365,7 +4509,11 @@ impl App {
                     };
                     // Query state is meaningless in the other mode, and a
                     // half-grown expansion belongs to the label press that
-                    // started it.
+                    // started it. The index goes too: the two modes scope
+                    // it differently (whole buffer vs. one viewport), so
+                    // carrying one over would have query mode searching
+                    // only the visible rows.
+                    s.cache = None;
                     s.query.clear();
                     s.editing = !s.mode.is_hints();
                     s.current = 0;
@@ -4532,7 +4680,7 @@ impl App {
                             Some(cache) => {
                                 let mut q = search.query.clone();
                                 q.push(ch);
-                                !search::find_matches(cache, &q, search.case_insensitive)
+                                !search::find_matches(&cache.text, &q, search.case_insensitive)
                                     .is_empty()
                             }
                             None => false,
@@ -5664,10 +5812,8 @@ impl ApplicationHandler for App {
                             (pos.y as f32 / ch) as isize
                         }
                     };
-                    self.with_focused_leaf_screen_mut(|screen| {
-                        let current = screen.scrollback() as isize;
-                        screen.set_scrollback((current + lines).max(0) as usize);
-                    });
+                    let path = self.focused_leaf_path();
+                    self.scroll_target_by_lines(&path, lines);
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -5703,11 +5849,14 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 let frame_start = Instant::now();
-                // Refresh jump labels to match this frame's scroll/match
-                // state before drawing. Doing it here (rather than in each
-                // key/scroll handler) guarantees the stored `labels` equal
-                // what gets drawn, so a label keypress always selects the
-                // match the user is looking at. No-op when not searching.
+                // Refresh the overlay to match this frame's scroll/match
+                // state before drawing: rescan first if the view has
+                // moved under a windowed index, then re-label. Doing it
+                // here (rather than in each key/scroll handler)
+                // guarantees the stored `labels` equal what gets drawn,
+                // so a label keypress always selects the match the user
+                // is looking at. No-op when not searching.
+                self.sync_search_index_to_viewport();
                 self.recompute_labels();
 
                 let size = self.window.as_ref().unwrap().inner_size();
@@ -6191,7 +6340,7 @@ mod jump_label_tests {
         // "foo bar" — the char right after the match "foo" (col_end 3)
         // is a space; after "bar" (col_end 7) the row ends -> None.
         let mut p = parse(b"foo bar", 1, 20);
-        let idx = search::extract_indexed_text(&mut p, 0);
+        let idx = search::extract_indexed_text(p.screen(), 0);
         let row = &idx.rows[0];
         assert_eq!(char_at_col(row, 0), Some('f'));
         assert_eq!(char_at_col(row, 3), Some(' '));
@@ -6205,7 +6354,7 @@ mod jump_label_tests {
         // "あb": あ is wide (cols 0..2), b at col 2. col 1 is the wide
         // continuation and has no lead byte -> None; col 2 is 'b'.
         let mut p = parse("あb".as_bytes(), 1, 10);
-        let idx = search::extract_indexed_text(&mut p, 0);
+        let idx = search::extract_indexed_text(p.screen(), 0);
         let row = &idx.rows[0];
         assert_eq!(char_at_col(row, 0), Some('あ'));
         assert_eq!(char_at_col(row, 1), None);
@@ -6387,7 +6536,7 @@ mod jump_label_tests {
     #[test]
     fn continuation_char_excluded_from_labels() {
         let mut p = parse(b"Desktop Documents Pictures Public Templates Videos", 1, 60);
-        let idx = search::extract_indexed_text(&mut p, 0);
+        let idx = search::extract_indexed_text(p.screen(), 0);
         let matches = search::find_matches(&idx, "p", true);
         assert!(!matches.is_empty());
 
@@ -6460,7 +6609,7 @@ mod jump_label_tests {
     /// the user would ever notice it.
     fn hint_selection_text(text: &str, cols: u16, kind: hints::HintKind) -> Vec<String> {
         let mut p = parse(text.as_bytes(), 24, cols);
-        let idx = search::extract_indexed_text(&mut p, 0);
+        let idx = search::extract_indexed_text(p.screen(), 0);
         let found = hints::find_hints(
             &idx,
             &hints::HintConfig {

@@ -187,10 +187,21 @@ impl RowDamage {
     /// 61us), which matters because this runs on every non-scrolling
     /// `WritePortal`.
     pub fn from_screen(screen: &Screen) -> Self {
+        Self::from_screen_at(screen, screen.scrollback())
+    }
+
+    /// [`from_screen`](Self::from_screen) at an explicit view offset.
+    ///
+    /// The damage rule reads the grid at its own offset, which for a
+    /// portal buffer is always the live screen. A caller asking "has
+    /// this content moved?" about a grid the *user* can scroll — the
+    /// host vt100 — passes 0 instead, so a scroll doesn't read as new
+    /// output.
+    pub fn from_screen_at(screen: &Screen, offset: usize) -> Self {
         let (rows, cols) = screen.size();
         let hashes = (0..rows)
             .map(|r| {
-                let cells = screen.visible_row_cells(r);
+                let cells = screen.visible_row_cells_at(offset, r);
                 let mut h = Self::FNV_OFFSET;
                 for c in 0..cols {
                     let contents = cells
@@ -536,5 +547,39 @@ impl PortalSet {
 impl Default for PortalSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod row_damage_tests {
+    use super::RowDamage;
+
+    /// The host grid is one the *user* can scroll, and veter's search
+    /// overlay fingerprints it to decide whether a PTY tick actually
+    /// changed the buffer under its index. Reading at an explicit
+    /// offset 0 is what keeps a scroll from reading as new output.
+    #[test]
+    fn an_explicit_offset_ignores_where_the_grid_is_scrolled() {
+        let mut p = vt100::Parser::new(2, 10, 100);
+        p.process(b"l0\r\nl1\r\nl2\r\nl3");
+        let live = RowDamage::from_screen_at(p.screen(), 0);
+
+        p.screen_mut().set_scrollback(2);
+        let scrolled = RowDamage::from_screen_at(p.screen(), 0);
+        assert_eq!(scrolled.changed_rows(&live), Some(0));
+        // The grid's own offset does see the scroll — which is why the
+        // fingerprint asks for 0 rather than taking what it is given.
+        assert_eq!(
+            RowDamage::from_screen(p.screen()).changed_rows(&live),
+            Some(2)
+        );
+
+        p.screen_mut().set_scrollback(0);
+        p.process(b"\r\nl4");
+        assert_ne!(
+            RowDamage::from_screen_at(p.screen(), 0).changed_rows(&live),
+            Some(0),
+            "new output must not read as unchanged"
+        );
     }
 }

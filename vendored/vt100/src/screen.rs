@@ -804,6 +804,16 @@ impl Screen {
             .is_some_and(crate::row::Row::wrapped)
     }
 
+    /// [`row_wrapped`](Self::row_wrapped) at an explicit view offset —
+    /// the companion of [`visible_row_cells_at`](Self::visible_row_cells_at)
+    /// for a caller walking history without moving the grid.
+    #[must_use]
+    pub fn row_wrapped_at(&self, offset: usize, row: u16) -> bool {
+        self.grid()
+            .visible_row_at(offset, row)
+            .is_some_and(crate::row::Row::wrapped)
+    }
+
     /// Returns whether the alternate screen is currently in use.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
