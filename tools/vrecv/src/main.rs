@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard};
+use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard, HostAborted};
 use vft_client::probe::{run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -186,16 +186,21 @@ fn main() -> Result<()> {
             // never confirms the abort. Note it, since draining can take a
             // moment and should not look like a hang. The error itself is
             // printed by the caller, so don't repeat it here.
-            {
-                let mut out = std::io::stdout().lock();
-                let _ = write!(out, "cancelling transfer...\r\n");
-                let _ = out.flush();
+            //
+            // Unless the host is the one that ended it: then there is
+            // nothing left to stop or to swallow (see `HostAborted`).
+            if !HostAborted::ended(&e, &transfer_id) {
+                {
+                    let mut out = std::io::stdout().lock();
+                    let _ = write!(out, "cancelling transfer...\r\n");
+                    let _ = out.flush();
+                }
+                const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+                warn_if_undrained(
+                    cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                    DRAIN_BUDGET,
+                );
             }
-            const DRAIN_BUDGET: Duration = Duration::from_secs(30);
-            warn_if_undrained(
-                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
-                DRAIN_BUDGET,
-            );
             cancel.disarm();
             let _ = std::fs::remove_file(&local_path);
             if !cli.no_progress && vge_probe.is_some() {
@@ -421,9 +426,5 @@ fn decode_err(body: &[u8]) -> anyhow::Error {
 }
 
 fn decode_aborted(body: &[u8]) -> anyhow::Error {
-    let mut r = Reader::new(body);
-    let id = r.string().unwrap_or("").to_owned();
-    let reason = r.u8().unwrap_or(0);
-    let msg = r.string().unwrap_or("").to_owned();
-    anyhow!("transfer {id} aborted (reason={reason}): {msg}")
+    anyhow::Error::new(HostAborted::decode(body))
 }

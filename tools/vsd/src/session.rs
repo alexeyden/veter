@@ -179,7 +179,7 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
     // to flip back to `false` (the last act of the handler thread's
     // closure, after Drop has run on all its locals) with a generous
     // timeout in case something jams.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + crate::attach::TEARDOWN_BUDGET;
     while session.attached.load(Ordering::Acquire) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }

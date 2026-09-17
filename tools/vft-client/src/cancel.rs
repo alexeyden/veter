@@ -205,6 +205,53 @@ impl Drop for CancelGuard {
     }
 }
 
+/// A `TransferAborted` from the host (§8.3), as the error a transfer
+/// loop returns when it reads one.
+///
+/// Distinct from every other failure because it leaves nothing to clean
+/// up: the host has already dropped the transfer, and every chunk it
+/// sent precedes the event, so a `CancelTransfer` would only draw an
+/// `err_unknown_transfer` — or no answer at all, when the abort was a
+/// `vsd` session detaching and the daemon now relays the cancel to
+/// nobody, leaving [`cancel_and_drain`] to wait out its whole budget.
+#[derive(Debug)]
+pub struct HostAborted {
+    pub transfer_id: String,
+    pub reason: u8,
+    pub message: String,
+}
+
+impl HostAborted {
+    /// Decode a `TransferAborted` body, tolerating a truncated one.
+    pub fn decode(body: &[u8]) -> Self {
+        let mut r = vft_protocol::codec::Reader::new(body);
+        Self {
+            transfer_id: r.string().unwrap_or("").to_owned(),
+            reason: r.u8().unwrap_or(0),
+            message: r.string().unwrap_or("").to_owned(),
+        }
+    }
+
+    /// Whether `err` is the host having already ended `transfer_id`,
+    /// so the caller can skip the cancel.
+    pub fn ended(err: &anyhow::Error, transfer_id: &str) -> bool {
+        err.downcast_ref::<Self>()
+            .is_some_and(|a| a.transfer_id == transfer_id)
+    }
+}
+
+impl std::fmt::Display for HostAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transfer {} aborted (reason={}): {}",
+            self.transfer_id, self.reason, self.message
+        )
+    }
+}
+
+impl std::error::Error for HostAborted {}
+
 /// Say so when [`cancel_and_drain`] gave up before the host confirmed.
 ///
 /// Anything the host writes from here on reaches a terminal already
@@ -305,6 +352,25 @@ mod tests {
     use vft_protocol::apc::ApcStream;
     use vft_protocol::codec::Reader;
     use vft_protocol::frame::{CMD_CANCEL_TRANSFER, MARKER_C2H};
+
+    /// Only an abort of *this* transfer excuses the cancel; any other
+    /// failure, or an abort of some other transfer, still needs one.
+    #[test]
+    fn a_host_abort_ends_only_its_own_transfer() {
+        let body = vft_protocol::envelope::transfer_aborted_body(
+            "vrecv-7",
+            vft_protocol::frame::ABORT_HOST_RESET,
+            "session detached",
+        );
+        let err = anyhow::Error::new(HostAborted::decode(&body));
+        assert!(HostAborted::ended(&err, "vrecv-7"));
+        assert!(!HostAborted::ended(&err, "vrecv-8"));
+        assert!(!HostAborted::ended(&anyhow::anyhow!("timed out"), "vrecv-7"));
+        assert_eq!(
+            err.to_string(),
+            "transfer vrecv-7 aborted (reason=4): session detached"
+        );
+    }
 
     #[test]
     fn cancel_envelope_encodes_a_parseable_cancel_command() {

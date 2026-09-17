@@ -124,10 +124,18 @@ pub fn encode_snapshot(
 /// Convenience for a single `DetachNotify` frame in its own
 /// envelope. Used by the engine (vsd) at attach teardown to ask
 /// the renderer to restore its pre-attach state.
-pub fn encode_detach_notify() -> Vec<u8> {
+pub fn encode_detach_notify(sequence_id: u32) -> Vec<u8> {
     let mut frames = Vec::new();
-    append_downstream(&mut frames, &DownstreamFrame::DetachNotify);
+    append_downstream(&mut frames, &DownstreamFrame::DetachNotify { sequence_id });
     wrap_e2r_envelope(&frames)
+}
+
+/// Convenience for a single upstream `DetachAccepted` frame in its own
+/// envelope.
+pub fn encode_detach_accepted(sequence_id: u32) -> Vec<u8> {
+    let mut frames = Vec::new();
+    append_upstream(&mut frames, &UpstreamFrame::DetachAccepted { sequence_id });
+    wrap_r2e_envelope(&frames)
 }
 
 /// Convenience for a single upstream Accept frame in its own envelope.

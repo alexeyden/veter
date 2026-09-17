@@ -478,6 +478,17 @@ down, releases all transfer state, and closes the destination /
 source file descriptors. Clients SHOULD treat a reset as a
 session-level event and not attempt to resume.
 
+The end of a `vsd` attach is the same kind of event
+(`doc/session-manager.md` §4.5): when a context applies a VSS
+`DetachNotify`, the client that started its transfers is no longer
+on the other end of that pty, so the host aborts every transfer in
+that context — its own engine and every portal's below it — with
+`reason = host_reset`, ahead of the `DetachAccepted` it answers
+with. A client that receives `TransferAborted` for its own
+transfer SHOULD NOT then send `CancelTransfer`: the transfer is
+already gone, every chunk for it precedes the event, and after a
+detach nobody is left to answer the cancel.
+
 Switching the host's alternate screen (§5.4 in the PRT spec) does
 **not** affect VFT state; transfers keep flowing across DECSET
 1047/1049 toggles. File transfer is a session-level operation
@@ -895,7 +906,8 @@ u8      reason             ; 0 = client_cancel
                            ; 1 = host_cancel        (host-side policy / UI cancel)
                            ; 2 = io_error           (read or write failed)
                            ; 3 = disk_full
-                           ; 4 = host_reset         (RIS / DECSTR)
+                           ; 4 = host_reset         (RIS / DECSTR, or a
+                           ;                          vsd detach)
                            ; 5 = path_revoked       (file unlinked or chmod'd
                            ;                          mid-transfer)
                            ; 6 = limit_exceeded     (byte / time cap hit)

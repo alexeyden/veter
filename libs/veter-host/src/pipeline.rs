@@ -160,6 +160,17 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 restore(parser, vge, prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes);
             }
             VssSegment::Detach => {
+                // The session's client is no longer on this pty, so
+                // neither are its transfers. The restore alone would
+                // drop the ones in portals — silently — and leave this
+                // context's own VFT engine, which no snapshot touches,
+                // streaming a download into whatever the pty belongs
+                // to next. Abort them all; the events land ahead of
+                // the `DetachAccepted` the VSS engine has queued, and
+                // `vsd` forwards what precedes it to the session.
+                const DETACHED: &str = "session detached";
+                vft.abort_all(vft_protocol::frame::ABORT_HOST_RESET, DETACHED);
+                prt.abort_all_vft(vft_protocol::frame::ABORT_HOST_RESET, DETACHED);
                 if let Some(b) = backup.take() {
                     restore(parser, vge, prt, &b.vt, &b.vge, &b.prt);
                 }

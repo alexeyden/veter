@@ -191,7 +191,7 @@ fn detach_restores_the_pre_attach_view_before_the_text_after_it() {
     let mut host = Host::new();
     host.feed(b"my shell");
     let mut chunk = snapshot_envelope(b"session");
-    chunk.extend_from_slice(&vss_protocol::encode_detach_notify());
+    chunk.extend_from_slice(&vss_protocol::encode_detach_notify(7));
     chunk.extend_from_slice(b"\r\nback");
     host.feed(&chunk);
 
@@ -259,7 +259,7 @@ fn a_second_attach_stashes_what_is_on_screen_now() {
     host.feed(&snapshot_of(24, 80, 2, b"session two"));
     assert_eq!(host.screen(), "session two");
 
-    host.feed(&vss_protocol::encode_detach_notify());
+    host.feed(&vss_protocol::encode_detach_notify(2));
     assert_eq!(
         host.screen(),
         "session one",
@@ -276,7 +276,7 @@ fn a_second_snapshot_of_one_attach_does_not_re_stash() {
     host.feed(b"my shell");
     host.feed(&snapshot_of(24, 80, 5, b"session"));
     host.feed(&snapshot_of(24, 80, 5, b"session redrawn"));
-    host.feed(&vss_protocol::encode_detach_notify());
+    host.feed(&vss_protocol::encode_detach_notify(5));
 
     assert_eq!(host.screen(), "my shell");
 }
@@ -295,4 +295,174 @@ fn a_restore_keeps_the_receiver_s_cell_metrics() {
 
     assert_eq!(host.vge.cell_px(), (11, 24));
     assert!((host.vge.scale_factor() - 2.0).abs() < f32::EPSILON);
+}
+
+// ---- Detach: what the renderer owes the session ------------------------
+//
+// `vsd` keeps reading after it sends `DetachNotify`, forwarding to the
+// session everything up to the renderer's `DetachAccepted` and treating
+// what follows as no longer the session's (`doc/session-manager.md`
+// §4.4). That only works if the answer comes *last*.
+
+impl Host {
+    /// Feed `chunk` and return what the renderer writes back, in the
+    /// order `veter`'s host loop writes it.
+    fn feed_replies(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let chunk = self.ses.process_pty_chunk(chunk);
+        drive_chunk(
+            &chunk,
+            Engines {
+                vss: &mut self.vss,
+                prt: &mut self.prt,
+                vft: &mut self.vft,
+                vge: &mut self.vge,
+                parser: &mut self.parser,
+            },
+            &mut self.backup,
+            None,
+        );
+        self.prt.flush_pending_events();
+        [
+            self.prt.take_responses(),
+            self.vge.take_responses(),
+            self.vft.take_responses(),
+            self.vss.take_responses(),
+            self.ses.take_responses(),
+        ]
+        .concat()
+    }
+}
+
+/// A `BeginUpload` to a fresh path under the temp dir, and that path.
+fn begin_upload(name: &str) -> (Vec<u8>, std::path::PathBuf) {
+    use vft_protocol::command::{BeginUploadBody, Command};
+    let path = std::env::temp_dir().join(format!("vss-detach-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let env = vft_protocol::encode::build_envelope(&[(
+        Command::BeginUpload(BeginUploadBody {
+            transfer_id: name.into(),
+            host_path: path.to_string_lossy().into_owned(),
+            basename: String::new(),
+            total_bytes: 100,
+            flags: 0,
+            mode: 0,
+            mtime: 0,
+        }),
+        1,
+    )]);
+    (env, path)
+}
+
+fn write_portal(id: &str, data: Vec<u8>) -> Vec<u8> {
+    use prt_protocol::command::{Command, WritePortalBody};
+    prt_protocol::encode::build_envelope(&[(
+        Command::WritePortal(WritePortalBody { id: id.into(), data }),
+        2,
+    )])
+}
+
+/// `(frame_type, request_id, body)` for every frame of every envelope
+/// under `marker` in `bytes`.
+fn frames(bytes: &[u8], marker: [u8; 3]) -> Vec<(u8, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    for payload in vft_protocol::apc::ApcStream::with_marker(marker).feed(bytes).payloads {
+        let mut r = vft_protocol::codec::Reader::new(&payload);
+        let _version = r.u8().unwrap();
+        let _len = r.u32().unwrap();
+        while !r.at_end() {
+            let ft = r.u8().unwrap();
+            let rid = r.u32().unwrap();
+            let len = r.u32().unwrap() as usize;
+            out.push((ft, rid, r.take(len).unwrap().to_vec()));
+        }
+    }
+    out
+}
+
+/// The ids of the transfers a host→client VFT stream says were aborted.
+fn aborted(bytes: &[u8]) -> Vec<String> {
+    frames(bytes, *vft_protocol::frame::MARKER_H2C)
+        .into_iter()
+        .filter(|(ft, _, _)| *ft == vft_protocol::frame::EVT_TRANSFER_ABORTED)
+        .map(|(_, _, body)| {
+            vft_protocol::codec::Reader::new(&body).string().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// Where `needle` starts in `haystack`.
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The context's own VFT engine is in no snapshot, so a restore leaves
+/// its transfers running: a download would go on streaming into
+/// whatever the pty belongs to after the detach. It is aborted, and
+/// the abort is ahead of the answer, so `vsd` hands it to the session.
+#[test]
+fn a_detach_aborts_the_session_s_transfer_ahead_of_its_answer() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+    host.feed(&snapshot_envelope(b"session"));
+    let (upload, path) = begin_upload("host-level");
+    host.feed(&upload);
+
+    let out = host.feed_replies(&vss_protocol::encode_detach_notify(7));
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(aborted(&out), ["host-level"]);
+    let answer = position(&out, &vss_protocol::encode_detach_accepted(7))
+        .expect("the detach was not answered");
+    let abort = position(&out, b"\x1b_vft").unwrap();
+    assert!(abort < answer, "the abort came after the answer");
+    assert_eq!(host.screen(), "my shell");
+}
+
+/// A transfer inside one of the session's portals: the restore throws
+/// the portal away, which used to stop the transfer without telling
+/// the client that started it.
+#[test]
+fn a_detach_tells_a_portal_s_client_its_transfer_is_gone() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+    host.feed(&snapshot_envelope(b"session"));
+    host.feed(&create_portal_envelope("pane"));
+    let (upload, path) = begin_upload("in-portal");
+    host.feed(&write_portal("pane", upload));
+
+    let out = host.feed_replies(&vss_protocol::encode_detach_notify(7));
+    let _ = std::fs::remove_file(&path);
+
+    let reply = frames(&out, *prt_protocol::frame::MARKER_T2C)
+        .into_iter()
+        .find(|(ft, _, _)| *ft == prt_protocol::frame::EVT_RAW_REPLY)
+        .expect("no RawReply for the portal");
+    let mut r = prt_protocol::codec::Reader::new(&reply.2);
+    assert_eq!(r.string().unwrap(), "pane");
+    assert_eq!(aborted(r.bytes().unwrap()), ["in-portal"]);
+
+    let answer = position(&out, &vss_protocol::encode_detach_accepted(7)).unwrap();
+    assert!(position(&out, b"\x1b_prt").unwrap() < answer);
+}
+
+/// The session's last commands and the `DetachNotify` arrive in one
+/// chunk routinely — the daemon writes the notify right behind the
+/// last output it forwards. Their replies are owed to the session, and
+/// the restore used to throw them away with the state it replaced.
+#[test]
+fn replies_to_commands_ahead_of_the_detach_survive_it() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+    host.feed(&snapshot_envelope(b"session"));
+
+    let mut chunk = create_portal_envelope("late");
+    chunk.extend_from_slice(&vss_protocol::encode_detach_notify(7));
+    let out = host.feed_replies(&chunk);
+
+    let ok = frames(&out, *prt_protocol::frame::MARKER_T2C)
+        .into_iter()
+        .any(|(ft, rid, _)| ft == prt_protocol::frame::RSP_OK && rid == 1);
+    assert!(ok, "the CreatePortal's Ok was dropped by the restore");
+    let answer = position(&out, &vss_protocol::encode_detach_accepted(7)).unwrap();
+    assert!(position(&out, b"\x1b_prt").unwrap() < answer);
 }

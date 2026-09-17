@@ -332,7 +332,7 @@ to PRT / VGE / VFT and routed by the same per-portal pipeline:
 | 0x03 | `VgeFragment`   | `varu index`, `varu total`, `bytes payload` |
 | 0x04 | `PrtFragment`   | `varu index`, `varu total`, `bytes payload` |
 | 0x05 | `SnapshotEnd`   | `u32 sequence_id` |
-| 0x06 | `DetachNotify`  | *(empty)* |
+| 0x06 | `DetachNotify`  | `u32 sequence_id` |
 
 #### Frame types (renderer → engine, marker `vss`)
 
@@ -340,6 +340,7 @@ to PRT / VGE / VFT and routed by the same per-portal pipeline:
 |---|---|---|
 | 0x01 | `SnapshotAccepted` | `u32 sequence_id` |
 | 0x02 | `SnapshotRejected` | `u32 sequence_id`, `u8 reason` (1 = version, 2 = malformed, 3 = capacity) |
+| 0x03 | `DetachAccepted` | `u32 sequence_id` |
 
 Fragmenting lets a multi-megabyte snapshot (images!) span several
 envelopes without busting any single APC budget. Reassembly is by
@@ -356,10 +357,18 @@ required to be ordered or dense, only distinct across the attaches a
 renderer might see in one lifetime, so a daemon that restarts must
 not begin again at the value its predecessor used.
 
-`DetachNotify` closes an attach: the renderer restores the state it
-stashed on the first `SnapshotBegin` of that attach and drops the
-stash. It carries no `sequence_id` — a renderer holds at most one
-attach at a time — and is not answered.
+`DetachNotify` closes an attach: the renderer aborts the transfers
+the session had running through that context, restores the state it
+stashed on the first `SnapshotBegin` of that attach, drops the
+stash, and answers `DetachAccepted` with the notify's `sequence_id`.
+The answer is a fence, not a courtesy. Everything the renderer wrote
+upstream before it is owed to the session — replies to its last
+commands, events, the in-flight chunks of a download, the
+`TransferAborted` for each transfer just ended — and nothing after it
+is, so the renderer MUST queue it behind every other reply the
+detach produced (§4.5), and `vsd` reads up to it before handing the
+pty back to the shell (§4.4). The `sequence_id` lets `vsd` tell its
+own answer from a late one for an earlier attach whose wait gave up.
 
 ### 4.2 Version policy
 
@@ -423,7 +432,9 @@ portal's vt100 snapshot, its `children` PrtEngine snapshot
 (recursive), and its VgeEngine snapshot — plus its
 **`PolledStateCache`** and **`pending_cursor_queries`** counter.
 VFT engines are deliberately *not* serialized: in-flight transfers
-are abandoned on reattach (same policy as the v1 replay). Lives in
+are abandoned on reattach (same policy as the v1 replay), and a
+detach aborts them explicitly (§4.5) so the client that started one
+is told. Lives in
 `veter-host` as `PrtEngine::binary_snapshot()` /
 `restore_from_binary_snapshot()`.
 
@@ -463,6 +474,27 @@ composition (lines ~237–245). Under the engines lock:
    stashed the pre-attach view either, and the detach path sends
    `ESC c` instead of relying on a stash that does not exist.
 
+The attach ends when the splice stops: the detach hotkey (§6), a SES
+`Detach`, the session exiting, or the renderer going away. Then:
+
+8. Uninstall the renderer-stdout fd under the engines lock, so no
+   session output can follow what comes next, and write
+   `DetachNotify { sequence_id }`.
+9. If the renderer accepted the snapshot and is still there, keep
+   reading its stdin until `DetachAccepted` for this attach arrives.
+   Envelope bytes read on the way are the session's and are forwarded
+   to the inner PTY — a program blocked on a reply gets it, and a
+   `vrecv` hears that its download was aborted; everything else is
+   keystrokes typed after the detach, and is dropped, since the shell
+   the pane returns to cannot be handed them. The parse state carries
+   over from the splice, which can stop part-way through an envelope.
+   Give up after ~2 s with nothing arriving or ~10 s in all.
+10. Restore the renderer tty's termios. Skipping step 9 is what used
+    to put a download's in-flight chunks into the shell's line editor
+    as keystrokes: kernel echo, `^C` and `^Z` acting as signals, and
+    usually `^D` ending the login shell. A wait that gave up also
+    flushes the input queue on the way (`TCSAFLUSH`).
+
 The per-session worker thread (`tools/vsd/src/engines.rs`) is
 **unchanged**: it keeps forwarding inner-PTY bytes verbatim once
 the snapshot is acknowledged. Pass-through after attach is exactly
@@ -493,6 +525,24 @@ validated):
 3. Emit `SnapshotAccepted { sequence_id }` upstream via the
    engine's `pending_response_bytes` queue (the same path PRT and
    VGE already use for upstream responses).
+
+On `DetachNotify`, in stream order like a snapshot:
+
+1. Abort every transfer in the context — its own VFT engine, which
+   no snapshot touches and which would otherwise keep streaming a
+   download into whatever the pty belongs to next, and each portal's
+   below it, whose `TransferAborted` rides a `RawReply` for its
+   portal. VFT §5.6.
+2. Restore the stash, if there is one.
+3. Answer `DetachAccepted { sequence_id }`. Every caller drains the
+   VSS engine's queue *after* the PRT, VGE and VFT ones, which is what
+   puts the answer behind steps 1 and 2's output.
+
+A restore — this one or a snapshot's — keeps the replies and events
+already queued. They answer commands the outgoing state applied, and
+belong to whoever is reading the stream at that point; at a detach
+that is the session, whose last commands routinely share a chunk
+with the notify.
 
 Restore is **side-effect-free by construction**: binary fields are
 assigned directly, so engine callbacks

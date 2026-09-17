@@ -66,6 +66,25 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// attach tears itself down (§4.2). Long enough to read one line.
 const REJECT_BANNER_HOLD: Duration = Duration::from_secs(2);
 
+/// How long a detach waits for `DetachAccepted` with nothing arriving
+/// at all (§4.4). What it outwaits is one round trip — `DetachNotify`
+/// out through ssh and the renderer's multiplexer, the answer back —
+/// so silence this long means nobody is going to answer.
+const DETACH_ACK_IDLE: Duration = Duration::from_secs(2);
+
+/// The most a detach waits for `DetachAccepted` while bytes keep
+/// arriving. The backlog ahead of the answer is bounded — a download
+/// stops at its unacknowledged window, 128 KiB — so this is only for a
+/// renderer that keeps talking and never answers.
+const DETACH_ACK_CAP: Duration = Duration::from_secs(10);
+
+/// Upper bound on an attach handler's teardown once its splice has
+/// been told to stop: the detach drain, plus the writes and termios
+/// restore around it. The session process waits this long for the
+/// handler before exiting, since exiting under it would leave the
+/// renderer's tty raw.
+pub const TEARDOWN_BUDGET: Duration = Duration::from_secs(12);
+
 /// What the renderer said about the snapshot we sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotAck {
@@ -137,15 +156,17 @@ fn await_snapshot_ack(
             let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
                 if let Ok(frame) = vss_protocol::frames::UpstreamFrame::parse(frame_type, body)
                 {
-                    verdict = Some(match frame {
+                    verdict = match frame {
                         vss_protocol::frames::UpstreamFrame::SnapshotAccepted { sequence_id: id } => {
-                            (id, SnapshotAck::Accepted)
+                            Some((id, SnapshotAck::Accepted))
                         }
                         vss_protocol::frames::UpstreamFrame::SnapshotRejected {
                             sequence_id: id,
                             reason,
-                        } => (id, SnapshotAck::Rejected(reason)),
-                    });
+                        } => Some((id, SnapshotAck::Rejected(reason))),
+                        // A late answer to an earlier attach's detach.
+                        vss_protocol::frames::UpstreamFrame::DetachAccepted { .. } => verdict,
+                    };
                 }
                 Ok::<(), u16>(())
             });
@@ -338,7 +359,7 @@ fn handler_main(
     // Step 3: while still under the lock, install the stdout fd on
     // engines so the worker starts forwarding live bytes the moment
     // we release.
-    let ack = {
+    let (ack, sequence_id) = {
         let mut guard = engines.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot: Vec<u8> = Vec::new();
         // No ATTACH_ENTER (alt-screen wrap) for the VSS path: the
@@ -411,7 +432,7 @@ fn handler_main(
             let _ = write_all_raw(stdout_raw, banner.as_bytes());
             drop(guard);
             std::thread::sleep(REJECT_BANNER_HOLD);
-            restore_tty_canonical(stdin_fd.as_raw_fd());
+            restore_tty_canonical(stdin_fd.as_raw_fd(), false);
             return Err(anyhow!(
                 "renderer rejected the snapshot (reason {reason})"
             ));
@@ -420,7 +441,7 @@ fn handler_main(
         guard.renderer_stdout = Some(
             dup_owned(&stdout_fd).with_context(|| "duping renderer stdout for worker")?,
         );
-        ack
+        (ack, sequence_id)
     };
 
     // Step 4: spawn the SIGWINCH watcher so the renderer can resize
@@ -460,12 +481,14 @@ fn handler_main(
     // isn't guaranteed (a `vmux` pane can still hold the master open),
     // so relying on stdin alone left the attach spliced forever and the
     // `attached` flag stuck at `true`, refusing every re-attach.
+    let mut input = InputState::new();
     let result = splice_input(
         &stdin_fd,
-        master_writer_fd,
+        &master_writer_fd,
         shutdown_read,
         ipc_socket.as_fd(),
         &master_write,
+        &mut input,
     );
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
@@ -489,8 +512,8 @@ fn handler_main(
     // pops the stash. After the renderer applies the restore the
     // portal is back to the exact view it had right before attach,
     // including modes.
-    let detach_env = vss_protocol::encode_detach_notify();
-    let _ = write_all_raw(stdout_fd.as_raw_fd(), &detach_env);
+    let detach_env = vss_protocol::encode_detach_notify(sequence_id);
+    let notified = write_all_raw(stdout_fd.as_raw_fd(), &detach_env).is_ok();
     // `ESC c` (RIS) only if nobody took the snapshot. It used to go
     // out unconditionally, a few bytes behind `DetachNotify` — and
     // vt100's `ris()` builds a fresh `Screen`, so it wiped the
@@ -503,6 +526,31 @@ fn handler_main(
         let _ = write_all_raw(stdout_fd.as_raw_fd(), b"\x1bc");
     }
 
+    // §4.4 — the renderer isn't done with the session just because we
+    // are. Whatever it wrote for the session before it saw the
+    // `DetachNotify` — a download's in-flight chunks, replies to the
+    // session's last commands, the aborts of its transfers — is still
+    // on its way here, and once the tty is back in canonical mode the
+    // shell reads it as keystrokes. So keep reading until the renderer
+    // says it has let go, passing what is the session's on to it. Only
+    // a renderer that took the snapshot speaks VSS, and only one that
+    // is still there can answer.
+    let drained = if notified
+        && ack == SnapshotAck::Accepted
+        && matches!(result, Ok(SpliceEnd::Detached))
+    {
+        drain_until_detached(
+            &stdin_fd,
+            &master_writer_fd,
+            ipc_socket.as_fd(),
+            &master_write,
+            &mut input,
+            sequence_id,
+        )
+    } else {
+        true
+    };
+
     // Explicitly restore tty termios here (instead of relying on
     // `RawTty::Drop` only). The Drop path was leaving the stdin tty
     // in raw mode in practice — `stty -a` post-detach showed
@@ -510,16 +558,20 @@ fn handler_main(
     // first. Loop on EINTR (SIGCHLD from the inner program exit can
     // hit us mid-call). The RawTty guard's Drop still runs after
     // and is a no-op iff we landed here cleanly.
-    restore_tty_canonical(stdin_fd.as_raw_fd());
+    //
+    // A drain that gave up discards whatever is still queued as it
+    // restores: it is more likely the session's than the user's.
+    restore_tty_canonical(stdin_fd.as_raw_fd(), !drained);
 
-    result
+    result.map(|_| ())
 }
 
 /// Defensive end-of-attach tty restore: read current termios, OR-in
 /// the cooked-mode bits (`ICANON | ECHO | ISIG | IEXTEN`, plus
 /// `ICRNL` and `OPOST | ONLCR`), and `tcsetattr` it back. Logs to
-/// stderr on failure so we have something to diagnose with.
-fn restore_tty_canonical(fd: std::os::fd::RawFd) {
+/// stderr on failure so we have something to diagnose with. `flush`
+/// discards the unread input queue on the way (`TCSAFLUSH`).
+fn restore_tty_canonical(fd: std::os::fd::RawFd, flush: bool) {
     use nix::errno::Errno;
     use nix::sys::termios::{tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg};
     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
@@ -534,9 +586,10 @@ fn restore_tty_canonical(fd: std::os::fd::RawFd) {
         LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN;
     t.input_flags |= InputFlags::ICRNL;
     t.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
+    let when = if flush { SetArg::TCSAFLUSH } else { SetArg::TCSANOW };
     let mut attempts = 0u8;
     loop {
-        match tcsetattr(borrowed, SetArg::TCSANOW, &t) {
+        match tcsetattr(borrowed, when, &t) {
             Ok(()) => return,
             Err(Errno::EINTR) if attempts < 5 => {
                 attempts += 1;
@@ -933,6 +986,16 @@ struct DetachScanner {
     pending_prefix: bool,
     /// Only keystrokes can trigger a detach; see [`INPUT_MARKERS`].
     envelope: Envelope,
+    /// Set once the attach is over: from then on only envelope bytes
+    /// are forwarded. A keystroke typed after a detach was meant for
+    /// the shell the pane is going back to, not the session — though
+    /// that shell can't be handed it either, so it is dropped.
+    draining: bool,
+    /// While draining, the start of what may be an envelope opener
+    /// (`ESC`, `ESC _`, part of a marker). Until the marker settles it
+    /// could as well be a typed `Esc _`, so it is released with the
+    /// envelope or dropped with the keystrokes.
+    opener: Vec<u8>,
 }
 
 impl DetachScanner {
@@ -945,16 +1008,36 @@ impl DetachScanner {
     /// usually right behind.
     fn feed(&mut self, chunk: &[u8]) -> ScanOutput {
         let mut out = Vec::with_capacity(chunk.len() + 1);
+        let mut detach = false;
         for &b in chunk {
             // A pending prefix is always resolved by the next byte, and
             // envelope bytes only follow an `ESC _`, so no prefix is
             // ever pending across this.
             if self.envelope.step(b) {
                 out.push(b);
+            } else if self.draining {
+                match self.envelope {
+                    // Any ESC outside a body starts over.
+                    Envelope::Esc => {
+                        self.opener.clear();
+                        self.opener.push(b);
+                    }
+                    Envelope::Marker(..) => self.opener.push(b),
+                    // That byte completed a marker.
+                    Envelope::Body => {
+                        out.append(&mut self.opener);
+                        out.push(b);
+                    }
+                    // A keystroke after the attach ended; see `draining`.
+                    Envelope::Outside | Envelope::BodyEsc => self.opener.clear(),
+                }
             } else if self.pending_prefix {
                 if b == DETACH_SECOND {
-                    self.pending_prefix = false;
-                    return ScanOutput { forward: out, detach: true };
+                    // The trigger ends the attach, not the chunk: an
+                    // envelope for the session may still follow it.
+                    self.start_draining();
+                    detach = true;
+                    continue;
                 }
                 // Not a detach — release the buffered prefix.
                 out.push(DETACH_PREFIX);
@@ -972,7 +1055,14 @@ impl DetachScanner {
                 out.push(b);
             }
         }
-        ScanOutput { forward: out, detach: false }
+        ScanOutput { forward: out, detach }
+    }
+
+    /// The attach is over, whichever way it ended: forward only what
+    /// belongs to the session from here on.
+    fn start_draining(&mut self) {
+        self.draining = true;
+        self.pending_prefix = false;
     }
 
     /// On stdin EOF, flush any buffered prefix so the inner PTY
@@ -985,6 +1075,79 @@ impl DetachScanner {
             None
         }
     }
+}
+
+/// How [`splice_input`] stopped, when it stopped cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpliceEnd {
+    /// The attach ended with the renderer still there — the detach
+    /// hotkey, a SES `Detach`, the session exiting — so whatever it
+    /// had in flight for the session is still on its way.
+    Detached,
+    /// The renderer went away: its stdin closed, or the `vsd attach`
+    /// CLI did.
+    RendererGone,
+}
+
+/// The parse state of the renderer's stdin. It outlives the splice: an
+/// attach can end mid-envelope (a SES `Detach` lands between two
+/// reads), and [`drain_until_detached`] has to pick the stream up
+/// exactly where [`splice_input`] left it — a fresh parser would take
+/// the rest of that envelope for keystrokes.
+struct InputState {
+    /// Strips the renderer's upstream VSS envelopes (`ESC _ vss …
+    /// ESC \`). The attach-time `SnapshotAccepted` was already read by
+    /// `await_snapshot_ack` before the splice began, so during the
+    /// splice anything here is a straggler, dropped; during the drain
+    /// it is where `DetachAccepted` turns up. Neither may reach the
+    /// inner shell: `ESC _` is meta-paren and the payload chars get
+    /// inserted as literal keystrokes.
+    vss_filter: vss_protocol::ApcStream,
+    scanner: DetachScanner,
+    trace_log: Option<std::fs::File>,
+}
+
+impl InputState {
+    fn new() -> Self {
+        Self {
+            vss_filter: vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E),
+            scanner: DetachScanner::default(),
+            trace_log: open_input_trace(),
+        }
+    }
+
+    fn trace(&mut self, chunk: &[u8]) {
+        if let Some(log) = self.trace_log.as_mut() {
+            let _ = log_input_chunk(log, chunk);
+        }
+    }
+
+    /// One read during the drain: what to forward to the session, and
+    /// whether the renderer has answered this attach's `DetachNotify`.
+    fn drain_chunk(&mut self, chunk: &[u8], sequence_id: u32) -> (Vec<u8>, bool) {
+        let vss_out = self.vss_filter.feed(chunk);
+        let answered = vss_out
+            .payloads
+            .iter()
+            .any(|payload| answers_detach(payload, sequence_id));
+        (self.scanner.feed(&vss_out.passthrough).forward, answered)
+    }
+}
+
+/// Whether an upstream VSS payload carries `DetachAccepted` for this
+/// attach. One for another attach is a late answer to a drain that
+/// gave up, and proves nothing about ours.
+fn answers_detach(payload: &[u8], sequence_id: u32) -> bool {
+    let mut found = false;
+    let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
+        if let Ok(vss_protocol::UpstreamFrame::DetachAccepted { sequence_id: id }) =
+            vss_protocol::UpstreamFrame::parse(frame_type, body)
+        {
+            found |= id == sequence_id;
+        }
+        Ok::<(), u16>(())
+    });
+    found
 }
 
 /// Renderer-stdin → inner-PTY-master forwarding loop. Returns on EOF
@@ -1002,16 +1165,18 @@ impl DetachScanner {
 /// `tcsetattr` on a live fd. An earlier version took it by value,
 /// which closed the fd on return and left every restore attempt
 /// silently failing with `EBADF` — the user's tty stayed in raw mode
-/// (`-echo -icanon -opost`) until they ran `reset` by hand. The
-/// other two fds are owned because they're attach-private and should
-/// close here.
+/// (`-echo -icanon -opost`) until they ran `reset` by hand. The master
+/// writer is borrowed for the same kind of reason: the drain after a
+/// detach still writes to it. `shutdown_read` is attach-private and
+/// closes here.
 fn splice_input(
     stdin_fd: &OwnedFd,
-    master_writer_fd: OwnedFd,
+    master_writer_fd: &OwnedFd,
     shutdown_read: OwnedFd,
     ipc_fd: BorrowedFd<'_>,
     master_write: &Mutex<()>,
-) -> Result<()> {
+    input: &mut InputState,
+) -> Result<SpliceEnd> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
     let stdin_raw = stdin_fd.as_raw_fd();
@@ -1026,20 +1191,6 @@ fn splice_input(
         write_all_raw(writer_raw, data)
     };
     let mut buf = [0u8; 4096];
-    let mut scanner = DetachScanner::default();
-    let mut trace_log = open_input_trace();
-    // Strip the renderer's upstream VSS envelopes (`ESC _ vss … ESC \`)
-    // before forwarding bytes to the inner PTY. The renderer queues
-    // SnapshotAccepted / SnapshotRejected frames in response to the
-    // attach-time snapshot; those bytes route back through PRT
-    // EVT_RAW_REPLY → vmux → SSH and land here on stdin. The one that
-    // matters was already read and acted on by `await_snapshot_ack`
-    // before the splice began — an attach sends one snapshot — so
-    // anything reaching here is a straggler. It still must not reach
-    // the inner shell: `ESC _` is meta-paren and the payload chars get
-    // inserted as literal keystrokes.
-    let mut vss_filter =
-        vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
     // The escape-time window for bytes `vss_filter` holds back: a lone
     // Esc landing in its `EscPending` state has to reach the inner PTY
     // when no follow-up byte arrives, or vim never sees the mode
@@ -1080,7 +1231,7 @@ fn splice_input(
         // tear down even if there are buffered keystrokes.
         let shutdown_revents = fds[1].revents().unwrap_or(PollFlags::empty());
         if shutdown_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
-            return Ok(());
+            return Ok(SpliceEnd::Detached);
         }
 
         // The IPC socket the `vsd attach` CLI holds open for the whole
@@ -1094,7 +1245,7 @@ fn splice_input(
         if ipc_revents
             .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)
         {
-            return Ok(());
+            return Ok(SpliceEnd::RendererGone);
         }
 
         let stdin_revents = fds[0].revents().unwrap_or(PollFlags::empty());
@@ -1105,18 +1256,19 @@ fn splice_input(
             // lets the ESC go and keeps the `_`, so the window may have
             // to run again for the rest.
             if esc_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                let flushed = vss_filter.flush_pending_esc();
-                esc_deadline = vss_filter
+                let flushed = input.vss_filter.flush_pending_esc();
+                esc_deadline = input
+                    .vss_filter
                     .has_deferred_bytes()
                     .then(|| std::time::Instant::now() + ESCAPE_TIME);
                 if !flushed.is_empty() {
-                    let out = scanner.feed(&flushed);
+                    let out = input.scanner.feed(&flushed);
                     if !out.forward.is_empty() {
                         write_master(&out.forward)
                             .with_context(|| "writing flushed Esc to inner PTY")?;
                     }
                     if out.detach {
-                        return Ok(());
+                        return Ok(SpliceEnd::Detached);
                     }
                 }
             }
@@ -1125,43 +1277,112 @@ fn splice_input(
 
         let n = match nix::unistd::read(stdin_raw, &mut buf) {
             Ok(0) => {
-                if let Some(b) = scanner.flush_on_eof() {
+                if let Some(b) = input.scanner.flush_on_eof() {
                     let _ = write_master(&[b]);
                 }
-                return Ok(());
+                return Ok(SpliceEnd::RendererGone);
             }
             Ok(n) => n,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(anyhow!("renderer stdin read: {e}")),
         };
-
-        if let Some(log) = trace_log.as_mut() {
-            let _ = log_input_chunk(log, &buf[..n]);
-        }
+        input.trace(&buf[..n]);
 
         // Filter out any renderer-side VSS envelopes; what's left is
         // user keystrokes and the envelopes bound for the session's
         // client, which the detach scanner tells apart.
-        let vss_out = vss_filter.feed(&buf[..n]);
+        let vss_out = input.vss_filter.feed(&buf[..n]);
         // Bytes that just arrived restart the window: they are evidence
         // that the rest of a split envelope is on its way.
-        esc_deadline = vss_filter
+        esc_deadline = input
+            .vss_filter
             .has_deferred_bytes()
             .then(|| std::time::Instant::now() + ESCAPE_TIME);
-        // `vss_out.payloads` carries any late SnapshotAccepted /
-        // Rejected bodies. The verdict this attach turns on was
-        // already taken before the splice started; these are dropped.
         if vss_out.passthrough.is_empty() {
             continue;
         }
 
-        let out = scanner.feed(&vss_out.passthrough);
+        let out = input.scanner.feed(&vss_out.passthrough);
         if !out.forward.is_empty() {
             write_master(&out.forward)
                 .with_context(|| "writing renderer input to inner PTY")?;
         }
         if out.detach {
-            return Ok(());
+            return Ok(SpliceEnd::Detached);
+        }
+    }
+}
+
+/// Read the renderer's stdin after a `DetachNotify` until it answers
+/// `DetachAccepted` for this attach (§4.4), forwarding the envelopes
+/// on it to the session and dropping everything else.
+///
+/// The envelopes are the session's: replies and events the renderer
+/// produced for it before the notify reached it, which its programs
+/// may be blocked on, and the `TransferAborted` that tells a `vrecv`
+/// its download is over. The renderer answers only once it has let go
+/// of the session, so nothing after the answer is.
+///
+/// Returns whether the answer came. Gives up after [`DETACH_ACK_IDLE`]
+/// of silence or [`DETACH_ACK_CAP`] in all, and at once when the
+/// renderer goes away.
+fn drain_until_detached(
+    stdin_fd: &OwnedFd,
+    master_writer_fd: &OwnedFd,
+    ipc_fd: BorrowedFd<'_>,
+    master_write: &Mutex<()>,
+    input: &mut InputState,
+    sequence_id: u32,
+) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::time::Instant;
+
+    input.scanner.start_draining();
+    let cap = Instant::now() + DETACH_ACK_CAP;
+    let mut idle = Instant::now() + DETACH_ACK_IDLE;
+    let mut buf = [0u8; 4096];
+    loop {
+        let now = Instant::now();
+        let deadline = cap.min(idle);
+        if now >= deadline {
+            return false;
+        }
+        let ms = u16::try_from((deadline - now).as_millis()).unwrap_or(u16::MAX);
+        let mut fds = [
+            PollFd::new(stdin_fd.as_fd(), PollFlags::POLLIN),
+            PollFd::new(ipc_fd, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::from(ms)) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return false,
+        }
+        let ipc_revents = fds[1].revents().unwrap_or(PollFlags::empty());
+        if ipc_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
+            return false;
+        }
+        if fds[0].revents().unwrap_or(PollFlags::empty()).is_empty() {
+            continue;
+        }
+        let n = match nix::unistd::read(stdin_fd.as_raw_fd(), &mut buf) {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return false,
+        };
+        idle = Instant::now() + DETACH_ACK_IDLE;
+        input.trace(&buf[..n]);
+
+        let (forward, answered) = input.drain_chunk(&buf[..n], sequence_id);
+        if !forward.is_empty() {
+            let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
+            // A session that has exited can't take it, and that is
+            // fine: the point of reading it was to keep it off the
+            // renderer's shell.
+            let _ = write_all_raw(master_writer_fd.as_raw_fd(), &forward);
+        }
+        if answered {
+            return true;
         }
     }
 }
@@ -1508,6 +1729,94 @@ mod tests {
             assert_eq!(out, typed, "{typed:?}");
             assert!(detached, "{typed:?}");
         }
+    }
+
+    /// The trigger ends the attach, not the chunk it arrived in: an
+    /// envelope behind it is still the session's, and a keystroke
+    /// behind it is not.
+    #[test]
+    fn what_follows_the_trigger_in_its_chunk_is_drained() {
+        let env = download_through_a_pane(b"data");
+        let chunk = [&b"ab"[..], &[DETACH_PREFIX, DETACH_SECOND], &env, b"cd"].concat();
+        let mut s = DetachScanner::default();
+        let out = s.feed(&chunk);
+        assert!(out.detach);
+        assert_eq!(out.forward, [&b"ab"[..], &env].concat());
+    }
+
+    /// A SES `Detach` or the session exiting can end the splice between
+    /// two reads of one envelope. The drain has to continue with the
+    /// splice's parser: a fresh one would take the rest of the envelope
+    /// for keystrokes and drop it, leaving the session's client with
+    /// half an envelope it waits on forever.
+    #[test]
+    fn a_drain_picks_up_an_envelope_the_splice_was_part_way_through() {
+        let env = download_through_a_pane(&[DETACH_PREFIX, DETACH_SECOND, 0x1B]);
+        let (head, tail) = env.split_at(env.len() / 2);
+        let mut input = InputState::new();
+        let head_out = input.scanner.feed(&input.vss_filter.feed(head).passthrough);
+        assert!(!head_out.detach);
+
+        input.scanner.start_draining();
+        let chunk = [tail, b"typed", &vss_protocol::encode_detach_accepted(9)].concat();
+        let (forward, answered) = input.drain_chunk(&chunk, 9);
+        assert!(answered);
+        assert_eq!([head_out.forward, forward].concat(), env);
+    }
+
+    /// Stdin as a pipe holding `bytes`, closed behind them when
+    /// `close` is set; the inner PTY master as a pipe to read back.
+    fn drain_over_pipes(bytes: &[u8], close: bool, sequence_id: u32) -> (bool, Vec<u8>) {
+        use std::io::Read;
+        let (stdin_read, stdin_write) = nix::unistd::pipe().expect("stdin pipe");
+        nix::unistd::write(&stdin_write, bytes).expect("write stdin");
+        let _held = (!close).then_some(stdin_write);
+        let (master_read, master_write) = nix::unistd::pipe().expect("master pipe");
+        let (_cli, daemon) = UnixStream::pair().expect("ipc socketpair");
+
+        let mut input = InputState::new();
+        let answered = drain_until_detached(
+            &stdin_read,
+            &master_write,
+            daemon.as_fd(),
+            &Mutex::new(()),
+            &mut input,
+            sequence_id,
+        );
+        drop(master_write);
+        let mut forwarded = Vec::new();
+        std::fs::File::from(master_read)
+            .read_to_end(&mut forwarded)
+            .expect("read master");
+        (answered, forwarded)
+    }
+
+    /// Everything ahead of this attach's answer is read: the session's
+    /// envelopes reach it, the keystrokes don't, and an answer meant
+    /// for an earlier attach doesn't end the wait.
+    #[test]
+    fn the_drain_forwards_the_session_s_envelopes_up_to_its_answer() {
+        let env = download_through_a_pane(b"chunk");
+        let bytes = [
+            &b"ls\r"[..],
+            &env,
+            &vss_protocol::encode_detach_accepted(8),
+            b"x",
+            &env,
+            &vss_protocol::encode_detach_accepted(9),
+        ]
+        .concat();
+        let (answered, forwarded) = drain_over_pipes(&bytes, false, 9);
+        assert!(answered);
+        assert_eq!(forwarded, [env.as_slice(), &env].concat());
+    }
+
+    #[test]
+    fn a_drain_stops_when_the_renderer_goes_away() {
+        let env = download_through_a_pane(b"chunk");
+        let (answered, forwarded) = drain_over_pipes(&env, true, 9);
+        assert!(!answered);
+        assert_eq!(forwarded, env);
     }
 
     #[test]

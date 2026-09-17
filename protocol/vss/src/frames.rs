@@ -38,9 +38,9 @@ pub enum DownstreamFrame {
     /// tears down. The renderer's owning context (host or per-portal
     /// VssEngine) is expected to have stashed a binary snapshot of
     /// its pre-attach engine state on the first `SnapshotBegin` of
-    /// this attach; on `DetachNotify` it restores from that stash.
-    /// No body.
-    DetachNotify,
+    /// this attach; on `DetachNotify` it restores from that stash,
+    /// then answers `DetachAccepted` with the same `sequence_id`.
+    DetachNotify { sequence_id: u32 },
 }
 
 impl DownstreamFrame {
@@ -51,7 +51,7 @@ impl DownstreamFrame {
             DownstreamFrame::VgeFragment { .. } => FRM_VGE_FRAGMENT,
             DownstreamFrame::PrtFragment { .. } => FRM_PRT_FRAGMENT,
             DownstreamFrame::SnapshotEnd { .. } => FRM_SNAPSHOT_END,
-            DownstreamFrame::DetachNotify => FRM_DETACH_NOTIFY,
+            DownstreamFrame::DetachNotify { .. } => FRM_DETACH_NOTIFY,
         }
     }
 
@@ -79,7 +79,9 @@ impl DownstreamFrame {
             DownstreamFrame::SnapshotEnd { sequence_id } => {
                 w.u32(*sequence_id);
             }
-            DownstreamFrame::DetachNotify => {}
+            DownstreamFrame::DetachNotify { sequence_id } => {
+                w.u32(*sequence_id);
+            }
         }
         w.buf
     }
@@ -115,7 +117,9 @@ impl DownstreamFrame {
             FRM_SNAPSHOT_END => DownstreamFrame::SnapshotEnd {
                 sequence_id: r.u32()?,
             },
-            FRM_DETACH_NOTIFY => DownstreamFrame::DetachNotify,
+            FRM_DETACH_NOTIFY => DownstreamFrame::DetachNotify {
+                sequence_id: r.u32()?,
+            },
             _ => return Err(ERR_UNKNOWN_FRAME),
         };
         if !r.at_end() {
@@ -127,11 +131,16 @@ impl DownstreamFrame {
 
 /// Renderer → engine frames (marker `vss`). The engine reads these
 /// after sending a snapshot to learn whether the renderer accepted
-/// it or rejected it (version mismatch, malformed, capacity).
+/// it or rejected it (version mismatch, malformed, capacity), and
+/// after sending `DetachNotify` to learn that the renderer has let
+/// go of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamFrame {
     SnapshotAccepted { sequence_id: u32 },
     SnapshotRejected { sequence_id: u32, reason: u8 },
+    /// Everything the renderer wrote before this was the session's;
+    /// nothing it writes after is. See `doc/session-manager.md` §4.4.
+    DetachAccepted { sequence_id: u32 },
 }
 
 impl UpstreamFrame {
@@ -139,6 +148,7 @@ impl UpstreamFrame {
         match self {
             UpstreamFrame::SnapshotAccepted { .. } => FRM_SNAPSHOT_ACCEPTED,
             UpstreamFrame::SnapshotRejected { .. } => FRM_SNAPSHOT_REJECTED,
+            UpstreamFrame::DetachAccepted { .. } => FRM_DETACH_ACCEPTED,
         }
     }
 
@@ -151,6 +161,9 @@ impl UpstreamFrame {
             UpstreamFrame::SnapshotRejected { sequence_id, reason } => {
                 w.u32(*sequence_id);
                 w.u8(*reason);
+            }
+            UpstreamFrame::DetachAccepted { sequence_id } => {
+                w.u32(*sequence_id);
             }
         }
         w.buf
@@ -165,6 +178,9 @@ impl UpstreamFrame {
             FRM_SNAPSHOT_REJECTED => UpstreamFrame::SnapshotRejected {
                 sequence_id: r.u32()?,
                 reason: r.u8()?,
+            },
+            FRM_DETACH_ACCEPTED => UpstreamFrame::DetachAccepted {
+                sequence_id: r.u32()?,
             },
             _ => return Err(ERR_UNKNOWN_FRAME),
         };
@@ -244,9 +260,10 @@ mod tests {
 
     #[test]
     fn detach_notify_round_trip() {
-        let f = DownstreamFrame::DetachNotify;
+        let f = DownstreamFrame::DetachNotify {
+            sequence_id: 0x0BAD_F00D,
+        };
         let body = f.encode_body();
-        assert!(body.is_empty());
         let parsed = DownstreamFrame::parse(f.frame_type(), &body).unwrap();
         assert_eq!(parsed, f);
     }
@@ -296,6 +313,16 @@ mod tests {
             let parsed = UpstreamFrame::parse(f.frame_type(), &body).unwrap();
             assert_eq!(parsed, f);
         }
+    }
+
+    #[test]
+    fn detach_accepted_round_trip() {
+        let f = UpstreamFrame::DetachAccepted {
+            sequence_id: 0x0BAD_F00D,
+        };
+        let body = f.encode_body();
+        let parsed = UpstreamFrame::parse(f.frame_type(), &body).unwrap();
+        assert_eq!(parsed, f);
     }
 
     #[test]

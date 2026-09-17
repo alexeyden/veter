@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard};
+use vft_client::cancel::{cancel_and_drain, warn_if_undrained, CancelGuard, HostAborted};
 use vft_client::probe::{run_vft_probe, run_vge_probe};
 use vft_client::progress::{AsciiProgress, DelayedProgress, ProgressUI, VgeProgress};
 use vft_client::stream::{HostFrame, ResponseStream};
@@ -169,11 +169,14 @@ fn main() -> Result<()> {
         Ok(resolved) => resolved,
         Err(e) => {
             // No progress bar is up yet, so this path only has to make
-            // sure the host stops writing before we hand the tty back.
-            warn_if_undrained(
-                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
-                DRAIN_BUDGET,
-            );
+            // sure the host stops writing before we hand the tty back —
+            // which it already has, if it is the one that ended it.
+            if !HostAborted::ended(&e, &transfer_id) {
+                warn_if_undrained(
+                    cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                    DRAIN_BUDGET,
+                );
+            }
             cancel.disarm();
             return Err(e);
         }
@@ -244,10 +247,14 @@ fn main() -> Result<()> {
             // every path that lands here has already failed to hear from
             // it, so the five seconds this used to allow were exactly
             // the five the host was least likely to answer in.
-            warn_if_undrained(
-                cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
-                DRAIN_BUDGET,
-            );
+            //
+            // A host abort needs none of it (see `HostAborted`).
+            if !HostAborted::ended(&e, &transfer_id) {
+                warn_if_undrained(
+                    cancel_and_drain(&stream, &transfer_id, DRAIN_BUDGET),
+                    DRAIN_BUDGET,
+                );
+            }
             cancel.disarm();
             Err(e)
         }
@@ -470,11 +477,7 @@ fn decode_err(body: &[u8]) -> anyhow::Error {
 }
 
 fn decode_aborted(body: &[u8]) -> anyhow::Error {
-    let mut r = Reader::new(body);
-    let id = r.string().unwrap_or("").to_owned();
-    let reason = r.u8().unwrap_or(0);
-    let msg = r.string().unwrap_or("").to_owned();
-    anyhow!("transfer {id} aborted (reason={reason}): {msg}")
+    anyhow::Error::new(HostAborted::decode(body))
 }
 
 #[cfg(test)]

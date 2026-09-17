@@ -21,12 +21,15 @@ pub const PROTOCOL_VERSION: u8 = 0;
 /// `doc/session-manager.md` §4.2.
 ///
 /// History:
+/// - v4: `DetachNotify` carries the attach's `sequence_id` and is
+///   answered with `DetachAccepted`, which `vsd` reads as the end of
+///   everything the renderer owed the session.
 /// - v3: added `DetachNotify` downstream frame so the renderer can
 ///   restore its pre-attach state when an attach ends.
 /// - v2: VGE and PRT sub-snapshots gained `top_of_live_screen` so
 ///   anchor-line semantics survive across attach.
 /// - v1: initial layout.
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 // Engine → renderer frame codes (marker `VSS`).
 pub const FRM_SNAPSHOT_BEGIN: u8 = 0x01;
@@ -36,12 +39,14 @@ pub const FRM_PRT_FRAGMENT: u8 = 0x04;
 pub const FRM_SNAPSHOT_END: u8 = 0x05;
 /// Tell the renderer that the attach is ending. Restore the
 /// pre-attach engine state that was saved on the first
-/// `SnapshotBegin` of this attach window. Body is empty.
+/// `SnapshotBegin` of this attach window. Body: `u32 sequence_id`.
 pub const FRM_DETACH_NOTIFY: u8 = 0x06;
 
 // Renderer → engine frame codes (marker `vss`).
 pub const FRM_SNAPSHOT_ACCEPTED: u8 = 0x01;
 pub const FRM_SNAPSHOT_REJECTED: u8 = 0x02;
+/// The renderer has applied a `DetachNotify`. Body: `u32 sequence_id`.
+pub const FRM_DETACH_ACCEPTED: u8 = 0x03;
 
 // SnapshotRejected reasons.
 pub const REJECT_VERSION_MISMATCH: u8 = 0x01;

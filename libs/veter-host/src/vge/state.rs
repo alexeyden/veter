@@ -902,10 +902,11 @@ impl VgeEngine {
         // renderer whose zoom has changed since lay out every element
         // against a cell size that isn't on screen, until the next
         // `set_dimensions` happens to correct it.
-        // Reset transient state that doesn't belong to the snapshot:
-        // any in-flight responses or cursor queries from before the
-        // restore are stale.
-        self.pending_response_bytes.clear();
+        // Reset transient state that doesn't belong to the snapshot.
+        // Queued responses are not part of that: they answer commands
+        // already applied, and are owed to whoever is reading the
+        // stream here — at a detach, the session (see the matching
+        // note in `PrtEngine::install_state_from_snapshot`).
         self.pending_image_deletes.clear();
         self.pending_uploads.clear();
         self.pending_cursor_queries = 0;

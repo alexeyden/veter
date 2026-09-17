@@ -127,8 +127,8 @@ impl SnapshotBuilder {
 /// one per portal — same shape, same lifecycle.
 pub struct VssEngine {
     apc: ApcStream,
-    /// Upstream `SnapshotAccepted` / `SnapshotRejected` envelopes
-    /// produced in response to completed snapshots. The caller drains
+    /// Upstream `SnapshotAccepted` / `SnapshotRejected` /
+    /// `DetachAccepted` envelopes. The caller drains
     /// this with `take_responses` and writes the bytes upstream — for
     /// per-portal engines that's the portal's `EVT_RAW_REPLY` path;
     /// for the host engine it's the PTY master.
@@ -245,7 +245,8 @@ impl VssEngine {
     }
 
     /// Drain pending upstream response bytes (one or more
-    /// `SnapshotAccepted` / `SnapshotRejected` envelopes).
+    /// `SnapshotAccepted` / `SnapshotRejected` / `DetachAccepted`
+    /// envelopes).
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_response_bytes)
     }
@@ -349,12 +350,17 @@ impl VssEngine {
                         // snapshot it never started parsing.
                     }
                 }
-                DownstreamFrame::DetachNotify => {
-                    // Bump the counter for the caller to observe.
-                    // No response is sent — the engine has already
-                    // torn down the connection by the time we'd want
-                    // to reply.
+                DownstreamFrame::DetachNotify { sequence_id } => {
+                    // The caller rolls back on the counter. The answer
+                    // is queued now but must reach the wire *behind*
+                    // whatever the rollback owes the session — the
+                    // aborts of its transfers, the replies to its last
+                    // commands — because `vsd` reads it as the end of
+                    // those: every caller drains this engine after the
+                    // PRT, VGE and VFT ones.
                     self.detach_signals += 1;
+                    self.pending_response_bytes
+                        .extend_from_slice(&vss_protocol::encode_detach_accepted(sequence_id));
                 }
             }
             Ok::<(), u16>(())
@@ -560,23 +566,24 @@ mod tests {
     }
 
     #[test]
-    fn detach_notify_bumps_counter_no_response() {
-        let env = vss_protocol::encode_detach_notify();
+    fn detach_notify_bumps_counter_and_is_answered() {
+        let env = vss_protocol::encode_detach_notify(21);
         let mut e = VssEngine::new();
         let passthrough = e.process_pty_chunk(&env);
         assert!(passthrough.is_empty());
         assert_eq!(e.take_detach_signals(), 1);
         // Drained — subsequent reads return 0 until next notify.
         assert_eq!(e.take_detach_signals(), 0);
-        // No upstream response queued.
-        assert!(e.take_responses().is_empty());
+        // Answered with the attach's own id, which is what the daemon
+        // is waiting on.
+        assert_eq!(e.take_responses(), vss_protocol::encode_detach_accepted(21));
     }
 
     #[test]
     fn back_to_back_detach_notifies_coalesce_count() {
-        let mut env = vss_protocol::encode_detach_notify();
-        env.extend(vss_protocol::encode_detach_notify());
-        env.extend(vss_protocol::encode_detach_notify());
+        let mut env = vss_protocol::encode_detach_notify(1);
+        env.extend(vss_protocol::encode_detach_notify(1));
+        env.extend(vss_protocol::encode_detach_notify(1));
         let mut e = VssEngine::new();
         let _ = e.process_pty_chunk(&env);
         assert_eq!(e.take_detach_signals(), 3);

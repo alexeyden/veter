@@ -618,9 +618,13 @@ impl PrtEngine {
     /// state is constructed with the recursion already done.
     pub(in crate::prt) fn install_state_from_snapshot(&mut self, state: PrtState) {
         self.state = state;
-        // Transient queues are stale w.r.t. the restored state.
-        self.pending_response_bytes.clear();
-        self.pending_events.clear();
+        // Replies and events stay queued. They answer commands the
+        // outgoing state already applied, so they belong to whoever is
+        // reading the stream at this point, not to the state being
+        // installed — and at a detach that is the session, whose last
+        // commands arrive in the same chunk as the `DetachNotify`
+        // routinely. Dropped, those requests go unanswered and their
+        // senders block.
         self.pending_image_deletes.clear();
         self.pending_clipboard_writes.clear();
         // `top_of_live_screen` is left alone: the origin
@@ -949,6 +953,45 @@ impl PrtEngine {
                 };
                 content.vft.drive();
                 content.children.drive_and_flush_vft();
+                let mut b = content.vft.take_responses();
+                b.extend_from_slice(&content.children.take_responses());
+                b
+            };
+            if !bundle.is_empty() {
+                self.emit_event(EVT_RAW_REPLY, raw_reply_body(&id, &bundle));
+            }
+        }
+        self.flush_pending_events();
+    }
+
+    /// Abort every transfer in this scope's active portal set,
+    /// recursively, each portal's `TransferAborted` events surfacing as
+    /// a RawReply for it — the route [`Self::drive_and_flush_vft`]
+    /// gives the events those transfers would otherwise have produced.
+    ///
+    /// For an ending attach (§4.5 of the session-manager doc): the
+    /// restore that follows replaces these portals and drops their VFT
+    /// engines, which would stop the transfers but tell nobody. Aborted
+    /// first, the client inside the session hears about it.
+    pub fn abort_all_vft(&mut self, reason: u8, message: &str) {
+        if self.vft_relay {
+            // A relay starts no transfers; see `drive_and_flush_vft`.
+            return;
+        }
+        let portal_ids: Vec<String> = self
+            .state
+            .current()
+            .portals
+            .keys()
+            .cloned()
+            .collect();
+        for id in portal_ids {
+            let bundle = {
+                let Some(content) = self.state.current_mut().content_mut(&id) else {
+                    continue;
+                };
+                content.vft.abort_all(reason, message);
+                content.children.abort_all_vft(reason, message);
                 let mut b = content.vft.take_responses();
                 b.extend_from_slice(&content.children.take_responses());
                 b

@@ -350,14 +350,19 @@ impl EngineState {
         // PRT probe advertising *this* process's limits and accent
         // rather than the terminal's. Drained either way: a discarded
         // queue must not accumulate.
+        //
+        // VSS goes last of the three: a nested attach's
+        // `DetachAccepted` tells its daemon that everything before it
+        // was that session's, so the replies to the session's last
+        // commands have to be ahead of it.
         let prt_replies = prt.take_responses();
+        let vge_replies = vge.take_responses();
         let vss_replies = vss.take_responses();
         let mut replies = if attached {
-            Vec::new()
+            vge_replies
         } else {
-            [prt_replies, vss_replies].concat()
+            [prt_replies, vge_replies, vss_replies].concat()
         };
-        replies.extend_from_slice(&vge.take_responses());
         // SES is the exception, and the reason the strip above exists:
         // the daemon is the only party that knows the session name, so
         // it answers whether or not a renderer is attached.
@@ -945,7 +950,7 @@ mod tests {
         );
 
         // And a detach puts back what the attach replaced.
-        st.process_chunk(&vss_protocol::encode_detach_notify());
+        st.process_chunk(&vss_protocol::encode_detach_notify(77));
         assert_eq!(st.parser.screen().contents().trim_end(), "my shell");
     }
 
