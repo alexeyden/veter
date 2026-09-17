@@ -844,6 +844,83 @@ struct ScanOutput {
     detach: bool,
 }
 
+/// The envelopes that ride the renderer's stdin: the host→client
+/// direction of every protocol in the family. Their bodies are payload
+/// on their way to the session's client, not keystrokes, and a binary
+/// one — a VFT download, which reaches a `vmux` inside the session as a
+/// PRT `RawReply` — carries a `Ctrl+\` `d` pair about once every 64 KiB,
+/// since stuffing leaves both bytes alone.
+///
+/// Known markers rather than any `ESC _`: a user typing `Esc _` (a vim
+/// motion) must not switch the hotkey off until some `ESC \` happens
+/// along, and nobody types `Esc _ vft`. A protocol added to the family
+/// has to be added here.
+const INPUT_MARKERS: [&[u8; 3]; 5] = [
+    prt_protocol::frame::MARKER_T2C,
+    vge_protocol::frame::MARKER_T2C,
+    vft_protocol::frame::MARKER_H2C,
+    ses_protocol::frame::MARKER_H2C,
+    vss_protocol::frame::MARKER_R2E,
+];
+
+/// Where the renderer's stdin is relative to the envelopes in it.
+///
+/// Observation only: the scanner holds back nothing but a detach
+/// prefix, so it needs none of the escape-time recovery the protocol
+/// parsers carry. An envelope split across reads is tracked the same
+/// whatever the gap between them.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Envelope {
+    /// Keystrokes.
+    #[default]
+    Outside,
+    /// Saw `ESC` outside an envelope.
+    Esc,
+    /// Saw `ESC _` and this many bytes of a marker in [`INPUT_MARKERS`].
+    Marker([u8; 3], usize),
+    /// Inside an envelope body.
+    Body,
+    /// Saw `ESC` inside a body: `ESC ESC` and `ESC <mark>` are stuffed
+    /// payload, `ESC \` closes it.
+    BodyEsc,
+}
+
+impl Envelope {
+    /// Advance past `b`. Returns whether `b` belongs to an envelope
+    /// body (or is the `ESC \` that closes one) and so is not a
+    /// keystroke.
+    fn step(&mut self, b: u8) -> bool {
+        const ESC: u8 = 0x1B;
+        let (next, payload) = match (*self, b) {
+            (Envelope::Body, ESC) => (Envelope::BodyEsc, true),
+            (Envelope::Body, _) => (Envelope::Body, true),
+            (Envelope::BodyEsc, b'\\') => (Envelope::Outside, true),
+            // Stuffing turns every ESC in a body into `ESC ESC`, so an
+            // `ESC _` can't be payload: the body we thought we were in
+            // was never one (the same call `ApcOtherEsc` makes in the
+            // protocol parsers), and this is an opener.
+            (Envelope::BodyEsc, b'_') => (Envelope::Marker([0; 3], 0), false),
+            (Envelope::BodyEsc, _) => (Envelope::Body, true),
+            (_, ESC) => (Envelope::Esc, false),
+            (Envelope::Esc, b'_') => (Envelope::Marker([0; 3], 0), false),
+            (Envelope::Marker(mut marker, len), _) => {
+                marker[len] = b;
+                let prefix = &marker[..=len];
+                if !INPUT_MARKERS.iter().any(|m| m.starts_with(prefix)) {
+                    (Envelope::Outside, false)
+                } else if len + 1 == marker.len() {
+                    (Envelope::Body, false)
+                } else {
+                    (Envelope::Marker(marker, len + 1), false)
+                }
+            }
+            (Envelope::Outside | Envelope::Esc, _) => (Envelope::Outside, false),
+        };
+        *self = next;
+        payload
+    }
+}
+
 /// State carried between chunks of renderer-stdin so the prefix
 /// scan works even if the user types `Ctrl+\` and `d` arrive in
 /// separate reads.
@@ -854,6 +931,8 @@ struct DetachScanner {
     /// inner PTY one prefix byte unless the next byte cancels it
     /// (which only happens for `d`).
     pending_prefix: bool,
+    /// Only keystrokes can trigger a detach; see [`INPUT_MARKERS`].
+    envelope: Envelope,
 }
 
 impl DetachScanner {
@@ -867,7 +946,12 @@ impl DetachScanner {
     fn feed(&mut self, chunk: &[u8]) -> ScanOutput {
         let mut out = Vec::with_capacity(chunk.len() + 1);
         for &b in chunk {
-            if self.pending_prefix {
+            // A pending prefix is always resolved by the next byte, and
+            // envelope bytes only follow an `ESC _`, so no prefix is
+            // ever pending across this.
+            if self.envelope.step(b) {
+                out.push(b);
+            } else if self.pending_prefix {
                 if b == DETACH_SECOND {
                     self.pending_prefix = false;
                     return ScanOutput { forward: out, detach: true };
@@ -1056,7 +1140,8 @@ fn splice_input(
         }
 
         // Filter out any renderer-side VSS envelopes; what's left is
-        // user keystrokes destined for the inner shell.
+        // user keystrokes and the envelopes bound for the session's
+        // client, which the detach scanner tells apart.
         let vss_out = vss_filter.feed(&buf[..n]);
         // Bytes that just arrived restart the window: they are evidence
         // that the rest of a split envelope is on its way.
@@ -1358,6 +1443,71 @@ mod tests {
         let (out, detached) = feed_chunks(&[&[DETACH_PREFIX]]);
         assert_eq!(out, &[DETACH_PREFIX]);
         assert!(!detached);
+    }
+
+    /// What a `vrecv` inside the session is sent, as it reaches this
+    /// splice from a renderer with a `vmux` pane in between: a VFT
+    /// `DownloadChunk` wrapped in the PRT `RawReply` addressed to the
+    /// session client's pane. `data` is the file's bytes.
+    fn download_through_a_pane(data: &[u8]) -> Vec<u8> {
+        let mut vft = Vec::new();
+        vft_protocol::envelope::append_frame(
+            &mut vft,
+            vft_protocol::frame::EVT_DOWNLOAD_CHUNK,
+            0,
+            &vft_protocol::envelope::download_chunk_body("vrecv-1", 0, data),
+        );
+        let reply = vft_protocol::envelope::wrap_h2c_envelope(&vft);
+        let mut prt = Vec::new();
+        prt_protocol::envelope::append_frame(
+            &mut prt,
+            prt_protocol::frame::EVT_RAW_REPLY,
+            0,
+            &prt_protocol::envelope::raw_reply_body("pane-1", &reply),
+        );
+        prt_protocol::envelope::wrap_t2c_envelope(&prt)
+    }
+
+    /// A file that happens to contain `Ctrl+\` `d` used to end the
+    /// attach mid-download, dropping the rest of the transfer onto the
+    /// renderer's shell as keystrokes. The ESCs around the pair put it
+    /// behind every kind of stuffed escape a body can hold, nested
+    /// terminator included.
+    #[test]
+    fn a_detach_pair_inside_an_envelope_is_payload() {
+        let data = [
+            b'x', 0x1B, b'\\', DETACH_PREFIX, DETACH_SECOND, 0x1B, b'_', b'\t', DETACH_PREFIX,
+        ];
+        let env = download_through_a_pane(&data);
+
+        assert_eq!(feed_chunks(&[&env]), (env.clone(), false));
+        // Wherever the reads split it, and byte by byte.
+        for at in 0..=env.len() {
+            let (head, tail) = env.split_at(at);
+            assert_eq!(feed_chunks(&[head, tail]), (env.clone(), false), "split at {at}");
+        }
+        let bytes: Vec<&[u8]> = env.chunks(1).collect();
+        assert_eq!(feed_chunks(&bytes), (env, false));
+    }
+
+    #[test]
+    fn the_hotkey_still_works_between_envelopes() {
+        let env = download_through_a_pane(&[DETACH_PREFIX, DETACH_SECOND]);
+        let (out, detached) = feed_chunks(&[&env, b"ls", &[DETACH_PREFIX, DETACH_SECOND]]);
+        assert_eq!(out, [env.as_slice(), b"ls"].concat());
+        assert!(detached);
+    }
+
+    /// `Esc _` is a vim motion. Typed, it opens nothing, so it must not
+    /// leave the hotkey waiting for an `ESC \` that is never coming —
+    /// including when what follows starts out like a marker.
+    #[test]
+    fn a_typed_esc_underscore_leaves_the_hotkey_armed() {
+        for typed in [&b"\x1b_"[..], b"\x1b_ciw", b"\x1b_pr", b"\x1b\x1b_v"] {
+            let (out, detached) = feed_chunks(&[typed, &[DETACH_PREFIX, DETACH_SECOND]]);
+            assert_eq!(out, typed, "{typed:?}");
+            assert!(detached, "{typed:?}");
+        }
     }
 
     #[test]

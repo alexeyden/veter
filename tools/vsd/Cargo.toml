@@ -9,6 +9,8 @@ veter-version = { path = "../../libs/veter-version" }
 veter-host = { path = "../../libs/veter-host" }
 vt100 = { path = "../../vendored/vt100" }
 prt-protocol = { path = "../../protocol/prt" }
+ses-protocol = { path = "../../protocol/ses" }
+vft-protocol = { path = "../../protocol/vft" }
 vge-protocol = { path = "../../protocol/vge" }
 vss-protocol = { path = "../../protocol/vss" }
 anyhow = "1"

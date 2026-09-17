@@ -553,6 +553,17 @@ prefix so it never collides with a local-vmux prefix that may
 itself be running inside the session). `vsd` reads this off
 its input stream before forwarding the rest to the inner PTY.
 
+Only keystrokes can trigger it. The same stream carries the
+renderer's host→client envelopes (`ESC _ prt`, `vge`, `vft`, `ses`,
+`vss` … `ESC \`) on their way to the session's client, and their
+bodies are payload: a VFT download reaching a `vmux` inside the
+session rides a PRT `RawReply`, and byte-stuffing leaves both
+`Ctrl+\` and `d` alone, so binary file data contains the trigger
+about once every 64 KiB. `vsd` tracks those envelopes and forwards
+their bodies verbatim, trigger bytes included. It recognises the
+openers by marker rather than as any `ESC _`, so a typed `Esc _` (a
+vim motion) doesn't disable the trigger until an `ESC \` arrives.
+
 A protocol-level detach command (so local `vmux` can offer a
 "prefix-D" that talks directly to `vsd`) is defined by the
 companion document `doc/session-extension.md` (SES) and is
