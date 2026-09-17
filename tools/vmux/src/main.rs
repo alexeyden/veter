@@ -6265,11 +6265,14 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                     .map(|p| p.scroll.is_some())
                     .unwrap_or(false);
                 if focus_scrolling {
-                    let env = handle_scroll_byte(state, &focus_id, b)?;
+                    let last = idx + 1 == bytes.len();
+                    let (env, consumed) = handle_scroll_byte(state, &focus_id, b, last)?;
                     if !env.is_empty() {
                         write_all_stdout(&env)?;
                     }
-                    idx += 1;
+                    if consumed {
+                        idx += 1;
+                    }
                     continue;
                 }
                 // Forward the entire residual chunk to the focused pane
@@ -6790,108 +6793,170 @@ fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
     }
 }
 
-/// Process one byte while in scroll mode. Recognises:
+/// What one byte of a scroll-mode pane's input does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrollKey {
+    /// Consumed, no effect: part of a sequence still arriving, or a key
+    /// scroll mode doesn't bind.
+    Nothing,
+    Delta(i64),
+    SetTop,
+    SetLive,
+    /// Leave scroll mode. The byte is consumed.
+    Exit,
+    /// Leave scroll mode *before* this byte, which is not consumed: it
+    /// starts input that belongs to the pane.
+    ExitBefore,
+    /// Leave scroll mode and hand the pane the sequence this byte
+    /// completed — a bracketed paste's opener, with the paste behind it.
+    ExitWith(Vec<u8>),
+    /// Yield to `Mode::Prefix`, keeping the pane's scroll state, so
+    /// prefix commands (tab switches, splits, help, …) are reachable
+    /// while scrolling. Coming back to the pane resumes scroll-key
+    /// dispatch.
+    ToPrefix,
+}
+
+/// The bracketed-paste opener (DECSET 2004): what a paste into a pane
+/// whose program asked for it starts with.
+const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// Classify byte `b` of a scroll-mode pane's input. `csi_buf` carries a
+/// partial escape sequence across calls, `last` says `b` ends the chunk,
+/// and `half` is the half-page jump. Recognises:
 ///   - vim-style: j/k (line down/up), d/u (half-page down/up),
-///     space/b (page down/up), g (top), G/q (exit)
-///   - arrow keys (`\e[A`/`\e[B`) and PgUp/PgDn (`\e[5~`/`\e[6~`)
-///   - bare ESC = exit
+///     space/b (page down/up), g (top), G/q (exit), 0 (live)
+///   - the arrows (CSI and SS3), Home/End and PgUp/PgDn
+///   - Esc (bare, or `CSI 27 u`) = exit
+///   - a bracketed paste = exit, and the paste goes to the pane
 ///
 /// "Up" means scroll *back* into history (offset +); "Down" means scroll
-/// toward live (offset −). Sends `SetPortalScrollback` to the host on
-/// any change.
-fn handle_scroll_byte(state: &mut State, pane_id: &str, b: u8) -> Result<Vec<u8>> {
-    enum Action {
-        Nothing,
-        Delta(i64),
-        SetTop,
-        SetLive,
-        Exit,
-        ToPrefix,
-    }
-
-    // Read half-page first under a shared borrow.
-    let half = match state.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
-        Some(s) => s.half_page as i64,
-        None => return Ok(Vec::new()),
-    };
-
-    let action = {
-        let Some(s) = state.panes.get_mut(pane_id).and_then(|p| p.scroll.as_mut()) else {
-            return Ok(Vec::new());
-        };
-        let csi_buf = &mut s.csi_buf;
-        if csi_buf.is_empty() {
-            // Plain key.
-            match b {
-                0x1B => {
-                    csi_buf.push(b);
-                    Action::Nothing
-                }
-                // Prefix byte: keep this pane's scroll state alive but
-                // yield to `Mode::Prefix` so prefix commands (tab
-                // switches, splits, help, …) are reachable while
-                // scrolling. Coming back to the focused pane resumes
-                // scroll-key dispatch automatically.
-                _ if b == prefix_byte() => Action::ToPrefix,
-                b'q' | b'G' => Action::Exit,
-                b'k' => Action::Delta(1),
-                b'j' => Action::Delta(-1),
-                b'u' => Action::Delta(half),
-                b'd' => Action::Delta(-half),
-                b'b' => Action::Delta(half * 2),
-                b' ' => Action::Delta(-half * 2),
-                b'g' => Action::SetTop,
-                b'0' => Action::SetLive,
-                _ => Action::Nothing,
-            }
-        } else if csi_buf.len() == 1 {
-            // After ESC; expecting '[' to continue CSI, otherwise the
-            // ESC was a lone keystroke and we exit.
-            if b == b'[' {
+/// toward live (offset −). Pure, so the rules can be tested without a
+/// pane.
+fn scroll_key(csi_buf: &mut Vec<u8>, b: u8, last: bool, half: i64) -> ScrollKey {
+    match csi_buf.as_slice() {
+        [] => match b {
+            // The APC parsers ahead of this hold a trailing ESC back until
+            // the byte after it arrives or the escape-time passes, so an
+            // ESC that ends the chunk is a lone Esc: act on it now. Holding
+            // it here to see what follows is what used to eat the next
+            // byte — and when that was a paste, the paste's own ESC, so the
+            // pane got `[200~` typed at it.
+            0x1B if last => ScrollKey::Exit,
+            0x1B => {
                 csi_buf.push(b);
-                Action::Nothing
-            } else {
-                csi_buf.clear();
-                Action::Exit
+                ScrollKey::Nothing
             }
-        } else {
+            _ if b == prefix_byte() => ScrollKey::ToPrefix,
+            b'q' | b'G' => ScrollKey::Exit,
+            b'k' => ScrollKey::Delta(1),
+            b'j' => ScrollKey::Delta(-1),
+            b'u' => ScrollKey::Delta(half),
+            b'd' => ScrollKey::Delta(-half),
+            b'b' => ScrollKey::Delta(half * 2),
+            b' ' => ScrollKey::Delta(-half * 2),
+            b'g' => ScrollKey::SetTop,
+            b'0' => ScrollKey::SetLive,
+            _ => ScrollKey::Nothing,
+        },
+        [0x1B] => match b {
+            b'[' | b'O' => {
+                csi_buf.push(b);
+                ScrollKey::Nothing
+            }
+            // Esc, then an ESC starting something else — a paste landing
+            // right behind the keypress. The first leaves scroll mode;
+            // the second is the pane's.
+            0x1B => {
+                csi_buf.clear();
+                ScrollKey::ExitBefore
+            }
+            // Alt+<key>: leave, as Esc does.
+            _ => {
+                csi_buf.clear();
+                ScrollKey::Exit
+            }
+        },
+        // SS3: the arrows of a pane whose program set DECCKM, which is
+        // the spelling veter then uses for them.
+        [0x1B, b'O'] => {
+            csi_buf.clear();
+            match b {
+                b'A' => ScrollKey::Delta(1),
+                b'B' => ScrollKey::Delta(-1),
+                b'H' => ScrollKey::SetTop,
+                b'F' => ScrollKey::SetLive,
+                _ => ScrollKey::Nothing,
+            }
+        }
+        _ => {
             // Inside CSI; accumulate until a final byte (0x40..=0x7E).
             csi_buf.push(b);
-            if (0x40..=0x7E).contains(&b) {
-                let act = match csi_buf.as_slice() {
-                    [0x1B, b'[', b'A'] => Action::Delta(1),         // Up
-                    [0x1B, b'[', b'B'] => Action::Delta(-1),        // Down
-                    [0x1B, b'[', b'5', b'~'] => Action::Delta(half * 2), // PgUp
-                    [0x1B, b'[', b'6', b'~'] => Action::Delta(-half * 2), // PgDn
-                    [0x1B, b'[', b'H'] => Action::SetTop,          // Home
-                    [0x1B, b'[', b'F'] => Action::SetLive,         // End
-                    _ => Action::Nothing,
-                };
-                csi_buf.clear();
-                act
-            } else if csi_buf.len() > 16 {
-                csi_buf.clear();
-                Action::Nothing
-            } else {
-                Action::Nothing
+            if !(0x40..=0x7E).contains(&b) {
+                if csi_buf.len() > 16 {
+                    csi_buf.clear();
+                }
+                return ScrollKey::Nothing;
+            }
+            let seq = std::mem::take(csi_buf);
+            match seq.as_slice() {
+                [0x1B, b'[', b'A'] => ScrollKey::Delta(1),              // Up
+                [0x1B, b'[', b'B'] => ScrollKey::Delta(-1),             // Down
+                [0x1B, b'[', b'5', b'~'] => ScrollKey::Delta(half * 2), // PgUp
+                [0x1B, b'[', b'6', b'~'] => ScrollKey::Delta(-half * 2), // PgDn
+                [0x1B, b'[', b'H'] => ScrollKey::SetTop,                // Home
+                [0x1B, b'[', b'F'] => ScrollKey::SetLive,               // End
+                // A paste isn't navigation. Leave, and deliver it where
+                // it was aimed, the way a paste into a scrolled-back
+                // shell with no multiplexer snaps to live.
+                PASTE_START => ScrollKey::ExitWith(seq),
+                // Esc, once the pane's program enabled the kitty keyboard
+                // protocol and veter encodes it as `CSI 27 u`.
+                _ if matches!(parse_csi_u(&seq), Some((27, _, _))) => ScrollKey::Exit,
+                _ => ScrollKey::Nothing,
             }
         }
+    }
+}
+
+/// Apply byte `b` of the focused pane's input while it is in scroll
+/// mode (see [`scroll_key`]). Returns the envelopes to send upstream and
+/// whether `b` was consumed; one that wasn't belongs to the pane, now
+/// out of scroll mode.
+fn handle_scroll_byte(
+    state: &mut State,
+    pane_id: &str,
+    b: u8,
+    last: bool,
+) -> Result<(Vec<u8>, bool)> {
+    let key = {
+        let Some(s) = state.panes.get_mut(pane_id).and_then(|p| p.scroll.as_mut()) else {
+            return Ok((Vec::new(), true));
+        };
+        let half = s.half_page as i64;
+        scroll_key(&mut s.csi_buf, b, last, half)
     };
 
-    match action {
-        Action::Nothing => Ok(Vec::new()),
-        Action::Delta(d) => state.scroll_delta(pane_id, d),
-        Action::SetTop => state.scroll_set(pane_id, u32::MAX),
-        Action::SetLive => state.scroll_set(pane_id, 0),
-        Action::Exit => state.exit_scroll(pane_id),
-        Action::ToPrefix => {
-            // Keep the pane's scroll state intact; just switch the
-            // global mode. Prefix commands run, and if focus returns
-            // to this pane, scroll-key dispatch resumes.
-            state.mode = Mode::Prefix;
-            Ok(Vec::new())
+    Ok(match key {
+        ScrollKey::Nothing => (Vec::new(), true),
+        ScrollKey::Delta(d) => (state.scroll_delta(pane_id, d)?, true),
+        ScrollKey::SetTop => (state.scroll_set(pane_id, u32::MAX)?, true),
+        ScrollKey::SetLive => (state.scroll_set(pane_id, 0)?, true),
+        ScrollKey::Exit => (state.exit_scroll(pane_id)?, true),
+        ScrollKey::ExitBefore => (state.exit_scroll(pane_id)?, false),
+        ScrollKey::ExitWith(seq) => {
+            let env = state.exit_scroll(pane_id)?;
+            if let Some(pty) = state.pty_mut(pane_id) {
+                trace_vmux_to_pane(pane_id, &seq);
+                pty.enqueue(&seq);
+            }
+            (env, true)
         }
-    }
+        ScrollKey::ToPrefix => {
+            state.mode = Mode::Prefix;
+            (Vec::new(), true)
+        }
+    })
 }
 
 /// Diagnostic trace of bytes vmux reads from stdin (what veter sent
@@ -6959,6 +7024,115 @@ fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- scroll mode ------------------------------------------------
+
+    /// Feed `chunks` to a focused pane that starts in scroll mode, the
+    /// way `process_user_input` routes them: through [`scroll_key`]
+    /// while the pane scrolls, then straight to the pane. Returns what
+    /// the pane received and the keys that did something.
+    fn scroll_session(chunks: &[&[u8]]) -> (Vec<u8>, Vec<ScrollKey>) {
+        let mut csi_buf = Vec::new();
+        let mut scrolling = true;
+        let mut pane = Vec::new();
+        let mut keys = Vec::new();
+        for chunk in chunks {
+            let mut i = 0;
+            while i < chunk.len() {
+                if !scrolling {
+                    pane.extend_from_slice(&chunk[i..]);
+                    break;
+                }
+                let key = scroll_key(&mut csi_buf, chunk[i], i + 1 == chunk.len(), 10);
+                match &key {
+                    ScrollKey::ExitBefore => scrolling = false,
+                    ScrollKey::ExitWith(seq) => {
+                        pane.extend_from_slice(seq);
+                        scrolling = false;
+                        i += 1;
+                    }
+                    ScrollKey::Exit => {
+                        scrolling = false;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+                if key != ScrollKey::Nothing {
+                    keys.push(key);
+                }
+            }
+        }
+        (pane, keys)
+    }
+
+    /// A paste, as veter writes it for a pane that asked for 2004. The
+    /// text is full of scroll-mode keys on purpose.
+    const PASTE: &[u8] = b"\x1b[200~git log -q\x1b[201~";
+
+    /// The reported bug: leave scroll mode with Esc, paste. The Esc used
+    /// to sit in the CSI buffer waiting for a follow-up byte, the
+    /// paste's own ESC was that byte and was eaten with it, and the
+    /// pane got `[200~git log -q` typed at it plus a stray end marker.
+    #[test]
+    fn a_paste_after_esc_reaches_the_pane_intact() {
+        let (pane, keys) = scroll_session(&[b"\x1b", PASTE]);
+        assert_eq!(keys, [ScrollKey::Exit]);
+        assert_eq!(pane, PASTE);
+    }
+
+    /// …and the same with nothing but a paste: it leaves scroll mode
+    /// and arrives whole, rather than being read as navigation.
+    #[test]
+    fn a_paste_in_scroll_mode_leaves_it_and_reaches_the_pane() {
+        let (pane, keys) = scroll_session(&[PASTE]);
+        assert_eq!(keys, [ScrollKey::ExitWith(PASTE_START.to_vec())]);
+        assert_eq!(pane, PASTE);
+
+        // Split mid-opener across reads.
+        let (head, tail) = PASTE.split_at(4);
+        assert_eq!(scroll_session(&[head, tail]).0, PASTE);
+    }
+
+    /// Esc and a paste coalesced into one read: the first ESC leaves,
+    /// the second belongs to the paste.
+    #[test]
+    fn esc_and_a_paste_in_one_read() {
+        let chunk = [b"\x1b".as_ref(), PASTE].concat();
+        let (pane, keys) = scroll_session(&[&chunk]);
+        assert_eq!(keys, [ScrollKey::ExitBefore]);
+        assert_eq!(pane, PASTE);
+    }
+
+    /// A lone Esc leaves at once, and the key typed after it is not
+    /// taken as the byte that decides what the Esc was.
+    #[test]
+    fn a_lone_esc_does_not_eat_the_next_key() {
+        let (pane, _) = scroll_session(&[b"\x1b", b"ls"]);
+        assert_eq!(pane, b"ls");
+    }
+
+    /// Esc in the kitty keyboard protocol's spelling, which is all a
+    /// pane whose program pushed "disambiguate" ever sends for it.
+    #[test]
+    fn csi_u_esc_leaves_scroll_mode() {
+        let (_, keys) = scroll_session(&[b"\x1b[27u"]);
+        assert_eq!(keys, [ScrollKey::Exit]);
+    }
+
+    #[test]
+    fn arrows_scroll_in_both_spellings() {
+        let (pane, keys) = scroll_session(&[b"\x1b[A", b"\x1bOB", b"\x1b[5~", b"k"]);
+        assert!(pane.is_empty());
+        assert_eq!(
+            keys,
+            [
+                ScrollKey::Delta(1),
+                ScrollKey::Delta(-1),
+                ScrollKey::Delta(20),
+                ScrollKey::Delta(1),
+            ]
+        );
+    }
 
     // --- the prefix chord in its kitty-protocol spelling -----------
 
