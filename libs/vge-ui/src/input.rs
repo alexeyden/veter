@@ -237,6 +237,13 @@ fn parse_seq(s: &[u8]) -> Option<Event> {
     if params.first() == Some(&b'<') {
         return parse_sgr_mouse(&params[1..], final_byte);
     }
+    if final_byte == b'u' {
+        // The kitty keyboard protocol's key form. A parameterless
+        // `CSI u` is SCORC, which is output rather than a keypress, and
+        // `csi_u_event` rejects it along with the private-prefix forms
+        // (`CSI ? 1 u`, the reply to a flag query).
+        return csi_u_event(params);
+    }
     // Strip a modifier suffix (`1;5A` — Ctrl+Up) down to the base param.
     let base: &[u8] = match params.iter().position(|&c| c == b';') {
         Some(p) => &params[..p],
@@ -277,6 +284,81 @@ fn parse_seq(s: &[u8]) -> Option<Event> {
         },
         _ => return None,
     })
+}
+
+/// Decode the body of a kitty keyboard protocol key sequence —
+/// `CSI <codepoint> [; <modifiers>] u` — into an [`Event`].
+///
+/// This is not an alternative spelling a client may ignore. The
+/// protocol's "disambiguate escape codes" flag exists to stop C0
+/// control bytes being sent at all, so the moment the terminal has that
+/// flag every `Ctrl+<key>` chord arrives *only* this way: reading
+/// `0x01` for Ctrl+A is what stops working. Esc arrives as `CSI 27 u`
+/// for the same reason.
+///
+/// Both fields may carry `:`-separated sub-parameters — the key's second
+/// is the shifted key, the modifier's is the event type — so the
+/// leading one is taken and the rest ignored, rather than the sequence
+/// being misread as something else.
+pub(crate) fn csi_u_event(params: &[u8]) -> Option<Event> {
+    let mut fields = params.split(|&c| c == b';');
+    let mut key = fields.next()?.split(|&c| c == b':');
+    let codepoint = csi_u_number(key.next()?)?;
+    let shifted = key.next().and_then(csi_u_number);
+    let modifiers = match fields.next() {
+        Some(f) => csi_u_number(f.split(|&c| c == b':').next()?)?,
+        None => 1,
+    };
+    // 1 + the bits: shift 1, alt 2, ctrl 4, super 8.
+    let bits = modifiers.saturating_sub(1);
+    let shift = bits & 0b1 != 0;
+    let alt = bits & 0b10 != 0;
+    let ctrl = bits & 0b100 != 0;
+    // The keys the protocol names by their C0 codepoint. Under the
+    // disambiguate flag alone these keep their legacy bytes — they were
+    // never ambiguous — but a terminal with more of the flag set pushed
+    // sends them here.
+    match codepoint {
+        27 => return Some(Event::Escape),
+        13 => return Some(Event::Enter),
+        9 => return Some(if shift { Event::BackTab } else { Event::Tab }),
+        8 | 127 => return Some(Event::Backspace),
+        _ => {}
+    }
+    // The protocol's functional keys (Caps Lock, the keypad, the media
+    // keys) are codepoints in the Unicode private-use area. Nothing
+    // here binds one, and reporting it as a `Key` would type a
+    // placeholder glyph into a prompt.
+    if (0xE000..=0xF8FF).contains(&codepoint) {
+        return None;
+    }
+    let c = char::from_u32(codepoint)?;
+    Some(if ctrl {
+        Event::Ctrl(c.to_ascii_lowercase())
+    } else if alt {
+        Event::Alt(c)
+    } else if shift {
+        // The protocol names the *unshifted* key and reports shift
+        // separately, so the character actually typed comes from the
+        // shifted sub-parameter, or from ASCII case when the terminal
+        // left that out.
+        Event::Key(
+            shifted
+                .and_then(char::from_u32)
+                .unwrap_or_else(|| c.to_ascii_uppercase()),
+        )
+    } else {
+        Event::Key(c)
+    })
+}
+
+/// One decimal CSI parameter. `None` for an empty or non-numeric field,
+/// which is what keeps a private-prefix form (`CSI ? 1 u`) out.
+fn csi_u_number(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// Parse the body of an SGR mouse report (`btn;col;row` plus a final
@@ -389,6 +471,41 @@ mod tests {
             events(b"\x1b[<65;3;3M"),
             vec![Event::WheelDown { col: 2, row: 2 }]
         );
+    }
+
+    /// The kitty keyboard protocol's key form, which is the only
+    /// spelling a chord has once the terminal has the disambiguate
+    /// flag: no C0 control byte is sent for it at all.
+    #[test]
+    fn csi_u_decodes_the_kitty_key_form() {
+        assert_eq!(events(b"\x1b[97;5u"), vec![Event::Ctrl('a')]);
+        assert_eq!(events(b"\x1b[27u"), vec![Event::Escape]);
+        // The unshifted codepoint is what the protocol names, so
+        // Ctrl+Shift+A is still `Ctrl('a')`.
+        assert_eq!(events(b"\x1b[97;6u"), vec![Event::Ctrl('a')]);
+        assert_eq!(events(b"\x1b[98;3u"), vec![Event::Alt('b')]);
+        assert_eq!(events(b"\x1b[97u"), vec![Event::Key('a')]);
+        // Shift reports the key it was typed as: the shifted
+        // sub-parameter when the terminal sent one, ASCII case when not.
+        assert_eq!(events(b"\x1b[97:65;2u"), vec![Event::Key('A')]);
+        assert_eq!(events(b"\x1b[97;2u"), vec![Event::Key('A')]);
+        // The named keys, when a fuller flag set puts them here.
+        assert_eq!(events(b"\x1b[13u"), vec![Event::Enter]);
+        assert_eq!(events(b"\x1b[9;2u"), vec![Event::BackTab]);
+        assert_eq!(events(b"\x1b[127u"), vec![Event::Backspace]);
+        // The event-type sub-parameter on the modifier field is ignored
+        // rather than making the sequence unreadable.
+        assert_eq!(events(b"\x1b[97;5:1u"), vec![Event::Ctrl('a')]);
+    }
+
+    /// `CSI u` with no parameters is SCORC, and the private-prefix
+    /// forms are the flag stack and its query reply — none is a key.
+    #[test]
+    fn csi_u_rejects_what_is_not_a_keypress() {
+        assert!(events(b"\x1b[u").is_empty());
+        assert!(events(b"\x1b[?1u").is_empty());
+        assert!(events(b"\x1b[>1u").is_empty());
+        assert!(events(b"\x1b[57358u").is_empty(), "a functional key");
     }
 
     #[test]

@@ -367,6 +367,19 @@ impl LineEditor {
             return (bytes.len(), EditOutcome::Noop);
         }
         let params = &bytes[2..i];
+        // A kitty keyboard protocol chord (`CSI 97 ; 5 u` — Ctrl+A).
+        // Every binding the byte path above reads as a C0 control
+        // arrives this way instead once the terminal has the
+        // disambiguate flag, which is the whole point of the flag; the
+        // event path holds the same table, so route it there rather
+        // than keeping a second copy.
+        if bytes[i] == b'u' {
+            let outcome = match crate::input::csi_u_event(params) {
+                Some(ev) => self.feed_event(ev),
+                None => EditOutcome::Noop,
+            };
+            return (i + 1, outcome);
+        }
         match bytes[i] {
             b'C' => self.move_right(),               // Right
             b'D' => self.move_left(),                // Left
@@ -431,6 +444,48 @@ mod tests {
         assert_eq!(ed.buffer, "hello ");
         let (ed, _) = feed("hello world", b"\x01\x1bd");
         assert_eq!(ed.buffer, " world");
+    }
+
+    /// The kitty keyboard protocol sends no C0 control bytes, so every
+    /// chord the byte path binds has to be recognised in this spelling
+    /// too. Reading `0x01` alone is what left Ctrl+A doing nothing in a
+    /// prompt run under a pane that had the flag on.
+    #[test]
+    fn ctrl_chords_work_in_the_kitty_spelling() {
+        // Ctrl+A / Ctrl+E — codepoints 97 and 101, ctrl = modifier 5.
+        let (ed, _) = feed("abc", b"\x1b[97;5u");
+        assert_eq!(ed.cursor, 0);
+        let (ed, _) = feed("abc", b"\x1b[97;5u\x1b[101;5u");
+        assert_eq!(ed.cursor, 3);
+        // Ctrl+K from the start, Ctrl+U from the end.
+        let (ed, _) = feed("hello", b"\x1b[97;5u\x1b[107;5u");
+        assert_eq!(ed.buffer, "");
+        let (ed, _) = feed("hello", b"\x1b[117;5u");
+        assert_eq!(ed.buffer, "");
+        // Ctrl+W, and Ctrl+B / Ctrl+F for motion.
+        let (ed, _) = feed("hello world", b"\x1b[119;5u");
+        assert_eq!(ed.buffer, "hello ");
+        let (ed, _) = feed("abc", b"\x1b[98;5u\x1b[98;5u");
+        assert_eq!(ed.cursor, 1);
+        // Ctrl+G cancels, and so does Esc as `CSI 27 u`.
+        assert_eq!(feed("x", b"\x1b[103;5u").1, "cancel");
+        assert_eq!(feed("x", b"\x1b[27u").1, "cancel");
+        // Alt+B / Alt+D — modifier 3.
+        let (ed, _) = feed("hello world", b"\x1b[98;3u\x1b[100;3u");
+        assert_eq!(ed.buffer, "hello ");
+    }
+
+    /// A sequence in this family that binds nothing must be consumed
+    /// whole and do nothing — not fall through and leave its tail to be
+    /// read as typed characters.
+    #[test]
+    fn an_unbound_csi_u_chord_is_swallowed_whole() {
+        let (ed, out) = feed("abc", b"\x1b[122;5u"); // Ctrl+Z
+        assert_eq!(ed.buffer, "abc");
+        assert_eq!(out, "noop");
+        // A functional key (private-use codepoint) types nothing.
+        let (ed, _) = feed("abc", b"\x1b[57358u"); // Caps Lock
+        assert_eq!(ed.buffer, "abc");
     }
 
     #[test]

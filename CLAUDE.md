@@ -158,6 +158,16 @@ recognise its own prefix chord in both spellings — a pane running a
 program that enabled `CSI u` encodings stops delivering `Ctrl+Space` as
 a byte at all (`prefix_csi_u` / `prefix_chord_at`).
 
+It applies to every chord vmux's *own* modals read, too, which is less
+obvious: a rename prompt or a picker is drawn by vmux, but the pane
+underneath is still the focused leaf, so `Ctrl+A` arrives there as
+`CSI 97 ; 5 u`. `vge-ui`'s `LineEditor` and `Picker` therefore decode
+that form (`input::csi_u_event`, which routes it into the same table
+their event path uses) rather than only the C0 byte, and a modal that
+reads single bytes and buffers no CSI has to swallow such a sequence
+whole (`modal_skip_len`) instead of taking its leading ESC for a
+keypress.
+
 ## Sessions (vsd)
 
 `vsd` is a persistent host-side session manager that holds a session's state (vt100 grids, scrollback, VGE/PRT/image tables, inner PTYs) across disconnections of the rendering client — the motivating case is SSH survivability. On attach it ships that state to the renderer as a **VSS** binary snapshot; **SES** is the sidecar control channel a `vmux` client uses to learn its session name and to detach (`Ctrl+\ d`). Because the host engines are factored into `veter-host`, `vsd` and the `veter` GUI run the same engine code. See `doc/session-manager.md` and `doc/session-extension.md`.

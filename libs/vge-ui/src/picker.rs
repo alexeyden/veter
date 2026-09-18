@@ -314,6 +314,18 @@ impl<P> Picker<P> {
                 return (bytes.len(), PickerOutcome::Noop); // incomplete
             }
             let params = &bytes[2..i];
+            // A kitty keyboard protocol chord — Ctrl+N / Ctrl+P and
+            // the editor's own bindings all arrive as `CSI … u` once
+            // the terminal has the disambiguate flag. Checked ahead of
+            // the nav table so the picker's chords keep working, not
+            // only the editor's.
+            if bytes[i] == b'u' {
+                let outcome = match crate::input::csi_u_event(params) {
+                    Some(ev) => self.feed_event(ev),
+                    None => PickerOutcome::Noop,
+                };
+                return (i + 1, outcome);
+            }
             let nav = match (bytes[i], params) {
                 (b'A', _) => Some(-1),                       // Up
                 (b'B', _) => Some(1),                        // Down
@@ -435,6 +447,27 @@ mod tests {
         assert_eq!(p.selected, 2);
         feed(&mut p, b"\x10\x10\x10\x10");
         assert_eq!(p.selected, 0, "clamped at the top");
+    }
+
+    /// The picker's own chords, in the kitty keyboard protocol's
+    /// spelling: the flag stops C0 controls being sent, so `0x0e` /
+    /// `0x10` never arrive and only this form does.
+    #[test]
+    fn ctrl_np_and_editing_work_in_the_kitty_spelling() {
+        let mut p = Picker::new("Command", FilterMode::CommandLine, items());
+        assert_eq!(feed(&mut p, b"\x1b[110;5u"), PickerOutcome::Redraw); // Ctrl+N
+        assert_eq!(p.selected, 1);
+        feed(&mut p, b"\x1b[112;5u"); // Ctrl+P
+        assert_eq!(p.selected, 0);
+        // Ctrl+G cancels, as does Esc in its `CSI 27 u` spelling.
+        assert_eq!(feed(&mut p, b"\x1b[103;5u"), PickerOutcome::Cancel);
+        assert_eq!(feed(&mut p, b"\x1b[27u"), PickerOutcome::Cancel);
+        // An editor chord still reaches the editor, and refilters.
+        feed(&mut p, b"rename");
+        assert_eq!(p.matches.len(), 2);
+        feed(&mut p, b"\x1b[117;5u"); // Ctrl+U
+        assert_eq!(p.editor.buffer, "");
+        assert_eq!(p.matches.len(), 5, "the kill refiltered");
     }
 
     #[test]

@@ -2325,6 +2325,29 @@ fn escape_sequence_len(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// How much of `bytes` a modal that reads single bytes has to swallow
+/// instead: the extent of a complete escape sequence that is *not* Esc.
+///
+/// `Mode::ConfirmQuit` buffers no CSI, so it would read such a
+/// sequence's leading ESC as the prompt's "no" and leave the rest to be
+/// typed at the pane it just handed focus back to. Under the kitty
+/// keyboard protocol that is every Ctrl chord (`CSI 97 ; 5 u` for
+/// Ctrl+A, where the legacy `0x01` did nothing at all), and it was
+/// already true of the arrows.
+///
+/// `None` for Esc in either spelling — that one the prompt acts on —
+/// and for a sequence still truncated in this read, where the caller's
+/// existing single-byte fallback applies.
+fn modal_skip_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() != Some(&0x1b) {
+        return None;
+    }
+    if matches!(parse_csi_u(bytes), Some((27, _, _))) {
+        return None;
+    }
+    escape_sequence_len(bytes)
+}
+
 /// Human-readable name for the current prefix key (e.g. `Ctrl+Space`,
 /// `Ctrl+A`). Used in the help modal so it reflects `--prefix`.
 fn prefix_name() -> String {
@@ -6225,8 +6248,10 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
         let esc_len = if b == 0x1b
             && !matches!(state.mode, Mode::Normal | Mode::Prefix)
         {
+            // Whatever modifiers came with it — a modified Esc is still
+            // the key the modals act on, the way `scroll_key` reads it.
             match parse_csi_u(&bytes[idx..]) {
-                Some((27, 1, len)) => Some(len),
+                Some((27, _, len)) => Some(len),
                 _ => None,
             }
         } else {
@@ -6358,6 +6383,15 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 idx += esc_len.unwrap_or(1);
             }
             Mode::ConfirmQuit => {
+                // A key the prompt doesn't bind, arriving as an
+                // escape sequence: swallow it whole rather than let its
+                // ESC read as "no" (see `modal_skip_len`). Esc itself
+                // is excluded there and reaches the handler as the lone
+                // ESC folded above.
+                if let Some(len) = modal_skip_len(&bytes[idx..]) {
+                    idx += len;
+                    continue;
+                }
                 let env = handle_confirm_byte(state, b)?;
                 if !env.is_empty() {
                     write_all_stdout(&env)?;
@@ -7190,6 +7224,28 @@ mod tests {
         assert_eq!(escape_sequence_len(b"\x1b[32;5"), None);
         assert_eq!(escape_sequence_len(b"\x1b["), None);
         assert_eq!(escape_sequence_len(b"\x1b"), None);
+    }
+
+    /// The quit prompt reads single bytes, so anything that arrives as
+    /// a sequence has to be taken off whole — otherwise its ESC answers
+    /// the prompt and the tail is typed at the pane.
+    #[test]
+    fn the_quit_prompt_swallows_a_chord_whole() {
+        // Ctrl+A and Ctrl+C in the kitty spelling, and a plain arrow.
+        assert_eq!(modal_skip_len(b"\x1b[97;5u"), Some(7));
+        assert_eq!(modal_skip_len(b"\x1b[99;5u"), Some(7));
+        assert_eq!(modal_skip_len(b"\x1b[A"), Some(3));
+        assert_eq!(modal_skip_len(b"\x1bOA"), Some(3));
+        // Esc is the key the prompt acts on, in either spelling.
+        assert_eq!(modal_skip_len(b"\x1b[27u"), None);
+        assert_eq!(modal_skip_len(b"\x1b[27;5u"), None);
+        assert_eq!(modal_skip_len(b"\x1b"), None);
+        // Alt+<key> is two bytes, not a CSI sequence; the byte path
+        // reads the ESC as "no", which is what it always did.
+        assert_eq!(modal_skip_len(b"\x1bb"), None);
+        // Not an escape sequence at all.
+        assert_eq!(modal_skip_len(b"y"), None);
+        assert_eq!(modal_skip_len(b""), None);
     }
 
     #[test]
