@@ -113,14 +113,22 @@ impl SnapshotAck {
 
 /// Wait for the renderer's verdict on the snapshot we just wrote.
 ///
-/// Bytes that aren't a VSS upstream envelope are the user typing
-/// during the attach; they come back as typeahead for the caller to
-/// forward, exactly as the probe phase does, rather than being
-/// swallowed.
+/// Bytes that aren't a VSS upstream envelope go through `probe`, which
+/// takes the VGE and PRT envelopes among them — a probe answer that
+/// missed [`PROBE_TIMEOUT`] lands here, and it is the daemon's, not the
+/// session's. What comes back is the user typing during the attach, and
+/// the caller forwards it to the inner PTY exactly as the probe phase
+/// does rather than swallowing it.
+///
+/// Feeding a `prt` envelope to the session instead is what put
+/// `insert-last-word`'s output and a payload's raw bytes on the shell's
+/// command line at attach time: `ESC _` is that zsh binding, and the
+/// rest of the envelope is inserted literally.
 fn await_snapshot_ack(
     stdin_fd: &OwnedFd,
     sequence_id: u32,
     timeout: Duration,
+    probe: &mut probe::Probe,
 ) -> Result<(SnapshotAck, Vec<u8>)> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::time::Instant;
@@ -150,7 +158,7 @@ fn await_snapshot_ack(
             Err(e) => return Err(anyhow!("read(stdin) waiting for snapshot ack: {e}")),
         };
         let out = apc.feed(&buf[..n]);
-        typeahead.extend_from_slice(&out.passthrough);
+        typeahead.extend_from_slice(&probe.feed(&out.passthrough));
         for payload in &out.payloads {
             let mut verdict = None;
             let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
@@ -318,7 +326,7 @@ fn handler_main(
     // `typeahead` and forwarded to the inner PTY after we apply the
     // probe results, so the user's keystrokes during attach aren't
     // dropped.
-    let outcome = probe::run(&stdin_fd, &stdout_fd, PROBE_TIMEOUT)
+    let mut outcome = probe::run(&stdin_fd, &stdout_fd, PROBE_TIMEOUT)
         .with_context(|| "running upstream probe")?;
     let theme_event = apply_probe(&engines, &master_writer_fd, &outcome);
     // Every write to the inner PTY master from this thread goes
@@ -410,8 +418,13 @@ fn handler_main(
         // that has not accepted the state it belongs to, and nothing
         // is lost — the bytes it already read are processed and
         // forwarded once we release.
-        let (ack, typeahead) = await_snapshot_ack(&stdin_fd, sequence_id, ACK_TIMEOUT)
-            .with_context(|| "waiting for the renderer's snapshot verdict")?;
+        let (ack, typeahead) = await_snapshot_ack(
+            &stdin_fd,
+            sequence_id,
+            ACK_TIMEOUT,
+            &mut outcome.probe,
+        )
+        .with_context(|| "waiting for the renderer's snapshot verdict")?;
         if !typeahead.is_empty() {
             let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
             write_all_raw(master_writer_fd.as_raw_fd(), &typeahead)
@@ -443,6 +456,27 @@ fn handler_main(
         );
         (ack, sequence_id)
     };
+
+    // An answer that missed `PROBE_TIMEOUT` and turned up during the
+    // verdict wait: apply it now. Late is not useless — the cell
+    // metrics and the `host.*` palette are what every client started in
+    // this session reads, and dropping them would leave the daemon on
+    // its 8x16 defaults for the session's whole life because the link
+    // was slow for one second. Outside the engines lock: `apply_probe`
+    // takes it itself.
+    let (late_vge, late_prt) = outcome.probe.data();
+    if (outcome.vge.is_none() && late_vge.is_some())
+        || (outcome.prt.is_none() && late_prt.is_some())
+    {
+        outcome.vge = late_vge;
+        outcome.prt = late_prt;
+        let theme_event = apply_probe(&engines, &master_writer_fd, &outcome);
+        if !theme_event.is_empty() {
+            let _g = master_write.lock().unwrap_or_else(|e| e.into_inner());
+            write_all_raw(master_writer_fd.as_raw_fd(), &theme_event)
+                .with_context(|| "announcing the renderer's theme")?;
+        }
+    }
 
     // Step 4: spawn the SIGWINCH watcher so the renderer can resize
     // its window mid-attach. The watcher polls `TIOCGWINSZ` on its
@@ -1570,11 +1604,76 @@ mod tests {
     /// Feed `bytes` through a pipe as if the renderer had sent them,
     /// and ask what verdict came back.
     fn ack_of(bytes: &[u8], timeout_ms: u64) -> (SnapshotAck, Vec<u8>) {
+        ack_and_probe(bytes, timeout_ms).0
+    }
+
+    /// The same, keeping the probe parsers so a test can ask what they
+    /// picked up along the way.
+    fn ack_and_probe(
+        bytes: &[u8],
+        timeout_ms: u64,
+    ) -> ((SnapshotAck, Vec<u8>), probe::Probe) {
         let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
         nix::unistd::write(&write_fd, bytes).expect("write");
         drop(write_fd);
-        await_snapshot_ack(&read_fd, 42, Duration::from_millis(timeout_ms))
-            .expect("ack")
+        let mut probe = probe::Probe::new();
+        let out = await_snapshot_ack(
+            &read_fd,
+            42,
+            Duration::from_millis(timeout_ms),
+            &mut probe,
+        )
+        .expect("ack");
+        (out, probe)
+    }
+
+    /// One PRT probe response, as the renderer answers the daemon's
+    /// attach probe.
+    fn prt_probe_response() -> Vec<u8> {
+        let body = prt_protocol::envelope::ProbeBody {
+            protocol_version: 1,
+            max_portals: 64,
+            max_portal_cells_w: 1024,
+            max_portal_cells_h: 512,
+            max_scrollback_lines: 100_000,
+            max_write_bytes: 1 << 20,
+            features: 0xFF,
+            max_nesting_depth: 8,
+            vge_features: None,
+            accent_rgba: None,
+            theme_rgba: None,
+        };
+        let mut frames = Vec::new();
+        prt_protocol::envelope::append_frame(
+            &mut frames,
+            prt_protocol::frame::RSP_PROBE,
+            1,
+            &body.encode(),
+        );
+        prt_protocol::envelope::wrap_t2c_envelope(&frames)
+    }
+
+    /// The reported attach corruption: the renderer's probe answer
+    /// missed the probe phase's timeout by one slow round trip and
+    /// arrived here, where everything that wasn't VSS used to be called
+    /// typeahead and written to the session's pty. zsh reads `ESC _` as
+    /// insert-last-word, so the session's prompt grew the previous
+    /// command's last word and then the envelope's bytes.
+    #[test]
+    fn a_late_probe_answer_is_read_here_not_typed_at_the_session() {
+        let bytes = [
+            &prt_probe_response()[..],
+            b"ls -l\r",
+            &vss_protocol::encode_accepted(42),
+        ]
+        .concat();
+        let ((ack, typeahead), probe) = ack_and_probe(&bytes, 500);
+        assert_eq!(ack, SnapshotAck::Accepted);
+        assert_eq!(typeahead, b"ls -l\r", "an envelope reached the session");
+        assert!(
+            probe.data().1.is_some(),
+            "the late answer was dropped instead of read"
+        );
     }
 
     #[test]

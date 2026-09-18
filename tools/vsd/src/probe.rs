@@ -21,6 +21,14 @@
 //!    inner PTY immediately after the probe phase ends — otherwise
 //!    those keystrokes would be silently dropped.
 //!
+//! The parsers outlive step 3. An answer that misses the timeout — one
+//! SSH hop and a busy renderer is all it takes — is still the daemon's,
+//! and the phase that runs next ([`crate::attach`]'s snapshot-verdict
+//! wait) keeps feeding them, so a late answer is read there rather than
+//! forwarded to the session as typeahead. It has to be: `ESC _` is
+//! `insert-last-word` in zsh, so a probe response delivered to a shell
+//! becomes an executed command line built out of protocol bytes.
+//!
 //! Renderers that don't speak VGE or PRT just don't answer; the daemon
 //! falls back to its compile-time defaults for any missing metric. The
 //! snapshot still lands as plain vt100 plus envelopes the renderer
@@ -79,8 +87,79 @@ pub struct PrtProbeData {
     pub theme_rgba: Option<[[u8; 4]; 8]>,
 }
 
+/// The probe's parsers and what they have learned, kept across the
+/// phases of an attach.
+///
+/// Every byte the renderer sends before the splice begins is the
+/// daemon's: nothing has been forwarded to it yet, so no reply can
+/// belong to the session's client. [`Probe::feed`] therefore returns
+/// only what is *not* an envelope — the keystrokes — and swallows the
+/// rest, picking up a probe answer wherever in the attach it turns up.
+pub struct Probe {
+    vge_apc: vge_protocol::apc::ApcStream,
+    prt_apc: prt_protocol::apc::ApcStream,
+    vge: Option<VgeProbeData>,
+    prt: Option<PrtProbeData>,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Probe {
+    pub fn new() -> Self {
+        Self {
+            vge_apc: vge_protocol::apc::ApcStream::with_marker(
+                *vge_protocol::frame::MARKER_T2C,
+            ),
+            prt_apc: prt_protocol::apc::ApcStream::with_marker(
+                *prt_protocol::frame::MARKER_T2C,
+            ),
+            vge: None,
+            prt: None,
+        }
+    }
+
+    /// Feed one read from the renderer. Returns the keystrokes in it;
+    /// the VGE and PRT envelopes are consumed, and a probe response
+    /// among them is remembered.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        // VGE first; its passthrough feeds the PRT filter.
+        let vge_out = self.vge_apc.feed(chunk);
+        let prt_out = self.prt_apc.feed(&vge_out.passthrough);
+        if self.vge.is_none() {
+            for payload in vge_out.payloads {
+                if let Some(data) = parse_vge_probe_payload(&payload) {
+                    self.vge = Some(data);
+                    break;
+                }
+            }
+        }
+        if self.prt.is_none() {
+            for payload in prt_out.payloads() {
+                if let Some(data) = parse_prt_probe_payload(payload) {
+                    self.prt = Some(data);
+                    break;
+                }
+            }
+        }
+        prt_out.passthrough
+    }
+
+    /// Both answers in hand, so there is nothing left to wait for.
+    pub fn answered(&self) -> bool {
+        self.vge.is_some() && self.prt.is_some()
+    }
+
+    /// What the renderer has reported so far.
+    pub fn data(&self) -> (Option<VgeProbeData>, Option<PrtProbeData>) {
+        (self.vge, self.prt)
+    }
+}
+
 /// Outcome of one probe round.
-#[derive(Debug)]
 pub struct ProbeOutcome {
     pub vge: Option<VgeProbeData>,
     /// Only the accent is consumed today; the limits ride along so
@@ -92,10 +171,12 @@ pub struct ProbeOutcome {
     /// size — in which case the daemon keeps the 24×80 default.
     pub winsize: Option<Winsize>,
     /// Bytes received from stdin during the probe phase that weren't
-    /// part of a probe response envelope. The attach handler must
-    /// forward these to the inner PTY master before entering the
-    /// regular splice loop so the user's typeahead isn't lost.
+    /// part of any envelope. The attach handler must forward these to
+    /// the inner PTY master before entering the regular splice loop so
+    /// the user's typeahead isn't lost.
     pub typeahead: Vec<u8>,
+    /// The parsers, for the phase that runs next; see [`Probe`].
+    pub probe: Probe,
 }
 
 /// Run one upstream probe. Writes the envelopes to `stdout_fd`, reads
@@ -118,20 +199,12 @@ pub fn run(stdin_fd: &OwnedFd, stdout_fd: &OwnedFd, timeout: Duration) -> Result
         drop(sink);
     }
 
-    use prt_protocol::apc::ApcStream as PrtApc;
-    use prt_protocol::frame::MARKER_T2C as PRT_T2C;
-    use vge_protocol::apc::ApcStream as VgeApc;
-    use vge_protocol::frame::MARKER_T2C as VGE_T2C;
-
-    let mut vge_apc = VgeApc::with_marker(*VGE_T2C);
-    let mut prt_apc = PrtApc::with_marker(*PRT_T2C);
-    let mut vge: Option<VgeProbeData> = None;
-    let mut prt: Option<PrtProbeData> = None;
+    let mut probe = Probe::new();
     let mut typeahead: Vec<u8> = Vec::new();
 
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
-    while vge.is_none() || prt.is_none() {
+    while !probe.answered() {
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -176,29 +249,11 @@ pub fn run(stdin_fd: &OwnedFd, stdout_fd: &OwnedFd, timeout: Duration) -> Result
         {
             log_probe_chunk(&buf[..n]);
         }
-        // Run VGE filter first; its passthrough feeds the PRT filter.
-        let vge_out = vge_apc.feed(&buf[..n]);
-        let prt_out = prt_apc.feed(&vge_out.passthrough);
-        typeahead.extend_from_slice(&prt_out.passthrough);
-        if vge.is_none() {
-            for payload in vge_out.payloads {
-                if let Some(data) = parse_vge_probe_payload(&payload) {
-                    vge = Some(data);
-                    break;
-                }
-            }
-        }
-        if prt.is_none() {
-            for payload in prt_out.payloads() {
-                if let Some(data) = parse_prt_probe_payload(payload) {
-                    prt = Some(data);
-                    break;
-                }
-            }
-        }
+        typeahead.extend_from_slice(&probe.feed(&buf[..n]));
     }
 
-    Ok(ProbeOutcome { vge, prt, winsize, typeahead })
+    let (vge, prt) = probe.data();
+    Ok(ProbeOutcome { vge, prt, winsize, typeahead, probe })
 }
 
 fn build_vge_probe() -> Vec<u8> {
@@ -457,6 +512,41 @@ mod tests {
             )
             .expect("sigaction restore");
         }
+    }
+
+    /// What [`Probe::feed`] is for: the envelopes are the daemon's and
+    /// are swallowed whenever they turn up, and only what a person
+    /// typed comes back to be forwarded to the session.
+    #[test]
+    fn feed_returns_keystrokes_and_swallows_envelopes() {
+        use prt_protocol::envelope::{append_frame, wrap_t2c_envelope, ProbeBody};
+        use prt_protocol::frame::RSP_PROBE;
+
+        let body = ProbeBody {
+            protocol_version: 1,
+            max_portals: 7,
+            max_portal_cells_w: 1024,
+            max_portal_cells_h: 512,
+            max_scrollback_lines: 100_000,
+            max_write_bytes: 1 << 20,
+            features: 0,
+            max_nesting_depth: 8,
+            vge_features: None,
+            accent_rgba: None,
+            theme_rgba: None,
+        };
+        let mut frames = Vec::new();
+        append_frame(&mut frames, RSP_PROBE, 1, &body.encode());
+        let answer = wrap_t2c_envelope(&frames);
+
+        let mut probe = Probe::new();
+        // Split across reads, with typing on both sides of the split.
+        let (head, tail) = answer.split_at(answer.len() / 2);
+        let mut keys = probe.feed(&[b"ls".as_ref(), head].concat());
+        keys.extend(probe.feed(&[tail, b" -l\r"].concat()));
+        assert_eq!(keys, b"ls -l\r");
+        assert_eq!(probe.data().1.map(|p| p.max_portals), Some(7));
+        assert!(!probe.answered(), "VGE never answered");
     }
 
     #[test]

@@ -463,6 +463,22 @@ composition (lines ~237–245). Under the engines lock:
    answer. Holding the lock across the wait blocks the worker rather
    than losing anything: the bytes it has already read are processed
    and forwarded once the lock is released.
+
+   Everything upstream in steps 1–4 is the daemon's. Nothing has been
+   forwarded to the renderer yet, so no reply can be the session's, and
+   the probe's parsers keep running across all of them: an answer that
+   missed `PROBE_TIMEOUT` — one SSH hop and a busy renderer is enough —
+   is read here, and applied, rather than being counted as the user's
+   typeahead. **Only bytes that are in no envelope are typeahead.**
+   Handing a shell a `prt` envelope is not cosmetic: `ESC _` is
+   `insert-last-word` in zsh, so it arrives as a command line built out
+   of the previous command's last word and the envelope's raw bytes.
+
+   The rule flips when the splice begins: an envelope there *is* the
+   session client's reply and is forwarded. An answer to the daemon's
+   own probe that arrives later than the verdict wait therefore reaches
+   the client instead — a `vmux` consumes it and ignores it, a bare
+   shell would not, which is the remaining corner of this.
 5. On accept: install the renderer-stdout fd on the engines so the
    worker forwards live PTY bytes; release the lock; splice input
    and run the winsize watcher exactly as today.
