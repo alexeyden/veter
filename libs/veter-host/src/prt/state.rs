@@ -252,6 +252,15 @@ pub struct PrtEngine {
     /// VGE engine keys its contextual `host.accent` on its own depth.
     /// Empty = host-themed styles disabled.
     host_palette: crate::vge::HostThemePalette,
+    /// Whether the program on the other end of this engine's stream has
+    /// ever sent a PRT envelope. Read by a host that wants to emit an
+    /// *unsolicited* event (`vsd`'s `HostThemeChanged`, §8.13): a
+    /// response answers someone who asked, but an event pushed at a
+    /// client that doesn't speak PRT is typed at it — `ESC _` is
+    /// `insert-last-word` in zsh, so a palette arrives as a command
+    /// line. Nothing is lost by staying quiet: a client that starts
+    /// later probes, and the probe response carries the palette.
+    client_spoke: bool,
     pending_response_bytes: Vec<u8>,
     /// Event frames produced during the *current* command's processing
     /// (e.g. WritePortal callbacks, polled state deltas, DSR replies)
@@ -423,6 +432,7 @@ impl PrtEngine {
             limits,
             depth,
             host_palette,
+            client_spoke: false,
             pending_response_bytes: Vec::new(),
             pending_events: Vec::new(),
             top_of_live_screen: 0,
@@ -727,6 +737,15 @@ impl PrtEngine {
     #[allow(dead_code)] // Phase 6 / introspection
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Whether this engine's client has ever sent it an envelope, and
+    /// so can be expected to consume an unsolicited event rather than
+    /// type it. See [`Self::client_spoke`] — the field's own docs carry
+    /// the reasoning.
+    #[must_use]
+    pub fn client_spoke(&self) -> bool {
+        self.client_spoke
     }
 
     /// Drain queued response bytes (one or more APC envelopes) ready to
@@ -1226,6 +1245,9 @@ impl PrtEngine {
         payload: &[u8],
         hit: Option<&dyn crate::vge::state::HitTester>,
     ) {
+        // Whatever it turns out to say, something on the other end
+        // speaks PRT; see `client_spoke`.
+        self.client_spoke = true;
         let mut frames_buf: Vec<u8> = Vec::new();
 
         let mut r = Reader::new(payload);
@@ -4870,6 +4892,27 @@ mod tests {
     }
 
     // ---- §10 (vft-in-portal): per-portal VFT plumbing ----------------
+
+    /// `client_spoke` is what a host asks before pushing an event
+    /// nobody requested: a program that has never sent an envelope is
+    /// not a PRT client, and one written to anyway *types* it.
+    #[test]
+    fn client_spoke_only_after_the_client_sends_an_envelope() {
+        let mut engine = PrtEngine::new();
+        assert!(!engine.client_spoke());
+
+        // Output from a program that speaks no PRT — text, and someone
+        // else's APC — leaves it false.
+        let _ = engine.process_pty_chunk_full(b"hello\x1b[2J\x1b_VGEx\x1b\\");
+        assert!(!engine.client_spoke(), "a non-PRT program looked like a client");
+
+        let probe = prt_protocol::encode::build_envelope(&[(
+            prt_protocol::command::Command::Probe,
+            1,
+        )]);
+        let _ = engine.process_pty_chunk_full(&probe);
+        assert!(engine.client_spoke());
+    }
 
     #[test]
     fn per_portal_vft_probe_surfaces_as_raw_reply() {

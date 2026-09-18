@@ -1103,6 +1103,16 @@ each portal's inner program by way of that portal's engine (whose
 outbound stream the parent relays as `RawReply`, §8.1). Each level gets
 the accent for its own depth.
 
+A host MUST NOT send it to a stream whose program has never sent this
+engine a PRT envelope. This is the only event in the protocol nobody
+asked for, and the program on the other end of a stream is not
+necessarily a client: `vsd new` with no argv runs the user's shell, and
+an envelope written to a shell is *typed* at it — zsh and readline both
+read `ESC _` as "insert the last word", so the palette arrives as a
+command line built from the previous command's last word and the
+event's raw bytes. Staying quiet costs nothing: a client that starts
+later probes, and the probe response carries the same palette (§10).
+
 A host whose palette cannot change after startup never emits this and
 need not set the bit; a client that does not see the bit may assume
 the palette from its probe is the one it keeps.

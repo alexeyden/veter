@@ -797,6 +797,20 @@ fn apply_probe(
     // have a *different* one, and the client is a long-lived process
     // still holding the colours it read from whichever renderer it
     // probed first.
+    //
+    // Only to a client that speaks PRT, though. A session's inner
+    // program is whatever the user asked for, and for `vsd new` with no
+    // argv that is their shell: an envelope written to it is *typed* at
+    // it, and zsh reads `ESC _` as insert-last-word, so the palette
+    // arrives as the previous command's last word followed by the
+    // event's raw bytes on the command line. Every attach did this to a
+    // session running a plain shell. Nothing is lost by staying quiet —
+    // a client that starts later probes, and the probe response carries
+    // the palette (§10) — and a `vmux` already running has long since
+    // spoken, so the case this event exists for still gets it.
+    if !guard.prt.client_spoke() {
+        return Vec::new();
+    }
     theme_announcement(&palette)
 }
 
@@ -1705,6 +1719,66 @@ mod tests {
         let (ack, typeahead) = ack_of(&vss_protocol::encode_accepted(7), 60);
         assert_eq!(ack, SnapshotAck::Silent);
         assert!(typeahead.is_empty(), "envelope leaked into the inner PTY");
+    }
+
+    /// A renderer that themes its `host.*` styles, as the probe
+    /// reports one.
+    fn themed_outcome() -> probe::ProbeOutcome {
+        probe::ProbeOutcome {
+            vge: None,
+            prt: Some(probe::PrtProbeData {
+                protocol_version: 0,
+                max_portals: 8,
+                max_portal_cells_w: 200,
+                max_portal_cells_h: 100,
+                max_scrollback_lines: 1000,
+                max_write_bytes: 1 << 16,
+                features: 0,
+                max_nesting_depth: 8,
+                vge_features: Some(prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES),
+                accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
+                theme_rgba: None,
+            }),
+            winsize: None,
+            typeahead: Vec::new(),
+            probe: probe::Probe::new(),
+        }
+    }
+
+    /// The attach-time corruption: `vsd new laptop` runs a shell, and
+    /// every attach wrote a `HostThemeChanged` event into it. zsh reads
+    /// `ESC _` as insert-last-word, so the prompt grew the previous
+    /// command's last word and then the event's bytes. The palette is
+    /// still seeded here — a client that starts later reads it off the
+    /// probe response — and a client that has spoken PRT still hears
+    /// about it, which is the reattach case the event exists for.
+    #[test]
+    fn the_theme_is_announced_only_to_a_client_that_speaks_prt() {
+        use crate::engines::EngineState;
+
+        let engines = Arc::new(Mutex::new(EngineState::new("t".into())));
+        let (_read, write) = nix::unistd::pipe().expect("pipe");
+        let outcome = themed_outcome();
+
+        assert!(
+            apply_probe(&engines, &write, &outcome).is_empty(),
+            "a plain shell was sent a PRT event"
+        );
+
+        // The session's client probes, the way `vmux` does at startup.
+        let probe_cmd = prt_protocol::encode::build_envelope(&[(
+            prt_protocol::command::Command::Probe,
+            1,
+        )]);
+        engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process_chunk(&probe_cmd);
+
+        assert!(
+            !apply_probe(&engines, &write, &outcome).is_empty(),
+            "a PRT client was left holding the old palette"
+        );
     }
 
     #[test]
