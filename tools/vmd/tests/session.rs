@@ -198,11 +198,17 @@ fn run(path: &std::path::Path) -> (Terminal, std::process::Child) {
 
 /// Replay what vmd wrote through the real host engine, in order.
 fn replay(bytes: &[u8]) -> VgeEngine {
+    replay_engine_and_screen(bytes).0
+}
+
+/// The same walk, keeping the vt100 too — for the questions that are
+/// about the screen rather than about the element table.
+fn replay_engine_and_screen(bytes: &[u8]) -> (VgeEngine, vt100::Parser) {
     let mut engine = VgeEngine::new((CELL_W, CELL_H), 1.0);
     let mut parser = vt100::Parser::new(ROWS, COLS, 1000);
     engine.after_vt100_process(&mut parser);
     drive_terminal_stage(&mut engine, &mut parser, bytes, None);
-    engine
+    (engine, parser)
 }
 
 fn write_doc(name: &str) -> std::path::PathBuf {
@@ -400,4 +406,40 @@ fn wait_for_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
     }
     let _ = child.kill();
     panic!("vmd did not exit within {TIMEOUT:?}");
+}
+
+/// The kitty keyboard flag, end to end against a real vt100: vmd puts
+/// it on the screen it runs on, and hands it back on the way out.
+///
+/// The hand-back is what earns a real terminal here. A screen's flag
+/// stack outlives the process that pushed onto it — nothing in the
+/// alt-screen swap clears it — so a vmd that exited without popping
+/// would leave the flag for whatever alt-screen program ran next in
+/// that pane. Which is usually vfm, since vfm is what opens vmd.
+#[test]
+fn the_keyboard_flag_is_pushed_on_our_screen_and_handed_back() {
+    let path = write_doc("kbd.md");
+    let (mut terminal, mut child) = run(&path);
+    std::thread::sleep(Duration::from_millis(120));
+    terminal.poll();
+
+    // While vmd is up: in effect, which is what makes the terminal
+    // encode its Esc as `CSI 27 u` rather than as a bare ESC.
+    let (_, screen) = replay_engine_and_screen(&terminal.seen);
+    assert_eq!(screen.screen().keyboard_flags(), 1, "never pushed");
+
+    terminal.send(b"q");
+    assert!(wait_for_exit(&mut child).success());
+    terminal.poll();
+
+    // After it: the shell's own screen was never touched, and the
+    // screen vmd borrowed is back the way it found it.
+    let (_, mut screen) = replay_engine_and_screen(&terminal.seen);
+    assert_eq!(screen.screen().keyboard_flags(), 0, "the shell's screen");
+    screen.process(b"\x1b[?1049h");
+    assert_eq!(
+        screen.screen().keyboard_flags(),
+        0,
+        "left its flag on the alt screen for the next program"
+    );
 }

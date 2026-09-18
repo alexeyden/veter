@@ -1150,9 +1150,27 @@ fn term_size() -> (u32, u32) {
 // Terminal setup
 // ─────────────────────────────────────────────────────────────────────
 
-/// Alt screen, hidden cursor, clear+home, button-event mouse tracking
-/// (?1002) in SGR encoding (?1006) — the pair vfm/vplay/vdraw use.
-const ENTER_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h";
+/// Alt screen, the kitty keyboard flag, hidden cursor, clear+home,
+/// button-event mouse tracking (?1002) in SGR encoding (?1006) — the
+/// same set vfm/vplay/vdraw use.
+///
+/// `CSI > 1 u` sits *after* `?1049h` deliberately: the flag stack is
+/// per screen, so a push before the swap lands on the shell's screen
+/// instead of ours — leaving the flag behind us and vmd itself still
+/// on legacy encodings. [`LEAVE_UI`] pops it before swapping back, and
+/// `the_ui_strings_bracket_the_keyboard_flag` pins both orderings.
+const ENTER_UI: &[u8] =
+    b"\x1b[?1049h\x1b[>1u\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h";
+
+/// Its inverse: keyboard flag popped, mouse off, cursor on, leave alt
+/// screen.
+///
+/// The pop is not housekeeping. A screen's flag stack outlives the
+/// process that pushed onto it, so leaving without popping hands the
+/// flag to whatever alt-screen program runs next in this pane — which
+/// may be one that reads only legacy control bytes. vmd is usually
+/// opened *by* vfm, which is exactly such a next program.
+const LEAVE_UI: &[u8] = b"\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 
 /// Restores the terminal on the way out, however we leave.
 struct TermGuard;
@@ -1161,7 +1179,7 @@ impl Drop for TermGuard {
     fn drop(&mut self) {
         let mut out = std::io::stdout();
         let _ = out.write_all(&sweep());
-        let _ = out.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        let _ = out.write_all(LEAVE_UI);
         let _ = out.flush();
     }
 }
@@ -1420,7 +1438,7 @@ fn main() -> Result<()> {
     );
     app.encoding = choose_encoding(probe.supported_image_encodings, is_ssh_session(), 88.0);
 
-    let mut parser = InputParser::new();
+    let mut parser = InputParser::disambiguated();
     let mut buf = [0u8; 4096];
     while !app.quit {
         let deadline = Instant::now() + FRAME_DT;
@@ -1461,6 +1479,27 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The push has to land on the screen it belongs to and come off
+    /// again. Both orderings are easy to break by editing the literal
+    /// — and neither failure is visible on screen — so they are pinned
+    /// here rather than only described in the doc comments.
+    #[test]
+    fn the_ui_strings_bracket_the_keyboard_flag() {
+        fn at(hay: &[u8], needle: &[u8]) -> usize {
+            hay.windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing"))
+        }
+        assert!(
+            at(ENTER_UI, b"\x1b[?1049h") < at(ENTER_UI, vge_render::keys::PUSH_DISAMBIGUATE),
+            "the push must follow ?1049h, or it lands on the shell's screen"
+        );
+        assert!(
+            at(LEAVE_UI, vge_render::keys::POP) < at(LEAVE_UI, b"\x1b[?1049l"),
+            "the pop must precede ?1049l, or it pops the shell's stack"
+        );
+    }
 
     fn app(text: &str) -> App {
         App::new(None, text, 100, 30, 10.0, 20.0, 1.0, Some(NARROW_EM))

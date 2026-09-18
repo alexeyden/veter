@@ -98,11 +98,40 @@ pub enum Event {
 #[derive(Default)]
 pub struct InputParser {
     buf: Vec<u8>,
+    /// Whether the client asked the terminal for the kitty keyboard
+    /// protocol's "disambiguate escape codes" flag. It changes one
+    /// thing: whether a lone buffered `ESC` can be a keypress.
+    disambiguated: bool,
 }
 
 impl InputParser {
+    /// A parser for a client that has **not** pushed the keyboard
+    /// flag. A bare `ESC` is then ambiguous — a keypress, or the first
+    /// byte of a sequence still arriving — so [`flush`] has to resolve
+    /// it on an idle tick, and sometimes resolves it wrongly.
+    ///
+    /// [`flush`]: Self::flush
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A parser for a client that pushed "disambiguate escape codes"
+    /// (`vge-render`'s `keys::PUSH_DISAMBIGUATE`).
+    ///
+    /// Under that flag `Esc` arrives as `CSI 27 u`, a complete
+    /// sequence, so a bare `ESC` on this channel can only be the
+    /// opener of something still arriving — a reply envelope split
+    /// across a read — and is kept buffered rather than guessed about.
+    /// Pushing the flag and then reading with [`new`] would lose `Esc`
+    /// entirely; reading with this one without pushing would never
+    /// report it.
+    ///
+    /// [`new`]: Self::new
+    pub fn disambiguated() -> Self {
+        Self {
+            disambiguated: true,
+            ..Self::default()
+        }
     }
 
     /// Feed freshly-read bytes; returns the events that completed.
@@ -112,8 +141,15 @@ impl InputParser {
         self.drain(false)
     }
 
-    /// Called on an idle timeout: a lone ESC still buffered is a real
-    /// Esc press rather than the start of an unfinished sequence.
+    /// Called on an idle timeout, to settle what buffering could not.
+    ///
+    /// For a [`new`] parser that means a lone `ESC`, read as a real
+    /// `Esc` press because nothing followed it. A [`disambiguated`]
+    /// one has nothing to settle: its `Esc` arrives complete, so a
+    /// bare `ESC` stays buffered and this returns nothing.
+    ///
+    /// [`new`]: Self::new
+    /// [`disambiguated`]: Self::disambiguated
     pub fn flush(&mut self) -> Vec<Event> {
         self.drain(true)
     }
@@ -126,7 +162,7 @@ impl InputParser {
             match b[i] {
                 0x1B => {
                     let Some(next) = b.get(i + 1).copied() else {
-                        if idle {
+                        if idle && !self.disambiguated {
                             out.push(Event::Escape);
                             i += 1;
                         } else {
@@ -148,6 +184,23 @@ impl InputParser {
                             out.push(Event::Alt('\x7f'));
                             i += 2;
                         }
+                        // A control string — APC / DCS / OSC / PM / SOS
+                        // — is something the *terminal* sent: a VGE or
+                        // PRT response envelope, an OSC colour report,
+                        // a DCS answer. A client reads those off the
+                        // same channel as its keystrokes, and read as
+                        // keys they are an `Esc` followed by a burst of
+                        // whatever the payload happens to spell. Skip
+                        // the whole string and emit nothing.
+                        b'_' | b'P' | b']' | b'^' | b'X' => {
+                            match find_string_end(&b[i..]) {
+                                Some(len) => i += len,
+                                None => break, // incomplete — keep buffering
+                            }
+                        }
+                        // A stray ST with no string open. Not a
+                        // keypress either.
+                        b'\\' => i += 2,
                         c if (0x20..0x7F).contains(&c) => {
                             out.push(Event::Alt(c as char));
                             i += 2;
@@ -211,6 +264,34 @@ pub(crate) fn utf8_len(lead: u8) -> usize {
         0xF0..=0xF7 => 4,
         _ => 1,
     }
+}
+
+/// Length of the control string starting at `s[0] == ESC`, including
+/// its terminator: `ESC \` (ST) for APC / DCS / PM / SOS, and either
+/// that or BEL for OSC. `None` while the terminator is still on its
+/// way.
+///
+/// A literal ESC inside a VGE or PRT payload arrives byte-stuffed as
+/// `ESC ESC` (§1.3 of the extension specs), so the scan steps over
+/// escaped pairs instead of stopping at the first ESC it meets —
+/// otherwise a payload carrying `ESC ESC \` would look like the end of
+/// the envelope and the rest of it would spill out as keystrokes.
+fn find_string_end(s: &[u8]) -> Option<usize> {
+    let osc = s[1] == b']';
+    let mut i = 2;
+    while i < s.len() {
+        match s[i] {
+            0x07 if osc => return Some(i + 1),
+            0x1B => {
+                if *s.get(i + 1)? == b'\\' {
+                    return Some(i + 2);
+                }
+                i += 2; // stuffed `ESC ESC` — step over the pair
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Length of the CSI/SS3 sequence starting at `s[0] == ESC`, or `None`
@@ -446,6 +527,83 @@ mod tests {
         let mut p = InputParser::new();
         assert!(p.feed(b"\x1b").is_empty(), "might be a sequence");
         assert_eq!(p.flush(), vec![Event::Escape], "idle → a real Esc");
+    }
+
+    /// The other half of reading one channel: what the terminal sends
+    /// back is not input. vplay hit this as "the viewer exits the
+    /// moment it starts" — under `vsd` an inner client got two replies
+    /// to its probe and the straggler landed in the event loop, where
+    /// `ESC _` read as an unmodelled ESC-prefixed key.
+    #[test]
+    fn a_reply_envelope_is_not_input() {
+        use vge_protocol::envelope::{ProbeBody, append_frame, wrap_t2c_envelope};
+        let body = ProbeBody {
+            protocol_version: 1,
+            cell_pixel_width: 9,
+            cell_pixel_height: 20,
+            scale_factor: 1.0,
+            max_elements: 4096,
+            max_commands_per_element: 256,
+            max_text_bytes: 65536,
+            max_image_bytes: 32 << 20,
+            max_images: 1024,
+            supported_image_encodings: 0x03,
+            max_nesting_depth: 8,
+        };
+        let mut frames = Vec::new();
+        append_frame(&mut frames, vge_protocol::frame::RSP_PROBE, 1, &body.encode());
+        let env = wrap_t2c_envelope(&frames);
+
+        let mut p = InputParser::disambiguated();
+        assert!(p.feed(&env).is_empty(), "an envelope, not keystrokes");
+        // Consumed whole: a keystroke behind it still arrives as itself.
+        assert_eq!(p.feed(b"q"), vec![Event::Key('q')]);
+        // And split across reads, the way one crossing a network
+        // boundary lands — including split at the opening ESC, which
+        // is the case the keyboard flag makes unambiguous.
+        let mut p = InputParser::disambiguated();
+        let (head, tail) = env.split_at(1);
+        assert!(p.feed(head).is_empty());
+        assert!(p.flush().is_empty(), "a lone ESC is not Esc");
+        assert!(p.feed(tail).is_empty());
+        assert_eq!(p.feed(b"q"), vec![Event::Key('q')]);
+    }
+
+    /// An OSC report ends at BEL as well as at ST, and a payload
+    /// carrying a stuffed `ESC ESC` must not end the string early —
+    /// otherwise its tail spills out as keys.
+    #[test]
+    fn control_strings_end_where_they_actually_end() {
+        let mut p = InputParser::disambiguated();
+        assert!(p.feed(b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07").is_empty());
+        assert_eq!(p.feed(b"k"), vec![Event::Key('k')]);
+        // `ESC ESC` inside the payload, then the real ST.
+        assert!(p.feed(b"\x1b_vge\x1b\x1b\\payload\x1b\\").is_empty());
+        assert_eq!(p.feed(b"k"), vec![Event::Key('k')]);
+    }
+
+    /// The point of pushing the flag: there is nothing left to guess.
+    /// A client that reads keystrokes and the terminal's own replies
+    /// off one channel used to have to decide, on an idle tick,
+    /// whether a buffered ESC was `Esc` or the head of a reply — and
+    /// deciding "keypress" both invented a keystroke and left the rest
+    /// of that reply to be read as more of them.
+    #[test]
+    fn a_disambiguated_parser_never_guesses_at_a_lone_esc() {
+        let mut p = InputParser::disambiguated();
+        assert!(p.feed(b"\x1b").is_empty());
+        assert!(p.flush().is_empty(), "not a keypress, however idle");
+        assert!(p.flush().is_empty(), "and still not, later");
+        // It is still buffered, so what it began completes intact.
+        assert_eq!(p.feed(b"[A"), vec![Event::Arrow(Dir::Up)]);
+        // Esc arrives whole instead.
+        assert_eq!(p.feed(b"\x1b[27u"), vec![Event::Escape]);
+        // An envelope opener split across the read that used to become
+        // an `Esc` now stays what it is.
+        let mut p = InputParser::disambiguated();
+        assert!(p.feed(b"\x1b").is_empty());
+        assert!(p.flush().is_empty());
+        assert!(p.feed(b"_vge").is_empty(), "an APC opener, not keys");
     }
 
     #[test]

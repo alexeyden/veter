@@ -169,16 +169,25 @@ whole (`modal_skip_len`) instead of taking its leading ESC for a
 keypress.
 
 A client that reads its *own* keystrokes can opt into the flag rather
-than cope with it. `vplay` and `vdraw` push it (`vge-render::keys`), so
-`Esc` reaches them as a complete `CSI 27 u` and a bare `ESC` on that
-channel can only be the opener of a reply envelope — which is what
-their lone-ESC timers used to guess at, badly, since a reply split
-across a read became a keypress and the rest of it became garbage. Two
-rules come with it: the push goes out **after** `?1049h` and the pop
-**before** `?1049l`, because the flag stack is per screen, and the pop
-is not optional — a screen's stack outlives the program that pushed
-onto it, so a client killed before popping leaves its flag for the next
-alt-screen program in that pane to inherit.
+than cope with it, and all four full-screen ones do — `vplay`, `vdraw`,
+`vfm`, `vmd`, via `vge-render::keys`. `Esc` then reaches them as a
+complete `CSI 27 u`, so a bare `ESC` on that channel can only be the
+opener of a reply envelope — which is what their lone-ESC timers used
+to guess at, badly, since a reply split across a read became a keypress
+and the rest of it became garbage. `vge-ui`'s parser has two modes for
+exactly this (`InputParser::new` still guesses, `::disambiguated` never
+does), and it skips APC/DCS/OSC control strings, without which the flag
+buys nothing: the envelope whose ESC is no longer mistaken for `Esc`
+would still be read as a burst of keys.
+
+Two rules come with the push: it goes out **after** `?1049h` and the
+pop **before** `?1049l`, because the flag stack is per screen — and the
+pop is not optional. A screen's stack outlives the program that pushed
+onto it (nothing in the alt-screen swap clears it; only RIS does), so a
+client that exits without popping leaves its flag for the next
+alt-screen program in that pane to inherit. That is not hypothetical:
+`vfm` opens `vmd` and `vplay` in-terminal, so it is routinely both
+sides of that handover.
 
 ## Sessions (vsd)
 
