@@ -3244,6 +3244,35 @@ mod xterm_semantics_tests {
         assert_eq!(q.screen().keyboard_flags(), 0);
     }
 
+    /// A screen's stack outlives the program that pushed onto it:
+    /// nothing in the alt-screen swap clears it, and DECSTR resets
+    /// modes rather than the keyboard stack. So a full-screen program
+    /// killed before it could pop leaves its flag for the *next*
+    /// alt-screen program in that terminal to inherit.
+    ///
+    /// This is the protocol's own design — the stack is what lets a
+    /// program restore what it found — which is why every client that
+    /// pushes has to pop, and why one that reads only legacy bytes
+    /// cannot assume it will get them.
+    #[test]
+    fn a_screens_kbd_stack_outlives_the_program_that_pushed() {
+        let mut p = Parser::new(2, 10, 0);
+        // A full-screen program: in, push, killed without popping.
+        p.process(b"\x1b[?1049h\x1b[>1u");
+        assert_eq!(p.screen().keyboard_flags(), 1);
+        p.process(b"\x1b[?1049l");
+        assert_eq!(p.screen().keyboard_flags(), 0, "the shell is clean");
+        // The next alt-screen program inherits what was left behind.
+        p.process(b"\x1b[?1049h");
+        assert_eq!(p.screen().keyboard_flags(), 1, "inherited");
+        // Popping is what hands it back, and it is the client's job.
+        p.process(b"\x1b[<u");
+        assert_eq!(p.screen().keyboard_flags(), 0);
+        // Only a hard reset clears the stacks wholesale.
+        p.process(b"\x1b[?1049h\x1b[>1u\x1bc");
+        assert_eq!(p.screen().keyboard_flags(), 0, "RIS");
+    }
+
     /// `CSI u` with no parameters and no private prefix is SCORC, and
     /// has to stay SCORC.
     #[test]

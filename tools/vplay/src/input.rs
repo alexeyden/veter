@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 /// before it is thrown away. A control string split across reads (a
 /// protocol reply crossing a network boundary) completes in
 /// milliseconds; one still open after this was never going to close —
-/// `Esc` followed by `_` typed by hand — and holding it any longer
-/// would swallow every keystroke queued behind it.
+/// a reply truncated by a session detaching mid-envelope — and holding
+/// it any longer would swallow every keystroke queued behind it.
+///
+/// This is the whole of what is left of the guessing. It used to also
+/// decide whether a lone ESC was a keypress, which the keyboard flag
+/// vplay pushes now answers outright.
 const SEQ_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,27 +90,28 @@ impl InputParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
         self.buf.extend_from_slice(bytes);
         self.last_input = Instant::now();
-        self.drain(false)
+        self.drain()
     }
 
-    /// Called on idle timeout: a lone ESC still buffered is treated as
-    /// Quit (rather than the start of an unfinished sequence), and a
-    /// longer sequence that has stopped arriving is discarded.
+    /// Called on idle timeout, to discard a sequence that has stopped
+    /// arriving. A lone ESC is *not* resolved here: under the keyboard
+    /// flag vplay pushes it can only be an unfinished sequence, so it
+    /// waits for the rest rather than being read as a keypress.
     ///
-    /// Dropping it is the lesser evil. If the rest does turn up later
-    /// its bytes read as keys — which is what a whole envelope used to
-    /// do, and needs a second-long stall mid-envelope to happen at all
-    /// — whereas holding it holds every keystroke behind it too, and a
-    /// sequence that never completes would take the keyboard with it.
+    /// Dropping a stalled sequence is the lesser evil. If the rest does
+    /// turn up later its bytes read as keys — which needs a
+    /// second-long stall mid-envelope to happen at all — whereas
+    /// holding it holds every keystroke behind it too, and a sequence
+    /// that never completes would take the keyboard with it.
     pub fn flush(&mut self) -> Vec<Event> {
-        let events = self.drain(true);
+        let events = self.drain();
         if !self.buf.is_empty() && self.last_input.elapsed() > SEQ_TIMEOUT {
             self.buf.clear();
         }
         events
     }
 
-    fn drain(&mut self, eof: bool) -> Vec<Event> {
+    fn drain(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
         let mut i = 0;
         let b = std::mem::take(&mut self.buf);
@@ -114,15 +119,16 @@ impl InputParser {
             let c = b[i];
             match c {
                 0x1B => {
-                    // Need at least one more byte to know the kind.
+                    // A bare ESC is never a keypress. vplay asks the
+                    // terminal for "disambiguate escape codes", so Esc
+                    // arrives as `CSI 27 u`, and an ESC with nothing
+                    // behind it yet can only be the opener of a
+                    // sequence that has not all landed — a reply
+                    // envelope split across a read, most often. That
+                    // is the guess this parser used to have to make,
+                    // and quitting on it was the wrong half of it.
                     if i + 1 >= b.len() {
-                        if eof {
-                            out.push(Event::Quit);
-                            i += 1;
-                        } else {
-                            break; // keep the lone ESC buffered
-                        }
-                        continue;
+                        break;
                     }
                     if b[i + 1] == b'[' {
                         if i + 2 < b.len() && b[i + 2] == b'<' {
@@ -291,7 +297,18 @@ fn find_csi_end(s: &[u8]) -> Option<usize> {
 }
 
 fn parse_csi(s: &[u8]) -> Option<Event> {
-    arrow_from_final(*s.last()?)
+    let final_byte = *s.last()?;
+    // The kitty keyboard protocol's key form. vplay pushes the flag
+    // that produces it, so this is the only spelling Esc and Ctrl+C
+    // have; the byte arms in `drain` stay for a terminal that ignored
+    // the request.
+    if final_byte == b'u' {
+        let c = vge_render::keys::parse_csi_u(&s[2..s.len() - 1])?;
+        // Esc quits, and so does Ctrl+C — the two the byte path read
+        // as `ESC` and `0x03`.
+        return (c.is_esc() || c.ctrl_letter() == Some('c')).then_some(Event::Quit);
+    }
+    arrow_from_final(final_byte)
 }
 
 /// Length of an SGR mouse report `ESC [ < ... (M|m)`.
@@ -408,11 +425,35 @@ mod tests {
         assert_eq!(p.feed(b"C"), vec![Event::Arrow(Dir::Right)]);
     }
 
+    /// A lone ESC is not a keypress: vplay pushes "disambiguate
+    /// escape codes", so Esc arrives complete and a bare ESC can only
+    /// be an envelope opener. Quitting on it is what made a reply that
+    /// straddled an idle tick close the viewer.
     #[test]
-    fn lone_esc_flushes_to_quit() {
+    fn a_lone_esc_waits_for_its_sequence() {
         let mut p = InputParser::new();
         assert!(p.feed(b"\x1b").is_empty());
-        assert_eq!(p.flush(), vec![Event::Quit]);
+        assert!(p.flush().is_empty());
+        // Still buffered, so what it began still completes.
+        assert_eq!(p.feed(b"[27u"), vec![Event::Quit]);
+    }
+
+    /// The two bindings the flag re-spells. `q` and the arrows are
+    /// unaffected — the flag leaves unmodified printable and cursor
+    /// keys on their legacy bytes.
+    #[test]
+    fn esc_and_ctrl_c_quit_as_csi_u_chords() {
+        let mut p = InputParser::new();
+        assert_eq!(p.feed(b"\x1b[27u"), vec![Event::Quit]);
+        assert_eq!(p.feed(b"\x1b[99;5u"), vec![Event::Quit]);
+        // Split across reads, the way a sequence actually arrives.
+        assert!(p.feed(b"\x1b[99").is_empty());
+        assert_eq!(p.feed(b";5u"), vec![Event::Quit]);
+        // An unbound chord does nothing, and its tail is not typed.
+        assert!(p.feed(b"\x1b[122;5u").is_empty(), "Ctrl+Z binds nothing");
+        assert_eq!(p.feed(b"+"), vec![Event::ZoomIn]);
+        // A reply on the same channel is not a keystroke.
+        assert!(p.feed(b"\x1b[?1u").is_empty(), "a flag-query reply");
     }
 
     /// Build a VGE ProbeResponse envelope — what the terminal sends

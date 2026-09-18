@@ -168,6 +168,18 @@ reads single bytes and buffers no CSI has to swallow such a sequence
 whole (`modal_skip_len`) instead of taking its leading ESC for a
 keypress.
 
+A client that reads its *own* keystrokes can opt into the flag rather
+than cope with it. `vplay` and `vdraw` push it (`vge-render::keys`), so
+`Esc` reaches them as a complete `CSI 27 u` and a bare `ESC` on that
+channel can only be the opener of a reply envelope — which is what
+their lone-ESC timers used to guess at, badly, since a reply split
+across a read became a keypress and the rest of it became garbage. Two
+rules come with it: the push goes out **after** `?1049h` and the pop
+**before** `?1049l`, because the flag stack is per screen, and the pop
+is not optional — a screen's stack outlives the program that pushed
+onto it, so a client killed before popping leaves its flag for the next
+alt-screen program in that pane to inherit.
+
 ## Sessions (vsd)
 
 `vsd` is a persistent host-side session manager that holds a session's state (vt100 grids, scrollback, VGE/PRT/image tables, inner PTYs) across disconnections of the rendering client — the motivating case is SSH survivability. On attach it ships that state to the renderer as a **VSS** binary snapshot; **SES** is the sidecar control channel a `vmux` client uses to learn its session name and to detach (`Ctrl+\ d`). Because the host engines are factored into `veter-host`, `vsd` and the `veter` GUI run the same engine code. See `doc/session-manager.md` and `doc/session-extension.md`.

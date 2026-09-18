@@ -111,8 +111,11 @@ impl InputParser {
         self.drain(false)
     }
 
-    /// Called on idle timeout: a lone ESC still buffered is a real Esc
-    /// press rather than the start of an unfinished sequence.
+    /// Called at the end of a frame, once nothing more is going to
+    /// arrive in it. A lone ESC is *not* resolved here — under the
+    /// keyboard flag vdraw asks for it can only be an unfinished
+    /// sequence, so it stays buffered; what this settles is a
+    /// multi-byte character whose tail never came.
     pub fn flush(&mut self) -> Vec<Event> {
         self.drain(true)
     }
@@ -124,14 +127,17 @@ impl InputParser {
         while i < b.len() {
             match b[i] {
                 0x1B => {
+                    // A bare ESC is never a keypress. vdraw asks the
+                    // terminal for "disambiguate escape codes", so Esc
+                    // arrives as `CSI 27 u`, and an ESC with nothing
+                    // behind it yet can only be a sequence that has
+                    // not all landed — which is what keeping it
+                    // buffered is for. Emitting an `Escape` here
+                    // instead is what used to deselect on a reply
+                    // that straddled a frame boundary, and then read
+                    // the rest of it as keystrokes.
                     if i + 1 >= b.len() {
-                        if eof {
-                            out.push(Event::Escape);
-                            i += 1;
-                        } else {
-                            break; // keep the lone ESC buffered
-                        }
-                        continue;
+                        break;
                     }
                     if b[i + 1] == b'[' {
                         if i + 2 < b.len() && b[i + 2] == b'<' {
@@ -267,12 +273,34 @@ fn find_csi_end(s: &[u8]) -> Option<usize> {
 }
 
 fn parse_csi(s: &[u8]) -> Option<Event> {
+    let final_byte = *s.last()?;
+    let params = &s[2..s.len() - 1];
     // ESC [ 3 ~ is Delete; everything else we handle is a cursor key.
-    if s.last() == Some(&b'~') {
-        let params = &s[2..s.len() - 1];
+    if final_byte == b'~' {
         return (params == b"3").then_some(Event::Delete);
     }
-    arrow_from_final(*s.last()?)
+    if final_byte == b'u' {
+        return chord_event(vge_render::keys::parse_csi_u(params)?);
+    }
+    arrow_from_final(final_byte)
+}
+
+/// Map a `CSI u` chord onto the bindings vdraw used to read as C0
+/// control bytes. The flag those bytes are replaced by is the one
+/// vdraw asked for, so this is now the only spelling `Ctrl+S` has;
+/// the byte arms in `drain` stay for a terminal that ignored the
+/// request.
+fn chord_event(c: vge_render::keys::Chord) -> Option<Event> {
+    if c.is_esc() {
+        return Some(Event::Escape);
+    }
+    Some(match c.ctrl_letter()? {
+        'c' => Event::Quit,
+        'z' => Event::Undo,
+        'y' => Event::Redo,
+        's' => Event::Save,
+        _ => return None,
+    })
 }
 
 /// Length of an SGR mouse report `ESC [ < ... (M|m)`.
@@ -354,12 +382,38 @@ mod tests {
         );
     }
 
+    /// The legacy spelling still works — a terminal that ignored the
+    /// push keeps sending it — but a lone ESC is no longer a keypress
+    /// in either case.
     #[test]
-    fn ctrl_c_quits_but_esc_does_not() {
+    fn ctrl_c_quits_and_a_lone_esc_is_not_a_keypress() {
         let mut p = InputParser::new();
         assert_eq!(p.feed(&[0x03]), vec![Event::Quit]);
         assert!(p.feed(b"\x1b").is_empty());
-        assert_eq!(p.flush(), vec![Event::Escape]);
+        assert!(p.flush().is_empty(), "a bare ESC is not Esc");
+        // It is still buffered, so the sequence it began completes.
+        assert_eq!(p.feed(b"[A"), vec![Event::Arrow(Dir::Up)]);
+    }
+
+    /// vdraw pushes "disambiguate escape codes", so this is the only
+    /// spelling its C0 bindings have: no `0x13` is sent for Ctrl+S at
+    /// all. Undo/redo/save going quiet is what the gap cost.
+    #[test]
+    fn the_control_bindings_arrive_as_csi_u_chords() {
+        let mut p = InputParser::new();
+        assert_eq!(p.feed(b"\x1b[27u"), vec![Event::Escape]);
+        assert_eq!(p.feed(b"\x1b[122;5u"), vec![Event::Undo]);
+        assert_eq!(p.feed(b"\x1b[121;5u"), vec![Event::Redo]);
+        assert_eq!(p.feed(b"\x1b[115;5u"), vec![Event::Save]);
+        assert_eq!(p.feed(b"\x1b[99;5u"), vec![Event::Quit]);
+        // Split across reads, the way a sequence actually arrives.
+        assert!(p.feed(b"\x1b[115").is_empty());
+        assert_eq!(p.feed(b";5u"), vec![Event::Save]);
+        // An unbound chord is consumed whole and does nothing — its
+        // tail must not be read as typed characters.
+        assert!(p.feed(b"\x1b[113;5u").is_empty(), "Ctrl+Q binds nothing");
+        // Nor may a reply on the same channel become a keystroke.
+        assert!(p.feed(b"\x1b[?1u").is_empty(), "a flag-query reply");
     }
 
     #[test]

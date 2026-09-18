@@ -26,6 +26,7 @@ use vge_protocol::command::{
 use vge_protocol::encode::build_envelope;
 use vge_protocol::frame::REQ_ID_NO_RESPONSE;
 use vge_render::is_ssh_session;
+use vge_render::keys;
 use vge_render::probe::run_probe;
 use vge_render::tty::{
     RawTty, drain_stale_stdin, install_sigwinch, poll_stdin_and, poll_stdin_until, read_stdin,
@@ -684,6 +685,12 @@ fn main() -> Result<()> {
     let winch = install_sigwinch();
     let mut out = std::io::stdout();
     out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h")?;
+    // Then the kitty keyboard flag, which makes Esc a complete
+    // sequence instead of a byte the parser has to tell apart from the
+    // opener of a reply envelope. It goes out *after* `?1049h`: the
+    // flag stack is per screen, so a push before the swap would land
+    // on the shell's screen rather than ours. `TermExit` pops it.
+    out.write_all(keys::PUSH_DISAMBIGUATE)?;
     out.flush()?;
     let _term = TermExit;
 
@@ -1518,6 +1525,11 @@ impl Drop for TermExit {
             ),
         ]);
         let _ = o.write_all(&env);
+        // The keyboard flag comes off while we are still on the
+        // alternate screen whose stack holds it — and it has to come
+        // off at all, or the next alt-screen program in this pane
+        // inherits a flag it never asked for.
+        let _ = o.write_all(keys::POP);
         let _ = o.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
     }

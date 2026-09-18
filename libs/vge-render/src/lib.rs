@@ -5,15 +5,20 @@
 //! of: the raw-tty + poll/read helpers ([`tty`]), the probe handshake
 //! ([`probe`]), image placement math ([`placement`]), chunked image
 //! upload encoding ([`upload`]), and response (chunk-ack) parsing
-//! ([`response`]). These crates are pure consumers of `vge-protocol`;
-//! no terminal state or rendering lives here.
+//! ([`response`]), plus the kitty keyboard protocol's key form
+//! ([`keys`]), which is what an interactive client reads once it has
+//! asked for the flag that makes `Esc` unambiguous. These crates are
+//! pure consumers of `vge-protocol`; no terminal state or rendering
+//! lives here.
 
+pub mod keys;
 pub mod placement;
 pub mod probe;
 pub mod response;
 pub mod tty;
 pub mod upload;
 
+pub use keys::{Chord, parse_csi_u};
 pub use placement::{Placement, compute_placement};
 pub use probe::{ProbeData, parse_probe_payload, probe_or_environment, run_probe};
 pub use upload::{Encoding, choose_encoding, encode_payload};
