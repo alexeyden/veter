@@ -548,7 +548,7 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         (Some(busy), _) => (format!("{busy}…"), accent_text(), true),
         (None, Some((msg, failed))) => (
             msg.to_string(),
-            if failed { error_color() } else { active_text() },
+            if failed { error_color() } else { title_text() },
             true,
         ),
         (None, None) => (v.cwd.display().to_string(), title_text(), false),

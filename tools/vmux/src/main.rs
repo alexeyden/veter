@@ -1482,7 +1482,7 @@ fn build_tabbar_commands(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: 0.0, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(active_text()),
+            fill: Style::Flat(title_text()),
             font_style: FontStyle(0x01),
             font_scale: 1.0,
             text: format!(" {label} "),
@@ -1533,11 +1533,14 @@ fn build_tabbar_commands(
                 false, // BL (sits on the row-1 rule)
             ),
         });
-        // Light text — legible on both the dim and the brand fill.
+        // The tag always sits on the surface, so it takes the surface's
+        // text colour. `active_text` is picked against the *accent* —
+        // near-black under every pastel-accented scheme — and vanished
+        // into a dark surface.
         cmds.push(DrawCmd::DrawText {
             origin: Point { x, y: 0.0 },
             align: Align::Left,
-            fill: Style::Flat(active_text()),
+            fill: Style::Flat(title_text()),
             font_style: FontStyle(0x00),
             font_scale: 1.0,
             text: num_text,
