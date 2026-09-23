@@ -237,6 +237,14 @@ pub fn host_fg() -> Option<Color> {
     host_color(1)
 }
 
+/// The host's recessed surface, opaque, when it publishes one — a
+/// plate that sits one step off [`host_bg`] in the terminal's own
+/// direction (darker on a dark theme, lighter or darker on a light
+/// one, as the theme derived it).
+pub fn host_surface_inset() -> Option<Color> {
+    host_color(3)
+}
+
 /// Ground for a modal or dialog: the host's panel surface at
 /// [`MODAL_ALPHA`], else the accent-tinted [`COLOR_MODAL_BG`].
 pub fn modal_bg() -> Color {

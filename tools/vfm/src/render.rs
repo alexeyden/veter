@@ -18,7 +18,7 @@ use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 use vge_ui::measure::text_cells;
 use vge_ui::shape::{chrome_corner_radii, rounded_rect_path};
 use vge_ui::theme::{
-    accent_color, accent_style, active_text, darken, dim_text, surface_style, title_text,
+    self, accent_color, accent_style, active_text, darken, dim_text, surface_style, title_text,
     title_thumb_style,
 };
 
@@ -27,21 +27,25 @@ use crate::icons::{self, IconBox};
 use crate::layout::{Area, Layout, View};
 use crate::thumbs::{Slot, Thumbs, stamp_of};
 
-/// Window backdrop — dark enough that the panes read as panels.
+/// Window backdrop on a terminal that publishes no theme — dark enough
+/// that the panes read as panels. Under a host theme it is the
+/// terminal's own background ([`backdrop_color`]).
 const COLOR_BACKDROP: Color = Color {
     r: 0.07,
     g: 0.07,
     b: 0.09,
     a: 1.0,
 };
-/// A tile's own plate, under its picture and label.
+/// A tile's own plate, under its picture and label, on a terminal that
+/// publishes no theme ([`tile_color`]).
 const COLOR_TILE: Color = Color {
     r: 0.13,
     g: 0.13,
     b: 0.16,
     a: 1.0,
 };
-/// Status-line text for a failed operation.
+/// Status-line text for a failed operation, on a terminal that
+/// publishes no theme ([`error_color`]).
 const COLOR_ERROR: Color = Color {
     r: 0.92,
     g: 0.48,
@@ -49,10 +53,29 @@ const COLOR_ERROR: Color = Color {
     a: 1.0,
 };
 
+/// The window's ground: the terminal's background when the host
+/// publishes its palette, so vfm sits on a light theme as a light
+/// window rather than a dark hole in it.
+fn backdrop_color() -> Color {
+    theme::host_bg().unwrap_or(COLOR_BACKDROP)
+}
+
+/// A tile's plate: the host's recessed surface, one step off the
+/// backdrop in whichever direction the theme runs.
+fn tile_color() -> Color {
+    theme::host_surface_inset()
+        .map(|c| Color { a: 1.0, ..c })
+        .unwrap_or(COLOR_TILE)
+}
+
+fn error_color() -> Color {
+    theme::warn_color().unwrap_or(COLOR_ERROR)
+}
+
 /// Full-window backdrop.
 pub fn backdrop(l: &Layout) -> Vec<DrawCmd> {
     vec![DrawCmd::FillRectangles {
-        fill: Style::Flat(COLOR_BACKDROP),
+        fill: Style::Flat(backdrop_color()),
         rects: vec![Rect {
             x: 0.0,
             y: 0.0,
@@ -201,7 +224,7 @@ pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
             a.x + 2.0,
             a.y + 1.0,
             Align::Left,
-            COLOR_ERROR,
+            error_color(),
             true,
             elide(err, a.w as usize - 4),
         ));
@@ -281,14 +304,14 @@ fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
                 ..accent_color()
             }
         } else {
-            COLOR_TILE
+            tile_color()
         }),
         segments: rounded_rect_path(x, y, x + l.tile_w, y + l.tile_h, rx, ry),
     }];
     // The picture sits on its own plate so a selected tile still frames
     // the image rather than tinting it.
     cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(darken(COLOR_TILE, 0.25)),
+        fill: Style::Flat(darken(tile_color(), 0.25)),
         segments: rounded_rect_path(
             x + 0.25,
             y + 0.15,
@@ -359,7 +382,7 @@ fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
         });
     } else if index % 2 == 1 {
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(Color { a: 0.5, ..COLOR_TILE }),
+            fill: Style::Flat(Color { a: 0.5, ..tile_color() }),
             segments: rounded_rect_path(x, y, x + w, y + l.tile_h, rx, ry),
         });
     }
@@ -525,7 +548,7 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         (Some(busy), _) => (format!("{busy}…"), accent_text(), true),
         (None, Some((msg, failed))) => (
             msg.to_string(),
-            if failed { COLOR_ERROR } else { active_text() },
+            if failed { error_color() } else { active_text() },
             true,
         ),
         (None, None) => (v.cwd.display().to_string(), title_text(), false),
@@ -545,11 +568,18 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
 /// we also shade, so this resolves it concretely.
 fn accent_text() -> Color {
     let c = accent_color();
-    // Lift it toward white so it stays legible as small text.
+    // Lift it toward the foreground so it stays legible as small text —
+    // toward white on a dark theme, toward the ink on a light one.
+    let f = theme::host_fg().unwrap_or(Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    });
     Color {
-        r: (c.r * 0.55 + 0.45).min(1.0),
-        g: (c.g * 0.55 + 0.45).min(1.0),
-        b: (c.b * 0.55 + 0.45).min(1.0),
+        r: (c.r * 0.55 + f.r * 0.45).min(1.0),
+        g: (c.g * 0.55 + f.g * 0.45).min(1.0),
+        b: (c.b * 0.55 + f.b * 0.45).min(1.0),
         a: 1.0,
     }
 }

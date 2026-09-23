@@ -8,24 +8,43 @@
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Color, DrawCmd, Style};
 use vge_protocol::path::{PathNode, PathSegment};
-use vge_ui::theme::{accent_color, darken};
+use vge_ui::theme::{self, accent_color, darken};
 
 use crate::entry::Media;
 
-/// Primary icon stroke/fill — light enough to read on the dark tile.
-pub const INK: Color = Color {
+/// Primary icon stroke/fill on a terminal that publishes no theme —
+/// light enough to read on the dark tile.
+const INK: Color = Color {
     r: 0.72,
     g: 0.76,
     b: 0.84,
     a: 1.0,
 };
-/// Secondary detail (text ruling, film sprockets).
-pub const INK_DIM: Color = Color {
+/// Secondary detail (text ruling, film sprockets), likewise.
+const INK_DIM: Color = Color {
     r: 0.46,
     g: 0.49,
     b: 0.57,
     a: 1.0,
 };
+
+/// Icon ink: the host's text colours when it publishes them, which is
+/// what reads on the host-surface tile under a light theme too.
+fn ink() -> Color {
+    if theme::host_bg().is_some() {
+        theme::title_text()
+    } else {
+        INK
+    }
+}
+
+fn ink_dim() -> Color {
+    if theme::host_bg().is_some() {
+        theme::dim_text()
+    } else {
+        INK_DIM
+    }
+}
 
 /// The box an icon is drawn into, in absolute cell coordinates.
 #[derive(Debug, Clone, Copy)]
@@ -139,8 +158,8 @@ pub fn draw(media: Media, b: IconBox, is_link: bool, broken: bool) -> Vec<DrawCm
         Media::Binary => page(&b, false),
     };
     if broken {
-        cmds.push(strip(&b, flat(INK_DIM), 0.08, &[(0.15, 0.15), (0.85, 0.85)]));
-        cmds.push(strip(&b, flat(INK_DIM), 0.08, &[(0.85, 0.15), (0.15, 0.85)]));
+        cmds.push(strip(&b, flat(ink_dim()), 0.08, &[(0.15, 0.15), (0.85, 0.85)]));
+        cmds.push(strip(&b, flat(ink_dim()), 0.08, &[(0.85, 0.15), (0.15, 0.85)]));
     } else if is_link {
         cmds.push(poly(
             &b,
@@ -182,7 +201,7 @@ fn page(b: &IconBox, ruled: bool) -> Vec<DrawCmd> {
     let mut cmds = vec![
         poly(
             b,
-            flat(INK),
+            flat(ink()),
             &[
                 (0.16, 0.08),
                 (0.66, 0.08),
@@ -192,12 +211,12 @@ fn page(b: &IconBox, ruled: bool) -> Vec<DrawCmd> {
             ],
         ),
         // The fold, in the tile's own shade so it reads as a crease.
-        poly(b, flat(INK_DIM), &[(0.66, 0.08), (0.84, 0.28), (0.66, 0.28)]),
+        poly(b, flat(ink_dim()), &[(0.66, 0.08), (0.84, 0.28), (0.66, 0.28)]),
     ];
     if ruled {
         for (i, v) in [0.44_f32, 0.58, 0.72].iter().enumerate() {
             let right = if i == 2 { 0.58 } else { 0.72 };
-            cmds.push(rect(b, flat(INK_DIM), 0.26, *v, right - 0.26, 0.06));
+            cmds.push(rect(b, flat(ink_dim()), 0.26, *v, right - 0.26, 0.06));
         }
     }
     cmds
@@ -207,12 +226,12 @@ fn page(b: &IconBox, ruled: bool) -> Vec<DrawCmd> {
 fn picture(b: &IconBox) -> Vec<DrawCmd> {
     let accent = accent_color();
     vec![
-        rect(b, flat(INK), 0.08, 0.16, 0.84, 0.68),
+        rect(b, flat(ink()), 0.08, 0.16, 0.84, 0.68),
         rect(b, flat(darken(accent, 0.55)), 0.14, 0.22, 0.72, 0.56),
         ellipse(b, flat(accent), 0.32, 0.38, 0.07, 0.07),
         poly(
             b,
-            flat(INK),
+            flat(ink()),
             &[(0.14, 0.78), (0.42, 0.46), (0.60, 0.66), (0.72, 0.54), (0.86, 0.78)],
         ),
     ]
@@ -222,7 +241,7 @@ fn picture(b: &IconBox) -> Vec<DrawCmd> {
 fn film(b: &IconBox) -> Vec<DrawCmd> {
     let accent = accent_color();
     let mut cmds = vec![
-        rect(b, flat(INK), 0.08, 0.18, 0.84, 0.64),
+        rect(b, flat(ink()), 0.08, 0.18, 0.84, 0.64),
         rect(b, flat(darken(accent, 0.6)), 0.22, 0.18, 0.56, 0.64),
     ];
     for i in 0..3 {
@@ -239,8 +258,8 @@ fn film(b: &IconBox) -> Vec<DrawCmd> {
 fn note(b: &IconBox) -> Vec<DrawCmd> {
     let accent = accent_color();
     vec![
-        rect(b, flat(INK), 0.52, 0.14, 0.07, 0.52),
-        poly(b, flat(INK), &[(0.52, 0.14), (0.84, 0.22), (0.84, 0.34), (0.52, 0.26)]),
+        rect(b, flat(ink()), 0.52, 0.14, 0.07, 0.52),
+        poly(b, flat(ink()), &[(0.52, 0.14), (0.84, 0.22), (0.84, 0.34), (0.52, 0.26)]),
         ellipse(b, flat(accent), 0.40, 0.68, 0.15, 0.12),
     ]
 }
@@ -249,7 +268,7 @@ fn note(b: &IconBox) -> Vec<DrawCmd> {
 fn archive(b: &IconBox) -> Vec<DrawCmd> {
     let accent = accent_color();
     vec![
-        rect(b, flat(INK), 0.10, 0.24, 0.80, 0.60),
+        rect(b, flat(ink()), 0.10, 0.24, 0.80, 0.60),
         rect(b, flat(darken(accent, 0.3)), 0.10, 0.24, 0.80, 0.14),
         rect(b, flat(darken(accent, 0.1)), 0.44, 0.24, 0.12, 0.60),
     ]
