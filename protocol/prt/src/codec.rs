@@ -72,6 +72,13 @@ impl<'a> Reader<'a> {
         Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn i64(&mut self) -> DecodeResult<i64> {
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(i64::from_le_bytes(a))
+    }
+
     /// LEB128 unsigned varint (§1.4 `varu`).
     pub fn varu(&mut self) -> DecodeResult<u64> {
         let mut result: u64 = 0;
@@ -137,6 +144,10 @@ impl Writer {
     }
 
     pub fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 

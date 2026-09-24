@@ -292,11 +292,23 @@ pub fn portal_scroll_delta_body(id: &str, delta: i32) -> Vec<u8> {
     w.buf
 }
 
-pub fn portal_scroll_set_body(id: &str, offset: u32) -> Vec<u8> {
-    let mut w = Writer::with_capacity(5 + id.len());
+/// `EVT_PORTAL_SCROLL_SET` (§8.12): the id, then the target in
+/// `SetPortalScrollback`'s own encoding.
+pub fn portal_scroll_set_body(id: &str, to: crate::command::ScrollTarget) -> Vec<u8> {
+    let mut w = Writer::with_capacity(13 + id.len());
     w.str(id);
-    w.u32(offset);
+    to.write(&mut w);
     w.buf
+}
+
+/// Inverse of [`portal_scroll_set_body`], for clients.
+pub fn parse_portal_scroll_set(
+    body: &[u8],
+) -> Result<(String, crate::command::ScrollTarget), crate::codec::DecodeError> {
+    let mut r = Reader::new(body);
+    let id = r.string()?.to_string();
+    let to = crate::command::ScrollTarget::read(&mut r)?;
+    Ok((id, to))
 }
 
 // ---- frame + envelope wrapping ----------------------------------------
@@ -557,11 +569,11 @@ mod tests {
 
     #[test]
     fn portal_scroll_set_body_round_trip() {
-        let body = portal_scroll_set_body("pane-2", 1234);
-        let mut r = Reader::new(&body);
-        assert_eq!(r.string().unwrap(), "pane-2");
-        assert_eq!(r.u32().unwrap(), 1234);
-        assert!(r.at_end());
+        use crate::command::ScrollTarget;
+        for to in [ScrollTarget::Live, ScrollTarget::Delta(-3), ScrollTarget::Line(1234)] {
+            let body = portal_scroll_set_body("pane-2", to);
+            assert_eq!(parse_portal_scroll_set(&body).unwrap(), ("pane-2".to_string(), to));
+        }
     }
 
     #[test]

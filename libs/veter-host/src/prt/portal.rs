@@ -316,12 +316,36 @@ pub struct Portal {
     pub is_visible: bool,
     pub draw_order: i32,
     pub creation_seq: u64,
-    /// §9.3 — this view's scrollback offset into the shared buffer, in
-    /// rows above the live region. The buffer itself always sits live
-    /// (its grid's own offset stays 0); every read goes through
-    /// `vt100::Screen::cell_at` with this value, which is what lets two
-    /// views of one buffer scroll independently.
-    pub view_offset: u32,
+    /// §9.3 — where this view sits in the shared buffer: the absolute
+    /// line (the buffer's `top_of_live_screen` numbering) at the top of
+    /// the view, or `None` while it follows the live region.
+    ///
+    /// A line rather than a distance from live, because a distance goes
+    /// stale with every line the program prints: a scrolled-back view
+    /// held that way slides toward live under the reader, and so does
+    /// anything laid over it. A line stays on its text for free. The
+    /// distance the render path needs is [`Self::view_offset`], derived
+    /// on read.
+    ///
+    /// The buffer itself always sits live (its grid's own offset stays
+    /// 0); every read goes through `vt100::Screen::cell_at` at that
+    /// derived offset, which is what lets two views of one buffer scroll
+    /// independently.
+    pub view_anchor: Option<i64>,
+}
+
+impl Portal {
+    /// How far this view is scrolled back from `content`'s live region,
+    /// in rows — the offset every read of the buffer goes through.
+    /// Clamped to the lines the buffer still holds, so a view whose
+    /// anchor has been evicted shows the oldest line rather than
+    /// reading past the ring.
+    pub fn view_offset(&self, content: &PortalContent) -> usize {
+        let Some(anchor) = self.view_anchor else { return 0 };
+        let top = content.children.top_of_live_screen();
+        let fill = content.vt.screen().scrollback_fill() as i64;
+        (top - anchor).clamp(0, fill) as usize
+    }
 }
 
 /// The buffer behind one or more [`Portal`] views: the inner vt100 and
@@ -484,6 +508,29 @@ impl PortalSet {
     pub fn content_mut(&mut self, id: &str) -> Option<&mut PortalContent> {
         let key = self.portals.get(id)?.content;
         self.contents.get_mut(&key)
+    }
+
+    /// Re-check every view onto the buffer behind view `id` after that
+    /// buffer changed under them. A pinned view's anchor survives
+    /// ordinary output by construction; what it can't survive is its
+    /// line numbering going away. So: a buffer whose history was erased
+    /// (`3J`), or whose numbering restarted below the anchor (RIS),
+    /// returns its views to live; an anchor the ring has evicted is
+    /// clamped to the oldest line still held, so the view keeps showing
+    /// the top of what is there.
+    pub fn settle_views(&mut self, id: &str) {
+        let Some(key) = self.portals.get(id).map(|p| p.content) else { return };
+        let Some(content) = self.contents.get(&key) else { return };
+        let top = content.children.top_of_live_screen();
+        let fill = content.vt.screen().scrollback_fill() as i64;
+        let oldest = top - fill;
+        for view in self.portals.values_mut().filter(|p| p.content == key) {
+            view.view_anchor = match view.view_anchor {
+                Some(a) if fill == 0 || a >= top => None,
+                Some(a) => Some(a.max(oldest)),
+                None => None,
+            };
+        }
     }
 
     /// Both halves of view `id` at once. Views and contents live in

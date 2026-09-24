@@ -52,12 +52,12 @@ pub const EVT_PORTAL_ACTIVITY: u8 = 0x8B;
 /// means toward live. The client owns the offset and decides how to
 /// apply it (usually a follow-up `SetPortalScrollback`).
 pub const EVT_PORTAL_SCROLL_DELTA: u8 = 0x8C;
-/// The host wants the portal scrolled to an *absolute* offset (e.g. a
+/// The host wants the portal's view moved to a named position (e.g. a
 /// host-driven scrollback search jumped to a match deep in history).
-/// Body is `string id, u32 offset`. Sibling to `EVT_PORTAL_SCROLL_DELTA`:
-/// same advisory semantics, but the value replaces rather than adjusts
-/// the client's stored offset. `offset == 0` is the canonical request
-/// to drop scroll mode and return to live.
+/// Body is `string id` followed by a scroll target, encoded exactly as
+/// in `SetPortalScrollback` (§9.3), so a client can pass it straight
+/// back. Sibling to `EVT_PORTAL_SCROLL_DELTA`: same advisory semantics.
+/// A `Live` target is the canonical request to drop scroll mode.
 pub const EVT_PORTAL_SCROLL_SET: u8 = 0x8D;
 /// The host's `host.*` theme changed (§7.3 of the VGE spec): a client
 /// that derived shades of its own from the old palette should recompute
@@ -121,6 +121,11 @@ pub const FOCUS_PORTAL: u8 = 1;
 pub const CURSOR_HIDDEN: u8 = 0;
 pub const CURSOR_HOLLOW: u8 = 1;
 pub const CURSOR_DIM: u8 = 2;
+
+// §9.3 — `SetPortalScrollback` target kinds.
+pub const SCROLL_LIVE: u8 = 0;
+pub const SCROLL_DELTA: u8 = 1;
+pub const SCROLL_LINE: u8 = 2;
 
 // §8.7 PortalEvicted reasons
 pub const EVICT_SCROLLBACK: u8 = 0;

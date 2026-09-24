@@ -676,7 +676,7 @@ Creates a second **view** onto `src_id`'s buffer. Both views show the
 same cells and share one scrollback ring, one sub-portal subtree and
 one set of per-portal engines. What the new view gets of its own is a
 position, an anchor, a draw order, visibility, and — the point of the
-command — its own scroll offset (§9.3).
+command — its own scroll position (§9.3).
 
 There is no `size_w` / `size_h` / `scrollback_lines`: there is one
 grid, so a view necessarily inherits its dimensions and history. For
@@ -1017,24 +1017,20 @@ i32    delta              ; lines; positive = deeper into history,
 ```
 
 Fired when a user gesture observed by the host implies a *relative*
-change to a portal's scrollback offset. The canonical case is a
-drag-select autoscroll whose anchor target is this portal: as the
-pointer crosses the portal's viewport edge, the host wants the view
-to follow, but the offset is owned by the client (the multiplexer's
-per-pane scroll state). Direct host-side mutation would silently
-desync the client's `[scroll: N]` indicator and any subsequent
-`SetPortalScrollback` it issues.
+move of a portal's view. The canonical case is a drag-select
+autoscroll whose anchor target is this portal: as the pointer crosses
+the portal's viewport edge, the host wants the view to follow, but
+scroll *mode* is owned by the client (the multiplexer's per-pane
+scroll state, its `[scroll: N]` indicator). Moving the view behind the
+client's back would leave that mode and its chrome out of step.
 
-The body is advisory: the client owns the policy and decides
-- whether to enter or exit a "scrolling" UI mode,
-- how to clamp `delta` against its scrollback ring depth,
-- and what offset to land on (typically `current + delta`,
-  clamped to `[0, history_depth]`).
-
-It typically responds with a `SetPortalScrollback` (§9.3) carrying
-the chosen absolute offset. Clients that do not implement scrollback
-(or do not wish to follow the gesture) MUST ignore the event without
-error.
+The body is advisory: the client owns the policy and decides whether
+to enter or exit a "scrolling" UI mode, and whether to follow the
+gesture at all. It typically responds with a `SetPortalScrollback`
+(§9.3) carrying `Delta(delta)` — a step, not the offset it expects to
+land on, for the reason §9.3 gives. Clients that do not implement
+scrollback (or do not wish to follow the gesture) MUST ignore the
+event without error.
 
 The host MAY emit this event at any rate (autoscroll typically
 fires every ~50 ms while a drag-select sits past the edge); clients
@@ -1044,21 +1040,23 @@ SHOULD coalesce bursts before re-rendering chrome.
 
 ```
 string id
-u32    offset             ; absolute scrollback offset, in lines
+target                    ; a §9.3 scroll target, same encoding
 ```
 
 Sibling of `PortalScrollDelta`: same advisory contract, but the body
-is an *absolute* target offset rather than a relative adjustment.
-Used when the host's gesture has a natural absolute coordinate —
-canonical case is the host's scrollback-search jumping to a match's
-absolute line, or restoring a previously-saved offset on cancel.
+names where the view should go rather than how far to move it. Used
+when the host's gesture has a natural position — canonical case is the
+host's scrollback search putting a match's line at the top of the
+view, or restoring the view it saved when the search opened.
 
-The value semantics mirror `SetPortalScrollback` (§9.3): `offset`
-lines back from the live screen, clamped client-side against the
-client's own scrollback ring and the host's `max_scrollback_lines`.
-`offset == 0` is the canonical request to drop "scrolling" mode and
-return to live — clients that surface a scroll-mode UI SHOULD treat
-this as the exit signal, not just an offset update.
+The target is encoded exactly as in `SetPortalScrollback` (§9.3), so a
+client that follows the gesture passes it back unchanged; the host
+resolves it when that command arrives. A host names a position in
+history as `Line`, never as a distance from live, which would be stale
+by however many lines the pane printed while the event was in flight.
+`Live` is the canonical request to drop "scrolling" mode — clients that
+surface a scroll-mode UI SHOULD treat it as the exit signal, not just a
+position update.
 
 Clients that do not implement scrollback (or do not wish to follow
 the gesture) MUST ignore the event without error.
@@ -1172,26 +1170,51 @@ Body:
 
 ```
 string id
-u32    lines       ; offset, in rows, from the top of the live screen
-                   ; into scrollback. 0 = live region (no offset).
+u8     kind        ; 0 = Live, 1 = Delta, 2 = Line
+if kind == Delta:
+  i32  rows        ; positive = further back into history,
+                   ; negative = toward live
+if kind == Line:
+  i64  line        ; absolute line, in the buffer's top_of_live_screen
+                   ; numbering (§5.2), to put at the top of the view
 ```
 
-Drives the offset of the named **view**. Two views of one buffer (§6.9)
-hold separate offsets, which is what lets a client show a scrolled-back
-transcript in one half of a split while the other tracks the live
-region. The buffer itself always sits live; nothing a view does to its
-own offset is observable by its peers.
+Moves the named **view**. Two views of one buffer (§6.9) hold separate
+positions, which is what lets a client show a scrolled-back transcript
+in one half of a split while the other tracks the live region. The
+buffer itself always sits live; nothing a view does to its own position
+is observable by its peers.
 
-While `lines > 0` the host
-renders that portion of the portal's history instead of the live
-region; new bytes still flow into the inner vt100 normally and accrue
-in scrollback. The value is silently capped at the portal's current
-history depth — the response carries the post-clamp offset so the
-client can show the actual scroll position even when its request
-exceeded the available history.
+The kinds:
 
-`lines = 0` returns the portal to live view. Clients SHOULD send this
-when the user exits scroll/copy mode.
+- `Live` — follow the live region. Clients SHOULD send this when the
+  user exits scroll/copy mode.
+- `Delta` — move by `rows` from wherever the view is now. A step that
+  reaches the live region returns the view to it.
+- `Line` — put `line` at the top of the view. A line at or below the
+  top of the live screen means `Live`; one older than the history the
+  buffer still holds means its oldest line, so `i64::MIN` is "the top".
+
+**A scrolled-back view stays on its text.** The host holds the view's
+position as the absolute line at its top, not as a distance from live,
+so output arriving under a scrolled-back view leaves it showing the
+same lines — the way a terminal's own scrollback behaves — and its
+distance from live grows by one for every line the inner program
+commits. Two cases move it anyway: once the ring evicts that line the
+view holds the oldest line still there, and when the buffer's history
+is erased (`3J`) or its numbering restarts (RIS) the view returns to
+live.
+
+That is why every kind is an intent the host resolves on arrival, and
+none is a distance from live computed by the client: the view moves
+under the client whenever the pane prints, so any such number is stale
+by the time it arrives, and an absolute request would throw the view
+that far toward live. A client that tracks the offset for display
+(a `[scroll: N]` indicator) takes it from the response below and
+treats its own figure as a prediction.
+
+New bytes still flow into the inner vt100 normally while a view is
+scrolled back, and accrue in scrollback.
 
 Errors:
 
@@ -1200,7 +1223,7 @@ Errors:
 Response: Ok with body
 
 ```
-u32 applied_lines  ; the offset actually in effect after clamping
+u32 applied_lines  ; the view's distance from live after the move
 u32 history_depth  ; rows currently held in the portal's scrollback ring
                    ; (grows with inner-program output, capped at
                    ;  scrollback_lines from CreatePortal)
@@ -1212,7 +1235,8 @@ only echoes `applied_lines` is still spec-compliant.
 
 Multiplexer-style clients typically issue `SetPortalScrollback` while
 in a "copy mode" UI driven by arrow keys / PgUp / PgDn / vim-style
-`j`/`k`. The applied-offset echo lets the indicator stop incrementing
+`j`/`k` — `Delta` for the steps, `Line(i64::MIN)` for "top", `Live`
+to leave. The applied-offset echo lets the indicator stop incrementing
 once the user reaches the top of the captured history;
 `history_depth` lets the client draw a scrollbar thumb sized to the
 actual history available.
@@ -1608,14 +1632,15 @@ with both halves showing the same shell.
 ```
 ForkPortal   src_id="p1", new_id="p1.b", origin=(80,0), anchor=Live
 UpdateSize   id="p1", new_w=80, new_h=50        ; both views, one grid
-SetPortalScrollback id="p1.b", lines=200        ; only the right half moves
+SetPortalScrollback id="p1.b", Delta(200)      ; only the right half moves
 ```
 
 The client keeps writing pty output to `p1` alone (§7.1) and routes
 keystrokes from whichever half has focus to the same pty — input never
 travels over PRT (§11), so which view is focused is a client-side
-question. `p1.b` stays parked 200 lines back while `p1` follows the
-live region.
+question. `p1.b` stays parked on the text it scrolled to — further
+back from live with every line the shell prints — while `p1` follows
+the live region.
 
 Closing either half is a plain `DeletePortal`; the buffer survives
 until the second one goes (§6.2), so the client does not have to track

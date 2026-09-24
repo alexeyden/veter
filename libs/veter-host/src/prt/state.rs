@@ -15,7 +15,7 @@ use prt_protocol::apc::{ApcStream, Item, TerminalEvent};
 use prt_protocol::codec::Reader;
 use prt_protocol::command::{
     self, AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody,
-    UpdateOriginBody, WritePortalBody,
+    ScrollTarget, UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
@@ -890,12 +890,11 @@ impl PrtEngine {
     }
 
     /// Queue an `EVT_PORTAL_SCROLL_SET` (§8.12) for the leaf portal at
-    /// `path` so its owning client can jump that portal to the absolute
-    /// `offset`. Sibling to [`Self::emit_scroll_delta_for_path`] — same
+    /// `path` so its owning client can move that portal's view to `to`. Sibling to [`Self::emit_scroll_delta_for_path`] — same
     /// cascade-up-as-RawReply behavior for nested portals; same
     /// caller responsibility to follow up with `flush_pending_events()`
     /// and `take_responses()`.
-    pub fn emit_scroll_set_for_path(&mut self, path: &[String], offset: u32) -> bool {
+    pub fn emit_scroll_set_for_path(&mut self, path: &[String], to: ScrollTarget) -> bool {
         if path.is_empty() {
             return false;
         }
@@ -906,7 +905,7 @@ impl PrtEngine {
             }
             self.emit_event(
                 EVT_PORTAL_SCROLL_SET,
-                portal_scroll_set_body(head, offset),
+                portal_scroll_set_body(head, to),
             );
             return true;
         }
@@ -914,7 +913,7 @@ impl PrtEngine {
             let Some(content) = self.state.current_mut().content_mut(head) else {
                 return false;
             };
-            if !content.children.emit_scroll_set_for_path(&path[1..], offset) {
+            if !content.children.emit_scroll_set_for_path(&path[1..], to) {
                 return false;
             }
             content.children.flush_pending_events();
@@ -1369,9 +1368,7 @@ impl PrtEngine {
             Command::WritePortal(b) => self.cmd_write_portal(b, hit),
             Command::SetFocus { target } => self.cmd_set_focus(target),
             Command::SetCursorStyle { unfocused } => self.cmd_set_cursor_style(unfocused),
-            Command::SetPortalScrollback { id, lines } => {
-                self.cmd_set_portal_scrollback(&id, lines)
-            }
+            Command::SetPortalScrollback { id, to } => self.cmd_set_portal_scrollback(&id, to),
             Command::ForkPortal(b) => self.cmd_fork_portal(b),
         }
     }
@@ -1530,7 +1527,7 @@ impl PrtEngine {
             is_visible: b.is_visible,
             draw_order: b.draw_order,
             creation_seq,
-            view_offset: 0,
+            view_anchor: None,
         };
         set.portals.insert(b.id, portal);
         Ok(Vec::new())
@@ -1592,7 +1589,7 @@ impl PrtEngine {
                 creation_seq,
                 // A fresh view starts at the live region regardless of
                 // where its peer is scrolled — the offset is per-view.
-                view_offset: 0,
+                view_anchor: None,
             },
         );
         Ok(Vec::new())
@@ -1648,6 +1645,9 @@ impl PrtEngine {
         portal.vge.after_vt100_process(&mut portal.vt);
         portal.size_w = new_w;
         portal.size_h = new_h;
+        // A push/pull resize moves rows across the scrollback boundary,
+        // which can put a pinned view's line into the live screen.
+        self.state.current_mut().settle_views(id);
         // §5.6 / §6.3 — emit ResizeNotify only on a material change so
         // idempotent UpdateSize calls don't generate spurious events.
         if changed {
@@ -1950,6 +1950,9 @@ impl PrtEngine {
 
             (raw_events, old_cache, new_cache, reverse, activity)
         };
+        // §9.3 — output leaves a pinned view where it is; RIS, 3J and
+        // eviction are what can take its line away.
+        self.state.current_mut().settle_views(&b.id);
 
         // ---- emit events ---------------------------------------------
         if !reverse_bytes.is_empty() {
@@ -2080,15 +2083,15 @@ impl PrtEngine {
         Ok(Vec::new())
     }
 
-    /// Drive a portal's vt100 scrollback offset. `lines = 0` returns to
-    /// the live region; larger values move the visible region back into
-    /// the portal's scrollback ring. The vt100 layer clamps requests
-    /// larger than the current history depth, so over-large `lines` is
-    /// silently capped.
+    /// §9.3 — move a view through its buffer's scrollback. `to` is
+    /// resolved against the buffer as it stands now, and the result is
+    /// stored as the line at the top of the view (see
+    /// [`Portal::view_anchor`]), so the view stays on that text as
+    /// output arrives rather than sliding toward live.
     ///
     /// The Ok body echoes:
     /// ```text
-    /// u32 applied_lines    ; offset actually in effect after clamping
+    /// u32 applied_lines    ; distance from live now in effect
     /// u32 history_depth    ; rows currently held in the portal's
     ///                      ; scrollback ring (sized by inner program
     ///                      ; output history, not the configured cap)
@@ -2098,25 +2101,35 @@ impl PrtEngine {
     fn cmd_set_portal_scrollback(
         &mut self,
         id: &str,
-        lines: u32,
+        to: ScrollTarget,
     ) -> Result<Vec<u8>, (u16, &'static str)> {
         let (view, content) = self
             .state
             .current_mut()
             .split_mut(id)
             .ok_or((ERR_UNKNOWN_PORTAL, "id not found"))?;
-        // The offset belongs to *this view*, not to the buffer — which
-        // is exactly what lets two forked views sit at different scroll
-        // positions over one shell. The buffer's own grid stays live and
-        // the render path reads it through `cell_at(view_offset, ..)`.
-        //
-        // History depth comes straight off the ring fill. The old code
-        // probed for it by scrolling to `usize::MAX` and reading the
-        // clamped value back, which is no longer possible (nothing may
-        // move the shared grid) and was never necessary.
-        let history_depth = content.vt.screen().scrollback_fill() as u32;
-        let applied = lines.min(history_depth);
-        view.view_offset = applied;
+        // Only the view moves. The buffer's own grid stays live and the
+        // render path reads it through `cell_at(view_offset, ..)` —
+        // which is what lets two forked views sit at different positions
+        // over one shell.
+        let top = content.children.top_of_live_screen();
+        let fill = content.vt.screen().scrollback_fill() as i64;
+        // The top line of a view `rows_back` rows into history, clamped
+        // to what the ring holds; `None` once that is the live region
+        // itself. Anchoring *at* the live top instead would pin a view
+        // the client believes is live, and the next line of output
+        // would scroll it back.
+        let at = |rows_back: i64| {
+            let rows = rows_back.min(fill);
+            (rows > 0).then(|| top - rows)
+        };
+        view.view_anchor = match to {
+            ScrollTarget::Live => None,
+            ScrollTarget::Delta(n) => at(view.view_offset(content) as i64 + i64::from(n)),
+            ScrollTarget::Line(line) => at(top.saturating_sub(line)),
+        };
+        let applied = view.view_offset(content) as u32;
+        let history_depth = fill as u32;
 
         let mut body = Vec::with_capacity(8);
         body.extend_from_slice(&applied.to_le_bytes());
@@ -3175,12 +3188,7 @@ mod tests {
         let content = set.content(id).unwrap();
         let (_, cols) = content.vt.screen().size();
         (0..cols)
-            .filter_map(|c| {
-                content
-                    .vt
-                    .screen()
-                    .cell_at(view.view_offset as usize, row, c)
-            })
+            .filter_map(|c| content.vt.screen().cell_at(view.view_offset(content), row, c))
             .map(vt100::Cell::contents)
             .collect::<String>()
             .trim_end()
@@ -3244,16 +3252,13 @@ mod tests {
         let _ = dispatch_one(&mut engine, CMD_WRITE_PORTAL, 3, &body);
 
         // Scroll only p2 back.
-        let body = encode::set_portal_scrollback_body("p2", 4);
-        let parsed = dispatch_one(&mut engine, CMD_SET_PORTAL_SCROLLBACK, 4, &body);
-        assert_eq!(parsed.frame_type, RSP_OK);
-        let mut r = Reader::new(&parsed.body);
-        assert_eq!(r.u32().unwrap(), 4, "applied offset");
-        assert!(r.u32().unwrap() >= 4, "history depth");
+        let (applied, depth) = scroll(&mut engine, "p2", ScrollTarget::Delta(4));
+        assert_eq!(applied, 4, "applied offset");
+        assert!(depth >= 4, "history depth");
 
         // p stays live, p2 shows older text — one grid, two positions.
-        assert_eq!(engine.state.current().portals["p"].view_offset, 0);
-        assert_eq!(engine.state.current().portals["p2"].view_offset, 4);
+        assert_eq!(offset_of(&engine, "p"), 0);
+        assert_eq!(offset_of(&engine, "p2"), 4);
         assert_ne!(view_row(&engine, "p", 0), view_row(&engine, "p2", 0));
 
         // And the buffer itself never moved: it is always live, which is
@@ -3261,6 +3266,167 @@ mod tests {
         assert_eq!(
             engine.state.current().content("p").unwrap().vt.screen().scrollback(),
             0
+        );
+    }
+
+    /// Send `SetPortalScrollback` and return the ack's
+    /// `(applied_lines, history_depth)`.
+    fn scroll(engine: &mut PrtEngine, id: &str, to: ScrollTarget) -> (u32, u32) {
+        let body = encode::set_portal_scrollback_body(id, to);
+        let parsed = dispatch_one(engine, CMD_SET_PORTAL_SCROLLBACK, 90, &body);
+        assert_eq!(parsed.frame_type, RSP_OK);
+        let mut r = Reader::new(&parsed.body);
+        (r.u32().unwrap(), r.u32().unwrap())
+    }
+
+    fn offset_of(engine: &PrtEngine, id: &str) -> usize {
+        let set = engine.state.current();
+        set.portals[id].view_offset(set.content(id).unwrap())
+    }
+
+    fn write(engine: &mut PrtEngine, id: &str, data: &[u8]) {
+        let body = encode::write_portal_body(&WritePortalBody {
+            id: id.into(),
+            data: data.to_vec(),
+        });
+        let _ = dispatch_one(engine, CMD_WRITE_PORTAL, 91, &body);
+    }
+
+    fn write_lines(engine: &mut PrtEngine, id: &str, lines: std::ops::Range<u32>) {
+        let mut data = Vec::new();
+        for i in lines {
+            data.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        write(engine, id, &data);
+    }
+
+    /// A 3-row portal with a `ring`-line scrollback, holding `line 0` ..
+    /// `line 9` (so 8 lines of history under the prompt row).
+    fn scrolled_fixture(ring: u32) -> PrtEngine {
+        let mut engine = PrtEngine::new();
+        let create = encode::create_portal_body(&CreatePortalBody {
+            id: "p".into(),
+            size_w: 20,
+            size_h: 3,
+            origin_x: 0,
+            origin_y: 0,
+            anchor_mode: AnchorMode::Live,
+            is_visible: true,
+            draw_order: 0,
+            flags: 0,
+            scrollback_lines: ring,
+        });
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &create);
+        write_lines(&mut engine, "p", 0..10);
+        engine
+    }
+
+    /// The point of anchoring by line: output arriving under a
+    /// scrolled-back view leaves it on the text it was showing, the way
+    /// the host grid's own scrollback behaves. As a distance from live
+    /// it slid one row toward live per line printed.
+    #[test]
+    fn scrolled_view_stays_on_its_text_as_output_arrives() {
+        let mut engine = scrolled_fixture(100);
+        scroll(&mut engine, "p", ScrollTarget::Delta(4));
+        let before = view_row(&engine, "p", 0);
+        write_lines(&mut engine, "p", 10..15);
+        assert_eq!(view_row(&engine, "p", 0), before);
+        assert_eq!(offset_of(&engine, "p"), 4 + 5);
+        // And a relative step still moves from where the view *is*.
+        let (applied, _) = scroll(&mut engine, "p", ScrollTarget::Delta(-1));
+        assert_eq!(applied, 8);
+    }
+
+    #[test]
+    fn a_live_view_keeps_following_output() {
+        let mut engine = scrolled_fixture(100);
+        write_lines(&mut engine, "p", 10..15);
+        assert_eq!(offset_of(&engine, "p"), 0);
+        assert_eq!(engine.state.current().portals["p"].view_anchor, None);
+    }
+
+    #[test]
+    fn stepping_back_to_live_follows_output_again() {
+        let mut engine = scrolled_fixture(100);
+        scroll(&mut engine, "p", ScrollTarget::Delta(3));
+        assert_eq!(scroll(&mut engine, "p", ScrollTarget::Delta(-10)).0, 0);
+        write_lines(&mut engine, "p", 10..12);
+        assert_eq!(offset_of(&engine, "p"), 0);
+    }
+
+    /// With no history there is nowhere to scroll to, and the view must
+    /// stay live rather than pin itself to the top of the live screen —
+    /// which the next line of output would turn into a scrolled view
+    /// nobody asked for.
+    #[test]
+    fn scrolling_with_no_history_stays_live() {
+        let mut engine = scrolled_fixture(100);
+        write(&mut engine, "p", b"\x1b[3J");
+        assert_eq!(scroll(&mut engine, "p", ScrollTarget::Delta(5)).0, 0);
+        write_lines(&mut engine, "p", 10..12);
+        assert_eq!(offset_of(&engine, "p"), 0);
+    }
+
+    #[test]
+    fn line_targets_resolve_against_the_buffer() {
+        let mut engine = scrolled_fixture(100);
+        let top = engine.state.current().content("p").unwrap().children.top_of_live_screen();
+        assert_eq!(scroll(&mut engine, "p", ScrollTarget::Line(top - 2)).0, 2);
+        assert_eq!(view_row(&engine, "p", 0), "line 6");
+        // The oldest line, however far back the request reaches.
+        let (applied, depth) = scroll(&mut engine, "p", ScrollTarget::Line(i64::MIN));
+        assert_eq!(applied, depth);
+        assert_eq!(view_row(&engine, "p", 0), "line 0");
+        // At or past the live top is live.
+        assert_eq!(scroll(&mut engine, "p", ScrollTarget::Line(top)).0, 0);
+        assert_eq!(engine.state.current().portals["p"].view_anchor, None);
+    }
+
+    #[test]
+    fn erasing_history_returns_a_scrolled_view_to_live() {
+        let mut engine = scrolled_fixture(100);
+        scroll(&mut engine, "p", ScrollTarget::Delta(4));
+        write(&mut engine, "p", b"\x1b[3J");
+        assert_eq!(engine.state.current().portals["p"].view_anchor, None);
+        write_lines(&mut engine, "p", 10..13);
+        assert_eq!(offset_of(&engine, "p"), 0);
+    }
+
+    #[test]
+    fn a_reset_returns_a_scrolled_view_to_live() {
+        let mut engine = scrolled_fixture(100);
+        scroll(&mut engine, "p", ScrollTarget::Delta(4));
+        write(&mut engine, "p", b"\x1bc");
+        write_lines(&mut engine, "p", 0..20);
+        assert_eq!(offset_of(&engine, "p"), 0);
+    }
+
+    /// Once the ring evicts the view's line, the view holds the oldest
+    /// line there is — it cannot stay on text that no longer exists.
+    #[test]
+    fn an_evicted_anchor_clamps_to_the_oldest_line() {
+        let mut engine = scrolled_fixture(10);
+        let (_, depth) = scroll(&mut engine, "p", ScrollTarget::Line(i64::MIN));
+        assert_eq!(depth, 8);
+        write_lines(&mut engine, "p", 10..20);
+        let set = engine.state.current();
+        let content = set.content("p").unwrap();
+        let fill = content.vt.screen().scrollback_fill();
+        assert_eq!(offset_of(&engine, "p"), fill);
+        let oldest = content.children.top_of_live_screen() - fill as i64;
+        assert_eq!(set.portals["p"].view_anchor, Some(oldest));
+    }
+
+    #[test]
+    fn a_scrolled_view_survives_a_snapshot() {
+        let mut a = scrolled_fixture(100);
+        scroll(&mut a, "p", ScrollTarget::Delta(4));
+        let mut b = PrtEngine::new();
+        b.restore_from_binary_snapshot(&a.binary_snapshot()).unwrap();
+        assert_eq!(
+            b.state.current().portals["p"].view_anchor,
+            a.state.current().portals["p"].view_anchor
         );
     }
 
@@ -3348,7 +3514,7 @@ mod tests {
             &mut a,
             CMD_SET_PORTAL_SCROLLBACK,
             4,
-            &encode::set_portal_scrollback_body("p2", 0),
+            &encode::set_portal_scrollback_body("p2", ScrollTarget::Live),
         );
 
         let bytes = a.binary_snapshot();
@@ -5361,13 +5527,14 @@ mod tests {
         );
         let _ = engine.take_responses();
 
-        assert!(engine.emit_scroll_set_for_path(&["p".to_string()], 42));
+        assert!(engine.emit_scroll_set_for_path(&["p".to_string()], ScrollTarget::Line(42)));
         engine.flush_pending_events();
         let frames = decode_all_response_frames(&engine.take_responses());
         let ev = first_event(&frames, EVT_PORTAL_SCROLL_SET).unwrap();
-        let mut r = Reader::new(&ev.body);
-        assert_eq!(r.string().unwrap(), "p");
-        assert_eq!(r.u32().unwrap(), 42);
+        assert_eq!(
+            prt_protocol::envelope::parse_portal_scroll_set(&ev.body).unwrap(),
+            ("p".to_string(), ScrollTarget::Line(42))
+        );
     }
 
     #[test]

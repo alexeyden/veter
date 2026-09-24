@@ -264,7 +264,7 @@ fn render_portal_at<T: Renderer>(
     // pair shows the cursor in whichever view is at live.
     let cursor_visible = content.state_cache.cursor_visible
         && !content.vt.screen().hide_cursor()
-        && portal.view_offset == 0;
+        && portal.view_offset(content) == 0;
     let focused_cursor = if is_focused_leaf && cursor_visible {
         Some(cursor_pos)
     } else {
@@ -277,7 +277,7 @@ fn render_portal_at<T: Renderer>(
             return None;
         }
         let portal_top = content.children.top_of_live_screen();
-        let portal_scrollback = portal.view_offset as usize;
+        let portal_scrollback = portal.view_offset(content);
         crate::renderer::selection_range_from_abs(
             s.anchor_line,
             s.anchor_col,
@@ -299,7 +299,7 @@ fn render_portal_at<T: Renderer>(
                 o.matches,
                 o.current,
                 content.children.top_of_live_screen(),
-                portal.view_offset as usize,
+                portal.view_offset(content),
                 content.size_h as u16,
                 content.size_w as u16,
             ))
@@ -307,7 +307,7 @@ fn render_portal_at<T: Renderer>(
     term_renderer.draw_screen_at(
         canvas,
         content.vt.screen(),
-        portal.view_offset as usize,
+        portal.view_offset(content),
         ox_px,
         oy_px,
         focused_cursor,
@@ -344,9 +344,9 @@ fn render_portal_at<T: Renderer>(
     //    host's. Sub-portal `origin_x` / anchor row are in cells from
     //    the parent portal's top-left, so pixel origin is
     //    `(ox_px, oy_px)` plus the cell offset.
-    let portal_scrollback = portal.view_offset as usize;
+    let portal_scrollback = portal.view_offset(content);
     let sub_top = content.children.top_of_live_screen();
-    let sub_scrollback = portal.view_offset as usize;
+    let sub_scrollback = portal.view_offset(content);
 
     let mut layers: Vec<(i32, u64, Layer<'_>)> = Vec::new();
     for el in content.vge.state.top_level_sorted() {

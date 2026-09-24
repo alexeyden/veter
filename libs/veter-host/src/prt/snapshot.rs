@@ -23,6 +23,9 @@ use prt_protocol::command::CursorStyle;
 /// match — see [`PrtEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v6: a view's scroll position is an absolute anchor line (or live)
+///   rather than a distance from live, so a restored view stays on the
+///   text it was showing (§9.3).
 /// - v4: split each portal into a view and a shared `PortalContent`.
 ///   Buffers are serialized once per set and views carry a content id,
 ///   so a forked pair (§6.9) comes back still sharing one grid instead
@@ -35,7 +38,7 @@ use prt_protocol::command::CursorStyle;
 ///   `PortalAnchor::Scrollback { anchor_line }` values stay aligned
 ///   with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 5;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 6;
 
 /// Error returned when a PRT binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -324,7 +327,8 @@ fn encode_portal(p: &Portal, w: &mut Writer) {
     w.bool(p.is_visible);
     w.i32(p.draw_order);
     w.u64(p.creation_seq);
-    w.u32(p.view_offset);
+    w.bool(p.view_anchor.is_some());
+    w.i64(p.view_anchor.unwrap_or(0));
 }
 
 fn decode_portal(r: &mut Reader) -> Result<Portal, SnapshotError> {
@@ -336,7 +340,11 @@ fn decode_portal(r: &mut Reader) -> Result<Portal, SnapshotError> {
         is_visible: r.bool()?,
         draw_order: r.i32()?,
         creation_seq: r.u64()?,
-        view_offset: r.u32()?,
+        view_anchor: {
+            let pinned = r.bool()?;
+            let line = r.i64()?;
+            pinned.then_some(line)
+        },
     })
 }
 

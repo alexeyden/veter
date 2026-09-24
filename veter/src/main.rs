@@ -273,7 +273,7 @@ fn resolve_portal_target<'a, CB: vt100::Callbacks>(
         last = Some((portal, content));
         parent_top = content.children.top_of_live_screen();
         // This view's offset, not the buffer's — the buffer never moves.
-        parent_scrollback = portal.view_offset as usize;
+        parent_scrollback = portal.view_offset(content);
         current_set = content.children.state.current();
     }
     last.map(|(p, c)| PortalTargetInfo {
@@ -1110,9 +1110,11 @@ struct SearchState {
     /// `resolve_portal_content`, and to a viewport via
     /// `App::target_viewport`.
     target_path: Vec<String>,
-    /// Scrollback offset of the target parser when search opened.
-    /// Restored on Esc if the user never committed (Enter) a match.
-    saved_scrollback: usize,
+    /// Where the target's view was when search opened — the line at its
+    /// top, not its distance from live, so output arriving while the
+    /// overlay is up can't shift what Esc goes back to. Restored on Esc
+    /// if the user never committed (Enter) a match.
+    saved_view: prt::ScrollTarget,
     /// Lazily-built per-row text index for the target parser. `None`
     /// after an invalidation — output that actually changed the target,
     /// or a scroll that moved the view out from under a windowed
@@ -1190,14 +1192,14 @@ struct JumpLabel {
 }
 
 impl SearchState {
-    fn new(target_path: Vec<String>, saved_scrollback: usize) -> Self {
+    fn new(target_path: Vec<String>, saved_view: prt::ScrollTarget) -> Self {
         Self {
             mode: OverlayMode::Query,
             query: String::new(),
             case_insensitive: true,
             editing: true,
             target_path,
-            saved_scrollback,
+            saved_view,
             cache: None,
             matches: Vec::new(),
             current: 0,
@@ -1209,11 +1211,11 @@ impl SearchState {
     /// A session that opens straight into hint mode. `editing` is false
     /// from the start: there is no query to type, so nothing may be
     /// mistaken for one.
-    fn new_hints(target_path: Vec<String>, saved_scrollback: usize) -> Self {
+    fn new_hints(target_path: Vec<String>, saved_view: prt::ScrollTarget) -> Self {
         Self {
             mode: OverlayMode::Hints { kinds: Vec::new() },
             editing: false,
-            ..Self::new(target_path, saved_scrollback)
+            ..Self::new(target_path, saved_view)
         }
     }
 
@@ -2016,7 +2018,7 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
             return;
         };
         let top = info.content.children.top_of_live_screen();
-        let sb = info.portal.view_offset as usize;
+        let sb = info.portal.view_offset(info.content);
         let (rows, _) = info.content.vt.screen().size();
         (info.origin_x_px, info.origin_y_px, top, sb, rows)
     };
@@ -2704,9 +2706,8 @@ impl App {
         for id in &path[..path.len() - 1] {
             set = set.content(id.as_str())?.children.state.current();
         }
-        set.portals
-            .get(path[path.len() - 1].as_str())
-            .map(|p| p.view_offset as usize)
+        let id = path[path.len() - 1].as_str();
+        Some(set.portals.get(id)?.view_offset(set.content(id)?))
     }
 
     /// Rows and columns of the leaf at `path`.
@@ -2759,29 +2760,48 @@ impl App {
         }
         let m = search.matches[search.current];
         let path = search.target_path.clone();
-        let Some(top) = self.target_top_of_live_screen(&path) else { return };
         let rows = self.target_size(&path).map_or(0, |(r, _)| r as i64);
-        let target = (top - m.line + rows / 2).max(0) as usize;
-        self.set_target_scrollback(&path, target);
+        self.set_target_scrollback(&path, prt::ScrollTarget::Line(m.line - rows / 2));
     }
 
-    /// Set the target leaf parser's scrollback to `offset`. For the
-    /// host parser this mutates `screen().set_scrollback` directly; for
-    /// a portal parser, the offset is owned by the portal's client
-    /// (e.g. vmux's `PaneScroll`), so we emit `EVT_PORTAL_SCROLL_SET`
-    /// and let the client round-trip back with a `SetPortalScrollback`.
-    /// Same desync-avoidance discipline as the drag-select autoscroll
-    /// path; see [`Self::autoscroll_step`].
-    fn set_target_scrollback(&mut self, path: &[String], offset: usize) {
+    /// Where the leaf at `path` is looking, as a target that puts it
+    /// back there: `Live`, or the line at the top of its view.
+    fn target_view_position(&self, path: &[String]) -> prt::ScrollTarget {
+        match self.target_viewport(path) {
+            Some((top, _, _)) if self.target_view_offset(path).unwrap_or(0) > 0 => {
+                prt::ScrollTarget::Line(top)
+            }
+            _ => prt::ScrollTarget::Live,
+        }
+    }
+
+    /// Move the target leaf's view to `to`. For the host parser this
+    /// mutates `screen().set_scrollback` directly; for a portal parser,
+    /// scroll mode is owned by the portal's client (e.g. vmux's
+    /// `PaneScroll`), so we emit `EVT_PORTAL_SCROLL_SET` and let the
+    /// client round-trip back with a `SetPortalScrollback` carrying the
+    /// same target. Same desync-avoidance discipline as the drag-select
+    /// autoscroll path; see [`Self::autoscroll_step`].
+    ///
+    /// A line rather than an offset is what makes the portal path
+    /// exact: the pane may print while the event is in flight, and a
+    /// distance from live would land that many rows off.
+    fn set_target_scrollback(&mut self, path: &[String], to: prt::ScrollTarget) {
         if path.is_empty() {
+            let top = self.prt.as_ref().map_or(0, |p| p.top_of_live_screen());
             if let Some(parser) = &mut self.parser {
-                parser.screen_mut().set_scrollback(offset);
+                let current = parser.screen().scrollback() as i64;
+                let offset = match to {
+                    prt::ScrollTarget::Live => 0,
+                    prt::ScrollTarget::Delta(n) => current + i64::from(n),
+                    prt::ScrollTarget::Line(line) => top.saturating_sub(line),
+                };
+                parser.screen_mut().set_scrollback(offset.max(0) as usize);
             }
             return;
         }
-        let offset_u32 = offset.min(u32::MAX as usize) as u32;
         if let (Some(prt), Some(pty)) = (self.prt.as_mut(), self.pty.as_ref()) {
-            if prt.emit_scroll_set_for_path(path, offset_u32) {
+            if prt.emit_scroll_set_for_path(path, to) {
                 prt.flush_pending_events();
                 let bytes = prt.take_responses();
                 if !bytes.is_empty() {
@@ -3278,7 +3298,7 @@ impl App {
                     origin_x = ox;
                     origin_y = oy;
                     parent_top = content.children.top_of_live_screen();
-                    parent_scrollback = portal.view_offset as usize;
+                    parent_scrollback = portal.view_offset(content);
                     current_set = content.children.state.current();
                 }
                 None => break,
@@ -3619,7 +3639,7 @@ impl App {
                 // Which line the pointer landed on depends on where
                 // *this view* is scrolled, so a click in the scrolled-back
                 // twin resolves against the text drawn under it.
-                let portal_scrollback = portal.view_offset as usize;
+                let portal_scrollback = portal.view_offset(content);
                 let viewport_top = portal_top - portal_scrollback as i64;
                 Some((viewport_top + row as i64, col))
             }
@@ -4264,7 +4284,7 @@ impl App {
         // opening search preserves the scroll position.
         if host_action == Some(HostAction::OpenSearch) && self.focused_leaf_scrollback() > 0 {
             let path = self.focused_leaf_path();
-            let saved = self.focused_leaf_scrollback();
+            let saved = self.target_view_position(&path);
             self.search = Some(SearchState::new(path, saved));
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -4307,7 +4327,7 @@ impl App {
         // position.
         if host_action == Some(HostAction::OpenOverlay) {
             let path = self.focused_leaf_path();
-            let saved = self.focused_leaf_scrollback();
+            let saved = self.target_view_position(&path);
             self.search = Some(SearchState::new(path, saved));
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -4322,7 +4342,7 @@ impl App {
         // the panel instead of one frame later.
         if host_action == Some(HostAction::OpenHints) {
             let path = self.focused_leaf_path();
-            let saved = self.focused_leaf_scrollback();
+            let saved = self.target_view_position(&path);
             self.search = Some(SearchState::new_hints(path, saved));
             self.recompute_search_matches();
             if let Some(w) = &self.window {
@@ -4366,7 +4386,7 @@ impl App {
                             // own their own scroll mode (see below).
                             let path = self.focused_leaf_path();
                             if path.is_empty() && self.focused_leaf_scrollback() > 0 {
-                                self.set_target_scrollback(&path, 0);
+                                self.set_target_scrollback(&path, prt::ScrollTarget::Live);
                             }
                         }
                     }
@@ -4427,7 +4447,7 @@ impl App {
         }
         let path = self.focused_leaf_path();
         if path.is_empty() && !is_modifier_only && !is_copy && self.focused_leaf_scrollback() > 0 {
-            self.set_target_scrollback(&path, 0);
+            self.set_target_scrollback(&path, prt::ScrollTarget::Live);
         }
 
         // Save-image is consumed only when there is an image to save,
@@ -4600,7 +4620,7 @@ impl App {
                     let search = self.search.as_ref().unwrap();
                     (
                         search.target_path.clone(),
-                        search.saved_scrollback,
+                        search.saved_view,
                         search.editing,
                     )
                 };

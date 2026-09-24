@@ -45,7 +45,7 @@ use prt_protocol::apc::ApcStream as PrtApcStream;
 use prt_protocol::codec::Reader as PrtReader;
 use prt_protocol::command::{
     AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, ForkPortalBody,
-    UpdateOriginBody, WritePortalBody,
+    ScrollTarget, UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
@@ -924,6 +924,15 @@ struct PaneScroll {
     /// recognise multi-byte arrow / PgUp / PgDn sequences while
     /// scroll-mode keys are dispatched to this pane.
     csi_buf: Vec<u8>,
+}
+
+impl PaneScroll {
+    /// The furthest back a prediction may go: the history the host last
+    /// reported, or the ring's capacity before the first ack. Only ever
+    /// a guess for the indicator — the host clamps the real thing.
+    fn depth_bound(&self) -> u32 {
+        if self.history_depth > 0 { self.history_depth } else { PORTAL_SCROLLBACK_LINES }
+    }
 }
 
 /// Where a pane's keystrokes go, and who owns the child process.
@@ -3989,12 +3998,12 @@ impl State {
             csi_buf: Vec::new(),
         });
         // Probe the host once for the current history depth so the
-        // scrollbar shows up right away (offset stays 0).
+        // scrollbar shows up right away (a zero step leaves the view live).
         let req_id = self.alloc_scroll_request(pane_id);
         let mut out = build_prt_envelope(&[(
             PrtCommand::SetPortalScrollback {
                 id: pane_id.to_string(),
-                lines: 0,
+                to: ScrollTarget::Delta(0),
             },
             req_id,
         )]);
@@ -4016,7 +4025,7 @@ impl State {
         let mut out = build_prt_envelope(&[(
             PrtCommand::SetPortalScrollback {
                 id: pane_id.to_string(),
-                lines: 0,
+                to: ScrollTarget::Live,
             },
             req_id,
         )]);
@@ -4024,42 +4033,45 @@ impl State {
         Ok(out)
     }
 
-    /// Apply a delta to `pane_id`'s scroll offset (positive = scroll
-    /// further back, negative = closer to live). Clamped to
-    /// `[0, PORTAL_SCROLLBACK_LINES]`. Silent no-op if the pane isn't
-    /// in scroll mode.
+    /// Move `pane_id`'s view by `delta` rows (positive = further back,
+    /// negative = closer to live). Silent no-op if the pane isn't in
+    /// scroll mode.
+    ///
+    /// Sent as a step, not as the offset we expect to end up at: the
+    /// host keeps a scrolled view on its text while the pane prints, so
+    /// the offset we last heard is stale by however many lines arrived
+    /// since, and an absolute request would throw the view that far
+    /// toward live.
     fn scroll_delta(&mut self, pane_id: &str, delta: i64) -> Result<Vec<u8>> {
-        let new_offset = match self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
-            Some(s) => {
-                let cur = s.offset as i64;
-                let next = (cur + delta).max(0);
-                (next.min(PORTAL_SCROLLBACK_LINES as i64)) as u32
-            }
+        let delta = delta.clamp(i32::MIN as i64, i32::MAX as i64);
+        let predicted = match self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
+            Some(s) => (s.offset as i64 + delta).clamp(0, s.depth_bound() as i64) as u32,
             None => return Ok(Vec::new()),
         };
-        self.scroll_set(pane_id, new_offset)
+        self.scroll_to(pane_id, ScrollTarget::Delta(delta as i32), Some(predicted))
     }
 
-    /// Jump `pane_id` to an absolute scroll offset.
-    fn scroll_set(&mut self, pane_id: &str, mut offset: u32) -> Result<Vec<u8>> {
-        if offset > PORTAL_SCROLLBACK_LINES {
-            offset = PORTAL_SCROLLBACK_LINES;
-        }
-        let Some(pane) = self.panes.get_mut(pane_id) else {
+    /// Send `to` for `pane_id`'s view. `predicted` is the offset the
+    /// chrome shows until the host's ack reports the real one (`None`
+    /// leaves the indicator as it is — for a target whose outcome we
+    /// can't know, like a line in history).
+    fn scroll_to(
+        &mut self,
+        pane_id: &str,
+        to: ScrollTarget,
+        predicted: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        let Some(s) = self.panes.get_mut(pane_id).and_then(|p| p.scroll.as_mut()) else {
             return Ok(Vec::new());
         };
-        let Some(s) = pane.scroll.as_mut() else {
-            return Ok(Vec::new());
-        };
-        if s.offset == offset {
-            return Ok(Vec::new());
+        if let Some(offset) = predicted {
+            s.offset = offset;
         }
-        s.offset = offset;
         let req_id = self.alloc_scroll_request(pane_id);
         let mut out = build_prt_envelope(&[(
             PrtCommand::SetPortalScrollback {
                 id: pane_id.to_string(),
-                lines: offset,
+                to,
             },
             req_id,
         )]);
@@ -5552,20 +5564,16 @@ fn handle_stdin_chunk(
                     let _ = wheel_scroll(state, &id, delta as i64);
                 }
             } else if ft == EVT_PORTAL_SCROLL_SET {
-                // §8.12: string id, u32 offset. The host is asking us to
-                // jump this pane to an absolute scrollback offset (e.g.
-                // a scrollback-search match). `apply_scroll_set` is the
-                // absolute-value sibling of `wheel_scroll`: it enters
-                // scroll mode if needed for a non-zero target, drops
-                // scroll mode at zero, and otherwise sets the offset
-                // through the normal `scroll_set` path so the chrome
-                // thumb and `SetPortalScrollback` envelope to the host
-                // stay coherent.
-                let mut br = PrtReader::new(body);
-                let id = br.string().unwrap_or("").to_string();
-                let offset = br.u32().unwrap_or(0);
-                if !id.is_empty() && state.panes.contains_key(&id) {
-                    let _ = apply_scroll_set(state, &id, offset);
+                // §8.12: string id, scroll target. The host is asking us
+                // to move this pane's view (e.g. to a scrollback-search
+                // match). `apply_scroll_set` enters or drops scroll mode
+                // as the target calls for and passes the target on in
+                // our own `SetPortalScrollback`, so the chrome and the
+                // host stay coherent.
+                if let Ok((id, to)) = prt_protocol::envelope::parse_portal_scroll_set(body)
+                    && state.panes.contains_key(&id)
+                {
+                    let _ = apply_scroll_set(state, &id, to);
                 }
             } else if ft == prt_protocol::frame::EVT_HOST_THEME_CHANGED {
                 // §8.13. The palette changed under us — in practice a
@@ -6152,27 +6160,31 @@ fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
 /// Used when the inner program hasn't enabled mouse reporting, so
 /// wheel naturally drives vmux's scrollback for the pane under the
 /// cursor.
-/// Absolute-target sibling of `wheel_scroll`. Routes
+/// Target-carrying sibling of `wheel_scroll`. Routes
 /// `EVT_PORTAL_SCROLL_SET` (e.g. a host-driven scrollback search jump)
-/// through the same enter/`scroll_set`/exit ladder so the chrome thumb,
+/// through the same enter/`scroll_to`/exit ladder so the chrome thumb,
 /// `[scroll: N]` indicator, and host `SetPortalScrollback` envelope all
-/// stay coherent. `offset == 0` drops scroll mode entirely.
-fn apply_scroll_set(state: &mut State, pane_id: &str, offset: u32) -> Result<()> {
+/// stay coherent. `Live` drops scroll mode entirely.
+fn apply_scroll_set(state: &mut State, pane_id: &str, to: ScrollTarget) -> Result<()> {
     let already_scrolling = state
         .panes
         .get(pane_id)
         .map(|p| p.scroll.is_some())
         .unwrap_or(false);
 
-    if offset == 0 {
-        if already_scrolling {
-            let env = state.exit_scroll(pane_id)?;
-            if !env.is_empty() {
-                write_all_stdout(&env)?;
+    let line = match to {
+        ScrollTarget::Delta(delta) => return wheel_scroll(state, pane_id, i64::from(delta)),
+        ScrollTarget::Live => {
+            if already_scrolling {
+                let env = state.exit_scroll(pane_id)?;
+                if !env.is_empty() {
+                    write_all_stdout(&env)?;
+                }
             }
+            return Ok(());
         }
-        return Ok(());
-    }
+        ScrollTarget::Line(line) => line,
+    };
 
     if !already_scrolling {
         let env = state.enter_scroll(pane_id)?;
@@ -6180,7 +6192,7 @@ fn apply_scroll_set(state: &mut State, pane_id: &str, offset: u32) -> Result<()>
             write_all_stdout(&env)?;
         }
     }
-    let env = state.scroll_set(pane_id, offset)?;
+    let env = state.scroll_to(pane_id, ScrollTarget::Line(line), None)?;
     if !env.is_empty() {
         write_all_stdout(&env)?;
     }
@@ -6977,8 +6989,15 @@ fn handle_scroll_byte(
     Ok(match key {
         ScrollKey::Nothing => (Vec::new(), true),
         ScrollKey::Delta(d) => (state.scroll_delta(pane_id, d)?, true),
-        ScrollKey::SetTop => (state.scroll_set(pane_id, u32::MAX)?, true),
-        ScrollKey::SetLive => (state.scroll_set(pane_id, 0)?, true),
+        ScrollKey::SetTop => {
+            let top = state
+                .panes
+                .get(pane_id)
+                .and_then(|p| p.scroll.as_ref())
+                .map(PaneScroll::depth_bound);
+            (state.scroll_to(pane_id, ScrollTarget::Line(i64::MIN), top)?, true)
+        }
+        ScrollKey::SetLive => (state.scroll_to(pane_id, ScrollTarget::Live, Some(0))?, true),
         ScrollKey::Exit => (state.exit_scroll(pane_id)?, true),
         ScrollKey::ExitBefore => (state.exit_scroll(pane_id)?, false),
         ScrollKey::ExitWith(seq) => {

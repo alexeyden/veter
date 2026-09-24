@@ -5,8 +5,8 @@
 
 use crate::codec::Writer;
 use crate::command::{
-    Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody, UpdateOriginBody,
-    WritePortalBody,
+    Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody, ScrollTarget,
+    UpdateOriginBody, WritePortalBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
 use crate::frame::*;
@@ -115,10 +115,10 @@ pub fn set_cursor_style_body(unfocused: CursorStyle) -> Vec<u8> {
     w.buf
 }
 
-pub fn set_portal_scrollback_body(id: &str, lines: u32) -> Vec<u8> {
-    let mut w = Writer::with_capacity(5 + id.len());
+pub fn set_portal_scrollback_body(id: &str, to: ScrollTarget) -> Vec<u8> {
+    let mut w = Writer::with_capacity(10 + id.len());
     w.str(id);
-    w.u32(lines);
+    to.write(&mut w);
     w.buf
 }
 
@@ -159,9 +159,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::WritePortal(b) => write_portal_body(b),
         Command::SetFocus { target } => set_focus_body(target),
         Command::SetCursorStyle { unfocused } => set_cursor_style_body(*unfocused),
-        Command::SetPortalScrollback { id, lines } => {
-            set_portal_scrollback_body(id, *lines)
-        }
+        Command::SetPortalScrollback { id, to } => set_portal_scrollback_body(id, *to),
         Command::ForkPortal(b) => fork_portal_body(b),
     }
 }
@@ -308,20 +306,39 @@ mod tests {
 
     #[test]
     fn set_portal_scrollback_round_trips() {
-        for &lines in &[0u32, 1, 100, 5_000, u32::MAX] {
-            let body = set_portal_scrollback_body("left", lines);
+        for to in [
+            ScrollTarget::Live,
+            ScrollTarget::Delta(0),
+            ScrollTarget::Delta(-12),
+            ScrollTarget::Delta(i32::MAX),
+            ScrollTarget::Line(0),
+            ScrollTarget::Line(-7),
+            ScrollTarget::Line(i64::MIN),
+            ScrollTarget::Line(i64::MAX),
+        ] {
+            let body = set_portal_scrollback_body("left", to);
             let cmd = parse(CMD_SET_PORTAL_SCROLLBACK, &body).unwrap();
-            let Command::SetPortalScrollback { id, lines: parsed } = cmd else {
+            let Command::SetPortalScrollback { id, to: parsed } = cmd else {
                 panic!("wrong variant");
             };
             assert_eq!(id, "left");
-            assert_eq!(parsed, lines);
+            assert_eq!(parsed, to);
         }
     }
 
     #[test]
+    fn set_portal_scrollback_unknown_target_rejected() {
+        let mut body = set_portal_scrollback_body("left", ScrollTarget::Live);
+        *body.last_mut().unwrap() = 9;
+        assert_eq!(
+            parse(CMD_SET_PORTAL_SCROLLBACK, &body).unwrap_err(),
+            crate::frame::ERR_BAD_PAYLOAD
+        );
+    }
+
+    #[test]
     fn set_portal_scrollback_empty_id_rejected() {
-        let body = set_portal_scrollback_body("", 5);
+        let body = set_portal_scrollback_body("", ScrollTarget::Delta(5));
         assert_eq!(
             parse(CMD_SET_PORTAL_SCROLLBACK, &body).unwrap_err(),
             crate::frame::ERR_BAD_PAYLOAD

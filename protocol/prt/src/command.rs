@@ -28,6 +28,55 @@ impl AnchorMode {
     }
 }
 
+/// §9.3 — where `SetPortalScrollback` moves a view.
+///
+/// Every form is an *intent* the host resolves against the buffer as it
+/// stands when the command is processed, never a position the client
+/// computed from what it last heard: the host moves a scrolled view on
+/// its own (it stays pinned to its text as output arrives, and is
+/// clamped when that text is evicted), so any number a client holds is
+/// stale by the time it arrives.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum ScrollTarget {
+    /// Follow the live region.
+    Live,
+    /// Move by this many rows; positive is back into history. Reaching
+    /// the live region returns the view to it.
+    Delta(i32),
+    /// Put this absolute line (the buffer's `top_of_live_screen`
+    /// numbering) at the top of the view, clamped to the lines still
+    /// held. A line at or below the top of the live screen is live;
+    /// `i64::MIN` is the oldest line.
+    Line(i64),
+}
+
+impl ScrollTarget {
+    pub fn read(r: &mut Reader<'_>) -> DecodeResult<Self> {
+        match r.u8()? {
+            SCROLL_LIVE => Ok(ScrollTarget::Live),
+            SCROLL_DELTA => Ok(ScrollTarget::Delta(r.i32()?)),
+            SCROLL_LINE => Ok(ScrollTarget::Line(r.i64()?)),
+            _ => Err(DecodeError::bad_payload()),
+        }
+    }
+
+    pub fn write(&self, w: &mut super::codec::Writer) {
+        match *self {
+            ScrollTarget::Live => w.u8(SCROLL_LIVE),
+            ScrollTarget::Delta(n) => {
+                w.u8(SCROLL_DELTA);
+                w.i32(n);
+            }
+            ScrollTarget::Line(l) => {
+                w.u8(SCROLL_LINE);
+                w.i64(l);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -144,11 +193,8 @@ pub enum Command {
     WritePortal(WritePortalBody),
     SetFocus { target: FocusTarget },
     SetCursorStyle { unfocused: CursorStyle },
-    /// Drive the named portal's scrollback offset (§13 future-work item,
-    /// implemented here). `lines = 0` means the live region is shown
-    /// (no offset); larger values move the visible region back into the
-    /// portal's scrollback ring up to the per-portal cap.
-    SetPortalScrollback { id: String, lines: u32 },
+    /// §9.3 — move the named view through its buffer's scrollback.
+    SetPortalScrollback { id: String, to: ScrollTarget },
     /// §6.9 — a second view onto an existing portal's buffer.
     ForkPortal(ForkPortalBody),
 }
@@ -347,11 +393,11 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
         }
         CMD_SET_PORTAL_SCROLLBACK => {
             let id = read_id(&mut r)?;
-            let lines = r.u32()?;
+            let to = ScrollTarget::read(&mut r)?;
             if !r.at_end() {
                 return Err(ERR_BAD_PAYLOAD);
             }
-            Ok(Command::SetPortalScrollback { id, lines })
+            Ok(Command::SetPortalScrollback { id, to })
         }
         // §3 — frame types in 0x80..=0xFF are events and MUST NOT appear
         // in client-to-host envelopes. Treat as unknown command.
