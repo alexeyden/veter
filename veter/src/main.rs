@@ -1159,9 +1159,21 @@ struct ExpandState {
 /// One flash jump label: a key, the match it acts on, and the cell the
 /// glyph is drawn at (just past the end of that match's word, in the
 /// target leaf's absolute scrollback coords).
+///
+/// The label carries its match rather than an index into
+/// `SearchState::matches`. Labels are rebuilt once per frame, but the
+/// match list is rebuilt whenever a PTY tick changes the target, and a
+/// tick lands between a frame and the keypress that answers it all the
+/// time under a busy program. An index then names whatever match moved
+/// into that slot — a hint that scrolled in, or one past the end —
+/// so the key acted on something other than the glyph the user read.
+/// Absolute lines don't renumber, so the span stays true to what was
+/// drawn.
 #[derive(Clone, Copy, Debug)]
 struct JumpLabel {
-    match_idx: usize,
+    span: search::MatchSpan,
+    /// Hint mode's classification of `span`; `None` in query mode.
+    kind: Option<hints::HintKind>,
     ch: char,
     anchor_line: i64,
     anchor_col: u16,
@@ -1269,20 +1281,45 @@ fn char_at_col(row: &search::IndexedRow, col: u16) -> Option<char> {
 /// when the usable alphabet runs out, leaving surplus matches unlabelled.
 /// Pure — the I/O-free core of [`App::recompute_labels`], split out so it
 /// can be unit-tested.
+///
+/// `previous` is the char a match was labelled with last frame, if any,
+/// and a match keeps it while it stays usable. Labels are reassigned
+/// every frame, and handing them out purely in reading order meant one
+/// hint scrolling off the top shifted every letter below it — under a
+/// program that is printing, the letter the user had just read belonged
+/// to the next hint by the time they pressed it. Newcomers take the
+/// unused chars, in alphabet order.
 fn assign_jump_labels(
     visible: &[usize],
     excluded: &std::collections::HashSet<char>,
     alphabet: &[char],
+    previous: impl Fn(usize) -> Option<char>,
 ) -> Vec<(usize, char)> {
-    let mut out = Vec::new();
-    let mut alpha = alphabet.iter().copied().filter(|c| !excluded.contains(c));
-    for &idx in visible {
+    let usable = |c: char| alphabet.contains(&c) && !excluded.contains(&c);
+    let mut taken: std::collections::HashSet<char> = std::collections::HashSet::new();
+    let mut slots: Vec<Option<char>> = visible
+        .iter()
+        .map(|&idx| {
+            let ch = previous(idx).filter(|&c| usable(c) && !taken.contains(&c))?;
+            taken.insert(ch);
+            Some(ch)
+        })
+        .collect();
+    let mut alpha = alphabet
+        .iter()
+        .copied()
+        .filter(|&c| !excluded.contains(&c) && !taken.contains(&c));
+    for slot in slots.iter_mut().filter(|s| s.is_none()) {
         match alpha.next() {
-            Some(ch) => out.push((idx, ch)),
+            Some(ch) => *slot = Some(ch),
             None => break,
         }
     }
-    out
+    visible
+        .iter()
+        .zip(slots)
+        .filter_map(|(&idx, ch)| Some((idx, ch?)))
+        .collect()
 }
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -2954,7 +2991,15 @@ impl App {
                     &mut std::collections::HashSet::new(),
                 );
                 labels.push(JumpLabel {
-                    match_idx: 0,
+                    // The word the next press adds. Informational only:
+                    // expansion dispatches on `ExpandState`, not on this.
+                    span: search::MatchSpan {
+                        line: next_line,
+                        col_start: next_col,
+                        end_line: next_line,
+                        col_end: next_col + 1,
+                    },
+                    kind: None,
                     ch: exp.ch,
                     anchor_line: next_line,
                     anchor_col,
@@ -3050,7 +3095,17 @@ impl App {
             } else {
                 JUMP_LABEL_ALPHABET
             };
-            assign_jump_labels(&visible, &excluded, alphabet)
+            // Last frame's letters, keyed by where each match starts.
+            let previous: std::collections::HashMap<(i64, u16), char> = search
+                .labels
+                .iter()
+                .map(|l| ((l.span.line, l.span.col_start), l.ch))
+                .collect();
+            let matches = &search.matches;
+            assign_jump_labels(&visible, &excluded, alphabet, |idx| {
+                let m = matches[idx];
+                previous.get(&(m.line, m.col_start)).copied()
+            })
         };
 
         // Anchor each label just past the end of its match's word, so the
@@ -3100,8 +3155,10 @@ impl App {
                     &mut lines_marked,
                 )
             };
+            let kind = self.search.as_ref().and_then(|s| s.hint_kind(idx));
             jump_labels.push(JumpLabel {
-                match_idx: idx,
+                span: m,
+                kind,
                 ch,
                 anchor_line,
                 anchor_col,
@@ -3893,23 +3950,22 @@ impl App {
         true
     }
 
+    /// The leaf the open overlay searches, as a selection target.
+    fn search_target(&self) -> Option<SelectionTarget> {
+        let s = self.search.as_ref()?;
+        Some(if s.target_path.is_empty() {
+            SelectionTarget::Host
+        } else {
+            SelectionTarget::Portal(s.target_path.clone())
+        })
+    }
+
     /// Shifted jump-label press: select the whole logical line the match
     /// sits on, rather than its word. The coarse counterpart to
     /// [`Self::select_word_at_match`] — `a` takes the word and then
     /// grows a word at a time, `A` takes the line in one go.
-    fn select_line_at_match(&mut self, idx: usize) {
-        let (m, target) = match self.search.as_ref() {
-            Some(s) => {
-                let Some(m) = s.matches.get(idx).copied() else { return };
-                let target = if s.target_path.is_empty() {
-                    SelectionTarget::Host
-                } else {
-                    SelectionTarget::Portal(s.target_path.clone())
-                };
-                (m, target)
-            }
-            None => return,
-        };
+    fn select_line_at_match(&mut self, m: search::MatchSpan) {
+        let Some(target) = self.search_target() else { return };
         if !self.select_whole_line(&target, m.line) {
             // Nothing but whitespace on that line — close the overlay
             // rather than leave it up with no selection, matching what
@@ -3944,19 +4000,8 @@ impl App {
     /// position is left as-is since the match is already on screen. If
     /// the match doesn't sit on a word (a whitespace query), nothing is
     /// selected and the overlay just closes, as before.
-    fn select_word_at_match(&mut self, idx: usize, ch: char) {
-        let (m, target) = match self.search.as_ref() {
-            Some(s) => {
-                let Some(m) = s.matches.get(idx).copied() else { return };
-                let target = if s.target_path.is_empty() {
-                    SelectionTarget::Host
-                } else {
-                    SelectionTarget::Portal(s.target_path.clone())
-                };
-                (m, target)
-            }
-            None => return,
-        };
+    fn select_word_at_match(&mut self, m: search::MatchSpan, ch: char) {
+        let Some(target) = self.search_target() else { return };
         let Some(((s_line, s_col), (e_line, e_col))) =
             self.find_word_range(&target, m.line, m.col_start)
         else {
@@ -4009,21 +4054,9 @@ impl App {
     /// only ever break it (a URL's word range stops at the first `/`).
     /// The kind is remembered so the command that runs next can tell a
     /// URL from a path.
-    fn select_hint(&mut self, idx: usize) {
-        let (m, kind, target) = match self.search.as_ref() {
-            Some(s) => {
-                let Some(m) = s.matches.get(idx).copied() else {
-                    return;
-                };
-                let target = if s.target_path.is_empty() {
-                    SelectionTarget::Host
-                } else {
-                    SelectionTarget::Portal(s.target_path.clone())
-                };
-                (m, s.hint_kind(idx), target)
-            }
-            None => return,
-        };
+    fn select_hint(&mut self, label: JumpLabel) {
+        let Some(target) = self.search_target() else { return };
+        let (m, kind) = (label.span, label.kind);
         self.vge_selection = None;
         self.selection = Some(Selection {
             target,
@@ -4671,10 +4704,10 @@ impl App {
                         .labels
                         .iter()
                         .find(|l| l.ch == ch || l.ch == lower)
-                })
-                .map(|l| l.match_idx);
+                        .copied()
+                });
             match hit {
-                Some(idx) => self.select_hint(idx),
+                Some(label) => self.select_hint(label),
                 None => {
                     self.search = None;
                     if let Some(w) = &self.window {
@@ -4761,16 +4794,16 @@ impl App {
                     && s.chars().count() == 1
                     // A label key selects its word; the shifted form of
                     // the same key selects the whole line it sits on.
-                    && let Some((match_idx, whole_line)) = shifted_label(ch)
+                    && let Some((span, whole_line)) = shifted_label(ch)
                         .and_then(|lower| {
-                            search.labels.iter().find(|l| l.ch == lower).map(|l| (l.match_idx, true))
+                            search.labels.iter().find(|l| l.ch == lower).map(|l| (l.span, true))
                         })
                         .or_else(|| {
                             search
                                 .labels
                                 .iter()
                                 .find(|l| l.ch == ch)
-                                .map(|l| (l.match_idx, false))
+                                .map(|l| (l.span, false))
                         })
                 {
                     let would_narrow = search.editing
@@ -4785,9 +4818,9 @@ impl App {
                         };
                     if !would_narrow {
                         if whole_line {
-                            self.select_line_at_match(match_idx);
+                            self.select_line_at_match(span);
                         } else {
-                            self.select_word_at_match(match_idx, ch);
+                            self.select_word_at_match(span, ch);
                         }
                         return;
                     }
@@ -6692,7 +6725,7 @@ mod jump_label_tests {
 
     #[test]
     fn labels_assigned_in_order() {
-        let labels = assign_jump_labels(&[0, 1, 2], &HashSet::new(), JUMP_LABEL_ALPHABET);
+        let labels = assign_jump_labels(&[0, 1, 2], &HashSet::new(), JUMP_LABEL_ALPHABET, |_| None);
         let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
         let idxs: Vec<usize> = labels.iter().map(|(i, _)| *i).collect();
         assert_eq!(idxs, vec![0, 1, 2]);
@@ -6705,7 +6738,7 @@ mod jump_label_tests {
         // Exclude 'a' and 'd' (chars that could continue a match): the
         // assignment must not hand them out, falling through to 's', 'f'.
         let excluded: HashSet<char> = ['a', 'd'].into_iter().collect();
-        let labels = assign_jump_labels(&[10, 11], &excluded, JUMP_LABEL_ALPHABET);
+        let labels = assign_jump_labels(&[10, 11], &excluded, JUMP_LABEL_ALPHABET, |_| None);
         let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
         assert_eq!(chars, vec!['s', 'f']);
         // The original match indices are preserved.
@@ -6739,7 +6772,7 @@ mod jump_label_tests {
             }
         }
         assert!(excluded.contains(&'i'), "expected 'i' excluded, got {excluded:?}");
-        let labels = assign_jump_labels(&visible, &excluded, JUMP_LABEL_ALPHABET);
+        let labels = assign_jump_labels(&visible, &excluded, JUMP_LABEL_ALPHABET, |_| None);
         assert!(
             labels.iter().all(|(_, c)| *c != 'i'),
             "no label should be 'i': {labels:?}"
@@ -6752,7 +6785,7 @@ mod jump_label_tests {
         // labelled, the rest are dropped (still nav-reachable via n/N).
         let n = JUMP_LABEL_ALPHABET.len();
         let visible: Vec<usize> = (0..n + 5).collect();
-        let labels = assign_jump_labels(&visible, &HashSet::new(), JUMP_LABEL_ALPHABET);
+        let labels = assign_jump_labels(&visible, &HashSet::new(), JUMP_LABEL_ALPHABET, |_| None);
         assert_eq!(labels.len(), n);
         assert_eq!(labels.last().unwrap().0, n - 1);
     }
@@ -6776,14 +6809,40 @@ mod jump_label_tests {
         );
     }
 
-    /// Hint mode has no query, so nothing is ever excluded: the label a
-    /// hint gets depends only on its position.
+    /// Hint mode has no query, so nothing is ever excluded: with no
+    /// labels carried over, the label a hint gets depends only on its
+    /// position.
     #[test]
     fn hint_labels_ignore_the_exclusion_set() {
         let visible: Vec<usize> = (0..4).collect();
-        let labels = assign_jump_labels(&visible, &HashSet::new(), HINT_LABEL_ALPHABET);
+        let labels = assign_jump_labels(&visible, &HashSet::new(), HINT_LABEL_ALPHABET, |_| None);
         let chars: Vec<char> = labels.iter().map(|(_, c)| *c).collect();
         assert_eq!(chars, vec!['a', 's', 'd', 'f']);
+    }
+
+    /// A match that stays on screen keeps its letter when one above it
+    /// scrolls away — the busy-program case, where reading-order
+    /// assignment moved every letter up by one between the frame the
+    /// user read and the keypress.
+    #[test]
+    fn labels_survive_a_match_scrolling_off() {
+        // Last frame: matches 0..4 were a, s, d, f. Match 0 has left the
+        // viewport and match 4 has arrived.
+        let before = ['a', 's', 'd', 'f'];
+        let previous = |idx: usize| before.get(idx).copied();
+        let labels = assign_jump_labels(&[1, 2, 3, 4], &HashSet::new(), HINT_LABEL_ALPHABET, previous);
+        assert_eq!(labels, vec![(1, 's'), (2, 'd'), (3, 'f'), (4, 'a')]);
+    }
+
+    /// A carried-over letter that has since become a query continuation
+    /// is dropped rather than kept, and nothing is labelled twice.
+    #[test]
+    fn carried_labels_still_respect_exclusions_and_uniqueness() {
+        let excluded: HashSet<char> = ['s'].into_iter().collect();
+        // Both matches claim 'a'; match 1's old 's' is now excluded.
+        let previous = |idx: usize| [Some('a'), Some('a'), Some('s')][idx];
+        let labels = assign_jump_labels(&[0, 1, 2], &excluded, JUMP_LABEL_ALPHABET, previous);
+        assert_eq!(labels, vec![(0, 'a'), (1, 'd'), (2, 'f')]);
     }
 
     /// End-to-end for the one conversion `App::select_hint` performs:
@@ -7119,3 +7178,4 @@ mod window_title_tests {
         assert_eq!(window_title_for(&sanitize_window_title(&raw)), "Veter");
     }
 }
+
