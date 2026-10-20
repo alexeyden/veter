@@ -36,7 +36,7 @@ use vge_render::upload::Encoding;
 
 use image_src::Frame;
 use input::{Dir, Event, InputParser};
-use playlist::Playlist;
+use playlist::{Playlist, is_image_ext, is_video_ext};
 use video::{Decode, DecodeState, VideoMeta, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
 
@@ -118,29 +118,6 @@ fn file_label(p: &std::path::Path) -> String {
         .unwrap_or(p.as_os_str())
         .to_string_lossy()
         .into_owned()
-}
-
-fn is_video_ext(p: &std::path::Path) -> bool {
-    match p.extension().and_then(|e| e.to_str()) {
-        Some(e) => matches!(
-            e.to_ascii_lowercase().as_str(),
-            "mp4"
-                | "mkv"
-                | "webm"
-                | "mov"
-                | "avi"
-                | "m4v"
-                | "mpg"
-                | "mpeg"
-                | "wmv"
-                | "flv"
-                | "ts"
-                | "gif"
-                | "ogv"
-                | "3gp"
-        ),
-        None => false,
-    }
 }
 
 fn np(c: Command) -> (Command, u32) {
@@ -667,14 +644,14 @@ fn main() -> Result<()> {
         is_video_ext(&cli.file)
     };
 
-    let path_str = cli.file.to_string_lossy().into_owned();
+    let mut path_str = cli.file.to_string_lossy().into_owned();
     let mut name = file_label(&cli.file);
 
     // Probe video metadata up front — it is cheap, and it fails before
     // we touch the terminal if the input is bad or ffmpeg is missing.
     // The pixels are decoded further down, after the chrome exists, so
     // the wait has something to say for itself.
-    let meta: Option<VideoMeta> = if is_video {
+    let mut meta: Option<VideoMeta> = if is_video {
         Some(probe_video(&path_str)?)
     } else {
         None
@@ -765,18 +742,18 @@ fn main() -> Result<()> {
 
     // Video state. There is no continuous playback: the displayed frame
     // changes only when the user seeks.
-    let fps = meta.as_ref().map(|m| m.fps).unwrap_or(30.0);
+    let mut fps = meta.as_ref().map(|m| m.fps).unwrap_or(30.0);
     let mut cur_pts = 0.0f64;
     let mut cur_index = 0u64;
 
-    // Image state: the opened file's sibling stills, which the left/right
-    // arrows cycle through. Scanned once — the directory as it was when
-    // vplay opened.
-    let mut pl = if is_video {
-        None
-    } else {
-        Some(Playlist::scan(&cli.file))
-    };
+    // The opened file's siblings of its own kind, which `n`/`p` cycle
+    // through (and, for stills, the left/right arrows). Scanned once —
+    // the directory as it was when vplay opened.
+    let mut pl = Playlist::scan(&cli.file, if is_video { is_video_ext } else { is_image_ext });
+    // Set when `n`/`p` opens another video, until its first frame lands:
+    // that frame brings a new geometry, which — unlike a still's — the
+    // worker cannot announce, since it only encoded it.
+    let mut video_switched = false;
 
     // Decoding and encoding run on a worker (see `work`), so neither
     // blocks the loop: keys keep working and the progress panel keeps
@@ -846,18 +823,9 @@ fn main() -> Result<()> {
     // applies — for exactly that long, with the chrome up and nothing in
     // it. The grid fallback covers seeking until the table lands.
     let mut frame_times: Vec<f64> = Vec::new();
-    let frame_times_rx = if is_video {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let path = path_str.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(probe_frame_times(&path));
-        });
-        Some(rx)
-    } else {
-        None
-    };
+    let mut frame_times_rx = is_video.then(|| spawn_frame_times(path_str.clone()));
     let mut total_frames = meta.as_ref().and_then(|m| m.total_frames());
-    let duration = meta.as_ref().map(|m| m.duration()).unwrap_or(0.0);
+    let mut duration = meta.as_ref().map(|m| m.duration()).unwrap_or(0.0);
 
     while !quit {
         // The packet index, if the probe thread has finished with it.
@@ -943,6 +911,13 @@ fn main() -> Result<()> {
         };
 
         for ev in events {
+            // A still playlist is the arrows' to walk already; `n`/`p`
+            // are the same step, spelled the way video mode spells it.
+            let ev = match ev {
+                Event::NextFile if !is_video => Event::Arrow(Dir::Right),
+                Event::PrevFile if !is_video => Event::Arrow(Dir::Left),
+                ev => ev,
+            };
             match ev {
                 Event::Quit => quit = true,
                 Event::Fit => {
@@ -998,9 +973,7 @@ fn main() -> Result<()> {
                         )?;
                         dirty_status = true;
                         dirty_seek = true;
-                    } else if horizontal
-                        && let Some(pl) = pl.as_mut()
-                    {
+                    } else if horizontal {
                         // Image mode: walk the directory's stills.
                         // Horizontal panning moves to `h`/`l`. The
                         // decode goes to the worker, so holding an arrow
@@ -1019,6 +992,54 @@ fn main() -> Result<()> {
                         dirty_media = true;
                         dirty_status = true;
                     }
+                }
+                Event::NextFile | Event::PrevFile => {
+                    // Video mode only — image mode rewrote these into
+                    // arrows above. ffprobe is quick and synchronous, so
+                    // a sibling that will not probe is skipped right here
+                    // rather than walked past on a later tick; once the
+                    // whole directory has refused, the cursor goes back.
+                    let delta = if ev == Event::NextFile { 1 } else { -1 };
+                    let start = pl.index();
+                    let mut opened = None;
+                    for _ in 1..pl.len() {
+                        let path = pl.step(delta);
+                        if let Ok(m) = probe_video(&path.to_string_lossy()) {
+                            opened = Some((path, m));
+                            break;
+                        }
+                    }
+                    let Some((path, m)) = opened else {
+                        pl.set_index(start);
+                        continue;
+                    };
+                    // Nothing still in flight belongs to the new file:
+                    // a frame being encoded or streamed would land on
+                    // screen under the new name and geometry. The
+                    // pending decode is replaced below, which kills its
+                    // ffmpeg.
+                    worker.cancel();
+                    if let Some(old) = upload.take() {
+                        send(&mut out, &[np(Command::DropImage { id: old.id, by_prefix: false })]);
+                    }
+                    path_str = path.to_string_lossy().into_owned();
+                    name = file_label(&path);
+                    (src_w, src_h) = (m.width, m.height);
+                    fps = m.fps;
+                    duration = m.duration();
+                    total_frames = m.total_frames();
+                    // Dropping the old receiver orphans its probe thread,
+                    // whose send then fails; seeking runs on the grid
+                    // until the new table lands.
+                    frame_times.clear();
+                    frame_times_rx = Some(spawn_frame_times(path_str.clone()));
+                    cur_pts = 0.0;
+                    cur_index = 0;
+                    pending = Some(start_decode(&path_str, m.width, m.height, 0.0)?);
+                    meta = Some(m);
+                    video_switched = true;
+                    dirty_status = true;
+                    dirty_seek = true;
                 }
                 Event::StepNext | Event::StepPrev => {
                     if is_video {
@@ -1144,10 +1165,12 @@ fn main() -> Result<()> {
             Some(work::Done::Ready(r)) => {
                 if let Some(path) = &r.path {
                     name = file_label(path);
-                    // Every still may be a different size, so the
-                    // viewport is rebuilt around it — keeping the zoom
-                    // the user had chosen, except for the very first,
-                    // which fits.
+                }
+                if r.path.is_some() || std::mem::take(&mut video_switched) {
+                    // Every still may be a different size, and so may
+                    // the next video, so the viewport is rebuilt around
+                    // the picture — keeping the zoom the user had
+                    // chosen, except for the very first, which fits.
                     let zoom = have_picture.then_some(vp.zoom);
                     src_w = r.frame.w;
                     src_h = r.frame.h;
@@ -1182,20 +1205,18 @@ fn main() -> Result<()> {
                 // usable picture. If the user was walking one, keep
                 // going in the same direction; give up (cursor restored)
                 // once the whole directory has refused.
-                let walking = match (path.is_some(), pl.as_mut()) {
-                    (true, Some(pl)) if step_dir != 0 && step_tries + 1 < pl.len() => {
-                        step_tries += 1;
-                        let next = pl.step(step_dir);
-                        loading = Some(file_label(&next));
-                        worker.load(next, enc_params);
-                        true
-                    }
-                    (true, Some(pl)) if step_dir != 0 => {
-                        pl.set_index(step_start);
-                        step_dir = 0;
-                        false
-                    }
-                    _ => false,
+                let walking = if path.is_none() || step_dir == 0 {
+                    false
+                } else if step_tries + 1 < pl.len() {
+                    step_tries += 1;
+                    let next = pl.step(step_dir);
+                    loading = Some(file_label(&next));
+                    worker.load(next, enc_params);
+                    true
+                } else {
+                    pl.set_index(step_start);
+                    step_dir = 0;
+                    false
                 };
                 if !walking {
                     loading = None;
@@ -1278,6 +1299,13 @@ fn main() -> Result<()> {
             let cur = cursor
                 .and_then(|(c, r)| vp.cursor_pixel(c, r))
                 .map(|(x, y)| (x, y, source_frame.pixel(x, y)));
+            // The playlist position only earns its space when there is
+            // somewhere to cycle to.
+            let pos = if pl.len() > 1 {
+                format!("  {}/{}", pl.index() + 1, pl.len())
+            } else {
+                String::new()
+            };
             let (left, center, right) = if is_video {
                 let totals = total_frames
                     .map(|t| t.to_string())
@@ -1285,7 +1313,7 @@ fn main() -> Result<()> {
                 (
                     format!("{name}  {src_w}x{src_h}  {fps:.2}fps"),
                     format!(
-                        "{}%  f {}/{}  {}",
+                        "{}%  f {}/{}  {}{pos}",
                         vp.zoom_percent(),
                         cur_index,
                         totals,
@@ -1294,12 +1322,6 @@ fn main() -> Result<()> {
                     cursor_readout(&cur),
                 )
             } else {
-                // The playlist position only earns its space when there
-                // is somewhere to cycle to.
-                let pos = match pl.as_ref().filter(|p| p.len() > 1) {
-                    Some(p) => format!("  {}/{}", p.index() + 1, p.len()),
-                    None => String::new(),
-                };
                 (
                     if have_picture {
                         format!("{name}  {src_w}x{src_h}")
@@ -1410,6 +1432,16 @@ fn main() -> Result<()> {
         bail!(e);
     }
     Ok(())
+}
+
+/// Read `path`'s per-frame presentation times on a thread (see the
+/// comment at the call site in `main` for why it can't run inline).
+fn spawn_frame_times(path: String) -> std::sync::mpsc::Receiver<Vec<f64>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe_frame_times(&path));
+    });
+    rx
 }
 
 #[derive(Clone, Copy)]

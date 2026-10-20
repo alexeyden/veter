@@ -143,6 +143,15 @@ impl Worker {
         let _ = self.tx.send(Job::Encode { seq, frame, params });
     }
 
+    /// Abandon whatever is in flight: its result, when it comes, is
+    /// discarded like any superseded one. For when the picture it would
+    /// produce no longer belongs on screen — a frame of the video the
+    /// user just stepped away from.
+    pub fn cancel(&mut self) {
+        self.submit();
+        self.inflight = None;
+    }
+
     fn submit(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;

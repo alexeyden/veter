@@ -1,23 +1,38 @@
-//! The stills sitting next to the opened file — the list the left/right
-//! arrows cycle through in image mode.
+//! The files sitting next to the opened one — the list `n`/`p` cycle
+//! through: sibling stills in image mode (the left/right arrows too),
+//! sibling videos in video mode.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Extensions [`crate::image_src::load_image`] can decode: the `image`
 /// crate is built with png/jpeg/webp only. `gif` is deliberately absent —
-/// `is_video_ext` claims it, so a gif opens in video mode and never takes
+/// [`VIDEO_EXTS`] claims it, so a gif opens in video mode and never takes
 /// part in a still playlist.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "jpe", "jfif", "webp"];
 
-pub fn is_image_ext(p: &Path) -> bool {
+/// Extensions that open in video mode unless `--image` says otherwise.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "webm", "mov", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "ts", "gif", "ogv",
+    "3gp",
+];
+
+fn has_ext(p: &Path, exts: &[&str]) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .is_some_and(|e| exts.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-/// The opened file's sibling stills in lexicographical order, with a
-/// cursor on the one currently displayed.
+pub fn is_image_ext(p: &Path) -> bool {
+    has_ext(p, IMAGE_EXTS)
+}
+
+pub fn is_video_ext(p: &Path) -> bool {
+    has_ext(p, VIDEO_EXTS)
+}
+
+/// The opened file's siblings of the same kind in lexicographical order,
+/// with a cursor on the one currently displayed.
 ///
 /// Names are stored relative to the opened path's parent so
 /// [`Self::current`] reproduces the caller's path form (`foo.png` stays
@@ -34,11 +49,12 @@ pub struct Playlist {
 }
 
 impl Playlist {
-    /// Scan `path`'s directory for stills, sorted by file name. `path`
-    /// itself joins the list even when its extension is not a known still
-    /// one (`--image` forces the mode), and an unreadable directory
-    /// degrades to a one-entry list.
-    pub fn scan(path: &Path) -> Self {
+    /// Scan `path`'s directory for the files `member` accepts (by
+    /// extension — [`is_image_ext`] or [`is_video_ext`]), sorted by file
+    /// name. `path` itself joins the list even when `member` rejects it
+    /// (`--image` / `--video` force the mode), and an unreadable
+    /// directory degrades to a one-entry list.
+    pub fn scan(path: &Path, member: fn(&Path) -> bool) -> Self {
         let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
         let Some(self_name) = path.file_name().map(|n| n.to_os_string()) else {
             // No trailing file name (`..`, `/`) — nothing to scan
@@ -64,7 +80,7 @@ impl Playlist {
                 // A directory called `foo.png` is not a still; follow
                 // symlinks (metadata, not symlink_metadata) so a link to
                 // an image counts as one.
-                is_image_ext(&e.path()) && e.metadata().is_ok_and(|m| m.is_file())
+                member(&e.path()) && e.metadata().is_ok_and(|m| m.is_file())
             })
             .map(|e| e.file_name())
             .collect();
@@ -130,6 +146,15 @@ mod tests {
     }
 
     #[test]
+    fn recognises_video_extensions() {
+        assert!(is_video_ext(Path::new("a.mp4")));
+        assert!(is_video_ext(Path::new("a.MKV")));
+        assert!(is_video_ext(Path::new("a.gif")));
+        assert!(!is_video_ext(Path::new("a.png")));
+        assert!(!is_video_ext(Path::new("README")));
+    }
+
+    #[test]
     fn step_wraps_both_ways() {
         let mut pl = playlist(&["a.png", "b.png", "c.png"], 0);
         assert_eq!(pl.step(1), PathBuf::from("/pics/b.png"));
@@ -157,16 +182,21 @@ mod tests {
         }
         std::fs::create_dir(dir.join("sub.png")).unwrap();
 
-        let pl = Playlist::scan(&dir.join("b.png"));
+        let pl = Playlist::scan(&dir.join("b.png"), is_image_ext);
         assert_eq!(pl.len(), 3, "only the three stills; sub.png is a dir");
         assert_eq!(pl.index(), 1, "uppercase A sorts before lowercase b");
         assert_eq!(pl.current(), dir.join("b.png"));
 
         // A file the scan filters out still anchors the cursor, so
         // `--image` on an odd extension can cycle out of it.
-        let pl = Playlist::scan(&dir.join("notes.txt"));
+        let pl = Playlist::scan(&dir.join("notes.txt"), is_image_ext);
         assert_eq!(pl.len(), 4);
         assert_eq!(pl.current(), dir.join("notes.txt"));
+
+        // Video mode walks the videos instead.
+        let pl = Playlist::scan(&dir.join("clip.mp4"), is_video_ext);
+        assert_eq!(pl.len(), 1);
+        assert_eq!(pl.current(), dir.join("clip.mp4"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -38,6 +38,10 @@ pub enum Event {
     Pan(Dir),
     StepNext,
     StepPrev,
+    /// `n` / `p` — the next / previous sibling file of the opened kind,
+    /// in both modes.
+    NextFile,
+    PrevFile,
     /// Left-button press at a 0-indexed cell.
     MouseDown {
         col: u16,
@@ -230,6 +234,14 @@ impl InputParser {
                     out.push(Event::StepPrev);
                     i += 1;
                 }
+                b'n' => {
+                    out.push(Event::NextFile);
+                    i += 1;
+                }
+                b'p' => {
+                    out.push(Event::PrevFile);
+                    i += 1;
+                }
                 _ => {
                     i += 1; // ignore other bytes
                 }
@@ -374,7 +386,7 @@ mod tests {
     #[test]
     fn parses_keys() {
         let mut p = InputParser::new();
-        let evs = p.feed(b"+-01.,q");
+        let evs = p.feed(b"+-01.,npq");
         assert_eq!(
             evs,
             vec![
@@ -384,6 +396,8 @@ mod tests {
                 Event::Actual,
                 Event::StepNext,
                 Event::StepPrev,
+                Event::NextFile,
+                Event::PrevFile,
                 Event::Quit,
             ]
         );
