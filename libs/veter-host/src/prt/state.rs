@@ -356,6 +356,10 @@ pub struct PrtEngine {
 pub const DEFAULT_DAMAGE_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(50);
 
+/// A decoded PRT snapshot, not yet installed. See
+/// [`PrtEngine::decode_binary_snapshot`].
+pub struct PrtSnapshot(PrtState);
+
 impl PrtEngine {
     /// Construct the host's top-level PRT engine with default cell
     /// metrics (suitable for unit tests; `main.rs` should use
@@ -665,6 +669,21 @@ impl PrtEngine {
         bytes: &[u8],
     ) -> Result<(), crate::prt::snapshot::SnapshotError> {
         crate::prt::snapshot::decode_engine_into(self, bytes)
+    }
+
+    /// The decoding half of [`Self::restore_from_binary_snapshot`],
+    /// leaving this engine as it is — so a VSS restore can read all
+    /// three of its parts before installing any (`pipeline::restore`).
+    pub fn decode_binary_snapshot(
+        &self,
+        bytes: &[u8],
+    ) -> Result<PrtSnapshot, crate::prt::snapshot::SnapshotError> {
+        crate::prt::snapshot::decode_engine(self, bytes).map(PrtSnapshot)
+    }
+
+    /// The installing half of [`Self::restore_from_binary_snapshot`].
+    pub fn install_binary_snapshot(&mut self, decoded: PrtSnapshot) {
+        self.install_state_from_snapshot(decoded.0);
     }
 
     /// Drain every pending image-delete in this engine's subtree:

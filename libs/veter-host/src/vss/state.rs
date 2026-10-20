@@ -335,10 +335,11 @@ impl VssEngine {
                 DownstreamFrame::SnapshotEnd { sequence_id } => {
                     if let Some(b) = self.builder.as_ref() {
                         if b.sequence_id == sequence_id && b.is_complete() {
+                            // Not answered here: these bytes are
+                            // only a snapshot once the caller has
+                            // decoded them. See `Self::answer`.
                             let b = self.builder.take().unwrap();
-                            let cs = b.finish();
-                            self.accept(cs.sequence_id);
-                            self.completed.push(cs);
+                            self.completed.push(b.finish());
                         } else {
                             // Incomplete or mismatched End — reject.
                             self.builder = None;
@@ -369,9 +370,26 @@ impl VssEngine {
         result
     }
 
-    fn accept(&mut self, sequence_id: u32) {
-        let env = vss_protocol::encode_accepted(sequence_id);
-        self.pending_response_bytes.extend_from_slice(&env);
+    /// Answer a snapshot this engine handed out, once the caller has
+    /// tried to apply it: `SnapshotAccepted`, or `SnapshotRejected`
+    /// with the reason.
+    ///
+    /// The answer waits for the caller because reassembly only proves
+    /// the fragments arrived. The three parts inside carry layout
+    /// versions of their own, which only the engines that decode them
+    /// can check — and a renderer that accepted a snapshot it then
+    /// could not read showed an attach with every pane empty, while
+    /// the daemon took the accept at its word.
+    pub fn answer(&mut self, sequence_id: u32, verdict: Result<(), RejectReason>) {
+        match verdict {
+            Ok(()) => self
+                .pending_response_bytes
+                .extend_from_slice(&vss_protocol::encode_accepted(sequence_id)),
+            Err(RejectReason::VersionMismatch) => {
+                self.reject(sequence_id, REJECT_VERSION_MISMATCH);
+            }
+            Err(RejectReason::Malformed) => self.reject(sequence_id, REJECT_MALFORMED),
+        }
     }
 
     fn reject(&mut self, sequence_id: u32, reason: u8) {
@@ -425,11 +443,25 @@ mod tests {
         assert_eq!(c.vge_bytes, b"vge-bytes");
         assert_eq!(c.prt_bytes, b"prt-bytes");
 
-        // Upstream Accepted envelope queued.
-        let responses = e.take_responses();
-        assert!(!responses.is_empty());
-        let expected = vss_protocol::encode_accepted(42);
-        assert_eq!(responses, expected);
+        // Reassembled is not accepted: nothing is said until whoever
+        // applies it reports back.
+        assert!(e.take_responses().is_empty());
+        e.answer(42, Ok(()));
+        assert_eq!(e.take_responses(), vss_protocol::encode_accepted(42));
+    }
+
+    #[test]
+    fn a_snapshot_its_caller_cannot_read_is_rejected() {
+        let env = encode_snapshot(SNAPSHOT_VERSION, 1, 1, 7, b"a", b"b", b"c", 256);
+        let mut e = VssEngine::new();
+        let _ = e.process_pty_chunk(&env);
+        assert_eq!(e.take_completed_snapshots().len(), 1);
+        e.answer(7, Err(RejectReason::VersionMismatch));
+        assert_eq!(
+            e.take_responses(),
+            encode_rejected(7, REJECT_VERSION_MISMATCH)
+        );
+        assert_eq!(e.take_rejected(), vec![(7, RejectReason::VersionMismatch)]);
     }
 
     #[test]
@@ -601,6 +633,9 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].sequence_id, 100);
         assert_eq!(c[1].sequence_id, 101);
+        for snapshot in &c {
+            e.answer(snapshot.sequence_id, Ok(()));
+        }
         // Two Accept envelopes back-to-back.
         let resp = e.take_responses();
         let mut expect = vss_protocol::encode_accepted(100);

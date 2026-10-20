@@ -39,9 +39,17 @@ pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotError(pub &'static str);
 
+const KIND_VERSION_MISMATCH: &str = "vt100 snapshot kind version mismatch";
+
 impl SnapshotError {
     pub(crate) fn kind_version_mismatch(_got: u16, _want: u16) -> Self {
-        Self("vt100 snapshot kind version mismatch")
+        Self(KIND_VERSION_MISMATCH)
+    }
+    /// Whether the payload was written by a different snapshot layout
+    /// rather than being damaged — the sender is another build.
+    #[must_use]
+    pub fn is_version_mismatch(&self) -> bool {
+        self.0 == KIND_VERSION_MISMATCH
     }
     pub(crate) fn bad_payload(reason: &'static str) -> Self {
         Self(reason)

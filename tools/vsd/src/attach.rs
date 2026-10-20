@@ -160,32 +160,35 @@ fn await_snapshot_ack(
         let out = apc.feed(&buf[..n]);
         typeahead.extend_from_slice(&probe.feed(&out.passthrough));
         for payload in &out.payloads {
-            let mut verdict = None;
-            let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
-                if let Ok(frame) = vss_protocol::frames::UpstreamFrame::parse(frame_type, body)
-                {
-                    verdict = match frame {
-                        vss_protocol::frames::UpstreamFrame::SnapshotAccepted { sequence_id: id } => {
-                            Some((id, SnapshotAck::Accepted))
-                        }
-                        vss_protocol::frames::UpstreamFrame::SnapshotRejected {
-                            sequence_id: id,
-                            reason,
-                        } => Some((id, SnapshotAck::Rejected(reason))),
-                        // A late answer to an earlier attach's detach.
-                        vss_protocol::frames::UpstreamFrame::DetachAccepted { .. } => verdict,
-                    };
-                }
-                Ok::<(), u16>(())
-            });
-            // An answer to some other snapshot is not ours to act on.
-            if let Some((id, ack)) = verdict
-                && id == sequence_id
-            {
+            if let Some(ack) = snapshot_verdict(payload, sequence_id) {
                 return Ok((ack, typeahead));
             }
         }
     }
+}
+
+/// The renderer's verdict on this attach's snapshot, if `payload` (an
+/// upstream VSS envelope) carries one. An answer to some other
+/// snapshot is not ours to act on, and a `DetachAccepted` is a late
+/// answer to an earlier attach's detach.
+fn snapshot_verdict(payload: &[u8], sequence_id: u32) -> Option<SnapshotAck> {
+    use vss_protocol::frames::UpstreamFrame;
+    let mut verdict = None;
+    let _ = vss_protocol::for_each_frame(payload, |frame_type, _rid, body| {
+        match UpstreamFrame::parse(frame_type, body) {
+            Ok(UpstreamFrame::SnapshotAccepted { sequence_id: id }) if id == sequence_id => {
+                verdict = Some(SnapshotAck::Accepted);
+            }
+            Ok(UpstreamFrame::SnapshotRejected { sequence_id: id, reason })
+                if id == sequence_id =>
+            {
+                verdict = Some(SnapshotAck::Rejected(reason));
+            }
+            _ => {}
+        }
+        Ok::<(), u16>(())
+    });
+    verdict
 }
 
 /// Cadence for the mid-attach SIGWINCH watcher. The renderer's stdio
@@ -437,12 +440,7 @@ fn handler_main(
         // user was looking at, with no way back. Say why, hold long
         // enough to read it, and tear the attach down.
         if let SnapshotAck::Rejected(reason) = ack {
-            let banner = format!(
-                "\r\nvsd: cannot attach — {}.\r\n     \
-                 Rebuild `veter` and `vsd` from the same commit.\r\n",
-                SnapshotAck::reject_reason(reason)
-            );
-            let _ = write_all_raw(stdout_raw, banner.as_bytes());
+            let _ = write_all_raw(stdout_raw, reject_banner(reason).as_bytes());
             drop(guard);
             std::thread::sleep(REJECT_BANNER_HOLD);
             restore_tty_canonical(stdin_fd.as_raw_fd(), false);
@@ -523,6 +521,7 @@ fn handler_main(
         ipc_socket.as_fd(),
         &master_write,
         &mut input,
+        sequence_id,
     );
 
     // Step 7: detach — clear the renderer-stdout fd and shutdown pipe
@@ -558,6 +557,10 @@ fn handler_main(
     // the pane still carries whatever modes the session left behind.
     if ack != SnapshotAck::Accepted {
         let _ = write_all_raw(stdout_fd.as_raw_fd(), b"\x1bc");
+    }
+    // Behind the reset, so it is what the pane is left showing.
+    if let Ok(SpliceEnd::Rejected(reason)) = result {
+        let _ = write_all_raw(stdout_fd.as_raw_fd(), reject_banner(reason).as_bytes());
     }
 
     // §4.4 — the renderer isn't done with the session just because we
@@ -597,7 +600,21 @@ fn handler_main(
     // restores: it is more likely the session's than the user's.
     restore_tty_canonical(stdin_fd.as_raw_fd(), !drained);
 
-    result.map(|_| ())
+    match result? {
+        SpliceEnd::Rejected(reason) => Err(anyhow!(
+            "renderer rejected the snapshot late (reason {reason})"
+        )),
+        SpliceEnd::Detached | SpliceEnd::RendererGone => Ok(()),
+    }
+}
+
+/// What the renderer is told when it refused the snapshot (§4.2).
+fn reject_banner(reason: u8) -> String {
+    format!(
+        "\r\nvsd: cannot attach — {}.\r\n     \
+         Rebuild `veter` and `vsd` from the same commit.\r\n",
+        SnapshotAck::reject_reason(reason)
+    )
 }
 
 /// Defensive end-of-attach tty restore: read current termios, OR-in
@@ -1135,6 +1152,11 @@ enum SpliceEnd {
     /// The renderer went away: its stdin closed, or the `vsd attach`
     /// CLI did.
     RendererGone,
+    /// The renderer refused the snapshot after [`ACK_TIMEOUT`] had
+    /// already given up on its answer — a snapshot big enough to still
+    /// be crossing a slow link when the timer ran out. The reason is
+    /// the `SnapshotRejected` code.
+    Rejected(u8),
 }
 
 /// The parse state of the renderer's stdin. It outlives the splice: an
@@ -1224,6 +1246,7 @@ fn splice_input(
     ipc_fd: BorrowedFd<'_>,
     master_write: &Mutex<()>,
     input: &mut InputState,
+    sequence_id: u32,
 ) -> Result<SpliceEnd> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
@@ -1340,6 +1363,15 @@ fn splice_input(
         // user keystrokes and the envelopes bound for the session's
         // client, which the detach scanner tells apart.
         let vss_out = input.vss_filter.feed(&buf[..n]);
+        // An answer to the snapshot that missed `ACK_TIMEOUT`. An
+        // acceptance changes nothing now; a refusal means the pane has
+        // none of the session's state, and every byte forwarded so far
+        // painted over whatever it was showing.
+        for payload in &vss_out.payloads {
+            if let Some(SnapshotAck::Rejected(reason)) = snapshot_verdict(payload, sequence_id) {
+                return Ok(SpliceEnd::Rejected(reason));
+            }
+        }
         // Bytes that just arrived restart the window: they are evidence
         // that the rest of a split envelope is on its way.
         esc_deadline = input
@@ -1598,6 +1630,26 @@ impl Drop for RawTty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The payload of an upstream VSS envelope, as the splice's filter
+    /// hands it over.
+    fn upstream_payload(env: &[u8]) -> Vec<u8> {
+        let mut apc = vss_protocol::ApcStream::with_marker(*vss_protocol::MARKER_R2E);
+        let mut out = apc.feed(env);
+        assert_eq!(out.payloads.len(), 1);
+        out.payloads.remove(0)
+    }
+
+    #[test]
+    fn a_verdict_counts_only_for_its_own_snapshot() {
+        let rejected = upstream_payload(&vss_protocol::encode_rejected(7, 1));
+        assert_eq!(snapshot_verdict(&rejected, 7), Some(SnapshotAck::Rejected(1)));
+        assert_eq!(snapshot_verdict(&rejected, 8), None);
+        let accepted = upstream_payload(&vss_protocol::encode_accepted(7));
+        assert_eq!(snapshot_verdict(&accepted, 7), Some(SnapshotAck::Accepted));
+        let detached = upstream_payload(&vss_protocol::encode_detach_accepted(7));
+        assert_eq!(snapshot_verdict(&detached, 7), None);
+    }
 
     fn feed_chunks(chunks: &[&[u8]]) -> (Vec<u8>, bool) {
         let mut s = DetachScanner::default();

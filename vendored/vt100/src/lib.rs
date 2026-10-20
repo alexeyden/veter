@@ -64,6 +64,6 @@ pub use callbacks::{Callbacks, DynamicColor};
 pub use cell::Cell;
 pub use parser::Parser;
 pub use screen::{
-    CursorShape, MouseProtocolEncoding, MouseProtocolMode, Screen,
+    CursorShape, MouseProtocolEncoding, MouseProtocolMode, Screen, ScreenSnapshot,
 };
 pub use snapshot::SnapshotError;

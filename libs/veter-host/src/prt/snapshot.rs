@@ -77,6 +77,20 @@ impl std::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl SnapshotError {
+    /// Whether this or any nested part was written by a different
+    /// snapshot layout rather than being damaged.
+    #[must_use]
+    pub fn is_version_mismatch(&self) -> bool {
+        match self {
+            Self::KindVersionMismatch { .. } => true,
+            Self::Vt100(e) => e.is_version_mismatch(),
+            Self::Vge(e) => e.is_version_mismatch(),
+            Self::BadPayload | Self::TrailingBytes | Self::Inconsistent => false,
+        }
+    }
+}
+
 impl From<vge_protocol::codec::DecodeError> for SnapshotError {
     fn from(_: vge_protocol::codec::DecodeError) -> Self {
         SnapshotError::BadPayload
@@ -122,6 +136,18 @@ pub(crate) fn decode_engine_into(
     engine: &mut PrtEngine,
     bytes: &[u8],
 ) -> Result<(), SnapshotError> {
+    let state = decode_engine(engine, bytes)?;
+    engine.install_state_from_snapshot(state);
+    Ok(())
+}
+
+/// Decode an engine snapshot without installing it. `engine` is only
+/// read — for the metrics and policy a restored portal inherits from
+/// the engine it will live in.
+pub(crate) fn decode_engine(
+    engine: &PrtEngine,
+    bytes: &[u8],
+) -> Result<PrtState, SnapshotError> {
     let mut r = Reader::new(bytes);
     let kind = r.u16()?;
     if kind != SNAPSHOT_KIND_VERSION {
@@ -147,14 +173,7 @@ pub(crate) fn decode_engine_into(
         return Err(SnapshotError::TrailingBytes);
     }
 
-    engine.install_state_from_snapshot(PrtState::from_raw_parts(
-        main,
-        alt,
-        on_alt,
-        focus,
-        cursor_style,
-    ));
-    Ok(())
+    Ok(PrtState::from_raw_parts(main, alt, on_alt, focus, cursor_style))
 }
 
 // ---- FocusKind --------------------------------------------------------

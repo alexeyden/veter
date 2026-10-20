@@ -925,8 +925,23 @@ impl VgeEngine {
         &mut self,
         bytes: &[u8],
     ) -> Result<(), crate::vge::snapshot::SnapshotError> {
-        let decoded = crate::vge::snapshot::decode_state(bytes)?;
-        self.state = decoded.state;
+        let decoded = Self::decode_binary_snapshot(bytes)?;
+        self.install_binary_snapshot(decoded);
+        Ok(())
+    }
+
+    /// The decoding half of [`Self::restore_from_binary_snapshot`],
+    /// touching no engine — so a VSS restore can read all three of its
+    /// parts before installing any (`pipeline::restore`).
+    pub fn decode_binary_snapshot(
+        bytes: &[u8],
+    ) -> Result<crate::vge::snapshot::VgeSnapshot, crate::vge::snapshot::SnapshotError> {
+        crate::vge::snapshot::decode_state(bytes).map(crate::vge::snapshot::VgeSnapshot)
+    }
+
+    /// The installing half of [`Self::restore_from_binary_snapshot`].
+    pub fn install_binary_snapshot(&mut self, decoded: crate::vge::snapshot::VgeSnapshot) {
+        self.state = decoded.0.state;
         // Cell metrics are the *receiver's*, and are deliberately not
         // taken from the snapshot — the same rule PRT already applies
         // to `portal_auto_reply` and `vft_relay`. The sender's are
@@ -963,7 +978,6 @@ impl VgeEngine {
         // wire format unchanged and makes it impossible for a stale
         // count to survive a restore.
         self.recompute_image_refs();
-        Ok(())
     }
 
     /// Ingest raw PTY bytes. Returns the passthrough byte slice that

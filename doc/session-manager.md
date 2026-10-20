@@ -380,6 +380,14 @@ banner to the renderer's pane, holds for ~2 s, and tears the attach
 down. No replay fallback. The operational expectation is that `vsd`
 and `veter` ship in lockstep.
 
+A refusal can also arrive *after* the step-4 wait has given up: the
+wait starts once the snapshot is written into the renderer's pty, and a
+large one is still crossing a slow link when it ends. `vsd` keeps
+watching upstream for the rest of the attach, and a late
+`SnapshotRejected` for this `sequence_id` ends it the same way — the
+pane is reset (live output has been painting on it in the meantime)
+and left showing the banner.
+
 A refused snapshot must also stop the attach from *starting*: the
 renderer holds none of the session's state, so live output forwarded
 into that pane would paint over whatever the user was looking at with
@@ -533,14 +541,22 @@ validated):
 1. Check `snapshot_version` against the compile-time constant.
    Mismatch → emit `SnapshotRejected { reason = 1 }`, drop the
    payload.
-2. Decode the three sub-snapshots and call
-   `restore_from_binary_snapshot()` on the **owning context's**
-   engines — host-level vt100 / PRT / VGE for the top-level
-   `VssEngine`, `portal.{vt, children, vge}` for a per-portal
-   `VssEngine`.
-3. Emit `SnapshotAccepted { sequence_id }` upstream via the
-   engine's `pending_response_bytes` queue (the same path PRT and
-   VGE already use for upstream responses).
+2. Decode **all three** sub-snapshots before installing any, for the
+   **owning context's** engines — host-level vt100 / PRT / VGE for the
+   top-level `VssEngine`, `portal.{vt, children, vge}` for a
+   per-portal `VssEngine` (`veter_host::pipeline`). Each sub-snapshot
+   leads with a layout version of its own, which `snapshot_version`
+   does not cover: a part that fails to decode → emit
+   `SnapshotRejected` (`reason = 1` for a layout version mismatch,
+   `2` otherwise) and install nothing. The context keeps the view it
+   had, and no stash is taken.
+3. Otherwise install the three and emit
+   `SnapshotAccepted { sequence_id }` upstream via the engine's
+   `pending_response_bytes` queue (the same path PRT and VGE already
+   use for upstream responses). **The answer follows the decode**:
+   reassembly only proves the fragments arrived, and a renderer that
+   accepted a snapshot it then could not read showed an attach with
+   every pane empty, while `vsd` took the accept at its word.
 
 On `DetachNotify`, in stream order like a snapshot:
 

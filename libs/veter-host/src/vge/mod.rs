@@ -8,7 +8,7 @@
 pub mod snapshot;
 pub mod state;
 
-pub use snapshot::SnapshotError;
+pub use snapshot::{SnapshotError, VgeSnapshot};
 pub use state::{GpuImageId, HostThemeColors, HostThemePalette, VgeEngine, VgeState};
 
 pub use vge_protocol::*;

@@ -36,7 +36,7 @@ use crate::prt::PrtEngine;
 use crate::vft::VftEngine;
 use crate::vge::VgeEngine;
 use crate::vge::state::HitTester;
-use crate::vss::{VssEngine, VssSegment};
+use crate::vss::{RejectReason, VssEngine, VssSegment};
 
 /// A context's engine state as of the moment before an attach, kept so
 /// a `DetachNotify` can put back the view the snapshot replaced (the
@@ -139,6 +139,17 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 crate::vge::drive_terminal_stage(vge, parser, &vft_pass, hit);
             }
             VssSegment::Restore(cs) => {
+                // All three parts are decoded before any is installed:
+                // a part this build cannot read leaves the context
+                // exactly as it was, rather than holding a session's
+                // grid under the pane's own portals.
+                let decoded = match decode(prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes) {
+                    Ok(decoded) => decoded,
+                    Err(reason) => {
+                        vss.answer(cs.sequence_id, Err(reason));
+                        continue;
+                    }
+                };
                 walk.restores += 1;
                 // First snapshot of an attach: stash what it is about
                 // to replace, so a later DetachNotify can put it back.
@@ -152,12 +163,8 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                         prt: prt.binary_snapshot(),
                     });
                 }
-                // A restore error leaves that engine at its
-                // pre-snapshot state, which is the right failure mode
-                // — no partial-apply corruption. The `Reject`
-                // envelope for a version mismatch was already queued
-                // by the VSS engine.
-                restore(parser, vge, prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes);
+                install(parser, vge, prt, decoded);
+                vss.answer(cs.sequence_id, Ok(()));
             }
             VssSegment::Detach => {
                 // The session's client is no longer on this pty, so
@@ -171,8 +178,13 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 const DETACHED: &str = "session detached";
                 vft.abort_all(vft_protocol::frame::ABORT_HOST_RESET, DETACHED);
                 prt.abort_all_vft(vft_protocol::frame::ABORT_HOST_RESET, DETACHED);
-                if let Some(b) = backup.take() {
-                    restore(parser, vge, prt, &b.vt, &b.vge, &b.prt);
+                // The stash was written by this build, so it decodes;
+                // if it somehow did not, keeping the session's view
+                // beats installing a part of it.
+                if let Some(b) = backup.take()
+                    && let Ok(decoded) = decode(prt, &b.vt, &b.vge, &b.prt)
+                {
+                    install(parser, vge, prt, decoded);
                 }
             }
         }
@@ -180,34 +192,66 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
     walk
 }
 
-/// Install one set of engine snapshots, then put the grid back to the
-/// size *this* context is being drawn at.
-///
-/// `restore_from_binary_snapshot` installs the sender's grid geometry
-/// along with its contents, and the sender's is only right at the
-/// instant the snapshot was taken. Attach, resize the window, detach:
-/// the stash was made at the pre-resize size, so restoring it silently
-/// puts the receiving portal's vt100 back to a size nothing else in
-/// the renderer agrees with, and it stays there until the next resize
-/// happens to correct it.
-fn restore<CB: vt100::Callbacks>(
-    parser: &mut vt100::Parser<CB>,
-    vge: &mut VgeEngine,
-    prt: &mut PrtEngine,
+/// One set of engine snapshots, decoded and not yet installed.
+struct Decoded {
+    vt: vt100::ScreenSnapshot,
+    vge: crate::vge::VgeSnapshot,
+    prt: crate::prt::PrtSnapshot,
+}
+
+/// Decode all three parts of a snapshot, or say why one of them cannot
+/// be read. `prt` is only read — a restored portal inherits metrics
+/// and policy from the engine it will live in.
+fn decode(
+    prt: &PrtEngine,
     vt_bytes: &[u8],
     vge_bytes: &[u8],
     prt_bytes: &[u8],
+) -> Result<Decoded, RejectReason> {
+    fn reason(version_mismatch: bool) -> RejectReason {
+        if version_mismatch {
+            RejectReason::VersionMismatch
+        } else {
+            RejectReason::Malformed
+        }
+    }
+    Ok(Decoded {
+        vt: vt100::Screen::decode_binary_snapshot(vt_bytes)
+            .map_err(|e| reason(e.is_version_mismatch()))?,
+        vge: VgeEngine::decode_binary_snapshot(vge_bytes)
+            .map_err(|e| reason(e.is_version_mismatch()))?,
+        prt: prt
+            .decode_binary_snapshot(prt_bytes)
+            .map_err(|e| reason(e.is_version_mismatch()))?,
+    })
+}
+
+/// Install one set of decoded engine snapshots, then put the grid back
+/// to the size *this* context is being drawn at.
+///
+/// A snapshot carries the sender's grid geometry along with its
+/// contents, and the sender's is only right at the instant the
+/// snapshot was taken. Attach, resize the window, detach: the stash
+/// was made at the pre-resize size, so restoring it silently puts the
+/// receiving portal's vt100 back to a size nothing else in the renderer
+/// agrees with, and it stays there until the next resize happens to
+/// correct it.
+fn install<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    vge: &mut VgeEngine,
+    prt: &mut PrtEngine,
+    decoded: Decoded,
 ) {
     let (rows, cols) = parser.screen().size();
-    let _ = parser.screen_mut().restore_from_binary_snapshot(vt_bytes);
+    parser.screen_mut().install_binary_snapshot(decoded.vt);
     if parser.screen().size() != (rows, cols) {
         parser.screen_mut().set_size(rows, cols);
     }
-    let _ = vge.restore_from_binary_snapshot(vge_bytes);
-    let _ = prt.restore_from_binary_snapshot(prt_bytes);
+    vge.install_binary_snapshot(decoded.vge);
+    prt.install_binary_snapshot(decoded.prt);
     // The line origin both sub-engines anchor against came in with the
-    // vt100 fragment restored just above — and moved again if the
-    // resize pushed rows into scrollback.
+    // vt100 part installed just above — and moved again if the resize
+    // pushed rows into scrollback.
     vge.sync_top_of_live_screen(parser);
     prt.sync_top_of_live_screen(parser);
 }

@@ -64,6 +64,15 @@ impl std::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl SnapshotError {
+    /// Whether the payload was written by a different snapshot layout
+    /// rather than being damaged — the sender is another build.
+    #[must_use]
+    pub fn is_version_mismatch(&self) -> bool {
+        matches!(self, Self::KindVersionMismatch { .. })
+    }
+}
+
 impl From<vge_protocol::codec::DecodeError> for SnapshotError {
     fn from(_: vge_protocol::codec::DecodeError) -> Self {
         SnapshotError::BadPayload
@@ -115,6 +124,10 @@ pub(crate) struct DecodedState {
     #[allow(dead_code)]
     pub scale_factor: f32,
 }
+
+/// A decoded VGE snapshot, not yet installed. See
+/// [`VgeEngine::decode_binary_snapshot`](super::VgeEngine::decode_binary_snapshot).
+pub struct VgeSnapshot(pub(crate) DecodedState);
 
 pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> {
     let mut r = Reader::new(bytes);

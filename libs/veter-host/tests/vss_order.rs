@@ -297,6 +297,55 @@ fn a_restore_keeps_the_receiver_s_cell_metrics() {
     assert!((host.vge.scale_factor() - 2.0).abs() < f32::EPSILON);
 }
 
+// ---- The answer: only after the parts decode -------------------------
+
+/// A snapshot whose VGE part this build cannot read — the sender was
+/// built with another layout — is refused, and nothing of it lands.
+/// The vt100 part decodes fine on its own, which is the trap: installed
+/// alone, it put a session's grid under the pane's own portals, and the
+/// renderer said `SnapshotAccepted` before it had looked inside.
+#[test]
+fn a_snapshot_with_an_unreadable_part_is_refused_and_installs_nothing() {
+    let mut host = Host::new();
+    host.feed(b"my shell");
+
+    let mut parser = vt100::Parser::new(24, 80, 100);
+    parser.process(b"the session");
+    let mut vge = VgeEngine::new(CELL, 1.0).binary_snapshot();
+    // The leading u16 is the VGE layout version.
+    vge[0] = vge[0].wrapping_add(1);
+    let env = vss_protocol::encode_snapshot(
+        vss_protocol::frame::SNAPSHOT_VERSION,
+        24,
+        80,
+        9,
+        &parser.screen().binary_snapshot(),
+        &vge,
+        &PrtEngine::new().binary_snapshot(),
+        vss_protocol::frame::DEFAULT_MAX_FRAGMENT_BYTES,
+    );
+
+    let replies = host.feed_replies(&env);
+    assert_eq!(host.screen(), "my shell");
+    assert_eq!(
+        replies,
+        vss_protocol::encode_rejected(9, vss_protocol::frame::REJECT_VERSION_MISMATCH)
+    );
+
+    // Nothing was stashed either: a detach has nothing to put back.
+    host.feed(b"\r\nstill mine");
+    host.feed(&vss_protocol::encode_detach_notify(9));
+    assert_eq!(host.screen(), "my shell\nstill mine");
+}
+
+#[test]
+fn a_snapshot_that_installs_is_accepted() {
+    let mut host = Host::new();
+    let replies = host.feed_replies(&snapshot_of(24, 80, 5, b"the session"));
+    assert_eq!(host.screen(), "the session");
+    assert_eq!(replies, vss_protocol::encode_accepted(5));
+}
+
 // ---- Detach: what the renderer owes the session ------------------------
 //
 // `vsd` keeps reading after it sends `DetachNotify`, forwarding to the

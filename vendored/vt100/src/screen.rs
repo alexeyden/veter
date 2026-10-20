@@ -204,6 +204,25 @@ pub enum MouseProtocolEncoding {
     // Urxvt,
 }
 
+/// A decoded [`Screen::binary_snapshot`], not yet installed. See
+/// [`Screen::decode_binary_snapshot`].
+pub struct ScreenSnapshot {
+    grid: crate::grid::Grid,
+    alternate_grid: crate::grid::Grid,
+    attrs: crate::attrs::Attrs,
+    saved_attrs: crate::attrs::Attrs,
+    alternate_saved_attrs: crate::attrs::Attrs,
+    charset: crate::charset::CharsetState,
+    saved_charset: crate::charset::CharsetState,
+    alternate_saved_charset: crate::charset::CharsetState,
+    modes: u16,
+    cursor_shape: CursorShape,
+    mouse_protocol_mode: MouseProtocolMode,
+    mouse_protocol_encoding: MouseProtocolEncoding,
+    keyboard: KeyboardStack,
+    alternate_keyboard: KeyboardStack,
+}
+
 /// Represents the overall terminal state.
 #[derive(Clone, Debug)]
 pub struct Screen {
@@ -529,6 +548,22 @@ impl Screen {
         &mut self,
         bytes: &[u8],
     ) -> Result<(), crate::snapshot::SnapshotError> {
+        let decoded = Self::decode_binary_snapshot(bytes)?;
+        self.install_binary_snapshot(decoded);
+        Ok(())
+    }
+
+    /// The decoding half of
+    /// [`restore_from_binary_snapshot`](Self::restore_from_binary_snapshot),
+    /// touching no screen.
+    ///
+    /// A caller that restores this screen together with other state —
+    /// a VSS snapshot carries a vt100, a VGE and a PRT part — decodes
+    /// all of them before installing any, so a part it cannot read
+    /// leaves every one of them as it was.
+    pub fn decode_binary_snapshot(
+        bytes: &[u8],
+    ) -> Result<ScreenSnapshot, crate::snapshot::SnapshotError> {
         let mut r = crate::snapshot::Reader::new(bytes);
         let kind_version = r.u16()?;
         if kind_version != crate::snapshot::SNAPSHOT_KIND_VERSION {
@@ -562,22 +597,43 @@ impl Screen {
             ));
         }
 
-        self.grid = grid;
-        self.alternate_grid = alternate_grid;
-        self.attrs = attrs;
-        self.saved_attrs = saved_attrs;
-        self.alternate_saved_attrs = alternate_saved_attrs;
-        self.charset = charset;
-        self.saved_charset = saved_charset;
-        self.alternate_saved_charset = alternate_saved_charset;
-        self.modes = modes;
-        self.cursor_shape = cursor_shape;
-        self.mouse_protocol_mode = mouse_protocol_mode;
-        self.mouse_protocol_encoding = mouse_protocol_encoding;
-        self.keyboard = keyboard;
-        self.alternate_keyboard = alternate_keyboard;
+        Ok(ScreenSnapshot {
+            grid,
+            alternate_grid,
+            attrs,
+            saved_attrs,
+            alternate_saved_attrs,
+            charset,
+            saved_charset,
+            alternate_saved_charset,
+            modes,
+            cursor_shape,
+            mouse_protocol_mode,
+            mouse_protocol_encoding,
+            keyboard,
+            alternate_keyboard,
+        })
+    }
 
-        Ok(())
+    /// The installing half of
+    /// [`restore_from_binary_snapshot`](Self::restore_from_binary_snapshot).
+    /// Cannot fail: everything that can was checked by
+    /// [`decode_binary_snapshot`](Self::decode_binary_snapshot).
+    pub fn install_binary_snapshot(&mut self, s: ScreenSnapshot) {
+        self.grid = s.grid;
+        self.alternate_grid = s.alternate_grid;
+        self.attrs = s.attrs;
+        self.saved_attrs = s.saved_attrs;
+        self.alternate_saved_attrs = s.alternate_saved_attrs;
+        self.charset = s.charset;
+        self.saved_charset = s.saved_charset;
+        self.alternate_saved_charset = s.alternate_saved_charset;
+        self.modes = s.modes;
+        self.cursor_shape = s.cursor_shape;
+        self.mouse_protocol_mode = s.mouse_protocol_mode;
+        self.mouse_protocol_encoding = s.mouse_protocol_encoding;
+        self.keyboard = s.keyboard;
+        self.alternate_keyboard = s.alternate_keyboard;
     }
 
     /// Return escape codes sufficient to turn the terminal state of the
