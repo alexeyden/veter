@@ -635,6 +635,16 @@ prefix so it never collides with a local-vmux prefix that may
 itself be running inside the session). `vsd` reads this off
 its input stream before forwarding the rest to the inner PTY.
 
+`Ctrl+\` has two spellings on that stream. The renderer encodes keys
+in the dialect of the program it takes to be focused, which during an
+attach is the focused leaf *of the session* (input never crosses PRT,
+so nothing upstream knows `vsd` is the reader). When that program has
+enabled the kitty keyboard protocol's "disambiguate escape codes" flag,
+`Ctrl+\` arrives as `CSI 92 ; 5 u` rather than `0x1C`, and `vsd`
+matches both. The `d` stays a plain byte under that flag. Not followed
+by `d`, the prefix is released to the session in the spelling it came
+in.
+
 Only keystrokes can trigger it. The same stream carries the
 renderer's host→client envelopes (`ESC _ prt`, `vge`, `vft`, `ses`,
 `vss` … `ESC \`) on their way to the session's client, and their

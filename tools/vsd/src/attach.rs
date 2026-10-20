@@ -951,6 +951,36 @@ fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostTheme
 const DETACH_PREFIX: u8 = 0x1C; // Ctrl+\
 const DETACH_SECOND: u8 = b'd';
 
+/// `Ctrl+\` as the kitty keyboard protocol spells it (`CSI 92 ; 5 u`:
+/// the backslash's codepoint, 1 + ctrl's bit).
+///
+/// The renderer encodes keys in the dialect of the program it believes
+/// is focused, and once a snapshot is restored that is the focused leaf
+/// *of the session* — the input never crosses PRT, so neither veter nor
+/// a multiplexer in between knows vsd is reading it. A pane whose
+/// program enabled "disambiguate escape codes" (Claude Code, vfm, vmd)
+/// therefore stops delivering `Ctrl+\` as a byte at all, and with only
+/// the byte form matched the detach chord did nothing. `vmux` has the
+/// same trap for its own prefix (`prefix_csi_u`). The `d` that follows
+/// is still a plain byte: that flag leaves printable keys alone.
+const DETACH_PREFIX_CSI_U: &[u8] = b"\x1b[92;5u";
+
+/// The detach prefix in either spelling at the head of `bytes`.
+///
+/// The `CSI u` form is matched only whole within one read. A terminal
+/// writes a key's sequence in one piece, and holding back a lone `ESC`
+/// on the chance that one is starting would cost every `Esc` keypress a
+/// round trip through the splice's escape-time window.
+fn detach_prefix_at(bytes: &[u8]) -> Option<&'static [u8]> {
+    if bytes.first() == Some(&DETACH_PREFIX) {
+        Some(&[DETACH_PREFIX])
+    } else if bytes.starts_with(DETACH_PREFIX_CSI_U) {
+        Some(DETACH_PREFIX_CSI_U)
+    } else {
+        None
+    }
+}
+
 /// Outcome of feeding one chunk of renderer-stdin bytes through the
 /// detach-hotkey state machine.
 struct ScanOutput {
@@ -1044,11 +1074,11 @@ impl Envelope {
 /// separate reads.
 #[derive(Default)]
 struct DetachScanner {
-    /// True iff the *last* byte we saw was the detach prefix and we
+    /// Set iff the last key we saw was the detach prefix and we
     /// haven't yet decided what to do with it — i.e. we owe the
-    /// inner PTY one prefix byte unless the next byte cancels it
-    /// (which only happens for `d`).
-    pending_prefix: bool,
+    /// inner PTY that prefix, in the spelling it arrived in, unless
+    /// the next byte cancels it (which only happens for `d`).
+    pending_prefix: Option<&'static [u8]>,
     /// Only keystrokes can trigger a detach; see [`INPUT_MARKERS`].
     envelope: Envelope,
     /// Set once the attach is over: from then on only envelope bytes
@@ -1074,13 +1104,18 @@ impl DetachScanner {
     fn feed(&mut self, chunk: &[u8]) -> ScanOutput {
         let mut out = Vec::with_capacity(chunk.len() + 1);
         let mut detach = false;
-        for &b in chunk {
+        let mut i = 0;
+        while i < chunk.len() {
+            let b = chunk[i];
+            i += 1;
             // A pending prefix is always resolved by the next byte, and
             // envelope bytes only follow an `ESC _`, so no prefix is
             // ever pending across this.
             if self.envelope.step(b) {
                 out.push(b);
-            } else if self.draining {
+                continue;
+            }
+            if self.draining {
                 match self.envelope {
                     // Any ESC outside a body starts over.
                     Envelope::Esc => {
@@ -1096,7 +1131,9 @@ impl DetachScanner {
                     // A keystroke after the attach ended; see `draining`.
                     Envelope::Outside | Envelope::BodyEsc => self.opener.clear(),
                 }
-            } else if self.pending_prefix {
+                continue;
+            }
+            if let Some(owed) = self.pending_prefix.take() {
                 if b == DETACH_SECOND {
                     // The trigger ends the attach, not the chunk: an
                     // envelope for the session may still follow it.
@@ -1105,19 +1142,18 @@ impl DetachScanner {
                     continue;
                 }
                 // Not a detach — release the buffered prefix.
-                out.push(DETACH_PREFIX);
-                if b == DETACH_PREFIX {
-                    // Another prefix arrived immediately; stay
-                    // pending for the next byte.
-                    self.pending_prefix = true;
-                } else {
-                    out.push(b);
-                    self.pending_prefix = false;
+                out.extend_from_slice(owed);
+            }
+            match detach_prefix_at(&chunk[i - 1..]) {
+                // Another prefix; stay pending for the next byte.
+                Some(prefix) => {
+                    for &rest in &prefix[1..] {
+                        self.envelope.step(rest);
+                    }
+                    i += prefix.len() - 1;
+                    self.pending_prefix = Some(prefix);
                 }
-            } else if b == DETACH_PREFIX {
-                self.pending_prefix = true;
-            } else {
-                out.push(b);
+                None => out.push(b),
             }
         }
         ScanOutput { forward: out, detach }
@@ -1127,18 +1163,14 @@ impl DetachScanner {
     /// belongs to the session from here on.
     fn start_draining(&mut self) {
         self.draining = true;
-        self.pending_prefix = false;
+        self.pending_prefix = None;
     }
 
     /// On stdin EOF, flush any buffered prefix so the inner PTY
-    /// sees the byte the user typed (writes to a dying tty are
+    /// sees the key the user typed (writes to a dying tty are
     /// benign).
-    fn flush_on_eof(&mut self) -> Option<u8> {
-        if std::mem::take(&mut self.pending_prefix) {
-            Some(DETACH_PREFIX)
-        } else {
-            None
-        }
+    fn flush_on_eof(&mut self) -> Option<&'static [u8]> {
+        self.pending_prefix.take()
     }
 }
 
@@ -1348,8 +1380,8 @@ fn splice_input(
 
         let n = match nix::unistd::read(stdin_raw, &mut buf) {
             Ok(0) => {
-                if let Some(b) = input.scanner.flush_on_eof() {
-                    let _ = write_master(&[b]);
+                if let Some(owed) = input.scanner.flush_on_eof() {
+                    let _ = write_master(owed);
                 }
                 return Ok(SpliceEnd::RendererGone);
             }
@@ -1661,8 +1693,8 @@ mod tests {
                 return (forwarded, true);
             }
         }
-        if let Some(b) = s.flush_on_eof() {
-            forwarded.push(b);
+        if let Some(owed) = s.flush_on_eof() {
+            forwarded.extend_from_slice(owed);
         }
         (forwarded, false)
     }
@@ -1888,6 +1920,46 @@ mod tests {
         // No follow-up byte — EOF releases the buffered prefix.
         let (out, detached) = feed_chunks(&[&[DETACH_PREFIX]]);
         assert_eq!(out, &[DETACH_PREFIX]);
+        assert!(!detached);
+    }
+
+    /// A focused pane whose program enabled the kitty keyboard flag
+    /// gets `Ctrl+\` as `CSI 92 ; 5 u`, and the chord has to work there
+    /// too — whole in one read, or split from its `d`.
+    #[test]
+    fn the_csi_u_prefix_detaches() {
+        let (out, detached) = feed_chunks(&[b"ab\x1b[92;5ud"]);
+        assert_eq!(out, b"ab");
+        assert!(detached);
+
+        let (out, detached) = feed_chunks(&[b"\x1b[92;5u", b"d"]);
+        assert!(out.is_empty());
+        assert!(detached);
+    }
+
+    /// Not followed by `d`, the prefix reaches the pane in the spelling
+    /// its program asked for.
+    #[test]
+    fn a_csi_u_prefix_not_followed_by_d_is_released_as_sent() {
+        let (out, detached) = feed_chunks(&[b"\x1b[92;5ux"]);
+        assert_eq!(out, b"\x1b[92;5ux");
+        assert!(!detached);
+
+        let (out, detached) = feed_chunks(&[b"\x1b[92;5u\x1b[92;5ud"]);
+        assert_eq!(out, b"\x1b[92;5u");
+        assert!(detached);
+
+        let (out, detached) = feed_chunks(&[b"\x1b[92;5u"]);
+        assert_eq!(out, b"\x1b[92;5u");
+        assert!(!detached);
+    }
+
+    /// Other `CSI u` keys pass straight through, and so does a lone
+    /// `Esc` — nothing is held back on the chance a prefix is starting.
+    #[test]
+    fn other_csi_u_keys_and_a_lone_esc_pass_through() {
+        let (out, detached) = feed_chunks(&[b"\x1b[97;5ud", b"\x1b", b"[92;5ud"]);
+        assert_eq!(out, b"\x1b[97;5ud\x1b[92;5ud");
         assert!(!detached);
     }
 
