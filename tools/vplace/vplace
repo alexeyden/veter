@@ -26,6 +26,13 @@ division of labour is:
 The terminal owns the grid, so it resolves the marker to a row. We never
 need to know where the cursor is.
 
+The anchor stays live (VGE §9.4): the terminal re-pins the element onto
+the newest row carrying the marker, so an application that repaints --
+after a suspend, a resize, a scroll -- takes the image with it, into the
+gap the repaint reserved. The flip side is that the marker must stay
+unique on screen for as long as the image should live, since any later
+row carrying the same string claims it.
+
 The marker's own row is left untouched -- the image starts one row below
 it -- so a marker written to be read (`[IMAGE: chart1] /path/chart.png`)
 doubles as the image's caption.
@@ -104,8 +111,10 @@ def main():
              "short and at the start of a line: it is matched against a single "
              "grid row, so a marker long enough to wrap cannot be found. It "
              "must not appear on screen below the row you mean -- the terminal "
-             "anchors to the lowest match, and a shell echoing this very "
-             "command line counts. Use --marker-file when invoking by hand.",
+             "anchors to the lowest match and keeps following it, so a later "
+             "row carrying the same string steals the image; a shell echoing "
+             "this very command line counts. Use --marker-file when invoking "
+             "by hand.",
     )
     p.add_argument(
         "--marker-file",

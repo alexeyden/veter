@@ -312,8 +312,18 @@ issued. As the screen scrolls, the element travels with the line it is
 anchored to. Once `anchor_line` falls off the top of scrollback (evicted),
 the element is silently destroyed and its ID becomes available for reuse.
 
+**Marker-anchored elements are the exception: their anchor is live.**
+A client that anchors by marker (§9.4) names a piece of *text* rather
+than a line, and text gets reprinted. The terminal therefore keeps the
+marker string and re-resolves it as the grid changes, re-pinning the
+element onto the newest row that contains it — which is the only
+behaviour that survives a repaint, since an application that redraws
+prints its frame again lower down rather than moving the rows it
+already emitted. The rules are in §9.4.
+
 `UpdateOrigin` re-pins the element using the same rule applied at the time
-of the update.
+of the update, and replaces what it tracks: a marker anchor starts
+tracking the new string, and any other anchor stops the tracking.
 
 Origin `x` is plain horizontal cell offset; it does not interact with
 scrolling.
@@ -603,6 +613,12 @@ Only the anchor bits (`bit3` cursor-relative, `bit4` marker-anchored;
 §9.4) are meaningful here. `parent`, `size` and `transform` are not
 re-pinnable through this command, so `bit0`–`bit2` and the reserved bits
 are `err_bad_payload`, as is setting both anchor bits.
+
+The command also replaces what the element tracks: with `bit4` it begins
+tracking the new marker, and without it the element stops tracking
+whatever it had and holds the line this command pinned it to. That is
+how a client freezes a marker-anchored element in place — `UpdateOrigin`
+with no anchor bits, having read back where it wants it.
 
 ### 6.7 ClearAll — retired (was 0x0E)
 
@@ -1339,6 +1355,41 @@ parent-relative.
   whose row has aged out of it matches nothing and takes the fallback
   below. Terminals SHOULD NOT bound it any more tightly than that.
 
+  **The anchor is live.** The terminal MUST retain the marker string and
+  re-resolve it whenever the grid may have changed — at minimum once per
+  processed write — re-pinning the element to `newest_marker_row +
+  floor(origin.y)`, with `sub_row` unchanged. Two rules make that
+  bounded and stable:
+
+  - **Forward only.** An occurrence at or above the row the element is
+    already pinned to MUST NOT move it. Absolute line indices only ever
+    grow, so the row it holds is at least as recent as anything above
+    it; without this rule, overwriting the newest copy in place would
+    walk the element backwards onto a stale one.
+  - **Only what can have changed.** A terminal MAY restrict each
+    re-resolution to the live screen plus the rows that have scrolled
+    off it since the previous one. No other row can have changed —
+    scrollback is immutable and only live rows can be rewritten in
+    place — so this loses nothing, and it is what keeps the cost
+    proportional to output rather than to scrollback depth.
+
+  Re-resolution MUST run ahead of scrollback eviction (§5.2), so an
+  element whose original row has just aged out is saved by a copy the
+  same write printed. A marker that has stopped appearing anywhere
+  leaves the element where it last was; it does not revert to the
+  fallback.
+
+  Tracking is what makes this mode usable by a client that does not own
+  the pane. Every TUI repaints — after a suspend and resume, a resize, a
+  scroll — and a repaint is *new text*: the frame is printed again
+  further down, and the copy the element was pinned to drifts up into
+  scrollback while the space the application reserved sits empty on
+  screen. A one-shot resolution loses the graphic on the first redraw.
+  The cost is that any *other* row carrying the same string claims the
+  element, so a marker must be distinctive enough not to be echoed by
+  something else in the pane (§6.8's namespacing advice applies to
+  markers as well as ids).
+
 The sub-row fraction (§5.2) is unchanged in both modes, so half-cell
 placement still works.
 
@@ -1347,7 +1398,10 @@ ways. If the marker matches no row — never printed, misspelled, or
 scrolled out of scrollback entirely — or the terminal has no live screen
 to resolve against, the origin falls back to viewport-relative rather
 than failing: the element lands where a default-anchored one would,
-which is visibly wrong rather than silently displaced.
+which is visibly wrong rather than silently displaced. The element still
+tracks the marker, so a later printing of it claims the element and puts
+it right — a client that draws before its marker reaches the screen ends
+up in the right place rather than stranded.
 
 Neither mode is affected by where the *user* has scrolled the view.
 Scroll position is a property of the view; the anchor is a property of

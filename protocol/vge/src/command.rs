@@ -254,11 +254,18 @@ pub enum OriginAnchor {
     /// lines above it. Simple, but the caller still has to know how far
     /// the cursor has drifted from the rows it means.
     Cursor,
-    /// `bit4`: the most recent live-screen row containing this
-    /// substring. The application prints a token on the first row it
-    /// reserved and the terminal, which owns the grid, resolves it — no
-    /// cursor arithmetic and no assumption about the application's
-    /// live-region height.
+    /// `bit4`: the most recent row containing this substring. The
+    /// application prints a token on the first row it reserved and the
+    /// terminal, which owns the grid, resolves it — no cursor
+    /// arithmetic and no assumption about the application's live-region
+    /// height.
+    ///
+    /// The anchor is **live** (§9.4): the terminal keeps the string and
+    /// re-pins the element whenever a newer copy of it is printed. That
+    /// is what carries an element through the sender's repaints, which
+    /// print the frame again lower down rather than moving the rows
+    /// already on screen. It also means any other row carrying the same
+    /// string claims the element, so markers want to be distinctive.
     Marker(String),
 }
 

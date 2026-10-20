@@ -409,6 +409,25 @@ impl Grid {
     /// to soft-wrap can never be found; callers keep their markers
     /// short.
     pub fn last_row_offset_containing(&self, needle: &str) -> Option<i64> {
+        self.last_row_offset_containing_from(needle, i64::MIN)
+    }
+
+    /// [`last_row_offset_containing`](Self::last_row_offset_containing),
+    /// but examining only rows at offset `>= min_offset` and giving up
+    /// as soon as the walk passes below it.
+    ///
+    /// The bound is what makes re-resolving a marker every chunk
+    /// affordable. A caller that only cares whether a *newer* copy of
+    /// the marker has appeared knows two floors — the row its answer
+    /// already sits on, and the oldest row written since it last asked
+    /// — and below the higher of them there is nothing it could learn.
+    /// Without the bound each such question costs a walk of the whole
+    /// scrollback, most of it re-reading rows that cannot have changed.
+    pub fn last_row_offset_containing_from(
+        &self,
+        needle: &str,
+        min_offset: i64,
+    ) -> Option<i64> {
         if needle.is_empty() {
             return None;
         }
@@ -426,12 +445,18 @@ impl Grid {
         let mut offset = i64::try_from(self.rows.len()).unwrap_or(i64::MAX);
         for row in self.rows.iter().rev() {
             offset -= 1;
+            if offset < min_offset {
+                return None;
+            }
             if contains(row) {
                 return Some(offset);
             }
         }
         for row in self.scrollback.iter().rev() {
             offset -= 1;
+            if offset < min_offset {
+                return None;
+            }
             if contains(row) {
                 return Some(offset);
             }

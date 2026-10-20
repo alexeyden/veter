@@ -150,6 +150,18 @@ impl<CB: vt100::Callbacks> ScreenAnchor for vt100::Parser<CB> {
     }
 }
 
+/// The marker a newly anchored element should track, if any (§9.4).
+///
+/// Only top-level elements carry one: a child's origin is
+/// parent-relative and its anchor bits are ignored, so tracking a
+/// marker on one would move nothing.
+fn tracked_marker(is_top_level: bool, anchor: &OriginAnchor) -> Option<String> {
+    match anchor {
+        OriginAnchor::Marker(m) if is_top_level => Some(m.clone()),
+        _ => None,
+    }
+}
+
 /// Parser payload cap derived from an advertised policy limit.
 ///
 /// The two serve different purposes and must not be the same number.
@@ -264,6 +276,13 @@ pub struct Element {
     pub transform: Option<Transform>,
     pub anchor_line: i64, // absolute scrollback line (top-level only)
     pub sub_row: f32,     // top-level only
+    /// The marker string a §9.4 marker-anchored element tracks, kept
+    /// past the resolution that placed it because the anchor is live
+    /// (§5.2): whenever a newer copy of this string is printed, the
+    /// element re-pins onto it. `None` for viewport- and
+    /// cursor-anchored elements, and for children, whose origin is
+    /// parent-relative and whose anchor bits are ignored.
+    pub marker: Option<String>,
     pub origin_x: f32,
     pub origin_y: f32, // for child elements; for top-level, redundant with sub_row
     pub is_visible: bool,
@@ -688,6 +707,13 @@ pub struct VgeEngine {
     /// Deliberately frozen while the alternate screen is up — see
     /// `after_vt100_process`.
     top_of_live_screen: i64,
+    /// `top_of_live_screen` as of the last marker re-resolution pass
+    /// ([`Self::retrack_markers`]). Rows at or below this line are the
+    /// ones written since, and so the only ones that can hold a copy
+    /// of a marker the engine has not already seen. Rows on the live
+    /// screen are always re-read on top of that, since a program can
+    /// rewrite them in place without scrolling.
+    marker_scan_floor: i64,
     pending_response_bytes: Vec<u8>,
     /// Chunked image uploads still in flight, keyed by image id.
     pending_uploads: HashMap<String, PendingUpload>,
@@ -761,6 +787,7 @@ impl VgeEngine {
             cell_px,
             scale_factor,
             top_of_live_screen: 0,
+            marker_scan_floor: 0,
             pending_response_bytes: Vec::new(),
             pending_uploads: HashMap::new(),
             pending_image_deletes: Vec::new(),
@@ -852,6 +879,12 @@ impl VgeEngine {
         parser: &vt100::Parser<CB>,
     ) {
         self.top_of_live_screen = parser.screen().top_of_live_screen();
+        // Same moment, same reason, for the marker walk: every element
+        // in a restored snapshot arrives with an anchor the sender
+        // already resolved, so the rows above this screen have been
+        // accounted for and only what the receiver sees from here on
+        // needs searching.
+        self.marker_scan_floor = self.top_of_live_screen;
     }
 
     /// Serialize the engine's full state as a binary blob for the VSS
@@ -1168,7 +1201,72 @@ impl VgeEngine {
         // step when the main screen comes back.
         if !self.state.on_alt() {
             self.top_of_live_screen = parser.screen().top_of_live_screen();
+            // Before eviction, not after: an element whose old line has
+            // just aged out of scrollback is saved by a marker this
+            // chunk reprinted, and the whole point of tracking is that
+            // a repainting application keeps its graphics.
+            self.retrack_markers(parser);
             self.evict(parser.screen().scrollback_fill());
+        }
+    }
+
+    /// Re-pin marker-anchored elements (§9.4) onto the newest copy of
+    /// the marker they name (§5.2).
+    ///
+    /// A marker anchor is live. An application that repaints — which,
+    /// for anything built on a TUI framework, means every application
+    /// that redraws after a suspend, a resize or a scroll — reprints
+    /// the marker line as *new text* further down rather than moving
+    /// the old one. Resolving once would leave the element glued to the
+    /// copy the repaint superseded, drifting up into scrollback while
+    /// the space the application reserved for it sits empty.
+    ///
+    /// Two rules keep this bounded and stable:
+    ///
+    /// * **Forward only.** An occurrence at or above the element's
+    ///   current anchor never moves it. Absolute line indices only
+    ///   grow, so the row it already holds is at least as recent as
+    ///   anything above; without this rule an element whose newest copy
+    ///   was overwritten would walk *backwards* onto a stale one.
+    /// * **Only what is new.** Rows older than
+    ///   [`Self::marker_scan_floor`] were already searched by an
+    ///   earlier pass and cannot have changed since — only the live
+    ///   screen can be rewritten in place. So each pass reads the live
+    ///   screen plus whatever scrolled past since the last one, making
+    ///   the cost proportional to output rather than to scrollback
+    ///   depth.
+    ///
+    /// Main screen only, like every other line-tracking path here: the
+    /// alternate screen has no scrollback, its `top_of_live_screen` is
+    /// frozen at the main grid's, and its element set is discarded
+    /// wholesale on the way out (§5.4).
+    fn retrack_markers<CB: vt100::Callbacks>(&mut self, parser: &vt100::Parser<CB>) {
+        let top = self.top_of_live_screen;
+        let floor = self.marker_scan_floor;
+        self.marker_scan_floor = top;
+
+        let mut moved: Vec<(String, i64)> = Vec::new();
+        for (key, el) in self.state.elements().iter() {
+            let (Some(marker), None) = (&el.marker, &el.parent) else {
+                continue;
+            };
+            // The element sits `row_offset` lines below the marker row;
+            // recovering the marker's own line is what makes "newer
+            // than where I am" expressible as a search bound.
+            let row_offset = el.origin_y.floor() as i64;
+            let current = el.anchor_line - row_offset;
+            let min_offset = floor.max(current + 1) - top;
+            if let Some(found) = parser
+                .screen()
+                .last_row_offset_containing_from(marker, min_offset)
+            {
+                moved.push((key.clone(), top + found + row_offset));
+            }
+        }
+        for (key, line) in moved {
+            if let Some(el) = self.state.elements_mut().get_mut(&key) {
+                el.anchor_line = line;
+            }
         }
     }
 
@@ -1791,6 +1889,7 @@ impl VgeEngine {
         } else {
             (0, 0.0)
         };
+        let marker = tracked_marker(b.parent.is_none(), &b.anchor);
 
         self.state.elements_mut().insert(
             key.clone(),
@@ -1803,6 +1902,7 @@ impl VgeEngine {
                 transform: b.transform,
                 anchor_line: anchor,
                 sub_row: sub,
+                marker,
                 origin_x: b.origin.x,
                 origin_y: b.origin.y,
                 is_visible: b.is_visible,
@@ -2191,9 +2291,11 @@ impl VgeEngine {
         } else {
             (0, 0.0)
         };
+        let marker = tracked_marker(is_top_level, &anchor);
         let el = self.state.elements_mut().get_mut(id).unwrap();
         el.anchor_line = line;
         el.sub_row = sub;
+        el.marker = marker;
         el.origin_x = origin.x;
         el.origin_y = origin.y;
         Ok(Vec::new())
@@ -3261,6 +3363,23 @@ mod tests {
         w.buf
     }
 
+    /// `CreateElement` body with the §9.4 `bit4` anchor tail, so the
+    /// element carries the marker it tracks.
+    fn create_marker_anchored(id: &str, origin_y: f32, marker: &str) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(id);
+        w.varu(0); // n_commands = 0 (bare grouping element)
+        w.f32(0.0);
+        w.f32(origin_y);
+        w.u8(1); // is_visible
+        for b in 0i32.to_le_bytes() {
+            w.u8(b);
+        }
+        w.u8(0b10000); // bit4: marker-anchored
+        w.str(marker);
+        w.buf
+    }
+
     #[test]
     fn create_child_element_succeeds() {
         let mut engine = VgeEngine::new((9, 20), 1.0);
@@ -4066,6 +4185,18 @@ mod tests {
         );
         drive_with_envelope(&mut e, &frames);
 
+        // A third carrying a tracked marker (§9.4), so the roundtrip
+        // covers v5's field. Without it an attaching renderer would
+        // hold an element that has stopped following its marker.
+        let mut frames = Vec::new();
+        append_command(
+            &mut frames,
+            CMD_CREATE_ELEMENT,
+            6,
+            &create_marker_anchored("el3", 1.0, "<<tok>>"),
+        );
+        drive_with_envelope(&mut e, &frames);
+
         e
     }
 
@@ -4082,7 +4213,13 @@ mod tests {
         // Sanity checks on restored state.
         assert!(e2.state.shared.images.contains_key("pic"));
         assert!(e2.state.shared.styles.contains_key("accent"));
-        assert_eq!(e2.state.elements().len(), 2);
+        assert_eq!(e2.state.elements().len(), 3);
+        assert_eq!(
+            e2.state.elements()["el3"].marker.as_deref(),
+            Some("<<tok>>"),
+            "a marker anchor is live, so the string has to cross the wire"
+        );
+        assert!(e2.state.elements()["el1"].marker.is_none());
         let t = e2.state.elements()["el2"].transform.unwrap();
         assert_eq!((t.a, t.b, t.c, t.d, t.e, t.f), (0.0, 1.0, -1.0, 0.0, 0.5, 1.5));
         assert!(e2.state.elements()["el1"].transform.is_none());

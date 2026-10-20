@@ -25,6 +25,9 @@ use super::state::{Element, ElementSet, SharedTables, UploadedImage, VgeState};
 /// match — see [`super::state::VgeEngine::restore_from_binary_snapshot`].
 ///
 /// History:
+/// - v5: per-element tracked `marker` (§9.4) — a marker anchor is live,
+///   so the string has to survive an attach or the element stops
+///   following its marker on the renderer that took over.
 /// - v4: drop `top_of_live_screen` — the line origin `anchor_line`
 ///   values reference now lives in (and is restored by) the vt100
 ///   snapshot that always accompanies this fragment.
@@ -32,7 +35,7 @@ use super::state::{Element, ElementSet, SharedTables, UploadedImage, VgeState};
 /// - v2: include `top_of_live_screen` so element `anchor_line` values
 ///   stay aligned with the receiving engine's line tracker.
 /// - v1: initial layout.
-pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 4;
+pub(crate) const SNAPSHOT_KIND_VERSION: u16 = 5;
 
 /// Error returned when a VGE binary snapshot cannot be decoded.
 #[derive(Debug, Clone)]
@@ -311,6 +314,13 @@ fn encode_element(elem: &Element, w: &mut Writer) {
     }
     w.i64(elem.anchor_line);
     w.f32(elem.sub_row);
+    match &elem.marker {
+        Some(m) => {
+            w.bool(true);
+            w.str(m);
+        }
+        None => w.bool(false),
+    }
     w.f32(elem.origin_x);
     w.f32(elem.origin_y);
     w.bool(elem.is_visible);
@@ -354,6 +364,11 @@ fn decode_element(r: &mut Reader) -> Result<Element, SnapshotError> {
     };
     let anchor_line = r.i64()?;
     let sub_row = r.f32()?;
+    let marker = if r.bool()? {
+        Some(r.string()?.to_owned())
+    } else {
+        None
+    };
     let origin_x = r.f32()?;
     let origin_y = r.f32()?;
     let is_visible = r.bool()?;
@@ -368,6 +383,7 @@ fn decode_element(r: &mut Reader) -> Result<Element, SnapshotError> {
         transform,
         anchor_line,
         sub_row,
+        marker,
         origin_x,
         origin_y,
         is_visible,

@@ -362,6 +362,22 @@ impl Screen {
         self.grid().last_row_offset_containing(needle)
     }
 
+    /// [`last_row_offset_containing`](Self::last_row_offset_containing)
+    /// restricted to rows at offset `>= min_offset`.
+    ///
+    /// Bounding the walk is what lets a caller ask "has a newer copy of
+    /// this marker appeared?" on every chunk: the answer can only lie
+    /// below the row it already knows about, so everything above it is
+    /// wasted reading.
+    #[must_use]
+    pub fn last_row_offset_containing_from(
+        &self,
+        needle: &str,
+        min_offset: i64,
+    ) -> Option<i64> {
+        self.grid().last_row_offset_containing_from(needle, min_offset)
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

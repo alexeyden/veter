@@ -878,6 +878,7 @@ mod tests {
             transform: None,
             anchor_line: 0,
             sub_row: 0.0,
+            marker: None,
             origin_x: 0.0,
             origin_y: 0.0,
             is_visible: true,

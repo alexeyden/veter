@@ -431,6 +431,104 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_anchor_follows_a_repaint() {
+        // The case this mode exists for, and the one resolving once
+        // got wrong. A TUI that repaints — after a suspend, a resize,
+        // a scroll — does not move its old rows; it prints the whole
+        // frame again as new text further down. An element pinned to
+        // the first copy drifts off into scrollback with it while the
+        // gap the application reserved sits empty on screen.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"<<tok>>\r\n".to_vec();
+        chunk.extend(create_anchored("m", 1.0, OriginAnchor::Marker("<<tok>>".into())));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
+        // Row 0 holds the marker; the element sits one row below it.
+        assert_eq!(engine.state.elements()["m"].anchor_line, 1);
+
+        // The repaint: the same frame printed again, lower down.
+        drive_terminal_stage(&mut engine, &mut parser, b"pad\r\n<<tok>>\r\n", None);
+        assert_eq!(
+            engine.state.elements()["m"].anchor_line, 3,
+            "the element re-pins onto the new copy, keeping its offset"
+        );
+    }
+
+    #[test]
+    fn a_marker_anchor_is_never_dragged_back_to_an_older_copy() {
+        // Absolute line indices only grow, so the row an element
+        // already sits on is at least as recent as anything above it.
+        // Without that rule, overwriting the newest copy in place would
+        // walk the element *backwards* onto a stale one — and a
+        // repainting application overwrites rows constantly.
+        let (mut engine, mut parser) = engine_and_parser();
+        // Two copies, rows 0 and 2 of a 4-row screen.
+        let mut chunk = b"<<tok>>\r\nmid\r\n<<tok>>\r\n".to_vec();
+        chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
+        assert_eq!(engine.state.elements()["m"].anchor_line, 2);
+
+        // Overwrite row 2 in place, leaving only the row-0 copy.
+        drive_terminal_stage(&mut engine, &mut parser, b"\x1b[3;1Hgone   ", None);
+        assert_eq!(
+            parser.screen().last_row_offset_containing("<<tok>>"),
+            Some(0),
+            "only the row-0 copy is left, so an unbounded re-search finds it"
+        );
+        assert_eq!(
+            engine.state.elements()["m"].anchor_line, 2,
+            "the element holds its line rather than reverting to row 0"
+        );
+    }
+
+    #[test]
+    fn a_reprinted_marker_outlives_the_line_it_was_placed_on() {
+        // Tracking runs ahead of the eviction sweep, so an element
+        // whose original row has just aged out of the ring is saved by
+        // the copy this chunk printed. A long-lived repainting
+        // application depends on it: every repaint is a fresh copy, and
+        // the one it was first pinned to eventually falls out.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"<<tok>>\r\n".to_vec();
+        chunk.extend(create_anchored("m", 0.0, OriginAnchor::Marker("<<tok>>".into())));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
+        assert_eq!(engine.state.elements()["m"].anchor_line, 0);
+
+        // Well past the 100-row ring, reprinting the marker as it goes.
+        for _ in 0..40 {
+            drive_terminal_stage(&mut engine, &mut parser, b"x\r\ny\r\n<<tok>>\r\n", None);
+        }
+        let el = engine
+            .state
+            .elements()
+            .get("m")
+            .expect("a marker still on screen keeps its element alive");
+        let on_screen = parser
+            .screen()
+            .last_row_offset_containing("<<tok>>")
+            .expect("the last repaint's copy is still on the live screen");
+        assert_eq!(
+            el.anchor_line,
+            engine.top_of_live_screen() + on_screen,
+            "pinned to the copy the last repaint printed"
+        );
+    }
+
+    #[test]
+    fn tracking_leaves_non_marker_anchors_alone() {
+        // Cursor- and viewport-anchored elements resolve once and stay
+        // put; only a marker names something the terminal can find
+        // again.
+        let (mut engine, mut parser) = engine_and_parser();
+        let mut chunk = b"<<tok>>\r\n".to_vec();
+        chunk.extend(create_anchored("cur", 0.0, OriginAnchor::Cursor));
+        drive_terminal_stage(&mut engine, &mut parser, &chunk, None);
+        let placed = engine.state.elements()["cur"].anchor_line;
+
+        drive_terminal_stage(&mut engine, &mut parser, b"pad\r\n<<tok>>\r\n", None);
+        assert_eq!(engine.state.elements()["cur"].anchor_line, placed);
+    }
+
+    #[test]
     fn unmatched_marker_falls_back_to_the_viewport() {
         // Wrong-but-sane beats silently off by an unpredictable amount.
         let (mut engine, mut parser) = engine_and_parser();

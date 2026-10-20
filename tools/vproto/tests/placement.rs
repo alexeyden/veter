@@ -211,6 +211,50 @@ fn anchor_is_the_marker_row_not_the_cursor() {
 }
 
 #[test]
+fn image_follows_the_application_s_repaint() {
+    // The failure this mode was fixed for. A TUI that redraws does not
+    // move the rows it already emitted -- it prints the whole frame
+    // again, lower down. Resolving the marker once left the image glued
+    // to the superseded copy, drifting up into scrollback while the gap
+    // the repaint reserved sat empty on screen. Claude Code's Ctrl+Z /
+    // `fg` cycle is exactly this: SIGCONT reprints the visible
+    // transcript as new text with no erase of any kind.
+    let dir = std::env::temp_dir().join("vplace-e2e-repaint");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("t.png");
+    tiny_png(&png, 64, 32);
+
+    let envelope = run_vplace(&[png.to_str().unwrap(), "--marker", "[IMAGE: r1]"]);
+    let frame = b"a message
+[IMAGE: r1] t.png
+
+
+
+
+";
+    let (mut engine, mut parser) = apply(frame, &envelope);
+
+    let placed = engine.state.elements()["vplace.IMAGE-r1"].anchor_line;
+    assert_eq!(
+        placed,
+        engine.top_of_live_screen() + i64::from(marker_row(&parser, "[IMAGE: r1]")) + 1
+    );
+
+    // The repaint: same frame again, below the old one.
+    drive_terminal_stage(&mut engine, &mut parser, b"$ fg
+", None);
+    drive_terminal_stage(&mut engine, &mut parser, frame, None);
+
+    let after = engine.state.elements()["vplace.IMAGE-r1"].anchor_line;
+    assert!(after > placed, "the element must leave the superseded copy");
+    assert_eq!(
+        after,
+        engine.top_of_live_screen() + i64::from(marker_row(&parser, "[IMAGE: r1]")) + 1,
+        "the image must sit one row below the marker the repaint printed"
+    );
+}
+
+#[test]
 fn placement_survives_scrolling_into_scrollback() {
     // `anchor_line` is absolute, so once resolved the image travels with
     // its text. This is what makes the approach usable at all: completed
