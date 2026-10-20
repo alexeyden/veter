@@ -70,7 +70,10 @@ fn open_chrome(box_w: f32, box_h: f32, title: &str, rx: f32, ry: f32) -> Vec<Dra
                 y: 0.0,
             },
             align: Align::Center,
-            fill: Style::Flat(modal_text()),
+            // On the accent strip, not the surface: `modal_text` is the
+            // terminal's ink, which on a light theme is a dark blue that
+            // vanishes into (or reads as) the accent behind it.
+            fill: Style::Flat(active_text()),
             font_style: FontStyle(0x01),
             font_scale: 1.0,
             text: title.into(),
@@ -248,11 +251,9 @@ pub fn picker_element<P>(
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: 1.5, y },
             align: Align::Left,
-            fill: Style::Flat(if selected {
-                active_text()
-            } else {
-                modal_text()
-            }),
+            // The highlight is the translucent thumb, so the row keeps
+            // the surface ink; bold is what marks it.
+            fill: Style::Flat(modal_text()),
             font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
             font_scale: 1.0,
             text: it.label.clone(),
@@ -452,7 +453,7 @@ impl ScrollModal {
                         y: 0.0,
                     },
                     align: Align::Center,
-                    fill: Style::Flat(modal_text()),
+                    fill: Style::Flat(active_text()),
                     font_style: FontStyle(0x01),
                     font_scale: 1.0,
                     text: title,
@@ -647,6 +648,25 @@ mod tests {
         // 20-char minimum inner width + 4 padding.
         assert_eq!(el.origin.x, ((80.0 - 24.0) * 0.5_f32).floor());
         assert_eq!(el.origin.y, 10.0);
+    }
+
+    /// The title sits on the accent strip, so it takes the text-on-accent
+    /// colour, not the surface ink the body line uses — on a light theme
+    /// that ink is a dark blue, the same family as the default accent.
+    #[test]
+    fn modal_titles_take_the_text_on_accent_colour() {
+        let title_fill = |cmds: &[DrawCmd], title: &str| {
+            cmds.iter()
+                .find_map(|c| match c {
+                    DrawCmd::DrawText { fill, text, .. } if text == title => Some(fill.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let prompt = prompt_element("p", 80, 24, "Rename", "abc", 10.0, 20.0, None, 0);
+        assert_eq!(title_fill(&prompt.commands, "Rename"), Style::Flat(active_text()));
+        let scroll = ScrollModal::new(lines(3)).elements(IDS, 80, 24, 0, 10.0, 20.0, 0);
+        assert_eq!(title_fill(&scroll[0].commands, "Title"), Style::Flat(active_text()));
     }
 
     #[test]

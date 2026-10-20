@@ -72,6 +72,14 @@ pub const COLOR_ACTIVE_TEXT: Color = Color {
     b: 0.85,
     a: 1.0,
 };
+/// Foreground over a light accent fill, for a terminal that publishes no
+/// `host.*` theme to take a near-black from.
+pub const COLOR_ON_LIGHT_ACCENT: Color = Color {
+    r: 0.08,
+    g: 0.08,
+    b: 0.10,
+    a: 1.0,
+};
 /// Primary chrome text over a surface fill.
 pub const COLOR_TITLE_TEXT: Color = Color {
     r: 0.92,
@@ -286,9 +294,68 @@ pub fn dim_text() -> Color {
     host_color(5).unwrap_or(COLOR_DIM_TEXT)
 }
 
-/// Foreground over an accent fill — selected picker rows, active tabs.
+/// Foreground over an accent fill — selected picker rows, active tabs,
+/// a modal's title strip.
+///
+/// The host's `host.text.on_accent` was picked against the host's own
+/// accent, so it only holds while that is the accent being painted. A
+/// `--accent` override paints something else — as light as the host's
+/// text, say a yellow under a dark theme — so then the pick is made
+/// here, against the accent actually on screen.
 pub fn active_text() -> Color {
-    host_color(6).unwrap_or(COLOR_ACTIVE_TEXT)
+    if CLI_SET.load(Ordering::Relaxed) {
+        text_over(accent_color())
+    } else {
+        host_color(6).unwrap_or(COLOR_ACTIVE_TEXT)
+    }
+}
+
+/// Text for an opaque `fill` this client shaded itself — a darkened
+/// accent, say — which no host colour was picked against. Light or
+/// dark by the fill's luminance, from the terminal's own extremes when
+/// it publishes them.
+///
+/// Only for a solid fill: over a translucent one (the
+/// [`title_thumb_style`] tint) the ground shows through and sets the
+/// lightness, so the surface ink ([`title_text`], [`modal_text`]) is
+/// what reads there.
+pub fn text_over(fill: Color) -> Color {
+    let (dark, light) = match (host_bg(), host_fg()) {
+        (Some(bg), Some(fg)) if luminance(bg) > luminance(fg) => (fg, bg),
+        (Some(bg), Some(fg)) => (bg, fg),
+        _ => (COLOR_ON_LIGHT_ACCENT, COLOR_ACTIVE_TEXT),
+    };
+    text_on(fill, dark, light)
+}
+
+/// Text for an `accent` fill, from a theme's darkest and lightest
+/// colours. The same rule veter derives `host.text.on_accent` by, so a
+/// CLI accent gets the text the host would have picked for it: the
+/// poles are pushed further out, because a theme's own ink is tuned
+/// against its ground, not against a mid-tone fill.
+fn text_on(accent: Color, darkest: Color, lightest: Color) -> Color {
+    if luminance(accent) > 0.55 {
+        darken(darkest, 0.35)
+    } else {
+        mix(lightest, Color { r: 1.0, g: 1.0, b: 1.0, a: lightest.a }, 0.5)
+    }
+}
+
+/// sRGB-weighted relative luminance, `0.0..=1.0` — veter's
+/// `Rgba::luminance`, so both ends pick text by the same measure.
+fn luminance(c: Color) -> f32 {
+    0.299 * c.r + 0.587 * c.g + 0.114 * c.b
+}
+
+/// `a` moved `t` of the way toward `b`, alpha included.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    Color {
+        r: l(a.r, b.r),
+        g: l(a.g, b.g),
+        b: l(a.b, b.b),
+        a: l(a.a, b.a),
+    }
 }
 
 /// The warm tone for a destructive answer or an error line.
@@ -339,7 +406,9 @@ pub fn accent_style() -> Style {
 }
 
 /// Translucent accent — the thumb behind title text and the highlight
-/// behind a selected list row.
+/// behind a selected list row. Text over it takes the surface ink, not
+/// [`active_text`]: at this alpha the ground underneath sets the
+/// lightness, so on a light theme the tint is pale.
 pub fn title_thumb_style() -> Style {
     Style::Flat(Color {
         a: THUMB_ALPHA,
@@ -380,7 +449,19 @@ fn tinted_modal_bg() -> Color {
 /// concrete `Style::Flat` rather than the `Style::Ref` [`accent_style`]
 /// emits, since a host style ref cannot be shaded locally.
 pub fn activity_style() -> Style {
-    Style::Flat(darken(accent_color(), 0.4))
+    Style::Flat(activity_color())
+}
+
+/// Text over [`activity_style`]. Picked against that darkened fill
+/// rather than reusing [`active_text`], which was picked against the
+/// full accent — dark text for a light accent, on a fill that no
+/// longer is.
+pub fn activity_text() -> Color {
+    text_over(activity_color())
+}
+
+fn activity_color() -> Color {
+    darken(accent_color(), 0.4)
 }
 
 /// A color darkened by `amount` (0..1) — each channel scaled toward
@@ -479,6 +560,19 @@ mod tests {
         assert!(parse_accent_color("nope").is_err());
         assert!(parse_accent_color("#12345").is_err());
         assert!(parse_accent_color("#zz0000").is_err());
+    }
+
+    /// A CLI accent gets its text by contrast, the way veter derives
+    /// `host.text.on_accent` for its own: dark on a light fill, light on
+    /// a dark one, pushed past the theme's own extremes either way.
+    #[test]
+    fn text_on_an_accent_follows_its_luminance() {
+        let ink = Color { r: 0.2, g: 0.3, b: 0.6, a: 1.0 };
+        let ground = Color { r: 0.9, g: 0.9, b: 0.92, a: 1.0 };
+        let yellow = unpack(parse_accent_color("#ffd700").unwrap());
+        let orange = unpack(parse_accent_color("#c06020").unwrap());
+        assert!(luminance(text_on(yellow, ink, ground)) < luminance(ink));
+        assert!(luminance(text_on(orange, ink, ground)) > luminance(ground));
     }
 
     /// With nothing configured the accent is the brand, and

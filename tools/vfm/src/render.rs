@@ -172,8 +172,11 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
                 ),
             });
         }
+        // The selection is the translucent thumb, which the column's
+        // ground shows through — so the selected row keeps the ink a
+        // file name has, not the text a solid accent would want.
         let color = if is_sel {
-            active_text()
+            title_text()
         } else if e.is_dir() {
             accent_text()
         } else {
