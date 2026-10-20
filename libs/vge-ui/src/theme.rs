@@ -297,8 +297,9 @@ pub fn dim_text() -> Color {
 /// Foreground over an accent fill — selected picker rows, active tabs,
 /// a modal's title strip.
 ///
-/// The host's `host.text.on_accent` was picked against the host's own
-/// accent, so it only holds while that is the accent being painted. A
+/// The host's `host.text.on_accent` was picked against the accent the
+/// host resolves for this depth, so it only holds while that is the
+/// accent being painted. A
 /// `--accent` override paints something else — as light as the host's
 /// text, say a yellow under a dark theme — so then the pick is made
 /// here, against the accent actually on screen.

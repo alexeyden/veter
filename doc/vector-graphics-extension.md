@@ -874,12 +874,14 @@ Reserved ids defined in v0:
 | `host.surface.inset` | A recessed surface inside such a panel: an input field, a switched-off segment. |
 | `host.text`     | Primary text over `host.surface`.                             |
 | `host.text.dim` | Secondary text: key hints, inactive labels.                   |
-| `host.text.on_accent` | Text over an accent fill — a selected row, an active tab. |
+| `host.text.on_accent` | Text over a `host.accent` fill — a selected row, an active tab. Contextual, like `host.accent`: it is the text for the accent this engine's depth resolves to. |
+| `host.text.on_accent.1` … | Text over explicit accent slot N (does not rotate with depth). |
 | `host.warn`     | The warm tone for a destructive answer or an error line.       |
 
 A host with fewer configured accents than slots populates only the slots
 it has; `host.accent` always resolves (it wraps around the available
-slots).
+slots). The numbered `host.text.on_accent.N` ids follow the same rule,
+and a host that publishes no per-slot text populates none of them.
 
 The accents and the eight colours after them are **independent**: a host
 may publish accents alone, which is what a host that predates the second
@@ -887,10 +889,13 @@ group does. A client MUST treat a missing id the way it treats an
 unthemed host — by falling back to its own colour for that one thing —
 rather than assuming the whole namespace is absent.
 
-Unlike `host.accent`, none of the eight rotate with nesting depth: there
-is one terminal behind every portal, and a client's modal should belong
-to it. Depth is a signal about *which pane you are in*, which is what
-the accent carries.
+Unlike `host.accent`, seven of the eight do not rotate with nesting
+depth: there is one terminal behind every portal, and a client's modal
+should belong to it. Depth is a signal about *which pane you are in*,
+which is what the accent carries. The eighth, `host.text.on_accent`, is
+text *over* that accent, so it rotates with it: text picked against
+slot 1 is unreadable on a slot 2 of the opposite lightness, and a
+nested client paints slot 2.
 
 A host publishing these SHOULD also report their concrete values in the
 PRT probe (portal-extension.md §10) so a client can derive shades — a

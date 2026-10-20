@@ -96,7 +96,10 @@
 # surface_inset  = "#1a1a1e"   # a recessed surface inside a panel
 # text           = "#ebebeb"   # primary text on `surface`
 # text_dim       = "#9a9a9a"   # key hints, inactive labels
-# text_on_accent = "#f5f5f5"   # text over an accent fill
+# text_on_accent = ["#f5f5f5", "#f5f5f5", "#f5f5f5"]
+#                              # text over each accent, slot for slot; a slot
+#                              # the list does not reach derives against its
+#                              # own accent, and a single string pins slot 1
 # warn_fill      = "#34282a"   # the Quit button, the `no matches` chip
 # warn_border    = "#964646"
 # warn_text      = "#e88282"

@@ -72,7 +72,8 @@ fn window_title_for(title: &str) -> String {
 /// Accent slot N maps to `host.accent.{N+1}`; the contextual
 /// `host.accent` rotates through them by portal nesting depth, so a
 /// top-level vmux, a vmux nested inside it, and one nested again render
-/// their chrome in slots 0/1/2. The rest of the namespace — the ground,
+/// their chrome in slots 0/1/2. `host.text.on_accent` rotates with it,
+/// being text over that accent. The rest of the namespace — the ground,
 /// the text, the surfaces a modal is built from — does not rotate;
 /// there is one terminal behind every portal, and a client's chrome
 /// should belong to it.

@@ -559,7 +559,9 @@ impl PrtEngine {
                 host_theme_changed_body(
                     "",
                     accent,
-                    palette.colors.map(crate::vge::HostThemeColors::to_rgba8),
+                    palette
+                        .contextual_colors(depth)
+                        .map(crate::vge::HostThemeColors::to_rgba8),
                 ),
             );
         }
@@ -1417,13 +1419,12 @@ impl PrtEngine {
             // The accent `host.accent` resolves to at this engine's depth,
             // so a client can derive its own shades from it.
             accent_rgba: self.host_palette.contextual_rgba8(self.depth),
-            // The rest of the namespace, for the same reason. Unlike the
-            // accent these do not vary with depth — there is one
-            // terminal background — but they ride the same tail so a
-            // client learns the whole palette from one probe.
+            // The rest of the namespace, for the same reason. These do
+            // not vary with depth — there is one terminal background —
+            // except the text over the accent, which follows it.
             theme_rgba: self
                 .host_palette
-                .colors
+                .contextual_colors(self.depth)
                 .map(crate::vge::HostThemeColors::to_rgba8),
         };
         Ok(pb.encode())
@@ -2306,6 +2307,7 @@ mod tests {
         let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
         crate::vge::HostThemePalette {
             accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+            on_accents: Vec::new(),
             colors: None,
         }
     }
@@ -2433,6 +2435,7 @@ mod tests {
         let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
         engine.set_host_palette(crate::vge::HostThemePalette {
             accents: vec![c(0.0, 0.0, 1.0), c(1.0, 1.0, 0.0)],
+            on_accents: Vec::new(),
             colors: None,
         });
         assert_eq!(
@@ -2494,6 +2497,57 @@ mod tests {
         let parsed = dispatch_one(child, CMD_PROBE, 1, &[]);
         let (_, accent) = probe_vge_features_and_accent(&parsed.body);
         assert_eq!(accent, Some([0, 255, 0, 255]));
+    }
+
+    /// Text over the accent follows the accent down the tree: the probe
+    /// at depth 1 reports slot 2's, and so does the portal's own
+    /// `host.text.on_accent` — the colour a client reads and the one it
+    /// references by `StyleRef` are the same pick.
+    #[test]
+    fn text_on_accent_follows_the_accent_by_depth() {
+        let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
+        let colors = crate::vge::HostThemeColors {
+            bg: c(0.0, 0.0, 0.0),
+            fg: c(1.0, 1.0, 1.0),
+            surface: c(0.2, 0.2, 0.2),
+            surface_inset: c(0.1, 0.1, 0.1),
+            text: c(0.9, 0.9, 0.9),
+            text_dim: c(0.5, 0.5, 0.5),
+            text_on_accent: c(1.0, 1.0, 1.0),
+            warn: c(1.0, 0.0, 0.0),
+        };
+        let light = c(1.0, 1.0, 1.0);
+        let dark = c(0.0, 0.0, 0.0);
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(crate::vge::HostThemePalette {
+            on_accents: vec![light, dark, light],
+            colors: Some(colors),
+            ..rgb_palette()
+        });
+        dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
+
+        let on_accent = |body: &[u8]| {
+            let theme = prt_protocol::envelope::ProbeBody::decode(body)
+                .unwrap()
+                .theme_rgba
+                .unwrap();
+            theme[6]
+        };
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        assert_eq!(on_accent(&parsed.body), [255, 255, 255, 255]);
+        let content = engine.state.current_mut().content_mut("p").unwrap();
+        let parsed = dispatch_one(&mut content.children, CMD_PROBE, 1, &[]);
+        assert_eq!(on_accent(&parsed.body), [0, 0, 0, 255]);
+
+        let styles = &content.vge.state.shared.styles;
+        assert_eq!(
+            styles.get("host.text.on_accent"),
+            Some(&crate::vge::ConcreteStyle::Flat(dark))
+        );
+        assert_eq!(
+            styles.get("host.text.on_accent.1"),
+            Some(&crate::vge::ConcreteStyle::Flat(light))
+        );
     }
 
     #[test]

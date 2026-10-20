@@ -1088,7 +1088,8 @@ told, and redraws them.
 
 The accent is the one *this* engine's depth resolves to, so a client
 never does depth arithmetic — the same rule as the probe (§10). The
-eight theme colours do not vary with depth and are carried whole. The
+eight theme colours are carried whole, with `host.text.on_accent` the
+one for that same accent, as in the probe. The
 block is all-or-nothing: a body that stops after the accent carries no
 theme colours, exactly as in the probe.
 
@@ -1313,8 +1314,10 @@ MUST treat the block as all-or-nothing** — a body that stops part-way
 through it carries no theme colors, since a half-decoded block would
 leave some ids at a color the host never sent.
 
-None of the eight vary with nesting depth, so unlike the accent the
-same values reach every portal in the tree. A client uses them for what
+Seven of the eight do not vary with nesting depth and reach every
+portal in the tree unchanged. `host.text.on_accent` is the exception:
+like the accent it precedes, it is reported for the probing engine's
+depth — the text for *that* accent (VGE §7.3). A client uses them for what
 a `StyleRef` cannot express: a modal ground at partial opacity, a
 scrollbar thumb derived from `host.fg`, a shade between `host.surface`
 and `host.bg`.

@@ -596,7 +596,10 @@ pub struct HostThemeColors {
     pub text: command::Color,
     /// `host.text.dim` — secondary text: hints, inactive labels.
     pub text_dim: command::Color,
-    /// `host.text.on_accent` — text over an accent fill.
+    /// `host.text.on_accent` — text over an accent fill. The fallback
+    /// for every depth when [`HostThemePalette::on_accents`] is empty;
+    /// otherwise [`HostThemePalette::contextual_colors`] replaces it with
+    /// the one picked against the accent that depth paints.
     pub text_on_accent: command::Color,
     /// `host.warn` — the warm tone for a destructive answer.
     pub warn: command::Color,
@@ -676,6 +679,12 @@ pub struct HostThemePalette {
     /// Ordered accent slots. `host.accent.{n}` resolves to `accents[n-1]`;
     /// the contextual `host.accent` resolves to `accents[depth % len]`.
     pub accents: Vec<command::Color>,
+    /// Text over each accent, slot for slot: `host.text.on_accent.{n}`
+    /// resolves to `on_accents[n-1]`, and the contextual
+    /// `host.text.on_accent` follows the contextual accent — text picked
+    /// against slot 1 is wrong on a slot 2 of the opposite lightness.
+    /// Empty (or short) falls back to `colors.text_on_accent`.
+    pub on_accents: Vec<command::Color>,
     /// The rest of the namespace. `None` when the host publishes only
     /// accents — a client then falls back to its own chrome colours.
     pub colors: Option<HostThemeColors>,
@@ -699,6 +708,23 @@ impl HostThemePalette {
         Some([q(c.r), q(c.g), q(c.b), q(c.a)])
     }
 
+    /// The eight non-accent colours as a VGE engine at the given tree
+    /// depth sees them: all but `text_on_accent` are the same everywhere,
+    /// and that one is the text for the accent this depth resolves to.
+    /// What the probe and `HostThemeChanged` report, and what
+    /// [`Self::entries`] seeds, so the three cannot disagree.
+    pub fn contextual_colors(&self, depth: u32) -> Option<HostThemeColors> {
+        let mut colors = self.colors?;
+        if !self.accents.is_empty()
+            && let Some(c) = self
+                .on_accents
+                .get((depth as usize) % self.accents.len())
+        {
+            colors.text_on_accent = *c;
+        }
+        Some(colors)
+    }
+
     /// Style-table entries this palette contributes for a VGE engine at
     /// the given tree depth (host = 0). Empty when the palette is empty.
     fn entries(&self, depth: u32) -> Vec<(String, ConcreteStyle)> {
@@ -711,9 +737,12 @@ impl HostThemePalette {
         for (i, c) in self.accents.iter().enumerate() {
             out.push((format!("host.accent.{}", i + 1), ConcreteStyle::Flat(*c)));
         }
-        if let Some(colors) = &self.colors {
+        if let Some(colors) = self.contextual_colors(depth) {
             for (id, c) in HostThemeColors::IDS.iter().zip(colors.as_array()) {
                 out.push(((*id).to_string(), ConcreteStyle::Flat(c)));
+            }
+            for (i, c) in self.on_accents.iter().enumerate() {
+                out.push((format!("host.text.on_accent.{}", i + 1), ConcreteStyle::Flat(*c)));
             }
         }
         out
@@ -2780,6 +2809,7 @@ mod tests {
         let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
         HostThemePalette {
             accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
+            on_accents: Vec::new(),
             colors: None,
         }
     }

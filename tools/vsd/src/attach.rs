@@ -843,7 +843,9 @@ fn theme_announcement(palette: &veter_host::vge::HostThemePalette) -> Vec<u8> {
     let body = prt_protocol::envelope::host_theme_changed_body(
         "",
         accent,
-        palette.colors.map(veter_host::vge::HostThemeColors::to_rgba8),
+        palette
+            .contextual_colors(0)
+            .map(veter_host::vge::HostThemeColors::to_rgba8),
     );
     let mut frames = Vec::new();
     prt_protocol::envelope::append_frame(
@@ -881,6 +883,7 @@ mod theme_announcement_tests {
         };
         let palette = veter_host::vge::HostThemePalette {
             accents: vec![color(1.0, 0.0, 0.0)],
+            on_accents: Vec::new(),
             colors: Some(colors),
         };
 
@@ -923,9 +926,12 @@ mod theme_announcement_tests {
 /// The probe reports one *accent* — the one `host.accent` resolves to
 /// at the probing engine's depth — not the renderer's whole accent
 /// list, so every depth inside the session resolves to that same
-/// accent while the daemon is the one answering. The rest of the
-/// palette does not vary with depth, so it comes across whole. A
-/// renderer re-seeds its own palette over both on attach.
+/// accent while the daemon is the one answering. The theme block's
+/// text over the accent is likewise the one for that accent, so it
+/// stays the fallback `colors.text_on_accent` with no per-slot list:
+/// one accent, one text. The rest of the palette does not vary with
+/// depth and comes across whole. A renderer re-seeds its own palette
+/// over all of it on attach.
 fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostThemePalette> {
     use prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES;
     if prt.vge_features? & FEAT_VGE_HOST_THEMED_STYLES == 0 {
@@ -939,6 +945,7 @@ fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostTheme
             b: f32::from(b) / 255.0,
             a: f32::from(a) / 255.0,
         }],
+        on_accents: Vec::new(),
         colors: prt
             .theme_rgba
             .map(veter_host::vge::HostThemeColors::from_rgba8),

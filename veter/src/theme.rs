@@ -158,6 +158,25 @@ impl<'de> Deserialize<'de> for Rgba {
     }
 }
 
+/// A colour list that also takes a bare colour as a list of one — how
+/// `text_on_accent` reads both its per-slot form and the single pin it
+/// was before it had slots, which existing configs still spell.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<Rgba>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Rgba),
+        Many(Vec<Rgba>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(c) => vec![c],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
@@ -209,10 +228,17 @@ pub struct Theme {
     /// faded toward `surface`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_dim: Option<Rgba>,
-    /// Text over an accent fill. Derives to whichever of near-white and
-    /// near-black contrasts better with accent slot 1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_on_accent: Option<Rgba>,
+    /// Text over each accent fill, slot for slot with `accents`: entry N
+    /// is the text for accent slot N+1. A slot the list does not reach
+    /// derives, to whichever of near-white and near-black contrasts
+    /// better with *that* accent — so pinning one colour pins slot 1
+    /// alone, and a light accent further down still gets dark text.
+    /// A single string is read as a one-entry list.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub text_on_accent: Vec<Rgba>,
 
     /// The warm trio for the answer that gets you nothing — the close
     /// prompt's Quit button, the search panel's `no matches`. All three
@@ -344,8 +370,17 @@ impl Theme {
     /// the mid grey that lightening its foreground would give.
     #[must_use]
     pub fn text_on_accent(&self) -> Rgba {
+        self.text_on_slot(0, self.accent_primary())
+    }
+
+    /// Text over accent slot `i + 1`, which is `accent`: the pin for
+    /// that slot, else derived against it.
+    #[must_use]
+    fn text_on_slot(&self, i: usize, accent: Rgba) -> Rgba {
         self.text_on_accent
-            .unwrap_or_else(|| self.text_on(self.accent_primary()))
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.text_on(accent))
     }
 
     /// Text over an arbitrary solid `fill`, by the rule
@@ -437,8 +472,17 @@ impl Theme {
     /// probe (`doc/portal-extension.md` §10).
     #[must_use]
     pub fn host_palette(&self, accents: Vec<Rgba>) -> veter_host::vge::HostThemePalette {
+        // One text colour per slot, each picked against its own accent:
+        // the contextual `host.text.on_accent` follows the contextual
+        // `host.accent` down the portal tree.
+        let on_accents = accents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| self.text_on_slot(i, *a).to_command_color())
+            .collect();
         veter_host::vge::HostThemePalette {
             accents: accents.into_iter().map(Rgba::to_command_color).collect(),
+            on_accents,
             colors: Some(veter_host::vge::HostThemeColors {
                 bg: self.background.to_command_color(),
                 fg: self.foreground.to_command_color(),
@@ -644,7 +688,7 @@ fn veter() -> Theme {
         surface_inset: Some(c(0x1a1a1e)),
         text: Some(c(0xebebeb)),
         text_dim: None,
-        text_on_accent: Some(c(0xf5f5f5)),
+        text_on_accent: vec![c(0xf5f5f5); 3],
         warn_fill: Some(c(0x34282a)),
         warn_border: Some(c(0x964646)),
         warn_text: Some(c(0xe88282)),
@@ -853,7 +897,7 @@ fn derived() -> Theme {
         surface_inset: None,
         text: None,
         text_dim: None,
-        text_on_accent: None,
+        text_on_accent: Vec::new(),
         warn_fill: None,
         warn_border: None,
         warn_text: None,
@@ -1108,12 +1152,70 @@ mod tests {
     fn text_on_accent_is_readable_on_a_light_theme_too() {
         for name in BUILTIN_NAMES {
             let t = Theme {
-                text_on_accent: None,
+                text_on_accent: Vec::new(),
                 ..builtin(name).unwrap()
             };
             let gap = (t.text_on_accent().luminance() - t.accent_primary().luminance()).abs();
             assert!(gap > 0.35, "{name}: text on the accent barely reads ({gap:.2})");
         }
+    }
+
+    /// Every slot of every built-in gets text that reads on *that*
+    /// slot — the colour a nested client paints, not just slot 1.
+    #[test]
+    fn text_on_every_accent_slot_reads() {
+        for name in BUILTIN_NAMES {
+            let t = builtin(name).unwrap();
+            let palette = t.host_palette(t.accents());
+            for (i, (accent, text)) in
+                t.accents().iter().zip(&palette.on_accents).enumerate()
+            {
+                let text = Rgba {
+                    r: (text.r * 255.0).round() as u8,
+                    g: (text.g * 255.0).round() as u8,
+                    b: (text.b * 255.0).round() as u8,
+                    a: 255,
+                };
+                let gap = (text.luminance() - accent.luminance()).abs();
+                assert!(gap > 0.3, "{name} slot {}: {gap:.2}", i + 1);
+            }
+        }
+    }
+
+    /// The pin list runs slot for slot, and a slot it does not reach
+    /// derives against its own accent — so a light accent below a dark
+    /// one gets dark text even when slot 1's light text is pinned. The
+    /// single string older configs spell is a one-entry list.
+    #[test]
+    fn text_on_accent_pins_per_slot() {
+        let dark = Rgba::rgb(0x2a, 0x2f, 0x6e);
+        let light = Rgba::rgb(0xff, 0xd7, 0x00);
+        let section: toml::Table = toml::from_str(
+            r##"
+            accents = ["#2a2f6e", "#ffd700", "#2a2f6e"]
+            text_on_accent = "#f5f5f5"
+            "##,
+        )
+        .unwrap();
+        let t = resolve(&section, None);
+        assert_eq!(t.text_on_accent, vec![Rgba::rgb(0xf5, 0xf5, 0xf5)]);
+        let palette = t.host_palette(t.accents());
+        assert_eq!(palette.on_accents.len(), 3);
+        assert_eq!(palette.on_accents[0], Rgba::rgb(0xf5, 0xf5, 0xf5).to_command_color());
+        assert_eq!(palette.on_accents[1], t.text_on(light).to_command_color());
+        assert!(t.text_on(light).luminance() < 0.25);
+        assert_eq!(palette.on_accents[2], t.text_on(dark).to_command_color());
+
+        let section: toml::Table = toml::from_str(
+            r##"
+            accents = ["#2a2f6e", "#ffd700"]
+            text_on_accent = ["#ffffff", "#000000"]
+            "##,
+        )
+        .unwrap();
+        let t = resolve(&section, None);
+        let palette = t.host_palette(t.accents());
+        assert_eq!(palette.on_accents[1], Rgba::rgb(0, 0, 0).to_command_color());
     }
 
     #[test]
