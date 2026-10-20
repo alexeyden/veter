@@ -143,7 +143,7 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 // a part this build cannot read leaves the context
                 // exactly as it was, rather than holding a session's
                 // grid under the pane's own portals.
-                let decoded = match decode(prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes) {
+                let decoded = match decode(vge, prt, &cs.vt_bytes, &cs.vge_bytes, &cs.prt_bytes) {
                     Ok(decoded) => decoded,
                     Err(reason) => {
                         vss.answer(cs.sequence_id, Err(reason));
@@ -182,7 +182,7 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
                 // if it somehow did not, keeping the session's view
                 // beats installing a part of it.
                 if let Some(b) = backup.take()
-                    && let Ok(decoded) = decode(prt, &b.vt, &b.vge, &b.prt)
+                    && let Ok(decoded) = decode(vge, prt, &b.vt, &b.vge, &b.prt)
                 {
                     install(parser, vge, prt, decoded);
                 }
@@ -200,9 +200,11 @@ struct Decoded {
 }
 
 /// Decode all three parts of a snapshot, or say why one of them cannot
-/// be read. `prt` is only read — a restored portal inherits metrics
-/// and policy from the engine it will live in.
+/// be read. The engines are only read — a restored portal inherits
+/// metrics and policy from the engine it will live in, and both take
+/// from theirs whether to decode images.
 fn decode(
+    vge: &VgeEngine,
     prt: &PrtEngine,
     vt_bytes: &[u8],
     vge_bytes: &[u8],
@@ -218,7 +220,8 @@ fn decode(
     Ok(Decoded {
         vt: vt100::Screen::decode_binary_snapshot(vt_bytes)
             .map_err(|e| reason(e.is_version_mismatch()))?,
-        vge: VgeEngine::decode_binary_snapshot(vge_bytes)
+        vge: vge
+            .decode_binary_snapshot(vge_bytes)
             .map_err(|e| reason(e.is_version_mismatch()))?,
         prt: prt
             .decode_binary_snapshot(prt_bytes)

@@ -210,6 +210,10 @@ pub struct GpuImageId(pub u64);
 pub struct UploadedImage {
     pub width: u32,
     pub height: u32,
+    /// `width × height` pixels, or **empty** for an image held by a
+    /// silent engine, which keeps only `source_data` (see
+    /// [`VgeEngine::set_auto_reply_commands`]). A renderer treats an
+    /// empty one as missing.
     pub pixels: Vec<RGBA8>,
     pub gpu: Cell<Option<GpuImageId>>,
     /// Encoding byte from the original `UploadImage` body (§8.1):
@@ -485,21 +489,47 @@ fn decode_raw_rgba8(
     Ok(pixels)
 }
 
-/// Snapshot-decode entry point. Same Raw / WebP dispatch as the
-/// upload path, but maps the protocol-level error into a snapshot
-/// error so the VSS engine surfaces a single error type.
-pub(in crate::vge) fn decode_image_pixels_from_snapshot(
+/// Decode an image payload (§8.1) into pixels, as finalize does.
+pub(in crate::vge) fn decode_image_pixels(
     encoding: u8,
+    data: &[u8],
     width: u32,
     height: u32,
-    data: &[u8],
-) -> Result<Vec<RGBA8>, crate::vge::snapshot::SnapshotError> {
-    let res = match encoding {
+) -> Result<Vec<RGBA8>, (u16, &'static str)> {
+    match encoding {
         0x01 => decode_raw_rgba8(data, width, height),
         0x02 => decode_webp(data, width, height),
-        _ => return Err(crate::vge::snapshot::SnapshotError::BadPayload),
-    };
-    res.map_err(|_| crate::vge::snapshot::SnapshotError::BadPayload)
+        _ => Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
+    }
+}
+
+/// The part of [`decode_image_pixels`] that costs nothing: Raw's byte
+/// count, and the dimensions in a WebP file's header — tens of
+/// microseconds, against most of a second to decode a photo.
+pub(in crate::vge) fn check_image_payload(
+    encoding: u8,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(), (u16, &'static str)> {
+    match encoding {
+        0x01 => {
+            if data.len() as u64 != (width as u64) * (height as u64) * 4 {
+                return Err((ERR_BAD_PAYLOAD, "raw image byte count != width*height*4"));
+            }
+            Ok(())
+        }
+        0x02 => {
+            use image::ImageDecoder;
+            let header = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(data))
+                .map_err(|_| (ERR_IMAGE_DECODE, "WebP decode failed"))?;
+            if header.dimensions() != (width, height) {
+                return Err((ERR_IMAGE_DECODE, "WebP dimensions do not match announced w/h"));
+            }
+            Ok(())
+        }
+        _ => Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
+    }
 }
 
 /// Decode an UploadImage WebP payload (§8.1, encoding 0x02). Decoded
@@ -837,6 +867,12 @@ impl VgeEngine {
     /// `auto_reply_commands` — vsd uses this so the upstream real
     /// host is the sole responder and the inner program doesn't get
     /// two response envelopes per command.
+    ///
+    /// A silent engine also stops decoding images, on upload and on
+    /// snapshot restore alike: it keeps the encoded bytes (all a
+    /// snapshot ships) and leaves [`UploadedImage::pixels`] empty. The
+    /// decode exists to produce an answer and something to paint, and a
+    /// silent engine has neither to give.
     pub fn set_auto_reply_commands(&mut self, enabled: bool) {
         self.auto_reply_commands = enabled;
     }
@@ -925,18 +961,21 @@ impl VgeEngine {
         &mut self,
         bytes: &[u8],
     ) -> Result<(), crate::vge::snapshot::SnapshotError> {
-        let decoded = Self::decode_binary_snapshot(bytes)?;
+        let decoded = self.decode_binary_snapshot(bytes)?;
         self.install_binary_snapshot(decoded);
         Ok(())
     }
 
     /// The decoding half of [`Self::restore_from_binary_snapshot`],
-    /// touching no engine — so a VSS restore can read all three of its
-    /// parts before installing any (`pipeline::restore`).
+    /// leaving this engine as it is — so a VSS restore can read all
+    /// three of its parts before installing any (`pipeline::restore`).
+    /// The engine is only read, for whether to decode the images.
     pub fn decode_binary_snapshot(
+        &self,
         bytes: &[u8],
     ) -> Result<crate::vge::snapshot::VgeSnapshot, crate::vge::snapshot::SnapshotError> {
-        crate::vge::snapshot::decode_state(bytes).map(crate::vge::snapshot::VgeSnapshot)
+        crate::vge::snapshot::decode_state(bytes, self.auto_reply_commands)
+            .map(crate::vge::snapshot::VgeSnapshot)
     }
 
     /// The installing half of [`Self::restore_from_binary_snapshot`].
@@ -1712,10 +1751,19 @@ impl VgeEngine {
             return Err((ERR_BAD_PAYLOAD, "is_last with bytes_received < total"));
         }
 
-        let pixels = match pending.encoding {
-            0x01 => decode_raw_rgba8(&pending.buf, pending.width, pending.height)?,
-            0x02 => decode_webp(&pending.buf, pending.width, pending.height)?,
-            _ => return Err((ERR_BAD_PAYLOAD, "unknown image encoding")),
+        // A silent engine checks only what is cheap to check. Its
+        // verdict reaches nobody — the host it forwards to decodes the
+        // same bytes and answers — and it paints nothing, so a full
+        // decode bought nothing but a stall: a photo-sized WebP held
+        // vsd's pty reader for most of a second, freezing every pane
+        // of the session behind it. What the header can't catch (a
+        // truncated or corrupt body) is caught by whoever decodes the
+        // snapshot that later ships it; see `decode_uploaded_image`.
+        let pixels = if self.auto_reply_commands {
+            decode_image_pixels(pending.encoding, &pending.buf, pending.width, pending.height)?
+        } else {
+            check_image_payload(pending.encoding, &pending.buf, pending.width, pending.height)?;
+            Vec::new()
         };
 
         // Preserve the on-wire form so snapshot replay can reship the
@@ -4359,6 +4407,102 @@ mod tests {
             matches!(err, crate::vge::snapshot::SnapshotError::BadPayload),
             "{err:?}",
         );
+    }
+
+    /// A lossless WebP file of `w × h` noise — noise so the body is
+    /// long enough to truncate past the header.
+    fn webp_file(w: u32, h: u32) -> Vec<u8> {
+        let mut seed = 7u32;
+        let rgba: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(&rgba, w, h, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        out
+    }
+
+    fn upload_webp(e: &mut VgeEngine, id: &str, w: u32, h: u32, data: Vec<u8>) {
+        use vge_protocol::encode::build_envelope as enc;
+        e.process_pty_chunk(&enc(&[(
+            Command::UploadImage(UploadImageBody {
+                id: id.into(),
+                encoding: 0x02,
+                retention: Retention::Manual,
+                width: w,
+                height: h,
+                total_bytes: data.len() as u32,
+                chunk_offset: 0,
+                is_last: true,
+                data,
+            }),
+            1,
+        )]));
+    }
+
+    #[test]
+    fn answering_engine_decodes_webp_on_upload() {
+        let mut e = VgeEngine::new((9, 20), 1.0);
+        upload_webp(&mut e, "pic", 16, 8, webp_file(16, 8));
+        assert_eq!(e.state.shared.images["pic"].pixels.len(), 16 * 8);
+    }
+
+    // vsd with a renderer attached: the renderer decodes and answers,
+    // so the daemon keeps the file and only reads its header.
+    #[test]
+    fn silent_engine_keeps_webp_undecoded() {
+        let mut e = VgeEngine::new((9, 20), 1.0);
+        e.set_auto_reply_commands(false);
+        let file = webp_file(16, 8);
+        upload_webp(&mut e, "pic", 16, 8, file.clone());
+        let img = &e.state.shared.images["pic"];
+        assert!(img.pixels.is_empty());
+        assert_eq!(img.source_data, file);
+        assert!(e.take_responses().is_empty());
+    }
+
+    #[test]
+    fn silent_engine_refuses_webp_whose_header_disagrees() {
+        let mut e = VgeEngine::new((9, 20), 1.0);
+        e.set_auto_reply_commands(false);
+        upload_webp(&mut e, "pic", 17, 8, webp_file(16, 8));
+        upload_webp(&mut e, "junk", 16, 8, vec![0xAB; 64]);
+        assert!(e.state.shared.images.is_empty());
+    }
+
+    #[test]
+    fn silent_engine_restores_without_decoding() {
+        let mut a = VgeEngine::new((9, 20), 1.0);
+        upload_webp(&mut a, "pic", 16, 8, webp_file(16, 8));
+        let bytes = a.binary_snapshot();
+        let mut b = VgeEngine::new((9, 20), 1.0);
+        b.set_auto_reply_commands(false);
+        b.restore_from_binary_snapshot(&bytes).unwrap();
+        assert!(b.state.shared.images["pic"].pixels.is_empty());
+        assert_eq!(b.binary_snapshot(), bytes);
+    }
+
+    // The header check misses a truncated body, so a silent sender can
+    // hold an image no renderer will decode. That costs the image, not
+    // the attach.
+    #[test]
+    fn snapshot_drops_an_image_that_does_not_decode() {
+        let mut a = populate_engine();
+        a.set_auto_reply_commands(false);
+        let file = webp_file(64, 64);
+        upload_webp(&mut a, "torn", 64, 64, file[..file.len() / 2].to_vec());
+        assert!(a.state.shared.images.contains_key("torn"));
+
+        let mut b = VgeEngine::new((9, 20), 1.0);
+        b.restore_from_binary_snapshot(&a.binary_snapshot()).unwrap();
+        assert!(!b.state.shared.images.contains_key("torn"));
+        let pic = &b.state.shared.images["pic"];
+        assert_eq!(pic.pixels.len(), (pic.width * pic.height) as usize);
+        assert_eq!(b.state.elements().len(), 3);
     }
 
     // ---- image refcounting (§8) ---------------------------------------

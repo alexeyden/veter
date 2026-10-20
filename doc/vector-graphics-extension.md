@@ -1160,6 +1160,12 @@ Lifecycle:
    dropped, `id` is released, and the response is `err_image_decode`
    (decode failure) or `err_bad_payload` (length mismatch).
 
+   A host that relays the stream to a terminal which answers in its
+   place (a session daemon with a renderer attached,
+   session-manager.md §2.1) MAY check WebP against its header's
+   dimensions instead of decoding it, since its verdict is not sent.
+   The answer the client gets is still a decode's.
+
 `DropImage` removes a finalized entry; on an in-progress `id` it
 also aborts the upload. It means "remove now, whatever is referencing
 it", under either retention policy (§8.0). Live `DrawImage` references

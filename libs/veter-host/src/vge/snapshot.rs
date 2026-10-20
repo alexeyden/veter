@@ -129,7 +129,12 @@ pub(crate) struct DecodedState {
 /// [`VgeEngine::decode_binary_snapshot`](super::VgeEngine::decode_binary_snapshot).
 pub struct VgeSnapshot(pub(crate) DecodedState);
 
-pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> {
+/// `decode_pixels` is the receiving engine's policy: a silent one
+/// keeps only the encoded bytes (`VgeEngine::set_auto_reply_commands`).
+pub(crate) fn decode_state(
+    bytes: &[u8],
+    decode_pixels: bool,
+) -> Result<DecodedState, SnapshotError> {
     let mut r = Reader::new(bytes);
     let kind = r.u16()?;
     if kind != SNAPSHOT_KIND_VERSION {
@@ -142,7 +147,7 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<DecodedState, SnapshotError> 
     let cell_px = (r.u16()?, r.u16()?);
     let scale_factor = r.f32()?;
 
-    let shared = decode_shared(&mut r)?;
+    let shared = decode_shared(&mut r, decode_pixels)?;
     let main = decode_element_set(&mut r)?;
     let has_alt = r.bool()?;
     let alt = if has_alt {
@@ -186,13 +191,14 @@ fn encode_shared(shared: &SharedTables, w: &mut Writer) {
     }
 }
 
-fn decode_shared(r: &mut Reader) -> Result<SharedTables, SnapshotError> {
+fn decode_shared(r: &mut Reader, decode_pixels: bool) -> Result<SharedTables, SnapshotError> {
     let mut images = HashMap::new();
     let n_images = r.varu()? as usize;
     for _ in 0..n_images {
         let id = r.string()?.to_owned();
-        let img = decode_uploaded_image(r)?;
-        images.insert(id, img);
+        if let Some(img) = decode_uploaded_image(r, decode_pixels)? {
+            images.insert(id, img);
+        }
     }
     let mut styles = HashMap::new();
     let n_styles = r.varu()? as usize;
@@ -217,27 +223,40 @@ fn encode_uploaded_image(img: &UploadedImage, w: &mut Writer) {
     w.u8(if img.pinned { 1 } else { 0 });
     w.bytes(&img.source_data);
     // GPU handle is renderer-private. `pixels` is the decoded form of
-    // `source_data` and the renderer recomputes it lazily — we don't
-    // ship either over the wire.
+    // `source_data`, which the receiver decodes again (or, silent,
+    // doesn't) — we don't ship either over the wire.
 }
 
-fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError> {
+/// `None` for an image whose payload does not decode. That is not a
+/// malformed snapshot: a silent sender (vsd with a renderer attached)
+/// stores uploads having checked only their headers, so a corrupt body
+/// the renderer refused at upload time is still in the sender's table.
+/// Dropping it leaves this side's table as the renderer that saw the
+/// upload left its own — any `DrawImage` naming it draws the §7.5
+/// missing-image fill — where refusing the snapshot would cost the
+/// whole attach over one picture.
+fn decode_uploaded_image(
+    r: &mut Reader,
+    decode_pixels: bool,
+) -> Result<Option<UploadedImage>, SnapshotError> {
     let width = r.u32()?;
     let height = r.u32()?;
     let source_encoding = r.u8()?;
     let pinned = r.u8()? != 0;
     let source_data = r.bytes()?.to_vec();
-    // Decode the bytes to populate `pixels` on the receiving side so the
-    // renderer doesn't have to redo it from scratch the first time it
-    // paints the image. If the bytes were Raw (0x01) we can short-circuit;
-    // for WebP (0x02) we have to ask `image` to decode.
-    let pixels = super::state::decode_image_pixels_from_snapshot(
-        source_encoding,
-        width,
-        height,
-        &source_data,
-    )?;
-    Ok(UploadedImage {
+    if !matches!(source_encoding, 0x01 | 0x02) {
+        return Err(SnapshotError::BadPayload);
+    }
+    let pixels = if decode_pixels {
+        super::state::decode_image_pixels(source_encoding, &source_data, width, height)
+    } else {
+        super::state::check_image_payload(source_encoding, &source_data, width, height)
+            .map(|()| Vec::new())
+    };
+    let Ok(pixels) = pixels else {
+        return Ok(None);
+    };
+    Ok(Some(UploadedImage {
         width,
         height,
         pixels,
@@ -249,7 +268,7 @@ fn decode_uploaded_image(r: &mut Reader) -> Result<UploadedImage, SnapshotError>
         refs: 0,
         was_referenced: false,
         pinned,
-    })
+    }))
 }
 
 // ---- ElementSet -------------------------------------------------------

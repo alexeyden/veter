@@ -752,7 +752,9 @@ fn ensure_image_paint<T: Renderer>(
     target_h: f32,
     source_rect: Option<super::codec::Rect>,
 ) -> Paint {
-    let img = match images.get(image_id) {
+    // An image with no pixels was stored by a silent engine, which is
+    // never painted; were one to be, it is as missing as no image.
+    let img = match images.get(image_id).filter(|i| !i.pixels.is_empty()) {
         Some(i) => i,
         None => {
             eprintln!("vge: DrawImage references missing image `{image_id}` — rendering magenta");

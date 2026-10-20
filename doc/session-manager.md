@@ -163,6 +163,19 @@ report — at the top level and inside every portal at any nesting depth
 the renderer owns the channel are consumed, not banked, so a detach
 never flushes a burst of stale reports at the inner program.
 
+The same switch decides whether the daemon decodes images. Finalizing
+an `UploadImage` decodes the payload (vector-graphics-extension.md
+§8.2) for two reasons — the client is owed `err_image_decode` if it
+fails, and the renderer needs pixels — and a silent daemon has neither
+to give: the renderer it forwards to decodes the same bytes and
+answers. So while attached it checks only what costs nothing (Raw's
+byte count, the dimensions in a WebP header) and keeps the encoded
+bytes, which is all a snapshot ships. This is not an optimisation at
+the margin. The daemon reads each session's pty on one thread, and a
+photo-sized WebP took most of a second to decode there — every pane of
+the session froze behind it, while the renderer's own panes went on
+drawing.
+
 VFT runs the other way round from VGE: the daemon never implements
 it, attached or not. A transfer's far end is the user's filesystem —
 §7.1's file picker, §6.1's open-after-finalize, one desktop session —
@@ -424,7 +437,12 @@ re-encoded), **both `main` and `alt` element sets** (the v1 replay
 shipped only the active one), the `on_alt` flag, and engine-level
 scalars (`cell_px`, `scale_factor`). GPU image handles are *not* on
 the wire; the renderer re-creates them lazily through the existing
-`Renderer::register_gpu_image` path on first paint. Lives in
+`Renderer::register_gpu_image` path on first paint. An image whose
+payload fails to decode on restore is dropped from the table, not
+treated as a malformed fragment: a daemon that stored it unchecked
+(above) holds a copy of an upload the renderer already refused, and
+one bad picture must not cost the attach. A `DrawImage` naming it
+draws the missing-image fill. Lives in
 `veter-host` as `VgeEngine::binary_snapshot()` /
 `restore_from_binary_snapshot()`. The restore re-seeds the reserved
 `host.*` styles afterwards (vector-graphics-extension.md §7.3): the

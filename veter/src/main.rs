@@ -420,7 +420,7 @@ fn crop_uploaded_image(
     use rgb::ComponentBytes;
 
     let (iw, ih) = (img.width, img.height);
-    if iw == 0 || ih == 0 {
+    if iw == 0 || ih == 0 || img.pixels.is_empty() {
         return None;
     }
     let Some(r) = roi else {
