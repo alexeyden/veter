@@ -1699,7 +1699,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
     // overlaps the draw calls below.
     let panel_bg = tr.panel_bg();
     let panel_inset_bg = tr.panel_inset_bg();
-    let on_accent_text = tr.on_accent_text();
+    let on_accent_text = tr.search_on_accent_text();
 
     // Sized in cells, like the close prompt, so the panel keeps its
     // proportions across font sizes and HiDPI scales.
@@ -5371,7 +5371,7 @@ impl ApplicationHandler for App {
         let [search_accent, search_text, current_match, other_match] =
             self.config.search_colors(&self.theme);
         term_renderer.set_search_colors(
-            search_accent.to_femto(),
+            search_accent,
             search_text.to_femto(),
             current_match.to_femto(),
             other_match.to_femto(),

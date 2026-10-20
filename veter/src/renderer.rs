@@ -1686,6 +1686,9 @@ pub struct TerminalRenderer {
     // (`[search]`); default to the values that were hardcoded here
     // before the config existed. Set via `set_search_colors`.
     search_accent: Color,
+    /// Text on a [`Self::search_accent`]-filled chip, picked against
+    /// that accent rather than the theme's primary one.
+    search_on_accent: Color,
     search_bar_text: Color,
     search_current_match: Color,
     search_match: Color,
@@ -1806,6 +1809,7 @@ impl TerminalRenderer {
             next_gpu_image_id: 0,
             pick: crate::vge::pick::PickList::new(),
             search_accent: Color::rgb(0x56, 0x79, 0x9f),
+            search_on_accent: Color::rgb(0xf5, 0xf5, 0xf5),
             search_bar_text: Color::rgb(230, 230, 230),
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
@@ -1913,6 +1917,9 @@ impl TerminalRenderer {
     pub fn set_theme(&mut self, theme: Theme) {
         self.palette = Palette::with_theme(&theme);
         self.search_accent = theme.search_accent().to_femto();
+        self.search_on_accent = theme
+            .text_on_search_accent(theme.search_accent())
+            .to_femto();
         self.search_bar_text = theme.search_text().to_femto();
         self.search_current_match = theme.search_current_match().to_femto();
         self.search_match = theme.search_match().to_femto();
@@ -1966,12 +1973,13 @@ impl TerminalRenderer {
     /// after construction; the defaults above stand in until then.
     pub fn set_search_colors(
         &mut self,
-        accent: Color,
+        accent: Rgba,
         bar_text: Color,
         current_match: Color,
         other_match: Color,
     ) {
-        self.search_accent = accent;
+        self.search_accent = accent.to_femto();
+        self.search_on_accent = self.theme.text_on_search_accent(accent).to_femto();
         self.search_bar_text = bar_text;
         self.search_current_match = current_match;
         self.search_match = other_match;
@@ -1983,6 +1991,11 @@ impl TerminalRenderer {
     /// `[search] accent` overrides it.
     pub fn search_accent(&self) -> Color {
         self.search_accent
+    }
+
+    /// Text on a chip filled with [`Self::search_accent`].
+    pub fn search_on_accent_text(&self) -> Color {
+        self.search_on_accent
     }
 
     /// Search-bar text color (for `draw_search_bar`).

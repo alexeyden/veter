@@ -344,13 +344,34 @@ impl Theme {
     /// the mid grey that lightening its foreground would give.
     #[must_use]
     pub fn text_on_accent(&self) -> Rgba {
-        self.text_on_accent.unwrap_or_else(|| {
-            if self.accent_primary().luminance() > 0.55 {
-                self.darkest().darken(0.35)
-            } else {
-                self.lightest().lighten(0.5)
-            }
-        })
+        self.text_on_accent
+            .unwrap_or_else(|| self.text_on(self.accent_primary()))
+    }
+
+    /// Text over an arbitrary solid `fill`, by the rule
+    /// [`Self::text_on_accent`] derives with. For a fill that is not the
+    /// primary accent — `[search] accent` set apart from the theme's —
+    /// where the pinned or derived `text_on_accent` was never picked
+    /// against what is painted.
+    #[must_use]
+    pub fn text_on(&self, fill: Rgba) -> Rgba {
+        if fill.luminance() > 0.55 {
+            self.darkest().darken(0.35)
+        } else {
+            self.lightest().lighten(0.5)
+        }
+    }
+
+    /// Text over [`Self::search_accent`]. The theme's own
+    /// `text_on_accent` while the two accents agree, so a pin still
+    /// applies; picked against the search accent once it differs.
+    #[must_use]
+    pub fn text_on_search_accent(&self, search_accent: Rgba) -> Rgba {
+        if search_accent == self.accent_primary() {
+            self.text_on_accent()
+        } else {
+            self.text_on(search_accent)
+        }
     }
 
     /// A warm tint of the background rather than a shade of red: the
@@ -1064,6 +1085,19 @@ mod tests {
             "derived accents are bright blue / magenta / cyan"
         );
         assert!(!t.accents().contains(&t.ansi[10]), "ansi bright green");
+    }
+
+    /// `[search] accent` can name a fill the theme's `text_on_accent`
+    /// was never picked against: a light one over the default theme,
+    /// whose pinned near-white is right only for its muted blue. While
+    /// the two accents agree, the pin still wins.
+    #[test]
+    fn search_chip_text_follows_the_search_accent() {
+        let t = builtin("veter").unwrap();
+        assert_eq!(t.text_on_search_accent(t.accent_primary()), t.text_on_accent());
+        let yellow = Rgba::rgb(0xff, 0xd7, 0x00);
+        assert!(t.text_on_search_accent(yellow).luminance() < 0.25);
+        assert!(t.text_on_accent().luminance() > 0.8);
     }
 
     /// Text over an accent fill has to be readable whichever way the
