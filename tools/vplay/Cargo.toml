@@ -8,6 +8,7 @@ description = "Interactive image and video viewer for VGE-aware terminals."
 veter-version = { path = "../../libs/veter-version" }
 vge-render = { path = "../../libs/vge-render" }
 vge-protocol = { path = "../../protocol/vge" }
+vge-ui = { path = "../../libs/vge-ui" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 nix = { version = "0.29", features = ["term", "poll", "signal"] }

@@ -39,6 +39,7 @@ use input::{Dir, Event, InputParser};
 use playlist::{Playlist, is_image_ext, is_video_ext};
 use video::{Decode, DecodeState, VideoMeta, probe_frame_times, probe_video, start_decode};
 use viewport::Viewport;
+use vge_ui::{elide, text_cells};
 
 /// Namespace every element and image id shares (§6.8), so cleanup is one
 /// prefix sweep per table rather than a list of ids to keep in step.
@@ -266,16 +267,23 @@ fn create_bg(cols: u16, media_rows: u16) -> Command {
     })
 }
 
-fn create_status(cols: u16, rows: u16) -> Command {
-    let sr = (rows - 1) as f32;
-    let text = |x: f32, align: Align, c: (f32, f32, f32)| DrawCmd::DrawText {
-        origin: Point { x, y: sr },
+/// Colour of the status bar's left and centre texts.
+const STATUS_TEXT: (f32, f32, f32) = (0.86, 0.90, 0.96);
+
+fn status_draw_text(x: f32, row: f32, align: Align, c: (f32, f32, f32), text: String) -> DrawCmd {
+    DrawCmd::DrawText {
+        origin: Point { x, y: row },
         align,
         fill: flat(c.0, c.1, c.2, 1.0),
         font_style: FontStyle::default(),
         font_scale: 1.0,
-        text: String::new(),
-    };
+        text,
+    }
+}
+
+fn create_status(cols: u16, rows: u16) -> Command {
+    let sr = (rows - 1) as f32;
+    let text = |x: f32, align: Align, c| status_draw_text(x, sr, align, c, String::new());
     Command::CreateElement(CreateElementBody {
         id: EL_STATUS.into(),
         commands: vec![
@@ -288,8 +296,8 @@ fn create_status(cols: u16, rows: u16) -> Command {
                     h: 1.0,
                 }],
             },
-            text(0.5, Align::Left, (0.86, 0.90, 0.96)),
-            text(cols as f32 / 2.0, Align::Center, (0.86, 0.90, 0.96)),
+            text(0.5, Align::Left, STATUS_TEXT),
+            text(cols as f32 / 2.0, Align::Center, STATUS_TEXT),
             text(cols as f32 - 0.5, Align::Right, (0.70, 0.78, 0.90)),
         ],
         origin: Point { x: 0.0, y: 0.0 },
@@ -300,6 +308,93 @@ fn create_status(cols: u16, rows: u16) -> Command {
         transform: None,
         anchor: OriginAnchor::Viewport,
     })
+}
+
+/// Columns kept clear between neighbouring status texts.
+const STATUS_GAP: f32 = 2.0;
+
+/// The status bar's three texts, fitted to the row: what each says and
+/// where the centre one is anchored.
+#[derive(Debug, PartialEq)]
+struct StatusFit {
+    left: String,
+    center: String,
+    /// The centre text's anchor (it stays `Align::Center`).
+    center_x: f32,
+    right: String,
+}
+
+/// Fit the status bar's texts into `cols` without overlapping.
+///
+/// The left text sits at 0.5 and the right one ends at `cols - 0.5`
+/// (see [`create_status`]). The centre one is centred while it fits —
+/// but the left text, a file name followed by `tail` (the resolution and
+/// frame rate), is routinely longer than half the row, and the cursor
+/// readout on the right is mostly a lone `—`. So rather than shorten
+/// anything while the row still has room, the centre text slides right
+/// into that room, keeping [`STATUS_GAP`] to either side.
+///
+/// Only a row that is genuinely full gives anything up. The readout goes
+/// first, whole, since a clipped colour value is worse than none; then
+/// the left text is elided to what is left of the centre text, the file
+/// name before `tail`, so the details survive a long name. The centre
+/// text (zoom, frame, time) is what the user is watching change, so it
+/// is never shortened.
+fn fit_status(cols: u16, name: &str, tail: &str, center: String, right: String) -> StatusFit {
+    let cols = cols as f32;
+    let left = format!("{name}{tail}");
+    let left_end = 0.5 + text_cells(&left);
+    let center_w = text_cells(&center);
+    let ideal = cols / 2.0 - center_w / 2.0;
+    // Where the centre text may start, given what is to its right.
+    let latest_start = |right: &str| {
+        let right_start = cols - 0.5 - text_cells(right);
+        if right.is_empty() {
+            right_start - center_w
+        } else {
+            right_start - STATUS_GAP - center_w
+        }
+    };
+    let fit = |left: String, start: f32, right: String| StatusFit {
+        left,
+        center_x: start + center_w / 2.0,
+        center: center.clone(),
+        right,
+    };
+
+    if center_w == 0.0 {
+        // Nothing in the middle: left and right share the row.
+        let right_start = cols - 0.5 - text_cells(&right);
+        if left_end + STATUS_GAP <= right_start {
+            return fit(left, ideal, right);
+        }
+        let budget = (cols - 1.0).max(0.0).floor() as usize;
+        return fit(elide_left(name, tail, budget), ideal, String::new());
+    }
+
+    let earliest = left_end + STATUS_GAP;
+    for right in [right.clone(), String::new()] {
+        let latest = latest_start(&right);
+        if earliest <= latest {
+            return fit(left, ideal.clamp(earliest, latest), right);
+        }
+    }
+    // Full row: the centre text goes as far right as it can, and the
+    // left text gets what remains in front of it.
+    let start = latest_start("").max(0.5);
+    let budget = (start - STATUS_GAP - 0.5).max(0.0).floor() as usize;
+    fit(elide_left(name, tail, budget), start, String::new())
+}
+
+/// `name` followed by `tail` in at most `budget` columns, shortening the
+/// name first.
+fn elide_left(name: &str, tail: &str, budget: usize) -> String {
+    let tail_w = text_cells(tail) as usize;
+    if tail_w < budget {
+        format!("{}{tail}", elide(name, budget - tail_w))
+    } else {
+        elide(&format!("{name}{tail}"), budget)
+    }
 }
 
 fn status_text(idx: usize, text: String) -> Command {
@@ -1306,12 +1401,14 @@ fn main() -> Result<()> {
             } else {
                 String::new()
             };
-            let (left, center, right) = if is_video {
+            // The left text comes in two parts, the file name and what
+            // follows it, so the layout can shorten the name first.
+            let (left_tail, center, right) = if is_video {
                 let totals = total_frames
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "?".into());
                 (
-                    format!("{name}  {src_w}x{src_h}  {fps:.2}fps"),
+                    format!("  {src_w}x{src_h}  {fps:.2}fps"),
                     format!(
                         "{}%  f {}/{}  {}{pos}",
                         vp.zoom_percent(),
@@ -1324,9 +1421,9 @@ fn main() -> Result<()> {
             } else {
                 (
                     if have_picture {
-                        format!("{name}  {src_w}x{src_h}")
+                        format!("  {src_w}x{src_h}")
                     } else {
-                        name.clone()
+                        String::new()
                     },
                     if have_picture {
                         format!("{}%{pos}", vp.zoom_percent())
@@ -1336,12 +1433,25 @@ fn main() -> Result<()> {
                     cursor_readout(&cur),
                 )
             };
+            let fit = fit_status(cols, &name, &left_tail, center, right);
             send(
                 &mut out,
                 &[
-                    np(status_text(1, left)),
-                    np(status_text(2, center)),
-                    np(status_text(3, right)),
+                    np(status_text(1, fit.left)),
+                    // The whole command rather than its text: the anchor
+                    // moves when the left text pushes it along.
+                    np(Command::UpdateCommand(UpdateCommandBody {
+                        id: EL_STATUS.into(),
+                        index: 2,
+                        command: status_draw_text(
+                            fit.center_x,
+                            (rows - 1) as f32,
+                            Align::Center,
+                            STATUS_TEXT,
+                            fit.center,
+                        ),
+                    })),
+                    np(status_text(3, fit.right)),
                 ],
             );
             dirty_status = false;
@@ -1691,6 +1801,95 @@ mod progress_tests {
         let (track, _) = progress_rects(10, 6);
         assert!(track.x >= 0.0);
         assert!(track.x + track.w <= 10.0);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// Where each text lands, as `(start, end)` columns.
+    fn spans(cols: u16, f: &StatusFit) -> [(f32, f32); 3] {
+        let (lw, cw, rw) = (text_cells(&f.left), text_cells(&f.center), text_cells(&f.right));
+        [
+            (0.5, 0.5 + lw),
+            (f.center_x - cw / 2.0, f.center_x + cw / 2.0),
+            (cols as f32 - 0.5 - rw, cols as f32 - 0.5),
+        ]
+    }
+
+    fn assert_apart(cols: u16, f: &StatusFit) {
+        let [l, c, r] = spans(cols, f);
+        let texts = [(&f.left, l), (&f.center, c), (&f.right, r)];
+        let shown: Vec<_> = texts.iter().filter(|(t, _)| !t.is_empty()).collect();
+        for w in shown.windows(2) {
+            assert!(w[0].1.1 <= w[1].1.0, "{:?} runs into {:?}: {f:?}", w[0].0, w[1].0);
+        }
+    }
+
+    const CENTER: &str = "100%  f 1234/56789  01:02.345  3/7";
+    const RIGHT: &str = "(1920,1080) #FFFFFFFF";
+    const NAME: &str = "stream-6-100-20261019214029_segment20261020024029.mp4";
+    const TAIL: &str = "  4096x2160  25.00fps";
+
+    #[test]
+    fn short_texts_keep_the_centre_centred() {
+        let f = fit_status(200, "clip.mp4", TAIL, CENTER.into(), RIGHT.into());
+        assert_eq!(f.left, format!("clip.mp4{TAIL}"));
+        assert_eq!(f.center_x, 100.0);
+        assert_eq!(f.right, RIGHT);
+        assert_apart(200, &f);
+    }
+
+    /// The reported case: a long name in a bar whose right half is
+    /// empty. The centre text moves over; nothing is shortened.
+    #[test]
+    fn long_left_text_pushes_the_centre_right() {
+        let f = fit_status(136, NAME, TAIL, CENTER.into(), "—".into());
+        assert_eq!(f.left, format!("{NAME}{TAIL}"));
+        assert_eq!(f.right, "—");
+        assert!(f.center_x > 68.0);
+        assert_apart(136, &f);
+    }
+
+    /// The readout gives way before anything is elided.
+    #[test]
+    fn readout_drops_before_the_name_is_cut() {
+        let f = fit_status(120, NAME, TAIL, CENTER.into(), RIGHT.into());
+        assert_eq!(f.left, format!("{NAME}{TAIL}"));
+        assert_eq!(f.right, "");
+        assert_apart(120, &f);
+    }
+
+    /// Once the row is full the name is shortened, not the details.
+    #[test]
+    fn full_row_elides_the_name_first() {
+        let f = fit_status(100, NAME, TAIL, CENTER.into(), RIGHT.into());
+        assert!(f.left.ends_with(&format!("…{TAIL}")), "{f:?}");
+        assert_eq!(f.center, CENTER);
+        assert_apart(100, &f);
+    }
+
+    #[test]
+    fn nothing_overlaps_at_any_width() {
+        for cols in 1..=200u16 {
+            let f = fit_status(cols, NAME, TAIL, CENTER.into(), RIGHT.into());
+            if text_cells(&f.center) + 1.0 < cols as f32 {
+                assert_apart(cols, &f);
+            }
+        }
+    }
+
+    /// A still that has not decoded yet has no centre text.
+    #[test]
+    fn empty_centre_shares_the_row() {
+        let f = fit_status(40, "photo.jpg", "", String::new(), RIGHT.into());
+        assert_eq!(f.left, "photo.jpg");
+        assert_eq!(f.right, RIGHT);
+        assert_apart(40, &f);
+        let f = fit_status(30, NAME, "", String::new(), RIGHT.into());
+        assert_eq!(f.right, "");
+        assert!(text_cells(&f.left) <= 29.0);
     }
 }
 

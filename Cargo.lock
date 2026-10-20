@@ -3305,6 +3305,7 @@ dependencies = [
  "veter-version",
  "vge-protocol",
  "vge-render",
+ "vge-ui",
  "zenwebp",
 ]
 
