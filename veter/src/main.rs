@@ -81,7 +81,7 @@ fn window_title_for(title: &str) -> String {
 /// The colours come from the resolved theme (`Config::theme`), which
 /// is where the accents are decided.
 fn host_palette(theme: &veter::theme::Theme) -> vge::HostThemePalette {
-    theme.host_palette(theme.accents())
+    theme.host_palette()
 }
 
 /// Run a user-defined selection command (`config.selection_commands`) on

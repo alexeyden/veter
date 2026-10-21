@@ -57,35 +57,13 @@ pub struct VgeProbeData {
 }
 
 /// Subset of PRT `ProbeBody` that the daemon stores for reference.
-/// PRT metrics other than the accent aren't currently consumed by the
-/// snapshot path — they're decoded so future limits work (e.g.
-/// clamping outbound `WritePortal` payloads to `max_write_bytes`).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // decoded for future limit-enforcement passes
-pub struct PrtProbeData {
-    pub protocol_version: u16,
-    pub max_portals: u32,
-    pub max_portal_cells_w: u32,
-    pub max_portal_cells_h: u32,
-    pub max_scrollback_lines: u32,
-    pub max_write_bytes: u32,
-    pub features: u8,
-    pub max_nesting_depth: u8,
-    /// VGE-integration byte (§10). `None` from a host that predates
-    /// it — the field is positional and simply absent from the body.
-    pub vge_features: Option<u8>,
-    /// The RGBA8 the renderer resolves `host.accent` to at depth 0,
-    /// meaningful only with `FEAT_VGE_HOST_THEMED_STYLES` set in
-    /// `vge_features`. The daemon adopts it as its own palette so a
-    /// client that probes while nothing is attached still gets a
-    /// themed accent instead of falling back to its brand color.
-    pub accent_rgba: Option<[u8; 4]>,
-    /// The rest of the renderer's `host.*` palette (VGE §7.3), in
-    /// `HostThemeColors::IDS` order, adopted for the same reason: a
-    /// client started in a detached session should not have to fall
-    /// back to its own dark chrome on a light terminal.
-    pub theme_rgba: Option<[[u8; 4]; 8]>,
-}
+/// The renderer's PRT probe answer. The palette (`theme`) is what the
+/// daemon adopts — so a client that probes while nothing is attached
+/// still gets the renderer's theme rather than falling back to its own
+/// dark chrome. The limits ride along for future limit-enforcement
+/// passes (e.g. clamping outbound `WritePortal` payloads to
+/// `max_write_bytes`).
+pub type PrtProbeData = prt_protocol::envelope::ProbeBody;
 
 /// The probe's parsers and what they have learned, kept across the
 /// phases of an attach.
@@ -155,7 +133,7 @@ impl Probe {
 
     /// What the renderer has reported so far.
     pub fn data(&self) -> (Option<VgeProbeData>, Option<PrtProbeData>) {
-        (self.vge, self.prt)
+        (self.vge, self.prt.clone())
     }
 }
 
@@ -301,55 +279,7 @@ fn parse_vge_probe_payload(payload: &[u8]) -> Option<VgeProbeData> {
 }
 
 fn parse_prt_probe_payload(payload: &[u8]) -> Option<PrtProbeData> {
-    use prt_protocol::codec::Reader;
-    use prt_protocol::frame::RSP_PROBE;
-    let mut r = Reader::new(payload);
-    let _version = r.u8().ok()?;
-    let _payload_len = r.u32().ok()?;
-    let frame_type = r.u8().ok()?;
-    if frame_type != RSP_PROBE {
-        return None;
-    }
-    let _req_id = r.u32().ok()?;
-    let _body_len = r.u32().ok()?;
-    let protocol_version = r.u16().ok()?;
-    let max_portals = r.u32().ok()?;
-    let max_portal_cells_w = r.u32().ok()?;
-    let max_portal_cells_h = r.u32().ok()?;
-    let max_scrollback_lines = r.u32().ok()?;
-    let max_write_bytes = r.u32().ok()?;
-    let features = r.u8().ok()?;
-    let max_nesting_depth = r.u8().ok()?;
-    // Positional tail fields (§10): a host that predates either stops
-    // the body early, which reads back as `None` rather than an error.
-    let vge_features = r.u8().ok();
-    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
-        (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
-        _ => None,
-    };
-    let accent_rgba = vge_features.and_then(|_| quad());
-    // All eight or none — a partial block would leave some ids at a
-    // colour the renderer never sent.
-    let theme_rgba = accent_rgba.and_then(|_| {
-        let mut quads = [[0u8; 4]; 8];
-        for slot in &mut quads {
-            *slot = quad()?;
-        }
-        Some(quads)
-    });
-    Some(PrtProbeData {
-        protocol_version,
-        max_portals,
-        max_portal_cells_w,
-        max_portal_cells_h,
-        max_scrollback_lines,
-        max_write_bytes,
-        features,
-        max_nesting_depth,
-        vge_features,
-        accent_rgba,
-        theme_rgba,
-    })
+    PrtProbeData::from_payload(payload)
 }
 
 /// A renderer grid size, with the pixel dimensions a veter host
@@ -532,8 +462,7 @@ mod tests {
             features: 0,
             max_nesting_depth: 8,
             vge_features: None,
-            accent_rgba: None,
-            theme_rgba: None,
+            theme: None,
         };
         let mut frames = Vec::new();
         append_frame(&mut frames, RSP_PROBE, 1, &body.encode());
@@ -600,8 +529,7 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: None,
-            accent_rgba: None,
-            theme_rgba: None,
+            theme: None,
         };
         let mut frames = Vec::new();
         append_frame(&mut frames, RSP_PROBE, 1, &body.encode());

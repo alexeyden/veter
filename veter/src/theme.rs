@@ -129,6 +129,14 @@ impl Rgba {
         self.mix(Rgba::rgb(255, 255, 255), amount)
     }
 
+    /// The grey of the same [`Self::luminance`]: the shade with the hue
+    /// taken out.
+    #[must_use]
+    pub fn grey(self) -> Self {
+        let v = (self.luminance() * 255.0).round() as u8;
+        Self { r: v, g: v, b: v, a: self.a }
+    }
+
     /// sRGB-weighted relative luminance, `0.0`..=`1.0`. Used to pick
     /// the higher-contrast text colour over a fill.
     #[must_use]
@@ -177,6 +185,90 @@ where
     })
 }
 
+/// An accent slot as a theme spells it: a colour, or the name of one of
+/// its [`Theme::swatches`]. A `#` marks the colour, so a swatch name can
+/// never be misread as hex — `"#bad"` is a colour, `"bad"` a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accent {
+    Color(Rgba),
+    Swatch(String),
+}
+
+impl From<Rgba> for Accent {
+    fn from(c: Rgba) -> Self {
+        Self::Color(c)
+    }
+}
+
+impl Serialize for Accent {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Color(c) => c.serialize(s),
+            Self::Swatch(name) => s.serialize_str(name),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Accent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s.starts_with('#') {
+            Rgba::parse(&s).map(Self::Color).map_err(serde::de::Error::custom)
+        } else if veter_host::vge::is_swatch_name(&s) {
+            Ok(Self::Swatch(s))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "accent '{s}' is neither a #hex colour nor a swatch name"
+            )))
+        }
+    }
+}
+
+/// A swatch as a theme spells it: the fill alone (its text derives), or
+/// the fill with the text the theme picked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SwatchSpec {
+    Fill(Rgba),
+    Pinned {
+        fill: Rgba,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Rgba>,
+    },
+}
+
+impl SwatchSpec {
+    fn fill(self) -> Rgba {
+        match self {
+            Self::Fill(fill) | Self::Pinned { fill, .. } => fill,
+        }
+    }
+
+    fn text(self) -> Option<Rgba> {
+        match self {
+            Self::Fill(_) => None,
+            Self::Pinned { text, .. } => text,
+        }
+    }
+}
+
+/// A resolved swatch: the fill and the text that goes on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Swatch {
+    pub name: String,
+    pub fill: Rgba,
+    pub text: Rgba,
+}
+
+/// The swatch names every theme answers to, in publishing order — the
+/// colour words a client's `--accent` takes. A theme may add more.
+pub const SWATCH_NAMES: [&str; 8] = [
+    "red", "orange", "yellow", "green", "cyan", "blue", "magenta", "purple",
+];
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
@@ -210,8 +302,18 @@ pub struct Theme {
 
     /// Ordered accent palette; slot N is `host.accent.{N+1}`, and the
     /// contextual `host.accent` rotates through it by portal nesting
-    /// depth. Empty derives blue / green / magenta from `ansi`.
-    pub accents: Vec<Rgba>,
+    /// depth. Each entry is a `#hex` colour or a swatch name. Empty
+    /// derives blue / magenta / cyan from `ansi`.
+    pub accents: Vec<Accent>,
+
+    /// Named colours, each with the text that sits on it — published as
+    /// `host.swatch.<name>`, which is what `vmux --accent orange` looks
+    /// up so a nested multiplexer paints this theme's orange rather
+    /// than one of its own. Merged by name over the set derived from
+    /// `ansi` (see [`Theme::swatches`]), so a theme pins only the names
+    /// it cares about.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub swatches: std::collections::BTreeMap<String, SwatchSpec>,
 
     /// Overlay panel fill. Derives as the background lifted a tenth of
     /// the way toward the foreground.
@@ -294,11 +396,110 @@ impl Theme {
     /// magenta and cyan stay near one another in weight.
     #[must_use]
     pub fn accents(&self) -> Vec<Rgba> {
-        if self.accents.is_empty() {
-            vec![self.ansi[12], self.ansi[13], self.ansi[14]]
-        } else {
-            self.accents.clone()
+        self.accent_slots().into_iter().map(|s| s.fill).collect()
+    }
+
+    /// The accent palette with each slot's name and text: a slot that
+    /// names a swatch is that swatch, text included; a literal colour
+    /// has no name. A name the theme has no swatch for is dropped
+    /// ([`resolve`] says so once), and a list that drops to nothing
+    /// derives as if unset. A `text_on_accent` pin beats the swatch's
+    /// own text.
+    #[must_use]
+    pub fn accent_slots(&self) -> Vec<Swatch> {
+        let swatches = self.swatches();
+        let mut slots: Vec<Swatch> = self
+            .accents
+            .iter()
+            .filter_map(|a| match a {
+                Accent::Color(fill) => Some(Swatch {
+                    name: String::new(),
+                    fill: *fill,
+                    text: self.text_on(*fill),
+                }),
+                Accent::Swatch(name) => swatches.iter().find(|s| &s.name == name).cloned(),
+            })
+            .collect();
+        if slots.is_empty() {
+            slots = [12, 13, 14]
+                .map(|i| Swatch {
+                    name: String::new(),
+                    fill: self.ansi[i],
+                    text: self.text_on(self.ansi[i]),
+                })
+                .to_vec();
         }
+        for (slot, pin) in slots.iter_mut().zip(&self.text_on_accent) {
+            slot.text = *pin;
+        }
+        slots
+    }
+
+    /// Say once, at load, what [`Self::accent_slots`] and
+    /// [`Self::swatches`] will quietly skip.
+    fn warn_unresolved(&self) {
+        let swatches = self.swatches();
+        for a in &self.accents {
+            if let Accent::Swatch(name) = a
+                && !swatches.iter().any(|s| &s.name == name)
+            {
+                eprintln!("veter: config: accent '{name}' names no swatch; skipping it");
+            }
+        }
+        for name in self.swatches.keys() {
+            if !veter_host::vge::is_swatch_name(name) {
+                eprintln!(
+                    "veter: config: swatch '{name}' is not a plain name \
+                     (letters, digits, '-', '_', at most 32); skipping it"
+                );
+            }
+        }
+    }
+
+    /// The theme's named swatches: one per [`SWATCH_NAMES`] entry,
+    /// derived from the bright half of `ansi` (orange between its red
+    /// and yellow, purple between its blue and magenta), with every
+    /// name in `swatches` laid over — so a scheme file that sets only
+    /// its palette still answers `--accent orange`, and a theme that
+    /// pins its own orange is not second-guessed. Text derives against
+    /// each fill unless pinned.
+    #[must_use]
+    pub fn swatches(&self) -> Vec<Swatch> {
+        let a = &self.ansi;
+        let derived = [
+            a[9],
+            a[9].mix(a[11], 0.5),
+            a[11],
+            a[10],
+            a[14],
+            a[12],
+            a[13],
+            a[12].mix(a[13], 0.5),
+        ];
+        let mut out: Vec<Swatch> = SWATCH_NAMES
+            .iter()
+            .zip(derived)
+            .map(|(name, fill)| Swatch {
+                name: (*name).to_string(),
+                fill,
+                text: self.text_on(fill),
+            })
+            .collect();
+        for (name, spec) in &self.swatches {
+            if !veter_host::vge::is_swatch_name(name) {
+                continue;
+            }
+            let swatch = Swatch {
+                name: name.clone(),
+                fill: spec.fill(),
+                text: spec.text().unwrap_or_else(|| self.text_on(spec.fill())),
+            };
+            match out.iter_mut().find(|s| &s.name == name) {
+                Some(slot) => *slot = swatch,
+                None => out.push(swatch),
+            }
+        }
+        out
     }
 
     /// Accent slot 1 — the one veter's own chrome and the grid
@@ -370,17 +571,7 @@ impl Theme {
     /// the mid grey that lightening its foreground would give.
     #[must_use]
     pub fn text_on_accent(&self) -> Rgba {
-        self.text_on_slot(0, self.accent_primary())
-    }
-
-    /// Text over accent slot `i + 1`, which is `accent`: the pin for
-    /// that slot, else derived against it.
-    #[must_use]
-    fn text_on_slot(&self, i: usize, accent: Rgba) -> Rgba {
-        self.text_on_accent
-            .get(i)
-            .copied()
-            .unwrap_or_else(|| self.text_on(accent))
+        self.accent_slots()[0].text
     }
 
     /// Text over an arbitrary solid `fill`, by the rule
@@ -388,12 +579,17 @@ impl Theme {
     /// primary accent — `[search] accent` set apart from the theme's —
     /// where the pinned or derived `text_on_accent` was never picked
     /// against what is painted.
+    ///
+    /// The poles keep the theme's lightness but not its hue: a light
+    /// scheme's ink is often a saturated colour of its own (tokyonight-
+    /// day's is the blue of its first accent), and text in that hue over
+    /// a different accent reads as the wrong accent rather than as text.
     #[must_use]
     pub fn text_on(&self, fill: Rgba) -> Rgba {
         if fill.luminance() > 0.55 {
-            self.darkest().darken(0.35)
+            self.darkest().darken(0.35).grey()
         } else {
-            self.lightest().lighten(0.5)
+            self.lightest().lighten(0.5).grey()
         }
     }
 
@@ -471,18 +667,15 @@ impl Theme {
     /// `host.*` VGE style namespace (VGE §7.3) and reported in the PRT
     /// probe (`doc/portal-extension.md` §10).
     #[must_use]
-    pub fn host_palette(&self, accents: Vec<Rgba>) -> veter_host::vge::HostThemePalette {
-        // One text colour per slot, each picked against its own accent:
-        // the contextual `host.text.on_accent` follows the contextual
-        // `host.accent` down the portal tree.
-        let on_accents = accents
-            .iter()
-            .enumerate()
-            .map(|(i, a)| self.text_on_slot(i, *a).to_command_color())
-            .collect();
+    pub fn host_palette(&self) -> veter_host::vge::HostThemePalette {
+        let publish = |s: Swatch| veter_host::vge::HostSwatch {
+            name: s.name,
+            fill: s.fill.to_command_color(),
+            text: s.text.to_command_color(),
+        };
         veter_host::vge::HostThemePalette {
-            accents: accents.into_iter().map(Rgba::to_command_color).collect(),
-            on_accents,
+            accents: self.accent_slots().into_iter().map(publish).collect(),
+            swatches: self.swatches().into_iter().map(publish).collect(),
             colors: Some(veter_host::vge::HostThemeColors {
                 bg: self.background.to_command_color(),
                 fg: self.foreground.to_command_color(),
@@ -576,7 +769,9 @@ pub fn resolve(section: &toml::Table, config_dir: Option<&Path>) -> Theme {
         .filter(|(k, _)| k.as_str() != "name")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    merge(base, &overrides, "config [theme]")
+    let theme = merge(base, &overrides, "config [theme]");
+    theme.warn_unresolved();
+    theme
 }
 
 /// Load `<config_dir>/themes/<name>.toml` as a theme: the keys it sets,
@@ -620,7 +815,18 @@ fn merge(base: Theme, overrides: &toml::Table, whence: &str) -> Theme {
         return base;
     };
     for (k, v) in overrides {
-        table.insert(k.clone(), v.clone());
+        // A table-valued key (`swatches`) merges by entry, so pinning
+        // one swatch does not drop the base theme's others.
+        match (table.get_mut(k), v) {
+            (Some(toml::Value::Table(base)), toml::Value::Table(over)) => {
+                for (name, entry) in over {
+                    base.insert(name.clone(), entry.clone());
+                }
+            }
+            _ => {
+                table.insert(k.clone(), v.clone());
+            }
+        }
     }
     match toml::Value::Table(table).try_into() {
         Ok(theme) => theme,
@@ -644,6 +850,18 @@ const fn c(hex: u32) -> Rgba {
         ((hex >> 8) & 0xFF) as u8,
         (hex & 0xFF) as u8,
     )
+}
+
+/// A built-in's swatches, one per [`SWATCH_NAMES`] entry in that order,
+/// each taken from the scheme's own published palette rather than its
+/// ANSI table — where a scheme names an orange, that is the orange.
+/// Text derives against each.
+fn swatch_set(fills: [u32; 8]) -> std::collections::BTreeMap<String, SwatchSpec> {
+    SWATCH_NAMES
+        .iter()
+        .zip(fills)
+        .map(|(name, hex)| ((*name).to_string(), SwatchSpec::Fill(c(hex))))
+        .collect()
 }
 
 /// veter's own look, and the shape of a fully-pinned theme: every
@@ -683,7 +901,8 @@ fn veter() -> Theme {
         cursor: None,
         selection_bg: None,
         selection_fg: None,
-        accents: vec![c(0x56799f), c(0x9f5685), c(0x9f7c56)],
+        accents: [c(0x56799f), c(0x9f5685), c(0x9f7c56)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xd05c5c, 0xcf7d3c, 0xc9a84c, 0x5ca05c, 0x4c9f9f, 0x56799f, 0xb05c9f, 0x8c6cc0]),
         surface: Some(c(0x26262a)),
         surface_inset: Some(c(0x1a1a1e)),
         text: Some(c(0xebebeb)),
@@ -726,7 +945,8 @@ fn tokyonight_storm() -> Theme {
         cursor: Some(c(0xc0caf5)),
         selection_bg: Some(c(0x2e3c64)),
         selection_fg: Some(c(0xc0caf5)),
-        accents: vec![c(0x7aa2f7), c(0xbb9af7), c(0x7dcfff)],
+        accents: [c(0x7aa2f7), c(0xbb9af7), c(0x7dcfff)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xf7768e, 0xff9e64, 0xe0af68, 0x9ece6a, 0x7dcfff, 0x7aa2f7, 0xbb9af7, 0x9d7cd8]),
         ..derived()
     }
 }
@@ -751,7 +971,8 @@ fn tokyonight_day() -> Theme {
         cursor: Some(c(0x3760bf)),
         selection_bg: Some(c(0xb7c1e3)),
         selection_fg: Some(c(0x3760bf)),
-        accents: vec![c(0x2e7de9), c(0x9854f1), c(0x007197)],
+        accents: [c(0x2e7de9), c(0x9854f1), c(0x007197)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xf52a65, 0xb15c00, 0x8c6c3e, 0x587539, 0x007197, 0x2e7de9, 0x9854f1, 0x7847bd]),
         ..derived()
     }
 }
@@ -785,7 +1006,8 @@ fn catppuccin_mocha() -> Theme {
         // near-white fill there swallows the row it highlights.
         selection_bg: Some(c(0x585b70)),
         selection_fg: None,
-        accents: vec![c(0x89b4fa), c(0xcba6f7), c(0x94e2d5)],
+        accents: [c(0x89b4fa), c(0xcba6f7), c(0x94e2d5)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xf38ba8, 0xfab387, 0xf9e2af, 0xa6e3a1, 0x94e2d5, 0x89b4fa, 0xf5c2e7, 0xcba6f7]),
         ..derived()
     }
 }
@@ -809,7 +1031,8 @@ fn catppuccin_latte() -> Theme {
         // marks when it sits under ordinary shell text.
         selection_bg: Some(c(0xacb0be)),
         selection_fg: None,
-        accents: vec![c(0x1e66f5), c(0x8839ef), c(0x179299)],
+        accents: [c(0x1e66f5), c(0x8839ef), c(0x179299)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xd20f39, 0xfe640b, 0xdf8e1d, 0x40a02b, 0x179299, 0x1e66f5, 0xea76cb, 0x8839ef]),
         ..derived()
     }
 }
@@ -843,7 +1066,8 @@ fn gruvbox_dark() -> Theme {
         cursor: Some(c(0xebdbb2)),
         selection_bg: Some(c(0x504945)),
         selection_fg: None,
-        accents: vec![c(0x83a598), c(0xd3869b), c(0xfabd2f)],
+        accents: [c(0x83a598), c(0xd3869b), c(0xfabd2f)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xfb4934, 0xfe8019, 0xfabd2f, 0xb8bb26, 0x8ec07c, 0x83a598, 0xd3869b, 0xb16286]),
         ..derived()
     }
 }
@@ -876,7 +1100,8 @@ fn nord() -> Theme {
         cursor: Some(c(0xd8dee9)),
         selection_bg: Some(c(0x434c5e)),
         selection_fg: None,
-        accents: vec![c(0x88c0d0), c(0xb48ead), c(0x81a1c1)],
+        accents: [c(0x88c0d0), c(0xb48ead), c(0x81a1c1)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xbf616a, 0xd08770, 0xebcb8b, 0xa3be8c, 0x88c0d0, 0x81a1c1, 0xb48ead, 0xb48ead]),
         ..derived()
     }
 }
@@ -893,6 +1118,7 @@ fn derived() -> Theme {
         selection_bg: None,
         selection_fg: None,
         accents: Vec::new(),
+        swatches: std::collections::BTreeMap::new(),
         surface: None,
         surface_inset: None,
         text: None,
@@ -1002,7 +1228,7 @@ mod tests {
         }
         // A dark accent flips it the other way.
         let t = Theme {
-            accents: vec![Rgba::rgb(0x2a, 0x2f, 0x6e)],
+            accents: vec![Rgba::rgb(0x2a, 0x2f, 0x6e).into()],
             ..builtin("nord").unwrap()
         };
         assert!(t.text_on_accent().luminance() > 0.8);
@@ -1166,19 +1392,101 @@ mod tests {
     fn text_on_every_accent_slot_reads() {
         for name in BUILTIN_NAMES {
             let t = builtin(name).unwrap();
-            let palette = t.host_palette(t.accents());
-            for (i, (accent, text)) in
-                t.accents().iter().zip(&palette.on_accents).enumerate()
-            {
-                let text = Rgba {
-                    r: (text.r * 255.0).round() as u8,
-                    g: (text.g * 255.0).round() as u8,
-                    b: (text.b * 255.0).round() as u8,
-                    a: 255,
-                };
-                let gap = (text.luminance() - accent.luminance()).abs();
+            for (i, slot) in t.accent_slots().iter().enumerate() {
+                let gap = (slot.text.luminance() - slot.fill.luminance()).abs();
                 assert!(gap > 0.3, "{name} slot {}: {gap:.2}", i + 1);
             }
+        }
+    }
+
+    /// …and so does every swatch: these are what `--accent` paints, a
+    /// whole tab strip of it, so a name that came out unreadable on
+    /// some theme would be a trap only that theme's users fall into.
+    #[test]
+    fn every_builtin_swatch_reads_and_is_complete() {
+        for name in BUILTIN_NAMES {
+            let t = builtin(name).unwrap();
+            let swatches = t.swatches();
+            let names: Vec<&str> = swatches.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, SWATCH_NAMES, "{name}");
+            for s in &swatches {
+                let gap = (s.text.luminance() - s.fill.luminance()).abs();
+                assert!(gap > 0.3, "{name} {}: {gap:.2}", s.name);
+            }
+        }
+    }
+
+    /// A scheme's own orange, not one mixed from its ANSI table and not
+    /// vmux's: this is the colour `vmux -A orange` paints there.
+    #[test]
+    fn a_builtin_swatch_is_the_schemes_own() {
+        let t = builtin("tokyonight-day").unwrap();
+        let orange = t.swatches().into_iter().find(|s| s.name == "orange").unwrap();
+        assert_eq!(orange.fill, Rgba::rgb(0xb1, 0x5c, 0x00));
+        assert!(orange.text.luminance() > 0.8, "light text on a dark orange");
+    }
+
+    /// A scheme file with no swatches still answers every name, from
+    /// its ANSI table; a pin lands by name and leaves the others alone,
+    /// from the config section too (which merges per entry rather than
+    /// replacing the table).
+    #[test]
+    fn swatches_derive_and_pin_by_name() {
+        let t = Theme {
+            swatches: std::collections::BTreeMap::new(),
+            ..builtin("nord").unwrap()
+        };
+        let red = t.swatches().into_iter().find(|s| s.name == "red").unwrap();
+        assert_eq!(red.fill, t.ansi[9]);
+
+        let section: toml::Table = toml::from_str(
+            r##"
+            name = "nord"
+            [swatches]
+            orange = { fill = "#ff8800", text = "#000000" }
+            teal = "#008080"
+            "##,
+        )
+        .unwrap();
+        let t = resolve(&section, None);
+        let get = |n: &str| t.swatches().into_iter().find(|s| s.name == n).unwrap();
+        assert_eq!(get("orange").fill, Rgba::rgb(0xff, 0x88, 0x00));
+        assert_eq!(get("orange").text, Rgba::rgb(0, 0, 0));
+        assert_eq!(get("teal").fill, Rgba::rgb(0, 0x80, 0x80));
+        assert_eq!(get("red").fill, Rgba::rgb(0xbf, 0x61, 0x6a), "nord's own red kept");
+    }
+
+    /// An accent can name a swatch, and then it is that swatch — its
+    /// fill, its text, and its name on the wire. A `#` keeps hex hex.
+    #[test]
+    fn accents_name_swatches() {
+        let section: toml::Table = toml::from_str(
+            r##"
+            name = "tokyonight-day"
+            accents = ["orange", "#2e7de9", "nonesuch"]
+            "##,
+        )
+        .unwrap();
+        let t = resolve(&section, None);
+        let slots = t.accent_slots();
+        assert_eq!(slots.len(), 2, "an unknown name is skipped");
+        assert_eq!(slots[0].name, "orange");
+        assert_eq!(slots[0].fill, Rgba::rgb(0xb1, 0x5c, 0x00));
+        assert_eq!(slots[1].name, "");
+        let palette = t.host_palette();
+        assert_eq!(palette.accents[0].name, "orange");
+        assert_eq!(palette.swatches.len(), SWATCH_NAMES.len());
+    }
+
+    /// Text over an accent carries no hue of its own: tokyonight-day's
+    /// ink is a saturated blue, which over its orange slot read as the
+    /// blue accent instead of as text.
+    #[test]
+    fn text_on_an_accent_is_neutral() {
+        let t = builtin("tokyonight-day").unwrap();
+        for fill in [Rgba::rgb(0xcf, 0x7d, 0x3c), Rgba::rgb(0x2e, 0x7d, 0xe9)] {
+            let Rgba { r, g, b, .. } = t.text_on(fill);
+            assert!(r == g && g == b, "{fill:?}");
         }
     }
 
@@ -1199,12 +1507,9 @@ mod tests {
         .unwrap();
         let t = resolve(&section, None);
         assert_eq!(t.text_on_accent, vec![Rgba::rgb(0xf5, 0xf5, 0xf5)]);
-        let palette = t.host_palette(t.accents());
-        assert_eq!(palette.on_accents.len(), 3);
-        assert_eq!(palette.on_accents[0], Rgba::rgb(0xf5, 0xf5, 0xf5).to_command_color());
-        assert_eq!(palette.on_accents[1], t.text_on(light).to_command_color());
+        let texts: Vec<Rgba> = t.accent_slots().iter().map(|s| s.text).collect();
+        assert_eq!(texts, [Rgba::rgb(0xf5, 0xf5, 0xf5), t.text_on(light), t.text_on(dark)]);
         assert!(t.text_on(light).luminance() < 0.25);
-        assert_eq!(palette.on_accents[2], t.text_on(dark).to_command_color());
 
         let section: toml::Table = toml::from_str(
             r##"
@@ -1214,8 +1519,8 @@ mod tests {
         )
         .unwrap();
         let t = resolve(&section, None);
-        let palette = t.host_palette(t.accents());
-        assert_eq!(palette.on_accents[1], Rgba::rgb(0, 0, 0).to_command_color());
+        let palette = t.host_palette();
+        assert_eq!(palette.accents[1].text, Rgba::rgb(0, 0, 0).to_command_color());
     }
 
     #[test]

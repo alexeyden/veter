@@ -4,14 +4,123 @@
 use crate::codec::{Reader, stuff, Writer};
 use crate::frame::*;
 
+/// One colour a host publishes with the text it picked to sit on it
+/// (§10): an accent slot, or a named swatch from the theme. `name` is
+/// empty for an accent the theme gave as a literal colour rather than
+/// by swatch name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct Swatch {
+    pub name: String,
+    /// Straight RGBA8.
+    pub fill: [u8; 4],
+    /// Straight RGBA8 text over `fill`.
+    pub text: [u8; 4],
+}
+
+impl Swatch {
+    fn encode(&self, w: &mut Writer) {
+        w.str(&self.name);
+        for b in self.fill.into_iter().chain(self.text) {
+            w.u8(b);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        let name = r.string()?.to_string();
+        let fill = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+        let text = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+        Ok(Self { name, fill, text })
+    }
+}
+
+/// The host's `host.*` palette as §10 reports it — the tail of a
+/// ProbeResponse and the body of `HostThemeChanged` (§8.13), so the two
+/// cannot drift apart.
+///
+/// Every part after the accent is positional and all-or-nothing: a
+/// body that stops before or part-way through one decodes with it (and
+/// everything after it) absent, never half-filled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct HostTheme {
+    /// What `host.accent` resolves to for the engine that reports it.
+    pub accent: [u8; 4],
+    /// The eight non-accent `host.*` colours (VGE §7.3), in the order
+    /// `veter_host::vge::HostThemeColors::IDS` lists them.
+    pub colors: Option<[[u8; 4]; 8]>,
+    /// The accent rotation, *starting with this engine's own* — entry 0
+    /// is `accent`, entry 1 what a portal one level in resolves, and so
+    /// on, wrapping. What a party that hosts portals of its own (a
+    /// session daemon) needs to rotate onward from here. Only after
+    /// `colors`.
+    pub accents: Vec<Swatch>,
+    /// The theme's named swatches (`host.swatch.<name>`). Only after
+    /// `accents`.
+    pub swatches: Vec<Swatch>,
+}
+
+impl HostTheme {
+    pub fn encode(&self, w: &mut Writer) {
+        for b in self.accent {
+            w.u8(b);
+        }
+        let Some(colors) = self.colors else { return };
+        for quad in colors {
+            for b in quad {
+                w.u8(b);
+            }
+        }
+        for list in [&self.accents, &self.swatches] {
+            w.u8(list.len().min(u8::MAX as usize) as u8);
+            for s in list.iter().take(u8::MAX as usize) {
+                s.encode(w);
+            }
+        }
+    }
+
+    /// Inverse of [`Self::encode`]. Errors only when the accent itself
+    /// is cut short.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, crate::codec::DecodeError> {
+        let accent = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+        let mut theme = Self {
+            accent,
+            colors: None,
+            accents: Vec::new(),
+            swatches: Vec::new(),
+        };
+        let mut quads = [[0u8; 4]; 8];
+        for slot in &mut quads {
+            match (r.u8(), r.u8(), r.u8(), r.u8()) {
+                (Ok(a), Ok(b), Ok(c), Ok(d)) => *slot = [a, b, c, d],
+                _ => return Ok(theme),
+            }
+        }
+        theme.colors = Some(quads);
+        let mut list = || -> Option<Vec<Swatch>> {
+            let n = r.u8().ok()?;
+            (0..n).map(|_| Swatch::decode(r).ok()).collect()
+        };
+        let Some(accents) = list() else { return Ok(theme) };
+        theme.accents = accents;
+        if let Some(swatches) = list() {
+            theme.swatches = swatches;
+        }
+        Ok(theme)
+    }
+}
+
 /// Build the body for a ProbeResponse (§2.1).
 ///
 /// `vge_features`, if `Some`, is appended as a trailing u8 byte carrying
 /// the §10 VGE-integration capability bits. The body length is the
 /// source of truth, so omitting it (`None`) is equivalent to advertising
 /// "VGE-in-portal not supported" — clients reading a shorter body MUST
-/// treat missing trailing fields as zero. `accent_rgba` and `theme_rgba`
-/// follow it on the same terms.
+/// treat missing trailing fields as zero. `theme` follows it on the
+/// same terms.
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ProbeBody {
@@ -25,19 +134,11 @@ pub struct ProbeBody {
     pub max_nesting_depth: u8,
     pub vge_features: Option<u8>,
     /// §10 — when the host themes `host.*` styles
-    /// (`FEAT_VGE_HOST_THEMED_STYLES`), the RGBA8 value `host.accent`
-    /// resolves to for the probing engine's nesting depth. Lets a client
-    /// derive its own shades (translucent, darkened) from the same accent
-    /// it references by `StyleRef`. Encoded only when `Some`, and only
-    /// meaningful when the themed bit is set in `vge_features`.
-    pub accent_rgba: Option<[u8; 4]>,
-    /// §10 — the eight non-accent `host.*` colours (VGE §7.3), in the
-    /// order `veter_host::vge::HostThemeColors::IDS` lists them, each a
-    /// straight RGBA8 quad. Lets a client shade its chrome from the same
-    /// surface and text colours it references by `StyleRef`, the way
-    /// `accent_rgba` does for the accent. Encoded only when `Some`, and
-    /// only reachable when `accent_rgba` is too.
-    pub theme_rgba: Option<[[u8; 4]; 8]>,
+    /// (`FEAT_VGE_HOST_THEMED_STYLES`), the palette those ids resolve
+    /// to for the probing engine's nesting depth, so a client can derive
+    /// its own shades from the colours it references by `StyleRef`.
+    /// Encoded only after `vge_features`.
+    pub theme: Option<HostTheme>,
 }
 
 impl ProbeBody {
@@ -51,32 +152,22 @@ impl ProbeBody {
         w.u32(self.max_write_bytes);
         w.u8(self.features);
         w.u8(self.max_nesting_depth);
-        // `accent_rgba` follows `vge_features`, so it can only be present
+        // The theme follows `vge_features`, so it can only be present
         // when `vge_features` is too (no positional gap).
         if let Some(extra) = self.vge_features {
             w.u8(extra);
-            if let Some(rgba) = self.accent_rgba {
-                for b in rgba {
-                    w.u8(b);
-                }
-                // Likewise positional: the theme block can only follow
-                // an accent, never stand in for one.
-                if let Some(theme) = self.theme_rgba {
-                    for quad in theme {
-                        for b in quad {
-                            w.u8(b);
-                        }
-                    }
-                }
+            if let Some(theme) = &self.theme {
+                theme.encode(&mut w);
             }
         }
         w.buf
     }
 
-    /// Inverse of [`Self::encode`]. `vge_features`, `accent_rgba` and
-    /// `theme_rgba` are positional tail fields, so a body that stops
-    /// early decodes with them `None` rather than failing — which is
-    /// exactly how a host that predates them replies.
+    /// Inverse of [`Self::encode`]. `vge_features` and `theme` are
+    /// positional tail fields, so a body that stops early decodes with
+    /// them `None` rather than failing — which is exactly how a host
+    /// that predates them replies. A theme is read only when the
+    /// `host_themed_styles` bit says there is one.
     pub fn decode(body: &[u8]) -> Result<Self, crate::codec::DecodeError> {
         let mut r = Reader::new(body);
         let protocol_version = r.u16()?;
@@ -88,33 +179,9 @@ impl ProbeBody {
         let features = r.u8()?;
         let max_nesting_depth = r.u8()?;
         let vge_features = r.u8().ok();
-        let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
-            (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
-            _ => None,
-        };
-        let accent_rgba = if vge_features.is_some() {
-            quad()
-        } else {
-            None
-        };
-        // All eight or none: a partial block would leave some ids at a
-        // colour the host never sent.
-        let theme_rgba = if accent_rgba.is_some() {
-            let mut quads = [[0u8; 4]; 8];
-            let mut all = true;
-            for slot in &mut quads {
-                match quad() {
-                    Some(q) => *slot = q,
-                    None => {
-                        all = false;
-                        break;
-                    }
-                }
-            }
-            all.then_some(quads)
-        } else {
-            None
-        };
+        let theme = vge_features
+            .filter(|f| f & FEAT_VGE_HOST_THEMED_STYLES != 0)
+            .and_then(|_| HostTheme::decode(&mut r).ok());
         Ok(Self {
             protocol_version,
             max_portals,
@@ -125,9 +192,27 @@ impl ProbeBody {
             features,
             max_nesting_depth,
             vge_features,
-            accent_rgba,
-            theme_rgba,
+            theme,
         })
+    }
+
+    /// The ProbeResponse in a decoded host→client payload (§1.2), if
+    /// it carries one — what a client's probe loop reads each envelope
+    /// with.
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(payload);
+        let _version = r.u8().ok()?;
+        let _payload_len = r.u32().ok()?;
+        while !r.at_end() {
+            let frame_type = r.u8().ok()?;
+            let _request_id = r.u32().ok()?;
+            let len = r.u32().ok()? as usize;
+            let body = r.take(len).ok()?;
+            if frame_type == RSP_PROBE {
+                return Self::decode(body).ok();
+            }
+        }
+        None
     }
 }
 
@@ -148,53 +233,24 @@ pub fn raw_reply_body(id: &str, data: &[u8]) -> Vec<u8> {
     w.buf
 }
 
-/// Body for an `EVT_HOST_THEME_CHANGED` event (§8.13). `id` is empty
-/// for the host itself; `colors` is the same all-or-nothing eight-quad
-/// block the probe carries, absent when the host publishes accents
-/// only.
-pub fn host_theme_changed_body(
-    id: &str,
-    accent: [u8; 4],
-    colors: Option<[[u8; 4]; 8]>,
-) -> Vec<u8> {
+/// Body for an `EVT_HOST_THEME_CHANGED` event (§8.13): the portal
+/// id — empty for the host itself — and the same palette tail the
+/// probe carries.
+pub fn host_theme_changed_body(id: &str, theme: &HostTheme) -> Vec<u8> {
     let mut w = Writer::with_capacity(1 + id.len() + 4 + 32);
     w.str(id);
-    for b in accent {
-        w.u8(b);
-    }
-    if let Some(quads) = colors {
-        for quad in quads {
-            for b in quad {
-                w.u8(b);
-            }
-        }
-    }
+    theme.encode(&mut w);
     w.buf
 }
 
 /// Inverse of [`host_theme_changed_body`], for clients. Returns the
-/// portal id (empty for the host), the accent, and the theme block if
-/// the body carried a whole one.
+/// portal id (empty for the host) and the palette.
 pub fn parse_host_theme_changed(
     body: &[u8],
-) -> Result<(String, [u8; 4], Option<[[u8; 4]; 8]>), crate::codec::DecodeError> {
+) -> Result<(String, HostTheme), crate::codec::DecodeError> {
     let mut r = Reader::new(body);
     let id = r.string()?.to_string();
-    let accent = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
-    let mut quads = [[0u8; 4]; 8];
-    let mut all = true;
-    'outer: for slot in &mut quads {
-        for b in slot.iter_mut() {
-            match r.u8() {
-                Ok(v) => *b = v,
-                Err(_) => {
-                    all = false;
-                    break 'outer;
-                }
-            }
-        }
-    }
-    Ok((id, accent, all.then_some(quads)))
+    Ok((id, HostTheme::decode(&mut r)?))
 }
 
 pub fn bell_body(id: &str) -> Vec<u8> {
@@ -360,6 +416,23 @@ mod tests {
     use crate::apc::ApcStream;
     use crate::codec::Reader;
 
+    fn swatch(name: &str, fill: u8, text: u8) -> Swatch {
+        Swatch {
+            name: name.into(),
+            fill: [fill, 0, 0, 0xFF],
+            text: [text, 0, 0, 0xFF],
+        }
+    }
+
+    fn full_theme() -> HostTheme {
+        HostTheme {
+            accent: [0x12, 0x34, 0x56, 0xFF],
+            colors: Some(std::array::from_fn(|i| [i as u8, 2, 3, 4])),
+            accents: vec![swatch("blue", 1, 2), swatch("", 3, 4)],
+            swatches: vec![swatch("orange", 5, 6)],
+        }
+    }
+
     #[test]
     fn probe_body_encoded_size() {
         // Required prefix: 2 + 4*5 + 1 + 1 = 24 bytes.
@@ -373,8 +446,7 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: None,
-            accent_rgba: None,
-            theme_rgba: None,
+            theme: None,
         };
         assert_eq!(pb.encode().len(), 24);
 
@@ -386,38 +458,36 @@ mod tests {
         assert_eq!(pb2.encode().len(), 25);
 
         // With VGE byte + accent RGBA: 25 + 4 = 29.
+        let accent_only = HostTheme {
+            colors: None,
+            accents: Vec::new(),
+            swatches: Vec::new(),
+            ..full_theme()
+        };
         let pb3 = ProbeBody {
             vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
-            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
-            ..pb
+            theme: Some(accent_only.clone()),
+            ..pb2
         };
         assert_eq!(pb3.encode().len(), 29);
 
-        // With VGE byte + accent + the eight theme colours: 29 + 32 = 61.
+        // + the eight theme colours, and two empty swatch lists:
+        // 29 + 32 + 2 = 63.
         let pb5 = ProbeBody {
-            vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
-            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
-            theme_rgba: Some([[1, 2, 3, 4]; 8]),
-            ..pb
+            theme: Some(HostTheme {
+                colors: full_theme().colors,
+                ..accent_only.clone()
+            }),
+            ..pb3
         };
-        assert_eq!(pb5.encode().len(), 61);
+        assert_eq!(pb5.encode().len(), 63);
 
-        // A theme block with no accent has no slot to sit in and is
-        // dropped, the same way an accent with no vge_features is.
-        let pb6 = ProbeBody {
-            vge_features: Some(FEAT_VGE_IN_PORTAL),
-            accent_rgba: None,
-            theme_rgba: Some([[1, 2, 3, 4]; 8]),
-            ..pb
-        };
-        assert_eq!(pb6.encode().len(), 25);
-
-        // accent_rgba without vge_features cannot be encoded (no gap):
-        // it is silently dropped, length stays at the 24-byte prefix.
+        // A theme without vge_features cannot be encoded (no gap): it
+        // is silently dropped, length stays at the 24-byte prefix.
         let pb4 = ProbeBody {
             vge_features: None,
-            accent_rgba: Some([1, 2, 3, 4]),
-            ..pb
+            theme: Some(accent_only),
+            ..pb5
         };
         assert_eq!(pb4.encode().len(), 24);
     }
@@ -425,7 +495,7 @@ mod tests {
     /// The tail fields are positional, so what a decoder must survive
     /// is a body that stops anywhere: at the prefix (a host that
     /// predates VGE integration), after the VGE byte, after the accent,
-    /// or mid-way through the theme block.
+    /// mid-way through the theme block, or mid-way through a swatch.
     #[test]
     fn probe_body_round_trips_and_tolerates_truncation() {
         let full = ProbeBody {
@@ -438,65 +508,75 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: Some(FEAT_VGE_IN_PORTAL | FEAT_VGE_HOST_THEMED_STYLES),
-            accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
-            theme_rgba: Some(std::array::from_fn(|i| [i as u8, 2, 3, 4])),
+            theme: Some(full_theme()),
         };
         let bytes = full.encode();
         let back = ProbeBody::decode(&bytes).unwrap();
         assert_eq!(back.protocol_version, full.protocol_version);
         assert_eq!(back.max_write_bytes, full.max_write_bytes);
         assert_eq!(back.vge_features, full.vge_features);
-        assert_eq!(back.accent_rgba, full.accent_rgba);
-        assert_eq!(back.theme_rgba, full.theme_rgba);
+        assert_eq!(back.theme, full.theme);
+        let theme = |n: usize| ProbeBody::decode(&bytes[..n]).unwrap().theme;
 
         // Truncated to just before the theme block: accent survives,
-        // theme is absent rather than an error.
-        let back = ProbeBody::decode(&bytes[..29]).unwrap();
-        assert_eq!(back.accent_rgba, full.accent_rgba);
-        assert_eq!(back.theme_rgba, None);
+        // colours are absent rather than an error.
+        let t = theme(29).unwrap();
+        assert_eq!(t.accent, full_theme().accent);
+        assert_eq!(t.colors, None);
 
         // Half a theme block is no theme block — all eight or none.
-        let back = ProbeBody::decode(&bytes[..45]).unwrap();
-        assert_eq!(back.accent_rgba, full.accent_rgba);
-        assert_eq!(back.theme_rgba, None);
+        assert_eq!(theme(45).unwrap().colors, None);
+
+        // Cut inside the accent list: the colours stand, the lists go.
+        let t = theme(66).unwrap();
+        assert_eq!(t.colors, full_theme().colors);
+        assert!(t.accents.is_empty() && t.swatches.is_empty());
+
+        // Cut inside the swatch list: the accents stand.
+        let t = theme(bytes.len() - 3).unwrap();
+        assert_eq!(t.accents, full_theme().accents);
+        assert!(t.swatches.is_empty());
 
         // A pre-VGE host's 24-byte body.
         let back = ProbeBody::decode(&bytes[..24]).unwrap();
         assert_eq!(back.vge_features, None);
-        assert_eq!(back.accent_rgba, None);
-        assert_eq!(back.theme_rgba, None);
+        assert_eq!(back.theme, None);
 
         // A longer body than this client knows about is tolerated by
         // skipping the excess (§2.1).
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0xAA; 6]);
-        assert_eq!(ProbeBody::decode(&longer).unwrap().theme_rgba, full.theme_rgba);
+        assert_eq!(ProbeBody::decode(&longer).unwrap().theme, full.theme);
+
+        // And it is found inside a whole host→client payload.
+        let mut frames = Vec::new();
+        append_frame(&mut frames, RSP_OK, 1, &[]);
+        append_frame(&mut frames, RSP_PROBE, 2, &bytes);
+        let mut payload = vec![PROTOCOL_VERSION];
+        payload.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&frames);
+        assert_eq!(ProbeBody::from_payload(&payload).unwrap().theme, full.theme);
     }
 
-    /// The theme block is the same all-or-nothing tail the probe
-    /// carries, so the event has to survive the same truncations — a
-    /// host that publishes accents only ends the body after the accent.
+    /// The event carries the probe's own tail, so it survives the same
+    /// truncations — a host that publishes accents only ends the body
+    /// after the accent.
     #[test]
     fn host_theme_changed_body_round_trips() {
-        let accent = [0x12, 0x34, 0x56, 0xFF];
-        let colors: [[u8; 4]; 8] = std::array::from_fn(|i| [i as u8, 2, 3, 4]);
-
-        let body = host_theme_changed_body("", accent, Some(colors));
-        let (id, got_accent, got_colors) = parse_host_theme_changed(&body).unwrap();
+        let body = host_theme_changed_body("", &full_theme());
+        let (id, got) = parse_host_theme_changed(&body).unwrap();
         assert_eq!(id, "", "the host itself names no portal");
-        assert_eq!(got_accent, accent);
-        assert_eq!(got_colors, Some(colors));
+        assert_eq!(got, full_theme());
 
         // Accents only.
-        let body = host_theme_changed_body("", accent, None);
-        let (_, got_accent, got_colors) = parse_host_theme_changed(&body).unwrap();
-        assert_eq!(got_accent, accent);
-        assert_eq!(got_colors, None);
-
-        // Half a block is no block.
-        let mut half = host_theme_changed_body("", accent, Some(colors));
-        half.truncate(half.len() - 9);
-        assert_eq!(parse_host_theme_changed(&half).unwrap().2, None);
+        let only = HostTheme {
+            colors: None,
+            accents: Vec::new(),
+            swatches: Vec::new(),
+            ..full_theme()
+        };
+        let body = host_theme_changed_body("", &only);
+        assert_eq!(parse_host_theme_changed(&body).unwrap().1, only);
 
         // A body too short even for the accent is an error, not a
         // silently zeroed colour.

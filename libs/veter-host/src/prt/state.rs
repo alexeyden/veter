@@ -553,17 +553,8 @@ impl PrtEngine {
                 content.children.set_host_palette(palette.clone());
             }
         }
-        if let Some(accent) = palette.contextual_rgba8(depth) {
-            self.emit_event(
-                EVT_HOST_THEME_CHANGED,
-                host_theme_changed_body(
-                    "",
-                    accent,
-                    palette
-                        .contextual_colors(depth)
-                        .map(crate::vge::HostThemeColors::to_rgba8),
-                ),
-            );
+        if let Some(theme) = palette.to_wire(depth) {
+            self.emit_event(EVT_HOST_THEME_CHANGED, host_theme_changed_body("", &theme));
         }
     }
 
@@ -1416,16 +1407,9 @@ impl PrtEngine {
                     f | FEAT_VGE_HOST_THEMED_STYLES | FEAT_VGE_HOST_THEME_EVENTS
                 }
             }),
-            // The accent `host.accent` resolves to at this engine's depth,
-            // so a client can derive its own shades from it.
-            accent_rgba: self.host_palette.contextual_rgba8(self.depth),
-            // The rest of the namespace, for the same reason. These do
-            // not vary with depth — there is one terminal background —
-            // except the text over the accent, which follows it.
-            theme_rgba: self
-                .host_palette
-                .contextual_colors(self.depth)
-                .map(crate::vge::HostThemeColors::to_rgba8),
+            // The palette as this engine's depth sees it, so a client can
+            // derive its own shades from the colours it references.
+            theme: self.host_palette.to_wire(self.depth),
         };
         Ok(pb.encode())
     }
@@ -2303,11 +2287,23 @@ mod tests {
         assert!(r.at_end());
     }
 
+    /// Accent slots with white text over each.
+    fn slots(fills: &[crate::vge::Color]) -> Vec<crate::vge::HostSwatch> {
+        fills
+            .iter()
+            .map(|&fill| crate::vge::HostSwatch {
+                name: String::new(),
+                fill,
+                text: crate::vge::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            })
+            .collect()
+    }
+
     fn rgb_palette() -> crate::vge::HostThemePalette {
         let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
         crate::vge::HostThemePalette {
-            accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
-            on_accents: Vec::new(),
+            accents: slots(&[c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)]),
+            swatches: Vec::new(),
             colors: None,
         }
     }
@@ -2319,28 +2315,15 @@ mod tests {
         }
     }
 
-    /// Read the trailing `vge_features` byte and (if the themed bit is
-    /// set) the accent RGBA from a ProbeResponse body.
+    /// The trailing `vge_features` byte and (if the themed bit is set)
+    /// the accent RGBA from a ProbeResponse body.
     fn probe_vge_features_and_accent(body: &[u8]) -> (u8, Option<[u8; 4]>) {
-        let mut r = Reader::new(body);
-        let _ = r.u16(); // protocol_version
-        for _ in 0..5 {
-            let _ = r.u32(); // 5 u32 caps
-        }
-        let _ = r.u8(); // features
-        let _ = r.u8(); // max_nesting_depth
-        let vge_features = r.u8().unwrap();
-        let accent = if vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0 {
-            Some([
-                r.u8().unwrap(),
-                r.u8().unwrap(),
-                r.u8().unwrap(),
-                r.u8().unwrap(),
-            ])
-        } else {
-            None
-        };
-        (vge_features, accent)
+        let pb = prt_protocol::envelope::ProbeBody::decode(body).unwrap();
+        (pb.vge_features.unwrap(), pb.theme.map(|t| t.accent))
+    }
+
+    fn probe_theme(body: &[u8]) -> prt_protocol::envelope::HostTheme {
+        prt_protocol::envelope::ProbeBody::decode(body).unwrap().theme.unwrap()
     }
 
     #[test]
@@ -2378,26 +2361,29 @@ mod tests {
             ..rgb_palette()
         });
         let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
-        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
-        assert_eq!(decoded.accent_rgba, Some([255, 0, 0, 255]));
-        assert_eq!(decoded.theme_rgba, Some(colors.to_rgba8()));
+        let theme = probe_theme(&parsed.body);
+        assert_eq!(theme.accent, [255, 0, 0, 255]);
+        assert_eq!(theme.colors, Some(colors.to_rgba8()));
 
-        // Inside a portal the accent rotates with depth; the theme
-        // colours describe the terminal and do not.
+        // Inside a portal the accent rotates with depth, and so does
+        // the accent list, which starts at the reader's own slot; the
+        // theme colours describe the terminal and do not.
         dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
         let child = &mut engine.state.current_mut().content_mut("p").unwrap().children;
         let parsed = dispatch_one(child, CMD_PROBE, 1, &[]);
-        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
-        assert_eq!(decoded.accent_rgba, Some([0, 255, 0, 255]));
-        assert_eq!(decoded.theme_rgba, Some(colors.to_rgba8()));
+        let theme = probe_theme(&parsed.body);
+        assert_eq!(theme.accent, [0, 255, 0, 255]);
+        assert_eq!(theme.colors, Some(colors.to_rgba8()));
+        let fills: Vec<[u8; 4]> = theme.accents.iter().map(|a| a.fill).collect();
+        assert_eq!(fills, [[0, 255, 0, 255], [0, 0, 255, 255], [255, 0, 0, 255]]);
 
         // Accents alone: the body simply stops after the accent.
         let mut engine = PrtEngine::new();
         engine.set_host_palette(rgb_palette());
         let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
-        let decoded = prt_protocol::envelope::ProbeBody::decode(&parsed.body).unwrap();
-        assert_eq!(decoded.accent_rgba, Some([255, 0, 0, 255]));
-        assert_eq!(decoded.theme_rgba, None);
+        let theme = probe_theme(&parsed.body);
+        assert_eq!(theme.accent, [255, 0, 0, 255]);
+        assert_eq!(theme.colors, None);
     }
 
     /// A palette set after portals exist must reach them — this is
@@ -2434,8 +2420,8 @@ mod tests {
         // ignored.
         let c = |r, g, b| crate::vge::Color { r, g, b, a: 1.0 };
         engine.set_host_palette(crate::vge::HostThemePalette {
-            accents: vec![c(0.0, 0.0, 1.0), c(1.0, 1.0, 0.0)],
-            on_accents: Vec::new(),
+            accents: slots(&[c(0.0, 0.0, 1.0), c(1.0, 1.0, 0.0)]),
+            swatches: Vec::new(),
             colors: None,
         });
         assert_eq!(
@@ -2470,15 +2456,15 @@ mod tests {
         assert_eq!(event_count(&frames, EVT_HOST_THEME_CHANGED), 1);
 
         let ev = first_event(&frames, EVT_HOST_THEME_CHANGED).unwrap();
-        let (id, accent, got) =
+        let (id, theme) =
             prt_protocol::envelope::parse_host_theme_changed(&ev.body).unwrap();
         // The host itself, not a portal — the one §8 event that names
         // none.
         assert_eq!(id, "");
         // Depth 0 → accent slot 0 (red), the same value the probe
         // would report to this client.
-        assert_eq!(accent, [255, 0, 0, 255]);
-        assert_eq!(got, Some(colors.to_rgba8()));
+        assert_eq!(theme.accent, [255, 0, 0, 255]);
+        assert_eq!(theme.colors, Some(colors.to_rgba8()));
 
         // The probe advertises that the event exists.
         let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
@@ -2518,21 +2504,16 @@ mod tests {
         };
         let light = c(1.0, 1.0, 1.0);
         let dark = c(0.0, 0.0, 0.0);
+        let mut palette = rgb_palette();
+        palette.accents[1].text = dark;
         let mut engine = PrtEngine::new();
         engine.set_host_palette(crate::vge::HostThemePalette {
-            on_accents: vec![light, dark, light],
             colors: Some(colors),
-            ..rgb_palette()
+            ..palette
         });
         dispatch_one(&mut engine, CMD_CREATE_PORTAL, 1, &make_create_body("p", 80, 24));
 
-        let on_accent = |body: &[u8]| {
-            let theme = prt_protocol::envelope::ProbeBody::decode(body)
-                .unwrap()
-                .theme_rgba
-                .unwrap();
-            theme[6]
-        };
+        let on_accent = |body: &[u8]| probe_theme(body).colors.unwrap()[6];
         let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
         assert_eq!(on_accent(&parsed.body), [255, 255, 255, 255]);
         let content = engine.state.current_mut().content_mut("p").unwrap();

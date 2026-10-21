@@ -50,8 +50,7 @@ use prt_protocol::command::{
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::frame::{
     EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_PORTAL_SCROLL_DELTA,
-    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, FEAT_VGE_HOST_THEMED_STYLES,
-    MARKER_T2C as PRT_MARKER_T2C, RSP_PROBE as PRT_RSP_PROBE,
+    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C,
 };
 
 use ses_protocol::apc::ApcStream as SesApcStream;
@@ -1556,7 +1555,7 @@ fn build_tabbar_commands(
         });
 
         // Name sub-rect — the body of the pill. Full accent on the active
-        // tab; the 40%-darker accent when an inactive tab has unseen
+        // tab; the muted activity shade when an inactive tab has unseen
         // background activity, so the whole pill lights up rather than just
         // the tag. Top-right corner rounded so the silhouette reads as a tab.
         let name_x0 = x + num_w;
@@ -1586,7 +1585,7 @@ fn build_tabbar_commands(
             });
         }
         // Text picked against whichever fill the pill body has (full
-        // accent, or the darkened activity shade); dim only on a bare
+        // accent, or the muted activity shade); dim only on a bare
         // pill. Bold still marks the active tab specifically.
         cmds.push(DrawCmd::DrawText {
             origin: Point { x: name_x0, y: 0.0 },
@@ -4673,68 +4672,16 @@ struct VgeProbeData {
 struct ProbeResults {
     /// Host advertised the Portal Extension (a hard requirement).
     prt_ok: bool,
-    /// Host pre-populates the reserved `host.*` VGE style namespace
-    /// (PRT probe `vge_features` bit, §10). When set, chrome uses
-    /// `StyleRef("host.accent")`; otherwise it falls back to `COLOR_BRAND`.
-    host_themed_styles: bool,
-    /// The accent `host.accent` resolves to at this vmux's depth, when the
-    /// host themes `host.*`. Used to derive shades (thumb, surface).
-    accent_rgba: Option<[u8; 4]>,
-    /// The rest of the host's `host.*` palette (§10 theme block), which
-    /// is what lets vmux's chrome sit on the terminal's own surfaces
-    /// instead of its built-in dark ones.
-    theme_rgba: Option<[[u8; 4]; 8]>,
+    /// The host's `host.*` palette for this vmux's depth (PRT §10),
+    /// when it themes them: the accent chrome references as
+    /// `StyleRef("host.accent")`, the surfaces and text that let vmux
+    /// sit on the terminal's own colours instead of its built-in dark
+    /// ones, and the swatches a `--accent <name>` resolves against.
+    host_theme: Option<prt_protocol::envelope::HostTheme>,
     /// VGE probe answer, if any (cell pixel metrics).
     vge: Option<VgeProbeData>,
     /// `Some(name)` when the host answered the SES probe `in_session`.
     session_name: Option<String>,
-}
-
-/// Parse a PRT ProbeResponse payload. Returns `(host_themed_styles,
-/// accent_rgba, theme_rgba)`, or `None` if the payload is not a probe
-/// response. A body too short to contain the trailing
-/// `vge_features`/accent/theme fields reads them as absent per §2.1
-/// (missing trailing fields = zero).
-type PrtProbeAnswer = (bool, Option<[u8; 4]>, Option<[[u8; 4]; 8]>);
-
-fn parse_prt_probe(payload: &[u8]) -> Option<PrtProbeAnswer> {
-    let mut r = PrtReader::new(payload);
-    let _ = r.u8(); // payload protocol_version
-    let _ = r.u32(); // payload_length
-    let ft = r.u8().ok()?; // frame_type
-    if ft != PRT_RSP_PROBE {
-        return None;
-    }
-    let _ = r.u32(); // request_id
-    let _ = r.u32(); // body_length
-    // ProbeBody (§2.1).
-    let _ = r.u16(); // protocol_version
-    let _ = r.u32(); // max_portals
-    let _ = r.u32(); // max_portal_cells_w
-    let _ = r.u32(); // max_portal_cells_h
-    let _ = r.u32(); // max_scrollback_lines
-    let _ = r.u32(); // max_write_bytes
-    let _ = r.u8(); // features
-    let _ = r.u8(); // max_nesting_depth
-    let vge_features = r.u8().unwrap_or(0); // trailing §10 byte
-    let themed = vge_features & FEAT_VGE_HOST_THEMED_STYLES != 0;
-    // The accent RGBA follows `vge_features` only when the host themes.
-    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
-        (Ok(red), Ok(green), Ok(blue), Ok(alpha)) => Some([red, green, blue, alpha]),
-        _ => None,
-    };
-    let accent = themed.then(&mut quad).flatten();
-    // Then the eight-colour theme block — all of it or none, so a
-    // truncated body never leaves half the palette at a colour the host
-    // did not send.
-    let theme = accent.and_then(|_| {
-        let mut quads = [[0u8; 4]; 8];
-        for slot in &mut quads {
-            *slot = quad()?;
-        }
-        Some(quads)
-    });
-    Some((themed, accent, theme))
 }
 
 /// Parse one decoded VGE response payload, returning probe metrics if
@@ -4777,9 +4724,7 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
 
     let mut res = ProbeResults {
         prt_ok: false,
-        host_themed_styles: false,
-        accent_rgba: None,
-        theme_rgba: None,
+        host_theme: None,
         vge: None,
         session_name: None,
     };
@@ -4804,11 +4749,9 @@ fn probe_all(timeout: Duration) -> Result<ProbeResults> {
         }
 
         for payload in prt_apc.feed(&buf[..n]).into_payloads() {
-            if let Some((themed, accent, theme)) = parse_prt_probe(&payload) {
+            if let Some(probe) = prt_protocol::envelope::ProbeBody::from_payload(&payload) {
                 res.prt_ok = true;
-                res.host_themed_styles = themed;
-                res.accent_rgba = accent;
-                res.theme_rgba = theme;
+                res.host_theme = probe.theme;
             }
         }
         for payload in vge_apc.feed(&buf[..n]).payloads {
@@ -4902,9 +4845,11 @@ vmux — terminal multiplexer for veter
 Usage: vmux [OPTIONS]
 
 Options:
-  -A, --accent <COLOR>   chrome accent color: a name (red, green, blue,
-                         yellow, orange, magenta, cyan, purple, white) or
-                         hex (#rgb, #rrggbb, #rrggbbaa)
+  -A, --accent <COLOR>   chrome accent color: a name (red, orange, yellow,
+                         green, cyan, blue, magenta, purple, grey, or any
+                         swatch the terminal's theme defines) or hex (#rgb,
+                         #rrggbb, #rrggbbaa). A name takes the terminal
+                         theme's own colour for it
   -P, --prefix <KEY>     prefix key (default Ctrl+Space). Accepts C-a,
                          ctrl+a, ^a, or a bare letter; 'space' for Ctrl+Space
   -h, --help             print this help and exit
@@ -4914,9 +4859,9 @@ The accent and prefix options give nested sessions (e.g. over ssh) a
 distinct color and prefix so they are easy to tell apart.
 ";
 
-/// Parsed command-line options. `accent` is a packed `0xRRGGBBAA`.
+/// Parsed command-line options.
 struct CliOptions {
-    accent: Option<u32>,
+    accent: Option<theme::AccentSpec>,
     prefix: Option<u8>,
 }
 
@@ -4956,10 +4901,10 @@ fn parse_cli_args() -> Result<CliOptions> {
     Ok(opts)
 }
 
-/// Parse an accent color into packed `0xRRGGBBAA`. Accepts a name or hex
-/// `#rgb` / `#rrggbb` / `#rrggbbaa`; see [`vge_ui::theme::parse_accent_color`].
-fn parse_accent_color(s: &str) -> Result<u32> {
-    theme::parse_accent_color(s).map_err(|e| anyhow!("invalid color '{s}': {e}"))
+/// Parse an accent: a colour name or hex `#rgb` / `#rrggbb` /
+/// `#rrggbbaa`; see [`vge_ui::theme::parse_accent`].
+fn parse_accent_color(s: &str) -> Result<theme::AccentSpec> {
+    theme::parse_accent(s).map_err(|e| anyhow!("invalid color '{s}': {e}"))
 }
 
 /// Parse a prefix-key spec into its control byte. vmux's prefix is always a
@@ -4992,8 +4937,8 @@ fn parse_prefix_key(s: &str) -> Result<u8> {
 fn main() -> Result<()> {
     use std::io::IsTerminal;
     let opts = parse_cli_args()?;
-    if let Some(rgba) = opts.accent {
-        theme::set_cli_accent(theme::unpack(rgba));
+    if let Some(spec) = opts.accent {
+        theme::set_cli_accent(spec);
     }
     if let Some(prefix) = opts.prefix {
         PREFIX_BYTE.store(prefix, Ordering::Relaxed);
@@ -5024,18 +4969,10 @@ fn main() -> Result<()> {
         (None, Some(p)) => (p.cell_pw as f32, p.cell_ph as f32),
         (None, None) => (9.0, 20.0),
     };
-    // Adopt the host's themed accent, so chrome references
-    // `host.accent` and locally-derived shades match what it resolves to.
-    if probe.host_themed_styles {
-        theme::set_host_accent(theme::unpack(
-            probe.accent_rgba.map(u32::from_be_bytes).unwrap_or(0),
-        ));
-    }
-    // And the rest of its palette, so surfaces and text belong to the
-    // terminal rather than to vmux's own dark scheme. Separate from the
-    // accent: a host may publish one and not the other.
-    if let Some(quads) = probe.theme_rgba {
-        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
+    // Adopt the host's palette, so chrome references `host.*` and
+    // locally-derived shades match what those resolve to.
+    if let Some(host) = &probe.host_theme {
+        theme::adopt_host_theme(host);
     }
 
     tty.enter_alt_screen()?;
@@ -5591,13 +5528,8 @@ fn handle_stdin_chunk(
                 //
                 // A `--accent` on the command line still wins: it is
                 // checked ahead of the host's in `theme::accent_color`.
-                if let Ok((_, accent, colors)) =
-                    prt_protocol::envelope::parse_host_theme_changed(body)
-                {
-                    theme::set_host_accent(theme::unpack(u32::from_be_bytes(accent)));
-                    if let Some(quads) = colors {
-                        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
-                    }
+                if let Ok((_, host)) = prt_protocol::envelope::parse_host_theme_changed(body) {
+                    theme::adopt_host_theme(&host);
                     theme_dirty = true;
                 }
             } else if ft == prt_protocol::frame::RSP_OK

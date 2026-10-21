@@ -3,7 +3,11 @@
 //! Three sources, in priority order:
 //!
 //! 1. a CLI override ([`set_cli_accent`]) — lets an outer session give a
-//!    nested one a distinct chrome color;
+//!    nested one a distinct chrome color. A colour *name* is looked up
+//!    in the host's swatches first (`host.swatch.<name>`, VGE §7.3), so
+//!    `--accent orange` paints the terminal theme's orange with the text
+//!    the theme picked for it; only a host that publishes no such
+//!    swatch gets this crate's own orange. A hex value is taken as is;
 //! 2. the host's themed `host.accent` ([`set_host_accent`]), surfaced
 //!    through the PRT probe (VGE §7.3), which tracks veter's theme and
 //!    the pane's nesting depth;
@@ -19,7 +23,10 @@
 //! All state is process-global and set once at startup, keeping the
 //! accent out of every render signature.
 
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use prt_protocol::envelope::HostTheme;
 
 use vge_protocol::command::{Color, Style};
 
@@ -153,8 +160,11 @@ static BRAND_RGBA: AtomicU32 = AtomicU32::new(0x56_79_9f_ff);
 static HOST_RGBA: AtomicU32 = AtomicU32::new(0);
 static HOST_THEMED: AtomicBool = AtomicBool::new(false);
 
-static CLI_RGBA: AtomicU32 = AtomicU32::new(0);
-static CLI_SET: AtomicBool = AtomicBool::new(false);
+static CLI: RwLock<Option<AccentSpec>> = RwLock::new(None);
+
+/// The host's named swatches as `(name, fill, text)`, fill and text
+/// packed `0xRRGGBBAA`. Empty until a host publishes some.
+static HOST_SWATCHES: RwLock<Vec<(String, u32, u32)>> = RwLock::new(Vec::new());
 
 /// The host's non-accent palette, packed `0xRRGGBBAA` in
 /// [`HostColors`] field order. Valid only when `HOST_COLORS_SET` is
@@ -223,6 +233,61 @@ pub fn set_host_theme(c: HostColors) {
         slot.store(pack(color), Ordering::Relaxed);
     }
     HOST_COLORS_SET.store(true, Ordering::Relaxed);
+}
+
+/// Adopt everything a host reports about its palette (PRT §10: the
+/// probe's tail, or a `HostThemeChanged`): the accent for this depth,
+/// the eight surface/text colours when present, and the named swatches
+/// a `--accent <name>` resolves against.
+pub fn adopt_host_theme(theme: &HostTheme) {
+    set_host_accent(unpack(u32::from_be_bytes(theme.accent)));
+    if let Some(quads) = theme.colors {
+        set_host_theme(HostColors::from_rgba8(quads));
+    }
+    if let Ok(mut swatches) = HOST_SWATCHES.write() {
+        *swatches = theme
+            .swatches
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    u32::from_be_bytes(s.fill),
+                    u32::from_be_bytes(s.text),
+                )
+            })
+            .collect();
+    }
+}
+
+/// The host's swatch called `name`: its fill and its text.
+fn host_swatch(name: &str) -> Option<(Color, Color)> {
+    let swatches = HOST_SWATCHES.read().ok()?;
+    let (_, fill, text) = swatches.iter().find(|(n, ..)| n == name)?;
+    Some((unpack(*fill), unpack(*text)))
+}
+
+/// The CLI accent as it resolves right now: its fill, the text the
+/// host picked for it (a host swatch only), and the swatch's name when
+/// it is the host's. `None` with no `--accent`, and for a name that
+/// neither the host nor this crate knows — which then falls through
+/// to the host's own accent rather than to an arbitrary colour.
+fn cli_accent() -> Option<(Color, Option<Color>, Option<String>)> {
+    let cli = CLI.read().ok()?;
+    resolve_accent(cli.as_ref()?, host_swatch)
+}
+
+/// [`cli_accent`] for a given spec and swatch lookup.
+fn resolve_accent(
+    spec: &AccentSpec,
+    host: impl Fn(&str) -> Option<(Color, Color)>,
+) -> Option<(Color, Option<Color>, Option<String>)> {
+    match spec {
+        AccentSpec::Literal(rgba) => Some((unpack(*rgba), None, None)),
+        AccentSpec::Named(name) => match host(name) {
+            Some((fill, text)) => Some((fill, Some(text), Some(name.clone()))),
+            None => named_color(name).map(|rgba| (unpack(rgba), None, None)),
+        },
+    }
 }
 
 /// One slot of the host palette, or `None` when the host published
@@ -299,15 +364,15 @@ pub fn dim_text() -> Color {
 ///
 /// The host's `host.text.on_accent` was picked against the accent the
 /// host resolves for this depth, so it only holds while that is the
-/// accent being painted. A
-/// `--accent` override paints something else — as light as the host's
-/// text, say a yellow under a dark theme — so then the pick is made
-/// here, against the accent actually on screen.
+/// accent being painted. A `--accent` naming one of the host's swatches
+/// takes that swatch's text, which the theme picked for it; any other
+/// override paints a colour no host text was picked against, so then
+/// the pick is made here.
 pub fn active_text() -> Color {
-    if CLI_SET.load(Ordering::Relaxed) {
-        text_over(accent_color())
-    } else {
-        host_color(6).unwrap_or(COLOR_ACTIVE_TEXT)
+    match cli_accent() {
+        Some((_, Some(text), _)) => text,
+        Some((fill, None, _)) => text_over(fill),
+        None => host_color(6).unwrap_or(COLOR_ACTIVE_TEXT),
     }
 }
 
@@ -333,13 +398,20 @@ pub fn text_over(fill: Color) -> Color {
 /// colours. The same rule veter derives `host.text.on_accent` by, so a
 /// CLI accent gets the text the host would have picked for it: the
 /// poles are pushed further out, because a theme's own ink is tuned
-/// against its ground, not against a mid-tone fill.
+/// against its ground, not against a mid-tone fill. Both poles lose
+/// their hue, since a light theme's ink is often an accent-like blue.
 fn text_on(accent: Color, darkest: Color, lightest: Color) -> Color {
     if luminance(accent) > 0.55 {
-        darken(darkest, 0.35)
+        grey(darken(darkest, 0.35))
     } else {
-        mix(lightest, Color { r: 1.0, g: 1.0, b: 1.0, a: lightest.a }, 0.5)
+        grey(mix(lightest, Color { r: 1.0, g: 1.0, b: 1.0, a: lightest.a }, 0.5))
     }
+}
+
+/// The grey of the same [`luminance`] — veter's `Rgba::grey`.
+fn grey(c: Color) -> Color {
+    let v = luminance(c);
+    Color { r: v, g: v, b: v, a: c.a }
 }
 
 /// sRGB-weighted relative luminance, `0.0..=1.0` — veter's
@@ -376,17 +448,20 @@ pub fn scrollbar() -> Color {
     }
 }
 
-/// Force a concrete accent, overriding both the host's and the brand's.
-pub fn set_cli_accent(c: Color) {
-    CLI_RGBA.store(pack(c), Ordering::Relaxed);
-    CLI_SET.store(true, Ordering::Relaxed);
+/// Override the accent, ahead of both the host's and the brand's. A
+/// name resolves late, against whatever swatches the host publishes —
+/// so it can be set before the probe has answered.
+pub fn set_cli_accent(spec: AccentSpec) {
+    if let Ok(mut cli) = CLI.write() {
+        *cli = Some(spec);
+    }
 }
 
 /// The accent as a concrete color, following the priority order above.
 /// Used to derive shades the host does not publish as their own styles.
 pub fn accent_color() -> Color {
-    if CLI_SET.load(Ordering::Relaxed) {
-        unpack(CLI_RGBA.load(Ordering::Relaxed))
+    if let Some((fill, ..)) = cli_accent() {
+        fill
     } else if HOST_THEMED.load(Ordering::Relaxed) {
         unpack(HOST_RGBA.load(Ordering::Relaxed))
     } else {
@@ -394,11 +469,15 @@ pub fn accent_color() -> Color {
     }
 }
 
-/// Accent fill/stroke style for chrome — a host `StyleRef` when the host
-/// themes `host.*` and nothing overrides it, else a concrete color.
+/// Accent fill/stroke style for chrome — a host `StyleRef` when the
+/// colour is the host's (its contextual accent, or the swatch a
+/// `--accent` named), else a concrete color.
 pub fn accent_style() -> Style {
-    if CLI_SET.load(Ordering::Relaxed) {
-        Style::Flat(accent_color())
+    if let Some((fill, _, name)) = cli_accent() {
+        match name {
+            Some(name) => Style::Ref(format!("host.swatch.{name}")),
+            None => Style::Flat(fill),
+        }
     } else if HOST_THEMED.load(Ordering::Relaxed) {
         Style::Ref(HOST_ACCENT_STYLE_ID.to_string())
     } else {
@@ -431,7 +510,7 @@ pub fn surface_style() -> Style {
 /// The accent-tinted fallback ground, for a terminal that publishes no
 /// `host.*` colours.
 fn tinted_modal_bg() -> Color {
-    if CLI_SET.load(Ordering::Relaxed) || HOST_THEMED.load(Ordering::Relaxed) {
+    if cli_accent().is_some() || HOST_THEMED.load(Ordering::Relaxed) {
         let c = accent_color();
         const K: f32 = 0.20;
         Color {
@@ -461,8 +540,18 @@ pub fn activity_text() -> Color {
     text_over(activity_color())
 }
 
+/// Toward the terminal's ground when it publishes one, so the marker
+/// recedes on a light theme too — where darkening would make it the
+/// loudest thing on the bar. Darkened on a host that publishes none,
+/// which is the dark chrome this crate falls back to.
 fn activity_color() -> Color {
-    darken(accent_color(), 0.4)
+    match host_bg() {
+        Some(bg) => Color {
+            a: 1.0,
+            ..mix(accent_color(), bg, 0.4)
+        },
+        None => darken(accent_color(), 0.4),
+    }
 }
 
 /// A color darkened by `amount` (0..1) — each channel scaled toward
@@ -477,13 +566,56 @@ pub fn darken(c: Color, amount: f32) -> Color {
     }
 }
 
-/// Parse an accent spec: a named color, `#rgb`, `#rrggbb`, or
-/// `#rrggbbaa` (the `#` is optional). Returns the packed `0xRRGGBBAA`.
+/// What `--accent` asked for: a colour name, resolved against the
+/// host's swatches once it has published them, or a literal colour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccentSpec {
+    /// A canonical swatch name — one of the colour words, or a name the
+    /// user's theme defines.
+    Named(String),
+    /// Packed `0xRRGGBBAA`.
+    Literal(u32),
+}
+
+/// Parse an accent spec: a colour name, `#rgb`, `#rrggbb`, or
+/// `#rrggbbaa`. The `#` is optional for hex, but a bare token that is
+/// one of the colour words (or an alias of one) is always a name, and
+/// any other bare token that is not hex names a swatch the terminal's
+/// theme may define.
+pub fn parse_accent(s: &str) -> Result<AccentSpec, String> {
+    let t = s.trim().to_ascii_lowercase();
+    let name = canonical_name(&t);
+    if named_color(name).is_some() {
+        return Ok(AccentSpec::Named(name.to_string()));
+    }
+    match parse_accent_color(&t) {
+        Ok(rgba) => Ok(AccentSpec::Literal(rgba)),
+        Err(_) if !t.starts_with('#') && is_swatch_token(&t) => Ok(AccentSpec::Named(t)),
+        Err(e) => Err(e),
+    }
+}
+
+/// A theme swatch name as veter accepts one (`host.swatch.<name>`).
+fn is_swatch_token(t: &str) -> bool {
+    (1..=32).contains(&t.len())
+        && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The swatch an alias stands for: veter publishes one name per hue.
+fn canonical_name(name: &str) -> &str {
+    match name {
+        "pink" => "magenta",
+        "teal" => "cyan",
+        "violet" => "purple",
+        "gray" | "white" => "grey",
+        other => other,
+    }
+}
+
+/// Parse a hex accent, `#rgb`, `#rrggbb`, or `#rrggbbaa` (the `#` is
+/// optional), into the packed `0xRRGGBBAA`.
 pub fn parse_accent_color(s: &str) -> Result<u32, String> {
     let t = s.trim();
-    if let Some(rgba) = named_color(&t.to_ascii_lowercase()) {
-        return Ok(rgba);
-    }
     let hex = t.strip_prefix('#').unwrap_or(t);
     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("not a color name or hex value: {s}"));
@@ -498,8 +630,10 @@ pub fn parse_accent_color(s: &str) -> Result<u32, String> {
     })
 }
 
-/// The handful of names accepted alongside hex specs. `blue` is the
-/// brand color itself, so `--accent blue` is the default made explicit.
+/// This crate's own colour for each canonical name — what a name
+/// paints on a host that publishes no swatch for it. `blue` is the
+/// brand color itself, so `--accent blue` there is the default made
+/// explicit. The same as veter's built-in theme's swatches.
 fn named_color(name: &str) -> Option<u32> {
     Some(match name {
         "red" => 0xd0_5c_5c_ff,
@@ -507,10 +641,10 @@ fn named_color(name: &str) -> Option<u32> {
         "blue" => 0x56_79_9f_ff,
         "yellow" => 0xc9_a8_4c_ff,
         "orange" => 0xcf_7d_3c_ff,
-        "magenta" | "pink" => 0xb0_5c_9f_ff,
-        "cyan" | "teal" => 0x4c_9f_9f_ff,
-        "purple" | "violet" => 0x8c_6c_c0_ff,
-        "white" | "gray" | "grey" => 0x9a_9a_9a_ff,
+        "magenta" => 0xb0_5c_9f_ff,
+        "cyan" => 0x4c_9f_9f_ff,
+        "purple" => 0x8c_6c_c0_ff,
+        "grey" => 0x9a_9a_9a_ff,
         _ => return None,
     })
 }
@@ -553,7 +687,6 @@ mod tests {
 
     #[test]
     fn parse_accent_color_variants() {
-        assert_eq!(parse_accent_color("blue").unwrap(), 0x56_79_9f_ff);
         assert_eq!(parse_accent_color("#ff8800").unwrap(), 0xff_88_00_ff);
         assert_eq!(parse_accent_color("ff8800").unwrap(), 0xff_88_00_ff);
         assert_eq!(parse_accent_color("#f80").unwrap(), 0xff_88_00_ff);
@@ -574,6 +707,46 @@ mod tests {
         let orange = unpack(parse_accent_color("#c06020").unwrap());
         assert!(luminance(text_on(yellow, ink, ground)) < luminance(ink));
         assert!(luminance(text_on(orange, ink, ground)) > luminance(ground));
+        let dark = text_on(yellow, ink, ground);
+        assert!(dark.r == dark.g && dark.g == dark.b, "the ink's blue leaks into the text");
+    }
+
+    /// Colour words and their aliases are names; hex stays hex with or
+    /// without the `#`; any other plain token names a theme's own
+    /// swatch; and a `#` that is not hex is an error, not a name.
+    #[test]
+    fn parse_accent_tells_names_from_hex() {
+        let named = |n: &str| AccentSpec::Named(n.into());
+        assert_eq!(parse_accent("Orange"), Ok(named("orange")));
+        assert_eq!(parse_accent("pink"), Ok(named("magenta")));
+        assert_eq!(parse_accent("grey"), Ok(named("grey")));
+        assert_eq!(parse_accent("#ff8800"), Ok(AccentSpec::Literal(0xff_88_00_ff)));
+        assert_eq!(parse_accent("ff8800"), Ok(AccentSpec::Literal(0xff_88_00_ff)));
+        assert_eq!(parse_accent("seafoam"), Ok(named("seafoam")));
+        assert!(parse_accent("#seafoam").is_err());
+        assert!(parse_accent("two words").is_err());
+    }
+
+    /// A name is the host's swatch when it has one — fill, the text the
+    /// theme picked, and a ref the host can re-resolve; this crate's own
+    /// colour when it has none; and nothing at all for a theme-only name
+    /// on a host that does not define it.
+    #[test]
+    fn a_named_accent_resolves_against_the_host_first() {
+        let fill = unpack(0xb1_5c_00_ff);
+        let text = unpack(0xf0_f0_f0_ff);
+        let host = |n: &str| (n == "orange").then_some((fill, text));
+        let named = |n: &str| AccentSpec::Named(n.into());
+
+        let (f, t, r) = resolve_accent(&named("orange"), host).unwrap();
+        assert_eq!((f, t, r.as_deref()), (fill, Some(text), Some("orange")));
+
+        let (f, t, r) = resolve_accent(&named("red"), host).unwrap();
+        assert_eq!((f, t, r), (unpack(0xd0_5c_5c_ff), None, None));
+
+        assert!(resolve_accent(&named("seafoam"), host).is_none());
+        let (f, t, _) = resolve_accent(&AccentSpec::Literal(0x11_22_33_ff), host).unwrap();
+        assert_eq!((f, t), (unpack(0x11_22_33_ff), None));
     }
 
     /// With nothing configured the accent is the brand, and

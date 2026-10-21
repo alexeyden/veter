@@ -877,11 +877,26 @@ Reserved ids defined in v0:
 | `host.text.on_accent` | Text over a `host.accent` fill — a selected row, an active tab. Contextual, like `host.accent`: it is the text for the accent this engine's depth resolves to. |
 | `host.text.on_accent.1` … | Text over explicit accent slot N (does not rotate with depth). |
 | `host.warn`     | The warm tone for a destructive answer or an error line.       |
+| `host.swatch.<name>` | A color the host's theme names — `red`, `orange`, … `purple`, and any others it defines. What a client paints when asked for a color *by name*, so that the name means this theme's version of it. Does not rotate with depth. |
+| `host.swatch.<name>.text` | Text over `host.swatch.<name>`, as the theme picked it. |
 
 A host with fewer configured accents than slots populates only the slots
 it has; `host.accent` always resolves (it wraps around the available
-slots). The numbered `host.text.on_accent.N` ids follow the same rule,
-and a host that publishes no per-slot text populates none of them.
+slots). The numbered `host.text.on_accent.N` ids follow the same rule.
+
+A swatch name is a plain token — ASCII letters, digits, `-` and `_`, at
+most 32 bytes — so `.text` can only ever be the suffix, and the longer
+id stays inside the 64-byte limit. The swatch ids are seeded with the
+rest of the namespace and come back with it after a reset. A client
+that references one by `StyleRef` MUST have seen that name in the
+probe's swatch list (portal-extension.md §10): an id the host does not
+publish renders magenta like any other unknown id.
+
+Text over an accent or a swatch is the host's call, not the client's.
+The host knows its theme — a light scheme's ink is often a saturated
+color in its own right, which drawn over a different accent reads as
+the wrong accent rather than as text — and a client deriving its own
+text from a luminance threshold only guesses.
 
 The accents and the eight colours after them are **independent**: a host
 may publish accents alone, which is what a host that predates the second

@@ -1137,39 +1137,18 @@ fn probe_host_accent(timeout: Duration) -> Option<Color> {
     }
 }
 
-/// Pull the themed accent out of a PRT ProbeResponse payload. The accent
-/// RGBA8 follows the `vge_features` byte (§10) only when the host sets
-/// `FEAT_VGE_HOST_THEMED_STYLES`; a short body (older host) reads the
-/// trailing fields as absent and yields `None`.
+/// Pull the themed accent out of a PRT ProbeResponse payload: present
+/// only when the host sets `FEAT_VGE_HOST_THEMED_STYLES` (§10); an
+/// older host's short body yields `None`.
 fn parse_prt_accent(payload: &[u8]) -> Option<Color> {
-    use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, RSP_PROBE};
-
-    let mut r = prt_protocol::Reader::new(payload);
-    let _ = r.u8(); // payload protocol_version
-    let _ = r.u32(); // payload_length
-    if r.u8().ok()? != RSP_PROBE {
-        return None;
-    }
-    let _ = r.u32(); // request_id
-    let _ = r.u32(); // body_length
-    let _ = r.u16(); // protocol_version
-    let _ = r.u32(); // max_portals
-    let _ = r.u32(); // max_portal_cells_w
-    let _ = r.u32(); // max_portal_cells_h
-    let _ = r.u32(); // max_scrollback_lines
-    let _ = r.u32(); // max_write_bytes
-    let _ = r.u8(); // features
-    let _ = r.u8(); // max_nesting_depth
-    let vge_features = r.u8().unwrap_or(0); // §10 trailing byte
-    if vge_features & FEAT_VGE_HOST_THEMED_STYLES == 0 {
-        return None;
-    }
-    let (red, green, blue, alpha) = (r.u8().ok()?, r.u8().ok()?, r.u8().ok()?, r.u8().ok()?);
+    let [r, g, b, a] = prt_protocol::envelope::ProbeBody::from_payload(payload)?
+        .theme?
+        .accent;
     Some(Color {
-        r: red as f32 / 255.0,
-        g: green as f32 / 255.0,
-        b: blue as f32 / 255.0,
-        a: alpha as f32 / 255.0,
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: a as f32 / 255.0,
     })
 }
 
@@ -1224,7 +1203,7 @@ impl Drop for TermExit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prt_protocol::envelope::{append_frame, wrap_t2c_envelope, ProbeBody};
+    use prt_protocol::envelope::{append_frame, wrap_t2c_envelope, HostTheme, ProbeBody};
     use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, MARKER_T2C, RSP_PROBE};
 
     /// Round-trip a PRT ProbeResponse through the real APC stream and
@@ -1240,8 +1219,12 @@ mod tests {
             features: 0,
             max_nesting_depth: 8,
             vge_features,
-            accent_rgba: accent,
-            theme_rgba: None,
+            theme: accent.map(|accent| HostTheme {
+                accent,
+                colors: None,
+                accents: Vec::new(),
+                swatches: Vec::new(),
+            }),
         }
         .encode();
         let mut frames = Vec::new();

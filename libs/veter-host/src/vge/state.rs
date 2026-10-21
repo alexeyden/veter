@@ -596,10 +596,9 @@ pub struct HostThemeColors {
     pub text: command::Color,
     /// `host.text.dim` — secondary text: hints, inactive labels.
     pub text_dim: command::Color,
-    /// `host.text.on_accent` — text over an accent fill. The fallback
-    /// for every depth when [`HostThemePalette::on_accents`] is empty;
-    /// otherwise [`HostThemePalette::contextual_colors`] replaces it with
-    /// the one picked against the accent that depth paints.
+    /// `host.text.on_accent` — text over an accent fill. Contextual:
+    /// [`HostThemePalette::contextual_colors`] replaces whatever a
+    /// palette holds here with the text of the accent that depth paints.
     pub text_on_accent: command::Color,
     /// `host.warn` — the warm tone for a destructive answer.
     pub warn: command::Color,
@@ -664,27 +663,82 @@ impl HostThemeColors {
     }
 }
 
+/// One colour a host publishes together with the text it picked for
+/// it: an accent slot, or a swatch the theme names (VGE §7.3,
+/// `doc/portal-extension.md` §10). The text is the theme's call, not
+/// the client's — a theme author can see whether light or dark reads
+/// on their orange, and a luminance threshold only guesses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostSwatch {
+    /// The swatch name; empty for an accent given as a literal colour.
+    pub name: String,
+    pub fill: command::Color,
+    pub text: command::Color,
+}
+
+impl HostSwatch {
+    fn to_wire(&self) -> prt_protocol::envelope::Swatch {
+        prt_protocol::envelope::Swatch {
+            name: self.name.clone(),
+            fill: rgba8(self.fill),
+            text: rgba8(self.text),
+        }
+    }
+
+    fn from_wire(s: &prt_protocol::envelope::Swatch) -> Self {
+        Self {
+            name: s.name.clone(),
+            fill: from_rgba8(s.fill),
+            text: from_rgba8(s.text),
+        }
+    }
+}
+
+fn rgba8(c: command::Color) -> [u8; 4] {
+    let q = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [q(c.r), q(c.g), q(c.b), q(c.a)]
+}
+
+fn from_rgba8([r, g, b, a]: [u8; 4]) -> command::Color {
+    command::Color {
+        r: f32::from(r) / 255.0,
+        g: f32::from(g) / 255.0,
+        b: f32::from(b) / 255.0,
+        a: f32::from(a) / 255.0,
+    }
+}
+
+/// Whether `name` can be published as `host.swatch.<name>`: a plain
+/// token, so the `.text` suffix cannot be confused with part of a name
+/// and the longer id stays inside the 64-byte style-id limit (§7.3).
+pub fn is_swatch_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Host-provided palette seeded into the reserved `host.*` style
 /// namespace (`doc/vector-graphics-extension.md` §7.3). An empty
 /// palette means host-themed styles are disabled: nothing is injected
 /// and the PRT probe does not advertise `FEAT_VGE_HOST_THEMED_STYLES`.
 ///
 /// "Empty" is about the accents alone. They are the part a client
-/// cannot do without — every chrome element keys off one — and the part
-/// that predates the rest, so a host that publishes accents but no
-/// [`HostThemeColors`] still themes styles, and a client that knows
-/// only about accents sees exactly what it saw before.
+/// cannot do without — every chrome element keys off one — so a host
+/// that publishes accents but no [`HostThemeColors`] still themes
+/// styles, and a client that knows only about accents sees exactly what
+/// it saw before.
 #[derive(Debug, Clone, Default)]
 pub struct HostThemePalette {
-    /// Ordered accent slots. `host.accent.{n}` resolves to `accents[n-1]`;
-    /// the contextual `host.accent` resolves to `accents[depth % len]`.
-    pub accents: Vec<command::Color>,
-    /// Text over each accent, slot for slot: `host.text.on_accent.{n}`
-    /// resolves to `on_accents[n-1]`, and the contextual
-    /// `host.text.on_accent` follows the contextual accent — text picked
-    /// against slot 1 is wrong on a slot 2 of the opposite lightness.
-    /// Empty (or short) falls back to `colors.text_on_accent`.
-    pub on_accents: Vec<command::Color>,
+    /// Ordered accent slots, each with its text. `host.accent.{n}` and
+    /// `host.text.on_accent.{n}` resolve to `accents[n-1]`; the
+    /// contextual `host.accent` / `host.text.on_accent` to
+    /// `accents[depth % len]`.
+    pub accents: Vec<HostSwatch>,
+    /// The theme's named swatches: `host.swatch.<name>` and
+    /// `host.swatch.<name>.text`. What a client's `--accent orange`
+    /// looks up, so it paints the theme's orange rather than its own.
+    pub swatches: Vec<HostSwatch>,
     /// The rest of the namespace. `None` when the host publishes only
     /// accents — a client then falls back to its own chrome colours.
     pub colors: Option<HostThemeColors>,
@@ -695,17 +749,11 @@ impl HostThemePalette {
         self.accents.is_empty()
     }
 
-    /// The contextual accent (`host.accent`) for a VGE engine at the given
-    /// tree depth, as a straight RGBA8 quad. `None` for an empty palette.
-    /// Clients read this from the probe to derive their own shades from
-    /// the same accent they reference by `StyleRef`.
-    pub fn contextual_rgba8(&self, depth: u32) -> Option<[u8; 4]> {
-        if self.accents.is_empty() {
-            return None;
-        }
-        let c = self.accents[(depth as usize) % self.accents.len()];
-        let q = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u8;
-        Some([q(c.r), q(c.g), q(c.b), q(c.a)])
+    /// The accent slot the contextual `host.accent` resolves to for a
+    /// VGE engine at the given tree depth. `None` for an empty palette.
+    pub fn contextual_accent(&self, depth: u32) -> Option<&HostSwatch> {
+        (!self.accents.is_empty())
+            .then(|| &self.accents[(depth as usize) % self.accents.len()])
     }
 
     /// The eight non-accent colours as a VGE engine at the given tree
@@ -715,35 +763,81 @@ impl HostThemePalette {
     /// [`Self::entries`] seeds, so the three cannot disagree.
     pub fn contextual_colors(&self, depth: u32) -> Option<HostThemeColors> {
         let mut colors = self.colors?;
-        if !self.accents.is_empty()
-            && let Some(c) = self
-                .on_accents
-                .get((depth as usize) % self.accents.len())
-        {
-            colors.text_on_accent = *c;
+        if let Some(accent) = self.contextual_accent(depth) {
+            colors.text_on_accent = accent.text;
         }
         Some(colors)
+    }
+
+    /// The palette as `doc/portal-extension.md` §10 reports it to a
+    /// client at the given depth — the probe tail and the
+    /// `HostThemeChanged` body. The accent list starts at this depth's
+    /// own slot, so whoever reads it can keep rotating from there
+    /// without knowing how deep it is. `None` for an empty palette.
+    pub fn to_wire(&self, depth: u32) -> Option<prt_protocol::envelope::HostTheme> {
+        let accent = self.contextual_accent(depth)?;
+        let n = self.accents.len();
+        let from = (depth as usize) % n;
+        Some(prt_protocol::envelope::HostTheme {
+            accent: rgba8(accent.fill),
+            colors: self
+                .contextual_colors(depth)
+                .map(HostThemeColors::to_rgba8),
+            accents: (0..n)
+                .map(|i| self.accents[(from + i) % n].to_wire())
+                .collect(),
+            swatches: self.swatches.iter().map(HostSwatch::to_wire).collect(),
+        })
+    }
+
+    /// Inverse of [`Self::to_wire`]: the palette a party that hosts
+    /// portals of its own adopts from the renderer's report. The report
+    /// is already rotated to the reader's depth, so it becomes this
+    /// palette's slot 1. A report with no accent list (a host that
+    /// predates it) is one accent, with the theme block's text.
+    pub fn from_wire(theme: &prt_protocol::envelope::HostTheme) -> Self {
+        let colors = theme.colors.map(HostThemeColors::from_rgba8);
+        let accents = if theme.accents.is_empty() {
+            vec![HostSwatch {
+                name: String::new(),
+                fill: from_rgba8(theme.accent),
+                text: colors.map_or(
+                    command::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    |c| c.text_on_accent,
+                ),
+            }]
+        } else {
+            theme.accents.iter().map(HostSwatch::from_wire).collect()
+        };
+        Self {
+            accents,
+            swatches: theme.swatches.iter().map(HostSwatch::from_wire).collect(),
+            colors,
+        }
     }
 
     /// Style-table entries this palette contributes for a VGE engine at
     /// the given tree depth (host = 0). Empty when the palette is empty.
     fn entries(&self, depth: u32) -> Vec<(String, ConcreteStyle)> {
-        if self.accents.is_empty() {
+        let Some(accent) = self.contextual_accent(depth) else {
             return Vec::new();
-        }
-        let mut out = Vec::with_capacity(self.accents.len() + 9);
-        let idx = (depth as usize) % self.accents.len();
-        out.push(("host.accent".to_string(), ConcreteStyle::Flat(self.accents[idx])));
-        for (i, c) in self.accents.iter().enumerate() {
-            out.push((format!("host.accent.{}", i + 1), ConcreteStyle::Flat(*c)));
+        };
+        let mut out = Vec::with_capacity(2 * (self.accents.len() + self.swatches.len()) + 10);
+        out.push(("host.accent".to_string(), ConcreteStyle::Flat(accent.fill)));
+        for (i, a) in self.accents.iter().enumerate() {
+            out.push((format!("host.accent.{}", i + 1), ConcreteStyle::Flat(a.fill)));
         }
         if let Some(colors) = self.contextual_colors(depth) {
             for (id, c) in HostThemeColors::IDS.iter().zip(colors.as_array()) {
                 out.push(((*id).to_string(), ConcreteStyle::Flat(c)));
             }
-            for (i, c) in self.on_accents.iter().enumerate() {
-                out.push((format!("host.text.on_accent.{}", i + 1), ConcreteStyle::Flat(*c)));
+            for (i, a) in self.accents.iter().enumerate() {
+                out.push((format!("host.text.on_accent.{}", i + 1), ConcreteStyle::Flat(a.text)));
             }
+        }
+        for s in self.swatches.iter().filter(|s| is_swatch_name(&s.name)) {
+            out.push((format!("host.swatch.{}", s.name), ConcreteStyle::Flat(s.fill)));
+            out.push((format!("host.swatch.{}.text", s.name), ConcreteStyle::Flat(s.text)));
         }
         out
     }
@@ -2805,13 +2899,58 @@ mod tests {
         }
     }
 
+    /// Red / green / blue accents, each with the same text (`r = 0.7`,
+    /// the value the theme-colour test expects at `host.text.on_accent`).
     fn palette_rgb() -> HostThemePalette {
         let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
+        let slot = |fill| HostSwatch {
+            name: String::new(),
+            fill,
+            text: c(0.7, 0.0, 0.0),
+        };
         HostThemePalette {
-            accents: vec![c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)],
-            on_accents: Vec::new(),
+            accents: vec![
+                slot(c(1.0, 0.0, 0.0)),
+                slot(c(0.0, 1.0, 0.0)),
+                slot(c(0.0, 0.0, 1.0)),
+            ],
+            swatches: Vec::new(),
             colors: None,
         }
+    }
+
+    /// A theme's named swatches are seeded with their text beside them,
+    /// and a name that could not be told apart from the `.text` suffix
+    /// is left out rather than published half-addressable.
+    #[test]
+    fn seed_host_styles_publishes_named_swatches() {
+        let c = |r, g, b| command::Color { r, g, b, a: 1.0 };
+        let palette = HostThemePalette {
+            swatches: vec![
+                HostSwatch { name: "orange".into(), fill: c(1.0, 0.5, 0.0), text: c(0.1, 0.1, 0.1) },
+                HostSwatch { name: "a.text".into(), fill: c(0.0, 0.0, 0.0), text: c(0.0, 0.0, 0.0) },
+            ],
+            ..palette_rgb()
+        };
+        let mut engine = VgeEngine::new((9, 20), 1.0);
+        engine.seed_host_styles(palette, 0);
+        let styles = &engine.state.shared.styles;
+        assert!((flat_g(styles, "host.swatch.orange") - 0.5).abs() < 1e-3);
+        assert!((flat_g(styles, "host.swatch.orange.text") - 0.1).abs() < 1e-3);
+        assert!(!styles.contains_key("host.swatch.a.text"));
+    }
+
+    /// What the probe reports starts the accent list at the reader's own
+    /// depth, and reading it back makes that slot 1 — so a daemon that
+    /// adopts it rotates onward from the accent its client was shown.
+    #[test]
+    fn the_wire_palette_rotates_to_the_readers_depth() {
+        let wire = palette_rgb().to_wire(1).unwrap();
+        assert_eq!(wire.accent, [0, 255, 0, 255]);
+        let back = HostThemePalette::from_wire(&wire);
+        let greens: Vec<f32> = back.accents.iter().map(|a| a.fill.g).collect();
+        assert_eq!(greens, [1.0, 0.0, 0.0]);
+        assert_eq!(back.accents[1].fill.b, 1.0, "then blue, as at depth 2");
     }
 
     fn flat_g(styles: &HashMap<String, ConcreteStyle>, id: &str) -> f32 {

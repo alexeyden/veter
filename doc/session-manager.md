@@ -144,12 +144,14 @@ going:
   that attached, or the defaults if there has not been one. Sessions
   outlive renderers, and a program started in a detached session must
   still be able to probe and draw. It should not have to know which
-  state it was started in. The accent it reports is borrowed the same
-  way: the daemon paints nothing, so it adopts the `host.accent` the
-  attaching renderer reported (portal-extension.md §10) as a one-slot
-  palette. That one color answers at every depth — the probe carries
-  the renderer's contextual accent, not its whole palette — until a
-  renderer attaches and re-seeds its own.
+  state it was started in. The palette it reports is borrowed the same
+  way: the daemon paints nothing, so it adopts the `host.*` palette
+  the attaching renderer reported (portal-extension.md §10) — accents,
+  swatches and the eight theme colours — until a renderer attaches
+  and re-seeds its own. The probe's accent list starts at the slot the
+  renderer resolved for the daemon's own depth, so it becomes the
+  daemon's slot 1 and nested portals rotate onward from it as they
+  would under the renderer.
 
 These are one decision rather than two: **the daemon answers exactly
 those chunks it does not forward**, decided under the same lock that

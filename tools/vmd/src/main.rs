@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow, bail};
 
 use vge_protocol::codec::Point;
 use vge_protocol::command::{
-    Color, Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, Retention,
+    Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, Retention,
     UpdateCommandsBody, UploadImageBody,
 };
 use vge_protocol::encode::build_envelope;
@@ -99,7 +99,8 @@ With no FILE, reads the document from standard input.
 Options:
   -w, --width <COLS>   reading measure, in characters (0 = fill the pane)
   -z, --zoom <FACTOR>  initial text size (1.0 = the terminal's own)
-  -A, --accent <COLOR> chrome accent: a name, or #rgb / #rrggbb / #rrggbbaa
+  -A, --accent <COLOR> chrome accent: a name (the terminal theme's colour
+                       for it), or #rgb / #rrggbb / #rrggbbaa
   -h, --help           show this help
   -V, --version        show the version
 ";
@@ -1209,7 +1210,7 @@ fn sweep() -> Vec<u8> {
 /// (portal-extension §2.1 / §10), so vmd's chrome tracks veter's theme
 /// and, inside a vmux pane, that pane's nesting depth. Best-effort: a
 /// terminal that does not speak PRT leaves vmd on its built-in colours.
-fn probe_host_theme(timeout: Duration) -> Option<(Color, Option<[[u8; 4]; 8]>)> {
+fn probe_host_theme(timeout: Duration) -> Option<prt_protocol::envelope::HostTheme> {
     use prt_protocol::frame::MARKER_T2C;
 
     let env = prt_protocol::encode::build_envelope(&[(prt_protocol::command::Command::Probe, 0)]);
@@ -1231,68 +1232,9 @@ fn probe_host_theme(timeout: Duration) -> Option<(Color, Option<[[u8; 4]; 8]>)> 
             return None;
         }
         if let Some(payload) = apc.feed(&buf[..n]).into_payloads().next() {
-            return parse_prt_theme(&payload);
+            return prt_protocol::envelope::ProbeBody::from_payload(&payload)?.theme;
         }
     }
-}
-
-/// Pull the themed palette out of a PRT ProbeResponse payload: the
-/// accent, and the eight-colour theme block behind it. Both follow the
-/// `vge_features` byte (§10) and are present only when the host sets
-/// `FEAT_VGE_HOST_THEMED_STYLES`; a short body (older host) reads the
-/// trailing fields as absent.
-fn parse_prt_theme(payload: &[u8]) -> Option<(Color, Option<[[u8; 4]; 8]>)> {
-    use prt_protocol::frame::{FEAT_VGE_HOST_THEMED_STYLES, RSP_PROBE};
-
-    let mut r = prt_protocol::Reader::new(payload);
-    let _ = r.u8(); // payload protocol_version
-    let _ = r.u32(); // payload_length
-    if r.u8().ok()? != RSP_PROBE {
-        return None;
-    }
-    let _ = r.u32(); // request_id
-    let _ = r.u32(); // body_length
-    let _ = r.u16(); // protocol_version
-    let _ = r.u32(); // max_portals
-    let _ = r.u32(); // max_portal_cells_w
-    let _ = r.u32(); // max_portal_cells_h
-    let _ = r.u32(); // max_scrollback_lines
-    let _ = r.u32(); // max_write_bytes
-    let _ = r.u8(); // features
-    let _ = r.u8(); // max_nesting_depth
-    let vge_features = r.u8().unwrap_or(0); // §10 trailing byte
-    if vge_features & FEAT_VGE_HOST_THEMED_STYLES == 0 {
-        return None;
-    }
-    let mut quad = || match (r.u8(), r.u8(), r.u8(), r.u8()) {
-        (Ok(a), Ok(b), Ok(c), Ok(d)) => Some([a, b, c, d]),
-        _ => None,
-    };
-    let [red, green, blue, alpha] = quad()?;
-    // All eight or none — half a palette is worse than none of it.
-    let colors = {
-        let mut quads = [[0u8; 4]; 8];
-        let mut all = true;
-        for slot in &mut quads {
-            match quad() {
-                Some(q) => *slot = q,
-                None => {
-                    all = false;
-                    break;
-                }
-            }
-        }
-        all.then_some(quads)
-    };
-    Some((
-        Color {
-            r: red as f32 / 255.0,
-            g: green as f32 / 255.0,
-            b: blue as f32 / 255.0,
-            a: alpha as f32 / 255.0,
-        },
-        colors,
-    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1303,7 +1245,7 @@ struct Args {
     path: Option<PathBuf>,
     measure: Option<f32>,
     zoom: f32,
-    accent: Option<u32>,
+    accent: Option<theme::AccentSpec>,
 }
 
 fn parse_args() -> Result<Option<Args>> {
@@ -1346,7 +1288,7 @@ fn parse_args() -> Result<Option<Args>> {
             }
             a if a == "-A" || a == "--accent" || a.starts_with("--accent=") => {
                 let v = value("--accent", a)?;
-                accent = Some(theme::parse_accent_color(&v).map_err(|e| anyhow!(e))?);
+                accent = Some(theme::parse_accent(&v).map_err(|e| anyhow!(e))?);
             }
             s if s.starts_with('-') && s.len() > 1 => bail!("unknown option: {s}"),
             s if path.is_none() => path = Some(PathBuf::from(s)),
@@ -1416,13 +1358,11 @@ fn main() -> Result<()> {
     // text — those describe the terminal vmd is drawing on, not which
     // colour its chrome should be.
     let host = probe_host_theme(PROBE_TIMEOUT);
-    match (args.accent, host) {
-        (Some(rgba), _) => theme::set_cli_accent(theme::unpack(rgba)),
-        (None, Some((accent, _))) => theme::set_host_accent(accent),
-        (None, None) => {}
+    if let Some(host) = &host {
+        theme::adopt_host_theme(host);
     }
-    if let Some((_, Some(quads))) = host {
-        theme::set_host_theme(theme::HostColors::from_rgba8(quads));
+    if let Some(spec) = args.accent {
+        theme::set_cli_accent(spec);
     }
 
     let (cols, rows) = term_size();

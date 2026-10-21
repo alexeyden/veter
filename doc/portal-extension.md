@@ -1072,6 +1072,10 @@ u8 accent_a          ; straight RGBA8 that `host.accent` resolves to
                      ; for the engine that emitted this
 [u8 r, g, b, a] × 8  ; optional — the eight `host.*` theme colours,
                      ; in the order §10 lists them
+u8 accent_count      ; optional, only after the eight — the accent
+Swatch × count       ; rotation and the named swatches, exactly as
+u8 swatch_count      ; the probe carries them (§10)
+Swatch × count
 ```
 
 The host's `host.*` palette (VGE §7.3) has changed. Emitted only when
@@ -1089,9 +1093,11 @@ told, and redraws them.
 The accent is the one *this* engine's depth resolves to, so a client
 never does depth arithmetic — the same rule as the probe (§10). The
 eight theme colours are carried whole, with `host.text.on_accent` the
-one for that same accent, as in the probe. The
-block is all-or-nothing: a body that stops after the accent carries no
-theme colours, exactly as in the probe.
+one for that same accent, as in the probe, and the accent rotation
+and swatches follow on the same terms. Each part is all-or-nothing: a
+body that stops after the accent carries no theme colours, exactly as
+in the probe. A client that resolved a color name against the old
+swatches resolves it again against the new ones.
 
 The id is empty because a theme belongs to the terminal, not to a
 pane. A client that dispatches events by portal id must not treat the
@@ -1321,6 +1327,44 @@ depth — the text for *that* accent (VGE §7.3). A client uses them for what
 a `StyleRef` cannot express: a modal ground at partial opacity, a
 scrollbar thumb derived from `host.fg`, a shade between `host.surface`
 and `host.bg`.
+
+After the eight colors come two lists, each a count followed by that
+many entries of the same shape:
+
+```
+u8  accent_count
+Swatch × accent_count           // the accent rotation, starting at the
+                                // probing engine's own slot
+u8  swatch_count
+Swatch × swatch_count           // the theme's named swatches
+
+Swatch:
+  string name                   // empty for an accent given as a literal
+  u8 ×4  fill                   // straight RGBA8
+  u8 ×4  text                   // straight RGBA8 text over `fill`
+```
+
+The **accent rotation** is the host's whole accent list, rotated so
+that entry 0 is the accent this engine resolves (`accent_r..a` above)
+and entry 1 is what a portal one level further in resolves, wrapping.
+A client that is itself a host — a session daemon, which runs portals
+of its own on behalf of whoever probes it — adopts it as its own slot
+list and rotates onward from there, with no depth arithmetic. An entry
+whose name is non-empty is the swatch of that name.
+
+The **swatches** are colors the theme names (VGE §7.3,
+`host.swatch.<name>`), each with the text the theme picked for it. They
+are what a client resolves a color *name* against — `vmux --accent
+orange` — so that it paints the terminal theme's orange, with text
+chosen for it, rather than a color of its own that may clash with the
+theme. A host that publishes swatches SHOULD include at least `red`,
+`orange`, `yellow`, `green`, `cyan`, `blue`, `magenta` and `purple`. A
+name it does not publish falls back to the client's own color.
+
+Both lists are positional and all-or-nothing, like the block before
+them: they can follow only the eight colors, the swatch list only the
+accent list, and a body that stops part-way through one carries
+neither it nor anything after it.
 
 **VGE inside a portal.** When `vge_in_portal` is set, every portal
 owns a private VGE engine that operates in the portal's cell

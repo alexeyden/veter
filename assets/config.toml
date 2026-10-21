@@ -66,7 +66,9 @@
 # vmux and the other in-terminal tools draw their chrome (pane outlines, tabs,
 # titles) from them: slot 1 is `host.accent.1`, and the contextual
 # `host.accent` rotates through the list by portal nesting depth. Any length
-# >= 1; unset, blue/green/magenta are taken from `ansi`.
+# >= 1; unset, blue/magenta/cyan are taken from `ansi`. Each entry is a
+# "#hex" colour or the name of a swatch (below), which brings that swatch's
+# text with it.
 #
 # They are a field of the theme rather than a section of their own because
 # `text_on_accent` and the search-panel tint are *derived from* the accent —
@@ -83,6 +85,17 @@
 # per-client to set.
 # accents = ["#56799f", "#9f5685", "#9f7c56"]   # muted blue / plum / amber
 #
+# Swatches: named colours, each with the text that goes on it, published as
+# `host.swatch.<name>`. They are what `vmux --accent orange` (and vfm's and
+# vmd's) looks up, so a nested multiplexer paints this theme's orange with
+# text the theme chose, rather than a colour of its own. Every theme answers
+# red, orange, yellow, green, cyan, blue, magenta and purple — the built-ins
+# from their scheme's own palette, any other from the bright half of `ansi`.
+# Pin one by name, or add your own (letters, digits, '-', '_'); the rest stay.
+# A bare colour derives its text; a table pins it too.
+# [theme.swatches]
+# orange = { fill = "#b15c00", text = "#f0f0f0" }
+# seafoam = "#5fb3a1"
 # `cursor` and the selection pair are optional. Unset, both keep veter's
 # built-in look: the cell drawn in reverse video. Setting only `selection_bg`
 # fills behind the selected cell and leaves each character its own colour.

@@ -787,7 +787,7 @@ fn apply_probe(
         guard.vge.set_dimensions(cell_px, vge.scale_factor);
         guard.prt.set_metrics(cell_px, vge.scale_factor);
     }
-    let Some(palette) = outcome.prt.and_then(accent_palette) else {
+    let Some(palette) = outcome.prt.as_ref().and_then(accent_palette) else {
         return Vec::new();
     };
     // §7.3 — the daemon paints nothing, so it has no palette of its
@@ -837,16 +837,10 @@ fn apply_probe(
 /// the palette.
 fn theme_announcement(palette: &veter_host::vge::HostThemePalette) -> Vec<u8> {
     // Depth 0: the session's client is the top-level one.
-    let Some(accent) = palette.contextual_rgba8(0) else {
+    let Some(theme) = palette.to_wire(0) else {
         return Vec::new();
     };
-    let body = prt_protocol::envelope::host_theme_changed_body(
-        "",
-        accent,
-        palette
-            .contextual_colors(0)
-            .map(veter_host::vge::HostThemeColors::to_rgba8),
-    );
+    let body = prt_protocol::envelope::host_theme_changed_body("", &theme);
     let mut frames = Vec::new();
     prt_protocol::envelope::append_frame(
         &mut frames,
@@ -882,8 +876,16 @@ mod theme_announcement_tests {
             warn: color(1.0, 0.0, 0.0),
         };
         let palette = veter_host::vge::HostThemePalette {
-            accents: vec![color(1.0, 0.0, 0.0)],
-            on_accents: Vec::new(),
+            accents: vec![veter_host::vge::HostSwatch {
+                name: String::new(),
+                fill: color(1.0, 0.0, 0.0),
+                text: color(1.0, 1.0, 1.0),
+            }],
+            swatches: vec![veter_host::vge::HostSwatch {
+                name: "orange".into(),
+                fill: color(1.0, 0.5, 0.0),
+                text: color(0.0, 0.0, 0.0),
+            }],
             colors: Some(colors),
         };
 
@@ -903,11 +905,11 @@ mod theme_announcement_tests {
         let body_len = r.u32().unwrap() as usize;
         let body = r.take(body_len).unwrap();
 
-        let (id, accent, got) =
-            prt_protocol::envelope::parse_host_theme_changed(body).unwrap();
+        let (id, theme) = prt_protocol::envelope::parse_host_theme_changed(body).unwrap();
         assert_eq!(id, "", "the host itself names no portal");
-        assert_eq!(accent, [255, 0, 0, 255]);
-        assert_eq!(got, Some(colors.to_rgba8()));
+        assert_eq!(theme.accent, [255, 0, 0, 255]);
+        assert_eq!(theme.colors, Some(colors.to_rgba8()));
+        assert_eq!(theme.swatches[0].name, "orange", "a --accent name can re-resolve");
         assert!(r.at_end(), "exactly one frame");
     }
 
@@ -923,33 +925,18 @@ mod theme_announcement_tests {
 
 /// The renderer's `host.*` palette, if it themes them at all.
 ///
-/// The probe reports one *accent* — the one `host.accent` resolves to
-/// at the probing engine's depth — not the renderer's whole accent
-/// list, so every depth inside the session resolves to that same
-/// accent while the daemon is the one answering. The theme block's
-/// text over the accent is likewise the one for that accent, so it
-/// stays the fallback `colors.text_on_accent` with no per-slot list:
-/// one accent, one text. The rest of the palette does not vary with
-/// depth and comes across whole. A renderer re-seeds its own palette
-/// over all of it on attach.
-fn accent_palette(prt: probe::PrtProbeData) -> Option<veter_host::vge::HostThemePalette> {
+/// The probe reports the accent rotation starting at the probing
+/// engine's own slot, which is exactly where the session's client sits
+/// — so it becomes the daemon's slot 1, and a portal one level in gets
+/// what that renderer would have shown one level in. The swatches and
+/// the rest of the palette do not vary with depth and come across
+/// whole. A renderer re-seeds its own palette over all of it on attach.
+fn accent_palette(prt: &probe::PrtProbeData) -> Option<veter_host::vge::HostThemePalette> {
     use prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES;
     if prt.vge_features? & FEAT_VGE_HOST_THEMED_STYLES == 0 {
         return None;
     }
-    let [r, g, b, a] = prt.accent_rgba?;
-    Some(veter_host::vge::HostThemePalette {
-        accents: vec![vge_protocol::command::Color {
-            r: f32::from(r) / 255.0,
-            g: f32::from(g) / 255.0,
-            b: f32::from(b) / 255.0,
-            a: f32::from(a) / 255.0,
-        }],
-        on_accents: Vec::new(),
-        colors: prt
-            .theme_rgba
-            .map(veter_host::vge::HostThemeColors::from_rgba8),
-    })
+    Some(veter_host::vge::HostThemePalette::from_wire(prt.theme.as_ref()?))
 }
 
 /// Detach hotkey prefix byte. Per `doc/session-manager.md` §6 vsd
@@ -1745,8 +1732,7 @@ mod tests {
             features: 0xFF,
             max_nesting_depth: 8,
             vge_features: None,
-            accent_rgba: None,
-            theme_rgba: None,
+            theme: None,
         };
         let mut frames = Vec::new();
         prt_protocol::envelope::append_frame(
@@ -1827,8 +1813,12 @@ mod tests {
                 features: 0,
                 max_nesting_depth: 8,
                 vge_features: Some(prt_protocol::frame::FEAT_VGE_HOST_THEMED_STYLES),
-                accent_rgba: Some([0x12, 0x34, 0x56, 0xFF]),
-                theme_rgba: None,
+                theme: Some(prt_protocol::envelope::HostTheme {
+                    accent: [0x12, 0x34, 0x56, 0xFF],
+                    colors: None,
+                    accents: Vec::new(),
+                    swatches: Vec::new(),
+                }),
             }),
             winsize: None,
             typeahead: Vec::new(),
