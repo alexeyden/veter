@@ -6283,15 +6283,33 @@ impl ApplicationHandler for App {
     }
 }
 
+const USAGE: &str = "\
+Usage: veter [-e <command> [args...]]
+
+Options:
+  -e, --command <command> [args...]
+                 Run <command> instead of the default program. Everything
+                 after it is passed to the command.
+  -h, --help     Print this help and exit.
+  -V, --version  Print the version and exit.
+
+Without -e, veter runs vmux (next to the veter binary, then on $PATH),
+falling back to $SHELL, then /bin/sh. Use e.g. `veter -e bash` to skip
+vmux.";
+
 fn main() {
-    // Before the window: `--version` has to answer from a terminal.
-    // Stop at `-e`, so a flag belonging to the entry-point command
-    // (`veter -e vplay --version`) stays that command's business.
-    if std::env::args()
+    // Before the window: `--version` and `--help` have to answer from a
+    // terminal. Stop at `-e`, so a flag belonging to the entry-point
+    // command (`veter -e vplay --version`) stays that command's business.
+    let own_args: Vec<String> = std::env::args()
         .skip(1)
         .take_while(|a| a != "-e" && a != "--command")
-        .any(|a| a == "--version" || a == "-V")
-    {
+        .collect();
+    if own_args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    if own_args.iter().any(|a| a == "--version" || a == "-V") {
         println!(
             "veter {}",
             veter_version::long_version(env!("CARGO_PKG_VERSION"))
