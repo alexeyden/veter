@@ -28,7 +28,7 @@
 //! built-in table below, a user file at `<config>/themes/<name>.toml`,
 //! and per-key overrides in the config's own `[theme]` section. All
 //! three share one schema — a user file is a `Theme` with the keys it
-//! cares about, merged onto the default.
+//! cares about, merged onto an unpinned base (see [`load_file`]).
 
 use std::path::Path;
 
@@ -282,7 +282,12 @@ pub const SWATCH_NAMES: [&str; 8] = [
 /// everything, so a config with no `[theme]` section is identical to
 /// veter before themes existed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+// Missing keys fall back to the *unpinned* base, not to `Default`: a
+// pin left unset is skipped when [`merge`] round-trips a theme through
+// TOML (which has no null), so reading it back with veter's pins as
+// the fallback turned every scheme's derived surfaces into veter's
+// dark ones the moment any `[theme]` key was overridden.
+#[serde(default = "scheme_base")]
 pub struct Theme {
     /// The ANSI-16 table. Indices 16..=255 are the standard 6×6×6 cube
     /// and greyscale ramp, computed rather than stored.
@@ -775,8 +780,11 @@ pub fn resolve(section: &toml::Table, config_dir: Option<&Path>) -> Theme {
 }
 
 /// Load `<config_dir>/themes/<name>.toml` as a theme: the keys it sets,
-/// merged onto the built-in default so a file carrying only a scheme's
-/// palette still gets a complete look (everything else derives).
+/// merged onto [`scheme_base`] — nothing pinned, so a file carrying only
+/// a scheme's palette gets surfaces, text, accents and swatches derived
+/// from *that* palette, the way the scheme built-ins do. Merging onto
+/// the `veter` default instead handed every such file veter's own dark
+/// panels and muted accents, whatever its background.
 fn load_file(config_dir: Option<&Path>, name: &str) -> Option<Theme> {
     // The name indexes a directory, so it must not be able to walk out
     // of one.
@@ -799,7 +807,7 @@ fn load_file(config_dir: Option<&Path>, name: &str) -> Option<Theme> {
             return None;
         }
     };
-    Some(merge(Theme::default(), &table, &path.display().to_string()))
+    Some(merge(scheme_base(), &table, &path.display().to_string()))
 }
 
 /// Apply `overrides` onto `base`, key by key. Round-tripping through a
@@ -1102,6 +1110,19 @@ fn nord() -> Theme {
         selection_fg: None,
         accents: [c(0x88c0d0), c(0xb48ead), c(0x81a1c1)].map(Accent::from).to_vec(),
         swatches: swatch_set([0xbf616a, 0xd08770, 0xebcb8b, 0xa3be8c, 0x88c0d0, 0x81a1c1, 0xb48ead, 0xb48ead]),
+        ..derived()
+    }
+}
+
+/// What a user theme file is laid over: [`derived`], with the three
+/// required fields taken from the default so a file that leaves one out
+/// still has a grid to draw — and everything else free to derive.
+fn scheme_base() -> Theme {
+    let veter = veter();
+    Theme {
+        ansi: veter.ansi,
+        background: veter.background,
+        foreground: veter.foreground,
         ..derived()
     }
 }
@@ -1574,10 +1595,28 @@ mod tests {
         );
     }
 
-    /// A user theme file is the same schema, merged onto the default,
-    /// and cannot be used to read a file outside the themes directory.
+    /// Overriding one key of a scheme keeps the rest of it as the
+    /// scheme had it — derived where the scheme derives — rather than
+    /// filling every unpinned field with veter's own chrome.
     #[test]
-    fn a_user_theme_file_merges_onto_the_default() {
+    fn an_override_keeps_the_schemes_derived_fields() {
+        let section: toml::Table =
+            toml::from_str("name = \"tokyonight-day\"\ncursor = \"#ff0000\"").unwrap();
+        let t = resolve(&section, None);
+        assert_eq!(t.cursor, Some(Rgba::rgb(255, 0, 0)));
+        let day = builtin("tokyonight-day").unwrap();
+        assert_eq!(t.surface, None);
+        assert_eq!(t.surface(), day.surface());
+        assert_eq!(t.text_on_accent, day.text_on_accent);
+        assert_eq!(t.swatches, day.swatches);
+    }
+
+    /// A user theme file is the same schema, merged onto an unpinned
+    /// base — so what it leaves out derives from what it gives rather
+    /// than being veter's own dark chrome — and cannot be used to read
+    /// a file outside the themes directory.
+    #[test]
+    fn a_user_theme_file_derives_what_it_leaves_out() {
         let dir = std::env::temp_dir().join(format!("veter-theme-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("themes")).unwrap();
         std::fs::write(
@@ -1590,8 +1629,26 @@ mod tests {
         let t = resolve(&section, Some(&dir));
         assert_eq!(t.background, Rgba::rgb(10, 11, 12));
         assert_eq!(t.foreground, Rgba::rgb(250, 251, 252));
-        // Unset keys come from the default theme.
+        // A required key it leaves out comes from the default theme…
         assert_eq!(t.ansi[1], Theme::default().ansi[1]);
+        // …and nothing veter pins for itself does: the chrome derives
+        // from this file's own ground and ink.
+        assert_eq!(t.surface, None);
+        assert_eq!(t.surface(), t.background.mix(t.foreground, 0.10));
+        assert_eq!(t.text(), t.foreground);
+        assert!(t.accents.is_empty() && t.swatches.is_empty());
+        assert_eq!(t.accents(), vec![t.ansi[12], t.ansi[13], t.ansi[14]]);
+
+        // A light scheme gets a light panel, not veter's dark one.
+        std::fs::write(
+            dir.join("themes").join("light.toml"),
+            "background = \"#f0f0f0\"\nforeground = \"#202020\"\n",
+        )
+        .unwrap();
+        let section: toml::Table = toml::from_str(r#"name = "light""#).unwrap();
+        let t = resolve(&section, Some(&dir));
+        assert!(t.surface().luminance() > 0.8, "{:?}", t.surface());
+        assert!(t.text_on_accent().luminance() > 0.8 || t.accent_primary().luminance() > 0.55);
 
         for escape in ["../mine", "..", ".mine"] {
             let section: toml::Table = toml::Table::from_iter([("name".into(), escape.into())]);

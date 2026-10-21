@@ -42,9 +42,10 @@
 #
 # A name that is not one of those is looked up as
 # $XDG_CONFIG_HOME/veter/themes/<name>.toml — same schema as the keys below,
-# merged onto the default, so any published scheme can be dropped in without
-# a rebuild. A file only has to give `ansi`, `background` and `foreground`;
-# everything else is derived from those unless it is named.
+# so any published scheme can be dropped in without a rebuild. A file only
+# has to give `ansi`, `background` and `foreground`; everything else
+# (surfaces, text, accents, swatches) is derived from those unless it is
+# named — none of veter's own pinned chrome carries over.
 #
 # Any key below overrides the named theme's own value.
 [theme]
