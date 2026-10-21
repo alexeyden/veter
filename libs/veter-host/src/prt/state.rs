@@ -553,6 +553,13 @@ impl PrtEngine {
                 content.children.set_host_palette(palette.clone());
             }
         }
+        // Only to a client that speaks PRT (see `client_spoke`). veter
+        // seeds its palette at startup, before anything has run on the
+        // pty, so without this every plain shell — `veter -e bash`, or
+        // a non-PRT program in a portal — got the event typed at it.
+        if !self.client_spoke {
+            return;
+        }
         if let Some(theme) = palette.to_wire(depth) {
             self.emit_event(EVT_HOST_THEME_CHANGED, host_theme_changed_body("", &theme));
         }
@@ -2447,6 +2454,8 @@ mod tests {
             warn: c(1.0, 0.0, 0.0),
         };
         let mut engine = PrtEngine::new();
+        // The client has probed, so it is one.
+        dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
         engine.set_host_palette(crate::vge::HostThemePalette {
             colors: Some(colors),
             ..rgb_palette()
@@ -2470,6 +2479,22 @@ mod tests {
         let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
         let (vge_features, _) = probe_vge_features_and_accent(&parsed.body);
         assert!(vge_features & FEAT_VGE_HOST_THEME_EVENTS != 0);
+    }
+
+    /// `veter -e bash`: the palette is seeded at startup, before the
+    /// shell has written a byte, and the shell must not be sent the
+    /// event — it would read it as typed input. A client that probes
+    /// afterwards still gets the palette, off the probe response.
+    #[test]
+    fn a_palette_is_not_announced_to_a_program_that_never_spoke_prt() {
+        let mut engine = PrtEngine::new();
+        engine.set_host_palette(rgb_palette());
+        engine.flush_pending_events();
+        assert!(engine.take_responses().is_empty(), "a plain shell was sent a PRT event");
+
+        let parsed = dispatch_one(&mut engine, CMD_PROBE, 1, &[]);
+        let (_, accent) = probe_vge_features_and_accent(&parsed.body);
+        assert_eq!(accent, Some([255, 0, 0, 255]));
     }
 
     #[test]
