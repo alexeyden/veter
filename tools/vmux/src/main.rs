@@ -24,6 +24,9 @@
 //! drawn with VGE elements. Keystrokes go to the focused pane's PTY
 //! master directly — no input crosses the PRT wire (§9.1).
 
+#[cfg(feature = "aero")]
+mod aero;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -505,6 +508,8 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
             lines,
         });
     }
+    #[cfg(feature = "aero")]
+    aero::restyle_separators(&mut cmds);
     CreateElementBody {
         id: SEPARATORS_ELEMENT_ID.to_string(),
         commands: cmds,
@@ -1443,6 +1448,11 @@ fn build_tabbar_commands(
 ) -> CreateElementBody {
     let host_wf = host_w as f32;
     let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
+    #[cfg(feature = "aero")]
+    if aero::enabled() {
+        let px = aero::Px { w: cell_pw, h: cell_ph };
+        return aero::tabbar(&layout, active, host_wf, px, activity);
+    }
 
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
@@ -1659,6 +1669,11 @@ fn build_chrome_commands(
     cell_ph: f32,
     scroll: Option<ScrollIndicator>,
 ) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if aero::enabled() {
+        let px = aero::Px { w: cell_pw, h: cell_ph };
+        return aero::pane_chrome(rect, title, focused, show_title, px, scroll);
+    }
     let pw = rect.w as f32;
     let ph = rect.h as f32;
     let mut cmds: Vec<DrawCmd> = Vec::new();
@@ -3879,6 +3894,10 @@ impl State {
     /// after) for whichever overlay the current mode wants up — rename
     /// prompt or help — or empty if no modal should be visible.
     fn build_modal_elements(&self) -> Vec<CreateElementBody> {
+        #[cfg(feature = "aero")]
+        if aero::enabled() {
+            return aero::modal_elements(self);
+        }
         match &self.mode {
             Mode::Rename { target, editor } => {
                 let title = match target {
@@ -4878,6 +4897,9 @@ fn parse_cli_args() -> Result<CliOptions> {
         match arg.as_str() {
             "--accent" | "-A" => opts.accent = Some(parse_accent_color(&take(&mut args)?)?),
             "--prefix" | "-P" => opts.prefix = Some(parse_prefix_key(&take(&mut args)?)?),
+            // Unlisted in `--help` on purpose; see `aero.rs`.
+            #[cfg(feature = "aero")]
+            "--style" => aero::select(&take(&mut args)?)?,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -4895,6 +4917,8 @@ fn parse_cli_args() -> Result<CliOptions> {
             other if other.starts_with("--prefix=") => {
                 opts.prefix = Some(parse_prefix_key(&other["--prefix=".len()..])?);
             }
+            #[cfg(feature = "aero")]
+            other if other.starts_with("--style=") => aero::select(&other["--style=".len()..])?,
             other => bail!("unknown argument: {other} (try --help)"),
         }
     }
