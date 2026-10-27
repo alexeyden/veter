@@ -13,6 +13,8 @@
 //! bytes. It owns no terminal state and performs no I/O — the consuming
 //! binary decides when to send what.
 
+#[cfg(feature = "aero")]
+pub mod aero;
 pub mod edit;
 pub mod input;
 pub mod measure;

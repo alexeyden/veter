@@ -27,6 +27,12 @@ use crate::icons::{self, IconBox};
 use crate::layout::{Area, Layout, View};
 use crate::thumbs::{Slot, Thumbs, stamp_of};
 
+/// A private Frutiger Aero style; see `vge_ui::aero`. A child of this
+/// module so it shares its geometry helpers.
+#[cfg(feature = "aero")]
+#[path = "aero.rs"]
+pub(crate) mod aero;
+
 /// Window backdrop on a terminal that publishes no theme — dark enough
 /// that the panes read as panels. Under a host theme it is the
 /// terminal's own background ([`backdrop_color`]).
@@ -133,6 +139,10 @@ pub fn column_row_at(
 }
 
 pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::column_commands(v, vge_ui::aero::Px { w: cell_pw, h: cell_ph });
+    }
     let a = v.area;
     let (rx, ry) = chrome_corner_radii(a.w, a.h, cell_pw, cell_ph);
     let mut cmds = vec![DrawCmd::FillPath {
@@ -218,6 +228,10 @@ pub struct GridView<'a> {
 }
 
 pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::grid_commands(v);
+    }
     let l = v.layout;
     let a = l.grid;
     let mut cmds: Vec<DrawCmd> = Vec::new();
@@ -507,6 +521,10 @@ pub struct StatusView<'a> {
 }
 
 pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::status_commands(v, vge_ui::aero::Px { w: cell_pw, h: cell_ph });
+    }
     let a = v.area;
     let (rx, ry) = chrome_corner_radii(a.w, a.h, cell_pw, cell_ph);
     let mut cmds = vec![DrawCmd::FillPath {

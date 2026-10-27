@@ -8,3 +8,8 @@ description = "Shared client-side widget toolkit for VGE-aware terminal apps: ac
 vge-protocol = { path = "../../protocol/vge" }
 prt-protocol = { path = "../../protocol/prt" }
 unicode-width = "0.2.1"
+
+[features]
+# A private Frutiger Aero style shared by vmux and vfm (`src/aero.rs`).
+# Off here; each client's own `aero` feature turns it on. Not for release.
+aero = []

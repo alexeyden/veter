@@ -1243,6 +1243,15 @@ impl App {
 
     // ── rendering ────────────────────────────────────────────────────
 
+    fn backdrop_commands(&self) -> Vec<DrawCmd> {
+        #[cfg(feature = "aero")]
+        if vge_ui::aero::enabled() {
+            let px = vge_ui::aero::Px { w: self.cell_pw, h: self.cell_ph };
+            return render::aero::backdrop(&self.layout, px);
+        }
+        render::backdrop(&self.layout)
+    }
+
     fn column_commands(&self, i: usize) -> Vec<DrawCmd> {
         let (Some(area), Some(col)) = (self.layout.ancestors.get(i), self.columns.get(i)) else {
             return Vec::new();
@@ -1305,6 +1314,10 @@ impl App {
 
     /// The modal elements for the current mode.
     fn modal_elements(&self) -> Vec<CreateElementBody> {
+        #[cfg(feature = "aero")]
+        if vge_ui::aero::enabled() {
+            return render::aero::modal_elements(self);
+        }
         match &self.mode {
             Mode::Normal => Vec::new(),
             Mode::Prompt { kind, editor } => vec![prompt_element(
@@ -1370,7 +1383,7 @@ impl App {
                 },
                 REQ_ID_NO_RESPONSE,
             ));
-            cmds.push(create(ID_BG, render::backdrop(&self.layout), ORDER_BG));
+            cmds.push(create(ID_BG, self.backdrop_commands(), ORDER_BG));
             for (i, id) in ID_COLS.iter().enumerate() {
                 cmds.push(create(id, self.column_commands(i), ORDER_PANE));
             }
@@ -1383,7 +1396,7 @@ impl App {
         }
 
         if self.dirty.bg {
-            cmds.push(update(ID_BG, render::backdrop(&self.layout)));
+            cmds.push(update(ID_BG, self.backdrop_commands()));
         }
         if self.dirty.columns {
             for (i, id) in ID_COLS.iter().enumerate() {
@@ -1576,6 +1589,16 @@ fn parse_args() -> Result<Option<Args>> {
                 return Ok(None);
             }
             "-a" | "--hidden" => hidden = true,
+            // Unlisted in `--help` on purpose; see `vge_ui::aero`.
+            #[cfg(feature = "aero")]
+            "--style" => {
+                let v = it.next().ok_or_else(|| anyhow!("--style needs a value"))?;
+                vge_ui::aero::select(&v).map_err(|e| anyhow!(e))?;
+            }
+            #[cfg(feature = "aero")]
+            s if s.starts_with("--style=") => {
+                vge_ui::aero::select(&s["--style=".len()..]).map_err(|e| anyhow!(e))?;
+            }
             "-l" | "--list" => view = View::List,
             "-A" | "--accent" => {
                 let v = it.next().ok_or_else(|| anyhow!("--accent needs a value"))?;

@@ -16,6 +16,7 @@ libc = "0.2"
 
 [features]
 default = ["aero"]
-# A private Frutiger Aero chrome (`src/aero.rs`), off unless
-# `VMUX_STYLE=aero` or `--style aero` asks for it. Not for release.
-aero = []
+# A private Frutiger Aero chrome (`src/aero.rs`, on `vge_ui::aero`),
+# off unless `VETER_STYLE=aero` or `--style aero` asks for it. Not for
+# release.
+aero = ["vge-ui/aero"]

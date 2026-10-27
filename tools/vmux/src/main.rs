@@ -1449,8 +1449,8 @@ fn build_tabbar_commands(
     let host_wf = host_w as f32;
     let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
     #[cfg(feature = "aero")]
-    if aero::enabled() {
-        let px = aero::Px { w: cell_pw, h: cell_ph };
+    if vge_ui::aero::enabled() {
+        let px = vge_ui::aero::Px { w: cell_pw, h: cell_ph };
         return aero::tabbar(&layout, active, host_wf, px, activity);
     }
 
@@ -1670,8 +1670,8 @@ fn build_chrome_commands(
     scroll: Option<ScrollIndicator>,
 ) -> Vec<DrawCmd> {
     #[cfg(feature = "aero")]
-    if aero::enabled() {
-        let px = aero::Px { w: cell_pw, h: cell_ph };
+    if vge_ui::aero::enabled() {
+        let px = vge_ui::aero::Px { w: cell_pw, h: cell_ph };
         return aero::pane_chrome(rect, title, focused, show_title, px, scroll);
     }
     let pw = rect.w as f32;
@@ -3895,7 +3895,7 @@ impl State {
     /// prompt or help — or empty if no modal should be visible.
     fn build_modal_elements(&self) -> Vec<CreateElementBody> {
         #[cfg(feature = "aero")]
-        if aero::enabled() {
+        if vge_ui::aero::enabled() {
             return aero::modal_elements(self);
         }
         match &self.mode {
@@ -4899,7 +4899,7 @@ fn parse_cli_args() -> Result<CliOptions> {
             "--prefix" | "-P" => opts.prefix = Some(parse_prefix_key(&take(&mut args)?)?),
             // Unlisted in `--help` on purpose; see `aero.rs`.
             #[cfg(feature = "aero")]
-            "--style" => aero::select(&take(&mut args)?)?,
+            "--style" => vge_ui::aero::select(&take(&mut args)?).map_err(|e| anyhow!(e))?,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -4918,7 +4918,9 @@ fn parse_cli_args() -> Result<CliOptions> {
                 opts.prefix = Some(parse_prefix_key(&other["--prefix=".len()..])?);
             }
             #[cfg(feature = "aero")]
-            other if other.starts_with("--style=") => aero::select(&other["--style=".len()..])?,
+            other if other.starts_with("--style=") => {
+                vge_ui::aero::select(&other["--style=".len()..]).map_err(|e| anyhow!(e))?
+            }
             other => bail!("unknown argument: {other} (try --help)"),
         }
     }

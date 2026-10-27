@@ -5,13 +5,17 @@ edition = "2024"
 description = "File browser with thumbnail previews for VGE-aware terminals — ranger-style navigation, Dolphin-style icon grid."
 
 [features]
-default = ["system-clipboard"]
+default = ["system-clipboard", "aero"]
 # Copy files (not just their paths) to the real system clipboard, as a
 # `text/uri-list` selection. Needs a reachable display server, so a build
 # destined for a headless or remote host can drop it and the dependency
 # on arboard with it — `src/clip.rs` then takes the OSC 52 text route,
 # which is all a remote vfm could use anyway.
 system-clipboard = ["dep:arboard"]
+# A private Frutiger Aero style (`src/aero.rs`, on `vge_ui::aero`), off
+# unless `VETER_STYLE=aero` or `--style aero` asks for it. Not for
+# release.
+aero = ["vge-ui/aero"]
 
 [dependencies]
 veter-version = { path = "../../libs/veter-version" }
