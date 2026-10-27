@@ -20,6 +20,10 @@ use vge_ui::theme;
 
 use crate::layout::{Body, Deco, Layout, Role, Row, Run};
 
+#[cfg(feature = "aero")]
+#[path = "aero.rs"]
+pub(crate) mod aero;
+
 /// Thickness of a block quote's bar, in cells before zoom.
 const BAR_W: f32 = 0.22;
 /// How far a quote bar sits from the text it marks.
@@ -155,6 +159,10 @@ pub fn page(
     pictures: &dyn Pictures,
     search: Search<'_>,
 ) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::page(layout, view, pictures, search);
+    }
     let mut cmds = Vec::new();
     for (i, row) in visible(layout, view) {
         let y = view.y_of(row.top);
@@ -453,6 +461,10 @@ pub struct Chrome<'a> {
 /// The header bar, status line and scrollbar — everything outside the
 /// page's clip.
 pub fn chrome(c: &Chrome<'_>, view: &View) -> Vec<DrawCmd> {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::chrome(c, view);
+    }
     let mut cmds = Vec::new();
     let surface = theme::modal_bg();
     let last_row = (view.rows - 1.0).max(0.0);

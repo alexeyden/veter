@@ -71,6 +71,18 @@ const ORDER_PAGE: i32 = 10;
 const ORDER_CHROME: i32 = 20;
 const ORDER_MODAL: i32 = 100;
 
+/// Rows the page viewport keeps clear above and below itself, inside
+/// the header and the status line. Only Aero has any: its page sits
+/// on a sheet that stops short of the bars, and the clip has to stop
+/// where the sheet does.
+fn page_inset() -> f32 {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return render::aero::PAGE_INSET;
+    }
+    0.0
+}
+
 /// Reading measure in em, when the pane is wider than one. Prose gets
 /// hard to track much past this, and a terminal is often much wider.
 const NARROW_EM: f32 = 88.0;
@@ -128,6 +140,8 @@ struct Dirty {
     page: bool,
     chrome: bool,
     modal: bool,
+    /// What a style draws under the page and only redraws on a re-wrap.
+    ground: bool,
 }
 
 impl Dirty {
@@ -136,6 +150,7 @@ impl Dirty {
             page: true,
             chrome: true,
             modal: true,
+            ground: true,
         }
     }
 }
@@ -243,9 +258,9 @@ impl App {
     // ── geometry ─────────────────────────────────────────────────────
 
     /// Rows the page viewport spans: everything but the header and the
-    /// status line.
+    /// status line, less the style's inset at either end.
     fn content_h(&self) -> f32 {
-        (self.rows as f32 - 2.0).max(1.0)
+        (self.rows as f32 - 2.0 - 2.0 * page_inset()).max(1.0)
     }
 
     /// Width of the reading column, in em.
@@ -266,7 +281,7 @@ impl App {
             cell_pw: self.cell_pw,
             cell_ph: self.cell_ph,
             content_x: ((self.cols as f32 - content_w) * 0.5).floor().max(MARGIN),
-            content_y: 1.0,
+            content_y: 1.0 + page_inset(),
             content_h: self.content_h(),
             zoom: self.zoom,
             scroll: self.scroll,
@@ -903,6 +918,10 @@ impl App {
     }
 
     fn modal_elements(&self) -> Vec<CreateElementBody> {
+        #[cfg(feature = "aero")]
+        if vge_ui::aero::enabled() {
+            return render::aero::modal_elements(self);
+        }
         match &self.mode {
             Mode::Normal => Vec::new(),
             Mode::Search(editor) => vec![prompt_element(
@@ -985,6 +1004,11 @@ impl App {
                 }),
                 REQ_ID_NO_RESPONSE,
             ));
+            #[cfg(feature = "aero")]
+            if vge_ui::aero::enabled() {
+                let ground = render::aero::ground(&view);
+                cmds.push(create(render::aero::ID_GROUND, ground, ORDER_PAGE - 1));
+            }
             cmds.push(create(ID_CHROME, self.chrome_commands(), ORDER_CHROME));
             self.dirty = Dirty {
                 modal: true,
@@ -992,6 +1016,13 @@ impl App {
             };
         }
 
+        if self.dirty.ground {
+            #[cfg(feature = "aero")]
+            if vge_ui::aero::enabled() {
+                let ground = render::aero::ground(&self.view());
+                cmds.push(update(render::aero::ID_GROUND, ground));
+            }
+        }
         if self.dirty.page {
             cmds.push(update(ID_PAGE, self.page_commands()));
         }
@@ -1285,6 +1316,12 @@ fn parse_args() -> Result<Option<Args>> {
                     .parse::<f32>()
                     .map_err(|_| anyhow!("--zoom wants a number"))?
                     .clamp(ZOOM_MIN, ZOOM_MAX);
+            }
+            // Deliberately absent from `--help`.
+            #[cfg(feature = "aero")]
+            a if a == "--style" || a.starts_with("--style=") => {
+                let v = value("--style", a)?;
+                vge_ui::aero::select(&v).map_err(|e| anyhow!(e))?;
             }
             a if a == "-A" || a == "--accent" || a.starts_with("--accent=") => {
                 let v = value("--accent", a)?;

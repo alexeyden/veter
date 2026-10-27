@@ -17,6 +17,13 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["simd
 unicode-width = "0.2.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 
+[features]
+default = ["aero"]
+# A private Frutiger Aero style (`src/aero.rs`, on `vge_ui::aero`), off
+# unless `VETER_STYLE=aero` or `--style aero` asks for it. Not for
+# public release.
+aero = ["vge-ui/aero"]
+
 [dev-dependencies]
 # The session test runs the real binary on a real pty and replays what
 # it wrote through the real host engine, so the seam being covered —
