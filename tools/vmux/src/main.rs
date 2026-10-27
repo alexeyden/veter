@@ -1107,6 +1107,38 @@ const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
 const TABBAR_CHEVRON_W: f32 = 2.0;
+/// The tab bar's size and spacing: how many rows it takes off the top
+/// of the host, and the cells it puts around and between tabs. The one
+/// place they are decided, so pane bounds, mouse routing, the layout
+/// and the hit-test all agree with what is drawn.
+#[derive(Clone, Copy, Debug)]
+struct TabbarMetrics {
+    /// Rows reserved for the bar; panes start below them.
+    rows: u32,
+    /// Cells left clear before the first tab and after the last.
+    margin: f32,
+    /// Cells between neighbouring tabs.
+    gap: f32,
+    /// Cells around a label inside its name rect, both sides together.
+    name_pad: f32,
+}
+
+/// The stock bar: one row, tabs abutting, a space either side of a label.
+const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
+    rows: 1,
+    margin: 0.0,
+    gap: 0.0,
+    name_pad: 2.0,
+};
+
+fn tabbar_metrics() -> TabbarMetrics {
+    #[cfg(feature = "aero")]
+    if vge_ui::aero::enabled() {
+        return aero::TABBAR_METRICS;
+    }
+    TABBAR_METRICS
+}
+
 /// Marker prefixed to a zoomed pane's title. Two columns wide, so with
 /// its trailing space it costs the same three the old `Z` spelling did
 /// — the thumb behind the title is measured, not counted, so a wide
@@ -1316,6 +1348,7 @@ fn compute_tabbar_layout(
 ) -> TabbarLayout {
     let host_wf = host_w as f32;
     let n = labels.len();
+    let m = tabbar_metrics();
 
     // Optional session-name segment, pinned to the left of the bar.
     // Capped so it never eats more than ~40% of row 0; the tabs get
@@ -1334,7 +1367,7 @@ fn compute_tabbar_layout(
         Some((label, w))
     });
     let session_w = session_seg.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
-    let bar_w = (host_wf - session_w).max(0.0);
+    let bar_w = (host_wf - session_w - 2.0 * m.margin).max(0.0);
 
     // Per-tab sub-rect widths: " N " number rect + " label " name rect.
     // The " N " number rect depends only on the index.
@@ -1344,15 +1377,23 @@ fn compute_tabbar_layout(
     // Pick the widest label cap the bar can afford, then elide to it —
     // so labels are only shortened to reclaim space, never pre-emptively,
     // and the widths used for scrolling match what gets drawn.
-    let cap = tabbar_label_cap(labels, &num_widths, bar_w);
+    // The cap budgets two padding cells per label; whatever padding
+    // and gap the metrics add beyond that is a fixed per-tab cost too.
+    let fixed: Vec<f32> = num_widths
+        .iter()
+        .map(|w| w + m.name_pad - 2.0 + m.gap)
+        .collect();
+    let cap = tabbar_label_cap(labels, &fixed, bar_w);
     let elided: Vec<String> =
         labels.iter().map(|l| elide_tab_label(l, cap)).collect();
     let name_widths: Vec<f32> = elided
         .iter()
-        .map(|l| vge_ui::measure::text_cells(l) + 2.0)
+        .map(|l| vge_ui::measure::text_cells(l) + m.name_pad)
         .collect();
-    let tab_widths: Vec<f32> =
-        (0..n).map(|i| num_widths[i] + name_widths[i]).collect();
+    // Each tab carries the gap after it, so scrolling budgets it too.
+    let tab_widths: Vec<f32> = (0..n)
+        .map(|i| num_widths[i] + name_widths[i] + m.gap)
+        .collect();
 
     let (first, last) = tabbar_window(&tab_widths, active, bar_w, scroll);
     let has_left = first > 0;
@@ -1362,7 +1403,7 @@ fn compute_tabbar_layout(
     // the first tab starts past the session segment and any left
     // chevron, and each subsequent tab abuts the previous one.
     let mut slots: Vec<TabSlot> = Vec::new();
-    let mut x = session_w + if has_left { TABBAR_CHEVRON_W } else { 0.0 };
+    let mut x = session_w + m.margin + if has_left { TABBAR_CHEVRON_W } else { 0.0 };
     for i in first..(last + 1).min(n) {
         slots.push(TabSlot {
             index: i,
@@ -1371,7 +1412,7 @@ fn compute_tabbar_layout(
             name_w: name_widths[i],
             label: elided[i].clone(),
         });
-        x += num_widths[i] + name_widths[i];
+        x += tab_widths[i];
     }
 
     TabbarLayout {
@@ -2701,12 +2742,13 @@ impl State {
     }
 
     fn full_bounds(&self) -> PaneRect {
-        // Row 0 is reserved for the tab bar; panes live in rows 1..host_h.
+        // The top rows are reserved for the tab bar; panes live below.
+        let bar = tabbar_metrics().rows;
         PaneRect {
             x: 0,
-            y: 1,
+            y: bar as i32,
             w: self.host_w,
-            h: self.host_h.saturating_sub(1).max(1),
+            h: self.host_h.saturating_sub(bar).max(1),
         }
     }
 
@@ -5841,10 +5883,10 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
-    // Row 0 is the tab bar, never part of a pane rect: a left click
+    // The top rows are the tab bar, never part of a pane rect: a left click
     // there switches tabs and the event goes no further. Gated to
     // `Mode::Normal` so a click can't reach through a modal.
-    if host_row == 0 {
+    if host_row < tabbar_metrics().rows as i32 {
         if is_left_press && matches!(state.mode, Mode::Normal) {
             handle_tabbar_click(state, host_col)?;
         }

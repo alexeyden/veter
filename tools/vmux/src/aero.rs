@@ -11,8 +11,26 @@ use vge_ui::measure::text_cells;
 
 use super::{
     CHROME_DRAW_ORDER, MODAL_DRAW_ORDER, MODAL_ELEMENT_ID, MODAL_IDS, Mode, PaneRect, RenameTarget,
-    ScrollIndicator, State, TABBAR_CHEVRON_W, TABBAR_ELEMENT_ID, TabbarLayout, help_modal,
+    ScrollIndicator, State, TABBAR_CHEVRON_W, TABBAR_ELEMENT_ID, TabbarLayout, TabbarMetrics,
+    help_modal,
 };
+
+/// A two-row bar, so a tab is a capsule with air above and below it:
+/// the label sits on the bar's centre line with half a row clear either
+/// way, and the capsules stand apart from each other and the edges.
+pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
+    rows: 2,
+    margin: 0.6,
+    gap: 0.8,
+    name_pad: 4.0,
+};
+/// The bar's height in cells.
+const BAR_H: f32 = TABBAR_METRICS.rows as f32;
+/// Top and bottom of a tab capsule.
+const CAP_Y0: f32 = 0.3;
+const CAP_Y1: f32 = BAR_H - 0.3;
+/// The text row, centred on the bar.
+const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
 
 /// The tab bar element — the Aero stand-in for `build_tabbar_commands`,
 /// drawn over the same [`TabbarLayout`] so clicks still land where the
@@ -45,46 +63,32 @@ fn tabbar_commands(
     activity: &[bool],
 ) -> Vec<DrawCmd> {
     let mut cmds = Vec::new();
+    let band = |y: f32, h: f32| Rect {
+        x: 0.0,
+        y,
+        w: host_w,
+        h,
+    };
 
     // The sky: a deep-to-light aqua bar with the glass sheen across its
     // upper half, a bright lip along the bottom and a glow spilling down
     // over the panes.
     cmds.push(DrawCmd::FillRectangles {
-        fill: vgrad(0.0, 1.0, hex(0x5ab8ef, 0.97), hex(0x1468b4, 0.97)),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 0.0,
-            w: host_w,
-            h: 1.0,
-        }],
+        fill: vgrad(0.0, BAR_H, hex(0x5ab8ef, 0.97), hex(0x1468b4, 0.97)),
+        rects: vec![band(0.0, BAR_H)],
     });
     cmds.push(DrawCmd::FillRectangles {
-        fill: vgrad(0.0, 0.5, white(0.28), white(0.04)),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 0.0,
-            w: host_w,
-            h: 0.5,
-        }],
+        fill: vgrad(0.0, BAR_H * 0.5, white(0.28), white(0.04)),
+        rects: vec![band(0.0, BAR_H * 0.5)],
     });
     let lip = px.y(1.0);
     cmds.push(DrawCmd::FillRectangles {
         fill: Style::Flat(hex(0xc8f6ff, 0.95)),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 1.0 - lip,
-            w: host_w,
-            h: lip,
-        }],
+        rects: vec![band(BAR_H - lip, lip)],
     });
     cmds.push(DrawCmd::FillRectangles {
-        fill: vgrad(1.0, 1.45, hex(0x3fb8ff, 0.55), hex(0x3fb8ff, 0.0)),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 1.0,
-            w: host_w,
-            h: 0.45,
-        }],
+        fill: vgrad(BAR_H, BAR_H + 0.45, hex(0x3fb8ff, 0.55), hex(0x3fb8ff, 0.0)),
+        rects: vec![band(BAR_H, 0.45)],
     });
 
     // Bubbles in the free stretch after the last tab, some rising out
@@ -110,7 +114,7 @@ fn tabbar_commands(
         }
         let r = 3.5 + unit(h >> 3) * 7.5;
         let cx = col as f32 + unit(h >> 7);
-        let cy = 0.2 + unit(h >> 11) * 1.0;
+        let cy = 0.25 + unit(h >> 11) * (BAR_H + 0.1);
         if cx - px.x(r) < free_x0 || cx + px.x(r) > free_x1 {
             continue;
         }
@@ -119,21 +123,21 @@ fn tabbar_commands(
 
     let navy = hex(0x06264d, 0.75);
     if let Some((label, w)) = &layout.session_seg {
-        let (x0, x1, y0, y1) = (0.1, *w - 0.1, 0.1, 0.92);
+        let (x0, x1) = (0.3, *w - 0.1);
         cmds.push(DrawCmd::OutlineFillPath {
-            fill: vgrad(y0, y1, white(1.0), hex(0x9fb3c8, 1.0)),
+            fill: vgrad(CAP_Y0, CAP_Y1, white(1.0), hex(0x9fb3c8, 1.0)),
             stroke: Style::Flat(hex(0x5f7a96, 0.9)),
             line_width: px.line(1.0),
-            segments: pill(px, x0, y0, x1, y1),
+            segments: pill(px, x0, CAP_Y0, x1, CAP_Y1),
         });
-        gloss(&mut cmds, px, x0, y0, x1, y1, 0.5);
+        gloss(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, 0.5);
         text(
             &mut cmds,
             px,
-            0.0,
-            0.0,
-            Align::Left,
-            &format!(" {label} "),
+            (x0 + x1) * 0.5,
+            TEXT_Y,
+            Align::Center,
+            label,
             hex(0x12345a, 1.0),
             true,
             Some(white(0.7)),
@@ -144,8 +148,8 @@ fn tabbar_commands(
         text(
             &mut cmds,
             px,
-            layout.session_w(),
-            0.0,
+            layout.session_w() + TABBAR_METRICS.margin,
+            TEXT_Y,
             Align::Left,
             " ‹",
             white(1.0),
@@ -157,30 +161,38 @@ fn tabbar_commands(
     for slot in &layout.slots {
         let i = slot.index;
         let x = slot.x0;
-        let (x0, x1, y0, y1) = (x + 0.1, x + slot.num_w + slot.name_w - 0.1, 0.1, 0.92);
+        let (x0, x1) = (x, x + slot.num_w + slot.name_w);
         let is_active = i == active;
         let has_activity = activity.get(i).copied().unwrap_or(false);
         let shadow = if is_active {
-            gel(&mut cmds, px, x0, y0, x1, y1, &GEL_GREEN);
+            gel(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_GREEN);
             hex(0x154a0c, 0.85)
         } else if has_activity {
-            gel(&mut cmds, px, x0, y0, x1, y1, &GEL_AMBER);
+            gel(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_AMBER);
             hex(0x6b3300, 0.85)
         } else {
-            frost(&mut cmds, px, x0, y0, x1, y1);
+            frost(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1);
             navy
         };
 
-        // The number rides in an orb at the head of the pill; " n " is
-        // centred over `num_w`, and so is the orb.
-        orb(&mut cmds, px, x + 0.35, 0.18, x + slot.num_w - 0.35, 0.84);
+        // The number rides in an orb at the head of the capsule, both
+        // centred over `num_w`.
+        let num_cx = x + 0.4 + slot.num_w * 0.5;
+        orb(
+            &mut cmds,
+            px,
+            num_cx - slot.num_w * 0.42,
+            CAP_Y0 + 0.22,
+            num_cx + slot.num_w * 0.42,
+            CAP_Y1 - 0.22,
+        );
         text(
             &mut cmds,
             px,
-            x,
-            0.0,
-            Align::Left,
-            &format!(" {} ", i + 1),
+            num_cx,
+            TEXT_Y,
+            Align::Center,
+            &format!("{}", i + 1),
             white(1.0),
             true,
             Some(hex(0x06264d, 0.9)),
@@ -188,10 +200,10 @@ fn tabbar_commands(
         text(
             &mut cmds,
             px,
-            x + slot.num_w,
-            0.0,
-            Align::Left,
-            &format!(" {} ", slot.label),
+            x + slot.num_w + slot.name_w * 0.5,
+            TEXT_Y,
+            Align::Center,
+            &slot.label,
             white(1.0),
             is_active,
             Some(shadow),
@@ -203,7 +215,7 @@ fn tabbar_commands(
             &mut cmds,
             px,
             host_w - TABBAR_CHEVRON_W,
-            0.0,
+            TEXT_Y,
             Align::Left,
             "› ",
             white(1.0),
