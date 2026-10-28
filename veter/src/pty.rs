@@ -8,6 +8,18 @@ use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{execvp, Pid};
 
+/// What the child execs.
+#[derive(Clone, Debug, Default)]
+pub enum Program {
+    /// The vmux → `$SHELL` → `/bin/sh` chain.
+    #[default]
+    Default,
+    /// `veter --shell`: the same chain without vmux.
+    Shell,
+    /// `veter -e <command> [args…]`: exec exactly this, no fallback.
+    Command(Vec<String>),
+}
+
 pub struct Pty {
     master: OwnedFd,
     child: Pid,
@@ -72,15 +84,16 @@ fn writer_loop(fd: OwnedFd, rx: Receiver<Vec<u8>>) {
 }
 
 impl Pty {
-    /// Spawn the child. With `command = None` the child runs the default
-    /// vmux → `$SHELL` chain; with `Some(argv)` (from `veter -e …`) it
-    /// execs that program directly instead — the standard terminal
-    /// entry-point-command behaviour (`xterm -e`, `alacritty -e`).
+    /// Spawn the child. `Program::Default` runs the vmux → `$SHELL`
+    /// chain, `Program::Shell` the same chain minus vmux, and
+    /// `Program::Command(argv)` (from `veter -e …`) execs that program
+    /// directly instead — the standard terminal entry-point-command
+    /// behaviour (`xterm -e`, `alacritty -e`).
     pub fn new(
         rows: u16,
         cols: u16,
         cell_px: (u16, u16),
-        command: Option<Vec<String>>,
+        program: Program,
     ) -> io::Result<Self> {
         let (xpixel, ypixel) = pixel_size(rows, cols, cell_px);
         let winsize = Winsize {
@@ -112,7 +125,7 @@ impl Pty {
                 // directly, bypassing vmux and the shell. On failure the
                 // child must exit — it must never fall through into
                 // veter's own vmux/$SHELL path (it's a fork of veter).
-                if let Some(argv) = command.filter(|c| !c.is_empty()) {
+                if let Program::Command(argv) = &program {
                     let cargv: Vec<CString> = argv
                         .iter()
                         .filter_map(|a| CString::new(a.as_bytes()).ok())
@@ -130,18 +143,20 @@ impl Pty {
                 // veter with a PATH that omits ~/.local/bin. Fall
                 // back to a normal $PATH search, then to the user's
                 // shell. execvp only returns on failure.
-                let argv0 = CString::new("vmux").unwrap();
-                let neighbor = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("vmux")))
-                    .filter(|p| p.is_file())
-                    .and_then(|p| {
-                        CString::new(p.as_os_str().as_bytes()).ok()
-                    });
-                if let Some(abs) = neighbor {
-                    let _ = execvp(&abs, &[&argv0]);
+                if matches!(program, Program::Default) {
+                    let argv0 = CString::new("vmux").unwrap();
+                    let neighbor = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("vmux")))
+                        .filter(|p| p.is_file())
+                        .and_then(|p| {
+                            CString::new(p.as_os_str().as_bytes()).ok()
+                        });
+                    if let Some(abs) = neighbor {
+                        let _ = execvp(&abs, &[&argv0]);
+                    }
+                    let _ = execvp(&argv0, &[&argv0]);
                 }
-                let _ = execvp(&argv0, &[&argv0]);
                 // Honor `$SHELL` (the user's login shell) and fall back
                 // to `/bin/sh` if it's unset or unusable, mirroring the
                 // convention tmux/screen/alacritty all follow. The

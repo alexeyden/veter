@@ -199,7 +199,7 @@ sides of that handover.
 
 ## veter spawns vmux by default
 
-`veter/src/pty.rs` execs `vmux` (first the binary next to `veter`, then `$PATH`) before falling back to `$SHELL` / `/bin/sh`. So launching `veter` normally drops you into `vmux` — bypass with e.g. `SHELL=/bin/bash` and a `vmux`-free `PATH`, or run a different binary. Tests and headless work should run individual crates with `cargo run -p …` rather than going through `veter`.
+`veter/src/pty.rs` execs `vmux` (first the binary next to `veter`, then `$PATH`) before falling back to `$SHELL` / `/bin/sh`. So launching `veter` normally drops you into `vmux` — bypass with `veter --shell` (the same chain minus `vmux`; `make install` also installs a `veter-shell.desktop` launcher for it) or `veter -e <program>`. Tests and headless work should run individual crates with `cargo run -p …` rather than going through `veter`.
 
 ## Conventions
 

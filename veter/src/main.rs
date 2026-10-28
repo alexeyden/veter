@@ -960,9 +960,9 @@ struct App {
     /// lingering highlight can't hijack normal typing: the first key
     /// forwarded to the PTY clears this.
     selection_fresh: bool,
-    /// `veter -e <command>` entry-point command: exec this instead of the
-    /// default vmux/`$SHELL`. `None` for a normal launch.
-    entry_command: Option<Vec<String>>,
+    /// What the window's pty runs: the vmux/`$SHELL` chain, `--shell`'s
+    /// chain without vmux, or a `veter -e <command>` entry point.
+    entry_command: pty::Program,
     /// True while the close-confirmation panel is up (`[window]
     /// confirm_close`, default on). Modal like the search bar: keys and
     /// clicks answer the prompt instead of reaching the focused PTY, and
@@ -2511,7 +2511,7 @@ impl App {
     fn new(
         proxy: EventLoopProxy<()>,
         config: config::Config,
-        entry_command: Option<Vec<String>>,
+        entry_command: pty::Program,
     ) -> Self {
         let keys = config.key_bindings();
         let hint_config = config.hint_config();
@@ -5327,7 +5327,7 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "vsd".into());
         let argv = vec![vsd, "attach".into(), session.clone()];
-        match pty::Pty::new(rows, cols, cell_px, Some(argv)) {
+        match pty::Pty::new(rows, cols, cell_px, pty::Program::Command(argv)) {
             Ok(pty) => {
                 let fd = pty.dup_master().expect("Failed to dup master fd");
                 self.pty = Some(pty);
@@ -6435,18 +6435,18 @@ impl ApplicationHandler for App {
 }
 
 const USAGE: &str = "\
-Usage: veter [-e <command> [args...]]
+Usage: veter [--shell | -e <command> [args...]]
 
 Options:
   -e, --command <command> [args...]
                  Run <command> instead of the default program. Everything
                  after it is passed to the command.
+  -s, --shell    Run $SHELL (or /bin/sh) directly, skipping vmux.
   -h, --help     Print this help and exit.
   -V, --version  Print the version and exit.
 
-Without -e, veter runs vmux (next to the veter binary, then on $PATH),
-falling back to $SHELL, then /bin/sh. Use e.g. `veter -e bash` to skip
-vmux.";
+Without -e or --shell, veter runs vmux (next to the veter binary, then
+on $PATH), falling back to $SHELL, then /bin/sh.";
 
 fn main() {
     // Before the window: `--version` and `--help` have to answer from a
@@ -6475,19 +6475,27 @@ fn main() {
     event_loop.run_app(&mut app).unwrap();
 }
 
-/// Parse a `veter -e <command> [args…]` entry-point command. Everything
-/// after `-e` (or `--command`) is the program + args to run instead of
-/// the default vmux/`$SHELL`. Returns `None` when the flag is absent (or
-/// has no command after it), leaving the default behaviour.
-fn parse_entry_command() -> Option<Vec<String>> {
+/// Parse what the window runs. Everything after `-e` (or `--command`)
+/// is the program + args to run instead of the default vmux/`$SHELL`;
+/// `--shell` ahead of it keeps the `$SHELL` fallback but drops vmux.
+/// An `-e` with no command after it is ignored.
+fn parse_entry_command() -> pty::Program {
     let mut args = std::env::args().skip(1);
+    let mut program = pty::Program::Default;
     while let Some(arg) = args.next() {
-        if arg == "-e" || arg == "--command" {
-            let rest: Vec<String> = args.collect();
-            return (!rest.is_empty()).then_some(rest);
+        match arg.as_str() {
+            "-e" | "--command" => {
+                let rest: Vec<String> = args.collect();
+                if !rest.is_empty() {
+                    program = pty::Program::Command(rest);
+                }
+                break;
+            }
+            "-s" | "--shell" => program = pty::Program::Shell,
+            _ => {}
         }
     }
-    None
+    program
 }
 
 /// Diagnostic-only trace of keyboard bytes about to be written to the

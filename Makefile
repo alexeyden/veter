@@ -13,6 +13,8 @@ ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
 PACKAGES := veter vcat vplay vdraw vfm vmd vmux vproto vsend vrecv vsd vssh
 DESKTOP_FILE := $(APPDIR)/veter.desktop
+# Second launcher: a plain shell, no vmux (`veter --shell`).
+SHELL_DESKTOP_FILE := $(APPDIR)/veter-shell.desktop
 
 # Scripts, which have no cargo build of their own but ship beside the
 # binaries: `vplace` drives vproto to put an image in a pane, and the
@@ -166,6 +168,22 @@ install-desktop:
 	    > $(DESKTOP_FILE)
 	@chmod 0644 $(DESKTOP_FILE)
 	@echo "    veter.desktop -> $(DESKTOP_FILE)"
+	@printf '%s\n' \
+	    '[Desktop Entry]' \
+	    'Type=Application' \
+	    'Name=Veter (shell)' \
+	    'GenericName=Terminal' \
+	    'Comment=Veter running your shell directly, without vmux' \
+	    'Exec=$(BINDIR)/veter --shell' \
+	    'TryExec=$(BINDIR)/veter' \
+	    'Icon=veter' \
+	    'Terminal=false' \
+	    'Categories=System;TerminalEmulator;' \
+	    'Keywords=shell;prompt;command;commandline;cmd;' \
+	    'StartupNotify=true' \
+	    > $(SHELL_DESKTOP_FILE)
+	@chmod 0644 $(SHELL_DESKTOP_FILE)
+	@echo "    veter-shell.desktop -> $(SHELL_DESKTOP_FILE)"
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database "$(APPDIR)" >/dev/null 2>&1 || true; \
 	fi
@@ -269,6 +287,7 @@ uninstall:
 	done
 	@rm -f "$(HOOK_DST)" && echo "    removed $(HOOK_DST)"
 	@rm -f "$(DESKTOP_FILE)" && echo "    removed $(DESKTOP_FILE)"
+	@rm -f "$(SHELL_DESKTOP_FILE)" && echo "    removed $(SHELL_DESKTOP_FILE)"
 	@rm -f "$(ICON_SVG_DST)" && echo "    removed $(ICON_SVG_DST)"
 	@for sz in $(ICON_PNG_SIZES); do \
 	    rm -f "$(ICONROOT)/$${sz}x$${sz}/apps/veter.png" && \
