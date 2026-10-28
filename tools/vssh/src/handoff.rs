@@ -14,7 +14,11 @@ use nix::unistd::execvp;
 ///     "$SHELL" -l` so the remote login shell sees `~/.local/bin` on
 ///     PATH (where veter-tools were installed). When the user did
 ///     pass a command, we leave their argv alone — injecting around
-///     their command would collide with their intent.
+///     their command would collide with their intent. The same `env`
+///     carries a local `VETER_STYLE` across (see [`style_assignment`]),
+///     since sshd passes no client environment by default and the
+///     clients' look should not change with the side of the hop they
+///     run on.
 pub fn exec_ssh(
     ssh_args: &[OsString],
     control_path: Option<&str>,
@@ -43,8 +47,12 @@ pub fn exec_ssh(
         );
     }
     if inject {
+        let style = style_assignment(std::env::var("VETER_STYLE").ok().as_deref());
         argv.push(
-            CString::new(r#"exec env PATH="$HOME/.local/bin:$PATH" "$SHELL" -l"#).unwrap(),
+            CString::new(format!(
+                r#"exec env PATH="$HOME/.local/bin:$PATH"{style} "$SHELL" -l"#
+            ))
+            .unwrap(),
         );
     }
 
@@ -56,6 +64,21 @@ pub fn exec_ssh(
     );
     let err = execvp(&argv0, &argv).unwrap_err();
     bail!("exec ssh failed: {err} (is ssh on $PATH?)")
+}
+
+/// ` VETER_STYLE=<name>` for the remote `env`, or nothing. The remote
+/// command is shell text, so only a plain name is passed; anything
+/// else is dropped rather than quoted.
+fn style_assignment(style: Option<&str>) -> String {
+    match style {
+        Some(s)
+            if !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            format!(" VETER_STYLE={s}")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Lightweight ssh-style argv scanner. Returns true iff the user's
@@ -143,6 +166,14 @@ mod tests {
         assert!(user_provided_remote_command(&os(&[
             "-p", "22", "host", "uptime"
         ])));
+    }
+
+    #[test]
+    fn only_a_plain_style_name_crosses_the_hop() {
+        assert_eq!(style_assignment(Some("aero")), " VETER_STYLE=aero");
+        assert_eq!(style_assignment(None), "");
+        assert_eq!(style_assignment(Some("")), "");
+        assert_eq!(style_assignment(Some("aero; rm -rf ~")), "");
     }
 
     #[test]

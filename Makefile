@@ -303,6 +303,9 @@ DIST_VERSION ?= 0.1.7
 # remote host these binaries ship to, where vfm falls back to putting
 # paths on the clipboard over OSC 52 anyway. Dropping it takes arboard's
 # X11 + Wayland stack out of the static binary (~1.2 MB of 5 MB).
+# `aero` is named back in: it is a default feature like every other
+# client's, and `--no-default-features` would otherwise drop it from
+# vfm alone.
 DIST_TOOLS_PLAIN := $(filter-out vfm,$(DIST_TOOLS))
 
 # `install-remote-<arch>` knobs. `REMOTE` is required — it's whatever
@@ -349,7 +352,7 @@ dist-$(3)-build:
 	$$(CARGO) build --release --target $(1) \
 	    $$(addprefix --package=,$$(DIST_TOOLS_PLAIN))
 	$$(CARGO) build --release --target $(1) \
-	    --no-default-features --package=vfm
+	    --no-default-features --features aero --package=vfm
 	@for t in $$(DIST_TOOLS); do \
 	    src="$$(DIST_BINDIR_$(1))/$$$$t"; \
 	    if [ ! -x "$$$$src" ]; then \
