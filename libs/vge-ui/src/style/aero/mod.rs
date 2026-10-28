@@ -1,194 +1,309 @@
 //! Frutiger Aero — glossy gel pills, frosted glass, aqua skies and
-//! bubbles. A private style, not a product one: the palette is its own
-//! and ignores the host theme on purpose, and none of it ships in a
-//! public release.
+//! bubbles. Its palette is its own: surfaces, inks and materials are
+//! fixed, and the host theme reaches it only through the accent.
 //!
-//! This module holds what the clients share: the style switch, the
-//! drawing primitives and palette, and Aero versions of the three
-//! [`crate::modal`] builders. Each client keeps its own chrome in its
-//! own `src/aero.rs` (`vmux`, `vfm`), reached through hooks that carry
-//! `#[cfg(feature = "aero")]` and return before the stock code runs, so
-//! the stock path never changes shape.
-//!
-//! On when `VETER_STYLE=aero`, or when a client's hidden `--style aero`
-//! says so. Compiled only with this crate's `aero` feature, which the
-//! clients' own `aero` features turn on. Dropping it is: delete this
-//! file and each client's `src/aero.rs`, the `aero` features in their
-//! `Cargo.toml`s, and every line `grep -rn 'feature = "aero"'` finds.
+//! This module holds the materials every part is made of (gel, frost,
+//! smoke, orbs, bubbles, scroll thumbs), the window pieces the modals
+//! are built from, and the modals themselves; each client family's
+//! parts live in a child module ([`mux`], [`doc`], [`browser`]).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+mod browser;
+mod doc;
+mod icons;
+mod mux;
 
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{
-    Align, Color, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
-};
-use vge_protocol::path::{PathNode, PathSegment};
+use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd, OriginAnchor, Style};
 
+use super::{
+    DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
+    StatusLeft, TabBar,
+};
 use crate::measure::{prefix_cells, text_cells};
 use crate::modal::{ModalIds, ScrollModal};
-use crate::picker::Picker;
-use crate::shape::{rounded_rect_path, rounded_rect_path_corners};
+use crate::paint::{Px, ellipse, hex, hgrad, pill, radial, rr, text, vgrad, white};
+use crate::picker::PickerView;
+use crate::shape::rounded_rect_path_corners;
 
-const UNSET: u8 = 0;
-const STOCK: u8 = 1;
-const AERO: u8 = 2;
+/// The Aero engine.
+pub struct Aero;
 
-static STYLE: AtomicU8 = AtomicU8::new(UNSET);
+const METRICS: Metrics = Metrics {
+    tabbar: mux::TABBAR_METRICS,
+    page_inset: doc::PAGE_INSET,
+};
 
-/// Pick the style by name — a client's `--style`, which outranks
-/// `VETER_STYLE`.
-pub fn select(name: &str) -> Result<(), String> {
-    STYLE.store(parse(name)?, Ordering::Relaxed);
-    Ok(())
-}
-
-fn parse(name: &str) -> Result<u8, String> {
-    match name {
-        "aero" => Ok(AERO),
-        "default" | "stock" => Ok(STOCK),
-        other => Err(format!("unknown style: {other}")),
+impl Engine for Aero {
+    fn name(&self) -> &'static str {
+        "aero"
     }
-}
 
-/// Whether the Aero chrome is on. Without a `--style`, `VETER_STYLE`
-/// decides on first use; an unknown value there falls back to stock
-/// rather than refusing to start.
-pub fn enabled() -> bool {
-    let mut s = STYLE.load(Ordering::Relaxed);
-    if s == UNSET {
-        s = std::env::var("VETER_STYLE")
-            .ok()
-            .and_then(|v| parse(&v).ok())
-            .unwrap_or(STOCK);
-        STYLE.store(s, Ordering::Relaxed);
+    fn metrics(&self) -> &Metrics {
+        &METRICS
     }
-    s == AERO
-}
 
-pub fn hex(rgb: u32, a: f32) -> Color {
-    Color {
-        r: ((rgb >> 16) & 0xff) as f32 / 255.0,
-        g: ((rgb >> 8) & 0xff) as f32 / 255.0,
-        b: (rgb & 0xff) as f32 / 255.0,
-        a,
+    fn tab_bar(&self, cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
+        mux::tab_bar(cmds, px, bar);
     }
-}
 
-pub fn white(a: f32) -> Color {
-    hex(0xffffff, a)
-}
-
-/// Pixel ↔ cell conversions for the current cell size.
-#[derive(Clone, Copy)]
-pub struct Px {
-    pub w: f32,
-    pub h: f32,
-}
-
-impl Px {
-    pub fn x(self, px: f32) -> f32 {
-        px / self.w.max(f32::EPSILON)
+    fn pane_chrome(&self, cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {
+        mux::pane_chrome(cmds, px, pane);
     }
-    pub fn y(self, px: f32) -> f32 {
-        px / self.h.max(f32::EPSILON)
+
+    fn separators(&self, cmds: &mut Vec<DrawCmd>, lines: Vec<(Point, Point)>) {
+        mux::separators(cmds, lines);
     }
-    /// A stroke width: VGE scales `line_width` by the mean cell side.
-    pub fn line(self, px: f32) -> f32 {
-        px / ((self.w + self.h) * 0.5).max(f32::EPSILON)
+
+    fn doc_ground(&self, cmds: &mut Vec<DrawCmd>, px: Px, frame: &DocFrame) {
+        doc::ground(cmds, px, frame);
     }
-}
 
-pub fn vgrad(y0: f32, y1: f32, c0: Color, c1: Color) -> Style {
-    Style::LinearGradient {
-        p0: Point { x: 0.0, y: y0 },
-        p1: Point { x: 0.0, y: y1 },
-        c0,
-        c1,
+    fn doc_chrome(&self, cmds: &mut Vec<DrawCmd>, px: Px, frame: &DocFrame, c: &DocChrome<'_>) {
+        doc::chrome(cmds, px, frame, c);
     }
-}
 
-pub fn hgrad(x0: f32, x1: f32, c0: Color, c1: Color) -> Style {
-    Style::LinearGradient {
-        p0: Point { x: x0, y: 0.0 },
-        p1: Point { x: x1, y: 0.0 },
-        c0,
-        c1,
+    fn doc_ink(&self, role: DocRole) -> Color {
+        doc::ink(role)
     }
-}
 
-pub fn radial(center: Point, outer: Point, c_inner: Color, c_outer: Color) -> Style {
-    Style::RadialGradient {
-        center,
-        outer,
-        c_inner,
-        c_outer,
+    fn code_plate(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x0: f32,
+        x1: f32,
+        y: f32,
+        h: f32,
+        first: bool,
+        last: bool,
+        zoom: f32,
+    ) {
+        doc::code_plate(cmds, px, x0, x1, y, h, first, last, zoom);
     }
-}
 
-/// A rounded rect whose corners are `r` *pixels* — circular on screen
-/// whatever the cell aspect.
-pub fn rr(px: Px, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> Vec<PathSegment> {
-    let rx = px.x(r).min((x1 - x0) / 2.0);
-    let ry = px.y(r).min((y1 - y0) / 2.0);
-    rounded_rect_path(x0, y0, x1, y1, rx, ry)
-}
-
-/// A capsule: ends fully round along its shorter side.
-pub fn pill(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PathSegment> {
-    let r = ((x1 - x0) * px.w).min((y1 - y0) * px.h) / 2.0;
-    rr(px, x0, y0, x1, y1, r)
-}
-
-pub fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<PathSegment> {
-    let arc = |x: f32| PathNode::ArcEllipseTo {
-        large: false,
-        sweep: false,
-        rx,
-        ry,
-        rotation: 0.0,
-        dst: Point { x, y: cy },
-    };
-    vec![PathSegment {
-        start: Point { x: cx - rx, y: cy },
-        nodes: vec![arc(cx + rx), arc(cx - rx), PathNode::ClosePath],
-    }]
-}
-
-/// Text with a one-pixel drop shadow down and to the right.
-#[allow(clippy::too_many_arguments)]
-pub fn text(
-    cmds: &mut Vec<DrawCmd>,
-    px: Px,
-    x: f32,
-    y: f32,
-    align: Align,
-    s: &str,
-    color: Color,
-    bold: bool,
-    shadow: Option<Color>,
-) {
-    let font_style = FontStyle(if bold { 0x01 } else { 0x00 });
-    if let Some(sh) = shadow {
-        cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: x + px.x(1.0),
-                y: y + px.y(1.0),
-            },
-            align,
-            fill: Style::Flat(sh),
-            font_style,
-            font_scale: 1.0,
-            text: s.to_string(),
-        });
+    fn table_band(&self, cmds: &mut Vec<DrawCmd>, r: Rect, head: bool) {
+        doc::table_band(cmds, r, head);
     }
-    cmds.push(DrawCmd::DrawText {
-        origin: Point { x, y },
-        align,
-        fill: Style::Flat(color),
-        font_style,
-        font_scale: 1.0,
-        text: s.to_string(),
-    });
+
+    fn quote_bar(&self, cmds: &mut Vec<DrawCmd>, r: Rect, warning: bool) {
+        doc::quote_bar(cmds, r, warning);
+    }
+
+    fn rule(&self, cmds: &mut Vec<DrawCmd>, r: Rect, weight: f32) {
+        doc::rule(cmds, r, weight);
+    }
+
+    fn figure(&self, cmds: &mut Vec<DrawCmd>, px: Px, r: Rect, content: Figure<'_>, zoom: f32) {
+        doc::figure(cmds, px, r, content, zoom);
+    }
+
+    fn code_chip(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x0: f32,
+        x1: f32,
+        y: f32,
+        h: f32,
+        zoom: f32,
+    ) {
+        doc::code_chip(cmds, px, x0, x1, y, h, zoom);
+    }
+
+    fn heading_mark(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        level: u8,
+        x: f32,
+        w: f32,
+        y: f32,
+        h: f32,
+        zoom: f32,
+    ) {
+        doc::heading_mark(cmds, level, x, w, y, h, zoom);
+    }
+
+    fn search_hit(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        w: f32,
+        y: f32,
+        h: f32,
+        zoom: f32,
+        current: bool,
+    ) {
+        doc::search_hit(cmds, px, x, w, y, h, zoom, current);
+    }
+
+    fn browser_backdrop(&self, cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
+        browser::backdrop(cmds, px, w, h);
+    }
+
+    fn column_pane(&self, cmds: &mut Vec<DrawCmd>, px: Px, area: Rect) {
+        browser::column_pane(cmds, px, area);
+    }
+
+    fn column_row(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        area: Rect,
+        y: f32,
+        label: &str,
+        is_dir: bool,
+        selected: bool,
+    ) {
+        browser::column_row(cmds, px, area, y, label, is_dir, selected);
+    }
+
+    fn browser_note(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        y: f32,
+        align: Align,
+        text: &str,
+        warn: bool,
+    ) {
+        browser::note(cmds, px, x, y, align, text, warn);
+    }
+
+    fn grid_pane(&self, cmds: &mut Vec<DrawCmd>, px: Px, area: Rect) {
+        browser::grid_pane(cmds, px, area);
+    }
+
+    fn browser_scrollbar(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        area: Rect,
+        track_h: f32,
+        thumb_h: f32,
+        frac: f32,
+    ) {
+        browser::scrollbar(cmds, px, area, track_h, thumb_h, frac);
+    }
+
+    fn tile_plate(&self, cmds: &mut Vec<DrawCmd>, px: Px, tile: Rect, img_h: f32, selected: bool) {
+        let _ = img_h;
+        browser::tile_plate(cmds, px, tile, selected);
+    }
+
+    fn tile_mark(&self, cmds: &mut Vec<DrawCmd>, px: Px, tile: Rect) {
+        browser::tile_mark(cmds, px, tile);
+    }
+
+    fn tile_label(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        y: f32,
+        label: &str,
+        is_dir: bool,
+        selected: bool,
+    ) {
+        browser::tile_label(cmds, px, x, y, label, is_dir, selected);
+    }
+
+    fn list_row_plate(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        row: Rect,
+        odd: bool,
+        selected: bool,
+    ) {
+        browser::list_row_plate(cmds, px, row, odd, selected);
+    }
+
+    fn list_row_mark(&self, cmds: &mut Vec<DrawCmd>, px: Px, row: Rect) {
+        browser::list_row_mark(cmds, px, row);
+    }
+
+    fn list_text(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        y: f32,
+        align: Align,
+        text: &str,
+        what: ListInk,
+        selected: bool,
+    ) {
+        browser::list_text(cmds, px, x, y, align, text, what, selected);
+    }
+
+    fn thumbnail(&self, cmds: &mut Vec<DrawCmd>, px: Px, r: Rect, image_id: String) {
+        browser::thumbnail(cmds, px, r, image_id);
+    }
+
+    fn file_icon(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        kind: FileKind,
+        b: IconBox,
+        is_link: bool,
+        broken: bool,
+    ) {
+        icons::icon(cmds, px, kind, b, is_link, broken);
+    }
+
+    fn status_bar(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        area: Rect,
+        left: &str,
+        left_kind: StatusLeft,
+        right: &str,
+    ) {
+        browser::status_bar(cmds, px, area, left, left_kind, right);
+    }
+
+    fn prompt(
+        &self,
+        id: &str,
+        host_w: u32,
+        host_h: u32,
+        title: &str,
+        line: &str,
+        px: Px,
+        caret: Option<usize>,
+        draw_order: i32,
+    ) -> CreateElementBody {
+        prompt_element(id, host_w, host_h, title, line, px, caret, draw_order)
+    }
+
+    fn picker(
+        &self,
+        id: &str,
+        host_w: u32,
+        host_h: u32,
+        picker: &dyn PickerView,
+        px: Px,
+        draw_order: i32,
+    ) -> Vec<CreateElementBody> {
+        vec![picker_element(id, host_w, host_h, picker, px, draw_order)]
+    }
+
+    fn scroll_modal(
+        &self,
+        modal: &ScrollModal,
+        ids: ModalIds<'_>,
+        host_w: u32,
+        host_h: u32,
+        offset: u32,
+        px: Px,
+        draw_order: i32,
+    ) -> Vec<CreateElementBody> {
+        scroll_elements(modal, ids, host_w, host_h, offset, px, draw_order)
+    }
 }
 
 /// A gel colourway: body gradient, the inner glow rising from the
@@ -330,19 +445,6 @@ pub fn bubble(cmds: &mut Vec<DrawCmd>, px: Px, cx: f32, cy: f32, r: f32) {
         fill: Style::Flat(white(0.9)),
         segments: ellipse(cx - rx * 0.4, cy - ry * 0.4, px.x(hr), px.y(hr * 0.75)),
     });
-}
-
-/// A cheap stable hash, so a bubble keeps its place across redraws.
-pub fn hash(mut v: u32) -> u32 {
-    v ^= v >> 16;
-    v = v.wrapping_mul(0x7feb_352d);
-    v ^= v >> 15;
-    v = v.wrapping_mul(0x846c_a68b);
-    v ^ (v >> 16)
-}
-
-pub fn unit(v: u32) -> f32 {
-    (v & 0xffff) as f32 / 65535.0
 }
 
 /// An aqua capsule scrollbar thumb, lit along its left edge.
@@ -497,7 +599,7 @@ pub fn rims(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
 /// Rename prompts and the quit confirm, after `prompt_element`: title
 /// on row 0, the line on row 2 — in a text field when there is a caret.
 #[allow(clippy::too_many_arguments)]
-pub fn prompt_element(
+fn prompt_element(
     id: &str,
     host_w: u32,
     host_h: u32,
@@ -543,32 +645,33 @@ pub fn prompt_element(
 /// The picker (command palette, tab and pane pickers), after
 /// `picker_element`: title on row 0, the input on row 1, matches from
 /// row 2.
-pub fn picker_element<P>(
+fn picker_element(
     id: &str,
     host_w: u32,
     host_h: u32,
-    picker: &Picker<P>,
+    picker: &dyn PickerView,
     px: Px,
     draw_order: i32,
 ) -> CreateElementBody {
     const MAX_ROWS: usize = 14;
     let avail = (host_h.saturating_sub(4)).max(1) as usize;
-    let visible_rows = picker.matches.len().max(1).min(avail).min(MAX_ROWS);
-    let total = picker.matches.len();
+    let visible_rows = picker.matches().len().max(1).min(avail).min(MAX_ROWS);
+    let total = picker.matches().len();
     let max_scroll = total.saturating_sub(visible_rows);
     let scroll = picker
-        .selected
+        .selected()
         .saturating_sub(visible_rows.saturating_sub(1))
         .min(max_scroll);
 
-    let input_line = format!("> {}", picker.editor.buffer);
-    let mut max_w = text_cells(&picker.title).max(text_cells(&input_line));
-    for it in &picker.items {
-        max_w = max_w.max(text_cells(&it.label) + 3.0 + text_cells(&it.hint));
+    let input_line = format!("> {}", picker.editor().buffer);
+    let mut max_w = text_cells(picker.title()).max(text_cells(&input_line));
+    for i in 0..picker.item_count() {
+        let (label, hint) = picker.item(i);
+        max_w = max_w.max(text_cells(label) + 3.0 + text_cells(hint));
     }
     let box_w = (max_w.max(26.0) + 4.0).min(host_w.saturating_sub(2) as f32);
     let box_h = (2 + visible_rows) as f32;
-    let max_rows = picker.items.len().max(1).min(avail).min(MAX_ROWS);
+    let max_rows = picker.item_count().max(1).min(avail).min(MAX_ROWS);
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - (2 + max_rows) as f32) * 0.5).floor();
 
@@ -578,7 +681,7 @@ pub fn picker_element<P>(
     let mut cmds = Vec::new();
     shadow(&mut cmds, px, box_w, frame_h);
     frame_glass(&mut cmds, px, box_w, frame_h);
-    title_bar(&mut cmds, px, box_w, &picker.title);
+    title_bar(&mut cmds, px, box_w, picker.title());
     panel(&mut cmds, px, 0.3, 1.0, box_w - 0.3, box_h + 0.05);
 
     let ink = hex(INK, 1.0);
@@ -597,7 +700,7 @@ pub fn picker_element<P>(
     caret(
         &mut cmds,
         px,
-        1.0 + 2.0 + picker.editor.cursor_cells(),
+        1.0 + 2.0 + picker.editor().cursor_cells(),
         1.2,
         1.8,
     );
@@ -609,9 +712,9 @@ pub fn picker_element<P>(
         if m >= total {
             break;
         }
-        let it = &picker.items[picker.matches[m]];
+        let (label, hint) = picker.item(picker.matches()[m]);
         let y = 2.0 + j as f32;
-        let selected = m == picker.selected;
+        let selected = m == picker.selected();
         if selected {
             gel(&mut cmds, px, 0.55, y + 0.06, row_x1, y + 0.94, &GEL_AQUA);
         }
@@ -626,13 +729,13 @@ pub fn picker_element<P>(
             1.5,
             y,
             Align::Left,
-            &it.label,
+            label,
             fg,
             selected,
             shade,
         );
-        if !it.hint.is_empty() {
-            let hint = if selected {
+        if !hint.is_empty() {
+            let hint_ink = if selected {
                 hex(0xe6f7ff, 1.0)
             } else {
                 hex(0x4a6f93, 1.0)
@@ -644,8 +747,8 @@ pub fn picker_element<P>(
                 hx,
                 y,
                 Align::Right,
-                &it.hint,
                 hint,
+                hint_ink,
                 false,
                 shade,
             );
@@ -682,7 +785,7 @@ pub fn track(cmds: &mut Vec<DrawCmd>, px: Px, x: f32, y: f32, h: f32) {
 /// children, ids and origins, so `ScrollModal::scroll_commands` scrolls
 /// it unchanged. The parent's own commands draw over its children, so
 /// the title bar lives there and masks body lines scrolling under it.
-pub fn scroll_elements(
+fn scroll_elements(
     modal: &ScrollModal,
     ids: ModalIds<'_>,
     host_w: u32,
@@ -807,12 +910,5 @@ mod tests {
                 .collect()
         };
         assert_eq!(shape(&stock), shape(&aero));
-    }
-
-    #[test]
-    fn style_names_parse() {
-        assert_eq!(parse("aero").unwrap(), AERO);
-        assert_eq!(parse("default").unwrap(), STOCK);
-        assert!(parse("vista").is_err());
     }
 }

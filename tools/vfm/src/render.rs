@@ -3,8 +3,10 @@
 //! The window is drawn entirely with VGE rather than terminal text: the
 //! text layer always renders *below* VGE elements (spec §12), so a
 //! selection bar behind a filename is only possible if the filename is a
-//! `DrawText` too. That also lets the panes share vmux's chrome — the
-//! same accent, surfaces and rounded corners, via `vge-ui`.
+//! `DrawText` too. What each part looks like is the style engine's
+//! ([`vge_ui::style`]), so the panes share vmux's look whichever engine
+//! is in force; this module decides where the parts go, which is also
+//! what the hit-tests read.
 //!
 //! Each pane is one element whose command list is rebuilt when it
 //! changes; the event loop pushes those with `UpdateCommands`, so
@@ -13,82 +15,46 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
+use vge_protocol::codec::Rect;
+use vge_protocol::command::{Align, DrawCmd};
 use vge_ui::measure::text_cells;
-use vge_ui::shape::{chrome_corner_radii, rounded_rect_path};
-use vge_ui::theme::{
-    self, accent_color, accent_style, active_text, darken, dim_text, surface_style, title_text,
-    title_thumb_style,
-};
+use vge_ui::paint::Px;
+use vge_ui::style::{self, Engine, FileKind, IconBox, ListInk, StatusLeft};
 
-use crate::entry::{Entry, ListOpts};
-use crate::icons::{self, IconBox};
+use crate::entry::{Entry, Kind, ListOpts, Media};
 use crate::layout::{Area, Layout, View};
 use crate::thumbs::{Slot, Thumbs, stamp_of};
 
-/// A private Frutiger Aero style; see `vge_ui::aero`. A child of this
-/// module so it shares its geometry helpers.
-#[cfg(feature = "aero")]
-#[path = "aero.rs"]
-pub(crate) mod aero;
-
-/// Window backdrop on a terminal that publishes no theme — dark enough
-/// that the panes read as panels. Under a host theme it is the
-/// terminal's own background ([`backdrop_color`]).
-const COLOR_BACKDROP: Color = Color {
-    r: 0.07,
-    g: 0.07,
-    b: 0.09,
-    a: 1.0,
-};
-/// A tile's own plate, under its picture and label, on a terminal that
-/// publishes no theme ([`tile_color`]).
-const COLOR_TILE: Color = Color {
-    r: 0.13,
-    g: 0.13,
-    b: 0.16,
-    a: 1.0,
-};
-/// Status-line text for a failed operation, on a terminal that
-/// publishes no theme ([`error_color`]).
-const COLOR_ERROR: Color = Color {
-    r: 0.92,
-    g: 0.48,
-    b: 0.45,
-    a: 1.0,
-};
-
-/// The window's ground: the terminal's background when the host
-/// publishes its palette, so vfm sits on a light theme as a light
-/// window rather than a dark hole in it.
-fn backdrop_color() -> Color {
-    theme::host_bg().unwrap_or(COLOR_BACKDROP)
+fn rect(a: Area) -> Rect {
+    Rect {
+        x: a.x,
+        y: a.y,
+        w: a.w,
+        h: a.h,
+    }
 }
 
-/// A tile's plate: the host's recessed surface, one step off the
-/// backdrop in whichever direction the theme runs.
-fn tile_color() -> Color {
-    theme::host_surface_inset()
-        .map(|c| Color { a: 1.0, ..c })
-        .unwrap_or(COLOR_TILE)
-}
-
-fn error_color() -> Color {
-    theme::warn_color().unwrap_or(COLOR_ERROR)
+fn file_kind(m: Media) -> FileKind {
+    match m {
+        Media::Dir => FileKind::Dir,
+        Media::Image => FileKind::Image,
+        Media::Video => FileKind::Video,
+        Media::Audio => FileKind::Audio,
+        Media::Text => FileKind::Text,
+        Media::Archive => FileKind::Archive,
+        Media::Binary => FileKind::Binary,
+    }
 }
 
 /// Full-window backdrop.
-pub fn backdrop(l: &Layout) -> Vec<DrawCmd> {
-    vec![DrawCmd::FillRectangles {
-        fill: Style::Flat(backdrop_color()),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 0.0,
-            w: l.cols as f32,
-            h: l.rows as f32,
-        }],
-    }]
+pub fn backdrop(l: &Layout, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
+    let mut cmds = Vec::new();
+    let px = Px {
+        w: cell_pw,
+        h: cell_ph,
+    };
+    style::engine().browser_backdrop(&mut cmds, px, l.cols as f32, l.rows as f32);
+    cmds
 }
 
 /// One ancestor column.
@@ -139,29 +105,25 @@ pub fn column_row_at(
 }
 
 pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::column_commands(v, vge_ui::aero::Px { w: cell_pw, h: cell_ph });
-    }
+    let px = Px {
+        w: cell_pw,
+        h: cell_ph,
+    };
+    column_commands_in(style::engine(), v, px)
+}
+
+fn column_commands_in(engine: &dyn Engine, v: &ColumnView, px: Px) -> Vec<DrawCmd> {
     let a = v.area;
-    let (rx, ry) = chrome_corner_radii(a.w, a.h, cell_pw, cell_ph);
-    let mut cmds = vec![DrawCmd::FillPath {
-        fill: surface_style(),
-        segments: rounded_rect_path(a.x + 0.25, a.y, a.x + a.w - 0.25, a.y + a.h, rx, ry),
-    }];
+    let mut cmds = Vec::new();
+    engine.column_pane(&mut cmds, px, rect(a));
 
     if let Some(err) = v.error {
-        cmds.push(text(
-            a.x + 1.0,
-            a.y + 1.0,
-            Align::Left,
-            dim_text(),
-            false,
-            elide(err, a.w as usize - 2),
-        ));
+        let s = elide(err, a.w as usize - 2);
+        engine.browser_note(&mut cmds, px, a.x + 1.0, a.y + 1.0, Align::Left, &s, false);
         return cmds;
     }
 
+    // Row geometry is what `column_row_at` hit-tests against.
     let rows = (a.h as usize).saturating_sub(1).max(1);
     let start = column_window(rows, v.entries.len(), v.selected);
     let text_w = (a.w as usize).saturating_sub(3).max(4);
@@ -169,46 +131,16 @@ pub fn column_commands(v: &ColumnView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
     for (row, e) in v.entries.iter().skip(start).take(rows).enumerate() {
         let y = a.y + 0.5 + row as f32;
         let is_sel = v.selected == Some(start + row);
-        if is_sel {
-            cmds.push(DrawCmd::FillPath {
-                fill: title_thumb_style(),
-                segments: rounded_rect_path(
-                    a.x + 0.5,
-                    y + 0.05,
-                    a.x + a.w - 0.5,
-                    y + 0.95,
-                    rx,
-                    ry,
-                ),
-            });
-        }
-        // The selection is the translucent thumb, which the column's
-        // ground shows through — so the selected row keeps the ink a
-        // file name has, not the text a solid accent would want.
-        let color = if is_sel {
-            title_text()
-        } else if e.is_dir() {
-            accent_text()
-        } else {
-            title_text()
-        };
         let label = if e.is_dir() {
             format!("{}/", elide(&e.name, text_w.saturating_sub(1)))
         } else {
             elide(&e.name, text_w)
         };
-        cmds.push(text(a.x + 1.0, y, Align::Left, color, is_sel, label));
+        engine.column_row(&mut cmds, px, rect(a), y, &label, e.is_dir(), is_sel);
     }
 
     if v.entries.is_empty() {
-        cmds.push(text(
-            a.x + 1.0,
-            a.y + 0.5,
-            Align::Left,
-            dim_text(),
-            false,
-            "empty".into(),
-        ));
+        engine.browser_note(&mut cmds, px, a.x + 1.0, a.y + 0.5, Align::Left, "empty", false);
     }
     cmds
 }
@@ -227,45 +159,44 @@ pub struct GridView<'a> {
     pub error: Option<&'a str>,
 }
 
-pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::grid_commands(v);
+impl GridView<'_> {
+    fn px(&self) -> Px {
+        Px {
+            w: self.cell_pw,
+            h: self.cell_ph,
+        }
     }
+}
+
+pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
+    grid_commands_in(style::engine(), v)
+}
+
+fn grid_commands_in(engine: &dyn Engine, v: &GridView) -> Vec<DrawCmd> {
+    let px = v.px();
     let l = v.layout;
     let a = l.grid;
     let mut cmds: Vec<DrawCmd> = Vec::new();
+    engine.grid_pane(&mut cmds, px, rect(a));
 
     if let Some(err) = v.error {
-        cmds.push(text(
-            a.x + 2.0,
-            a.y + 1.0,
-            Align::Left,
-            error_color(),
-            true,
-            elide(err, a.w as usize - 4),
-        ));
+        let s = elide(err, a.w as usize - 4);
+        engine.browser_note(&mut cmds, px, a.x + 2.0, a.y + 1.0, Align::Left, &s, true);
         return cmds;
     }
     if v.entries.is_empty() {
-        cmds.push(text(
-            a.x + a.w * 0.5,
-            a.y + a.h * 0.5,
-            Align::Center,
-            dim_text(),
-            false,
-            "empty directory".into(),
-        ));
+        let (cx, cy) = (a.x + a.w * 0.5, a.y + a.h * 0.5);
+        engine.browser_note(&mut cmds, px, cx, cy, Align::Center, "empty directory", false);
         return cmds;
     }
 
     let first = v.scroll_row * l.grid_cols;
     let last = (first + l.page()).min(v.entries.len());
     for index in first..last {
-        cmds.extend(match l.view {
-            View::Grid => tile_commands(v, index),
-            View::List => row_commands(v, index),
-        });
+        match l.view {
+            View::Grid => tile_commands(&mut cmds, engine, v, index),
+            View::List => row_commands(&mut cmds, engine, v, index),
+        }
     }
 
     // Scrollbar down the right edge when the listing overflows.
@@ -279,93 +210,40 @@ pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
         } else {
             0.0
         };
-        let x = a.x + a.w - 0.6;
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(Color {
-                a: 0.18,
-                ..title_text()
-            }),
-            rects: vec![Rect {
-                x,
-                y: a.y + 0.5,
-                w: 0.3,
-                h: track_h,
-            }],
-        });
-        cmds.push(DrawCmd::FillRectangles {
-            fill: accent_style(),
-            rects: vec![Rect {
-                x,
-                y: a.y + 0.5 + (track_h - thumb_h) * frac,
-                w: 0.3,
-                h: thumb_h,
-            }],
-        });
+        engine.browser_scrollbar(&mut cmds, px, rect(a), track_h, thumb_h, frac);
     }
     cmds
 }
 
-/// One tile: plate, selection, picture (thumbnail or icon), label.
-fn tile_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
+/// One tile: plate, selection, picture (thumbnail or icon), mark, label.
+fn tile_commands(cmds: &mut Vec<DrawCmd>, engine: &dyn Engine, v: &GridView, index: usize) {
+    let px = v.px();
     let l = v.layout;
     let e = &v.entries[index];
     let (x, y) = l.tile_origin(index, v.scroll_row);
-    let (rx, ry) = chrome_corner_radii(l.tile_w, l.tile_h, v.cell_pw, v.cell_ph);
+    let tile = Rect {
+        x,
+        y,
+        w: l.tile_w,
+        h: l.tile_h,
+    };
     let selected = index == v.cursor;
-    let marked = v.marks.contains(&e.path);
-
-    let mut cmds = vec![DrawCmd::FillPath {
-        fill: Style::Flat(if selected {
-            Color {
-                a: 0.9,
-                ..accent_color()
-            }
-        } else {
-            tile_color()
-        }),
-        segments: rounded_rect_path(x, y, x + l.tile_w, y + l.tile_h, rx, ry),
-    }];
-    // The picture sits on its own plate so a selected tile still frames
-    // the image rather than tinting it.
-    cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(darken(tile_color(), 0.25)),
-        segments: rounded_rect_path(
-            x + 0.25,
-            y + 0.15,
-            x + l.tile_w - 0.25,
-            y + l.tile_img_h,
-            rx,
-            ry,
-        ),
-    });
-    cmds.extend(picture(
+    engine.tile_plate(cmds, px, tile, l.tile_img_h, selected);
+    picture(
+        cmds,
+        engine,
         v,
         e,
         (x + 0.25, y + 0.15, l.tile_w - 0.5, l.tile_img_h - 0.15),
         0.66,
-    ));
-
-    if marked {
-        cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(MARK_COLOR),
-            segments: rounded_rect_path(x + 0.3, y + 0.2, x + 1.3, y + 1.0, rx, ry),
-        });
+    );
+    if v.marks.contains(&e.path) {
+        engine.tile_mark(cmds, px, tile);
     }
-
     let label_w = (l.tile_w as usize).saturating_sub(1).max(3);
-    cmds.push(text(
-        x + l.tile_w * 0.5,
-        y + l.tile_img_h,
-        Align::Center,
-        if selected {
-            active_text()
-        } else {
-            title_text()
-        },
-        selected,
-        elide(&e.name, label_w),
-    ));
-    cmds
+    let label = elide(&e.name, label_w);
+    let lx = x + l.tile_w * 0.5;
+    engine.tile_label(cmds, px, lx, y + l.tile_img_h, &label, e.is_dir(), selected);
 }
 
 /// Detail columns of a list row, in cells: the size and the modified
@@ -378,63 +256,42 @@ const LIST_SIZE_MIN_W: f32 = 30.0;
 const LIST_DATE_MIN_W: f32 = 50.0;
 
 /// One list row: selection, mark, picture at the left, then name, size
-/// and modified time. Rows are contiguous, so alternate ones get a faint
-/// plate — that striping is what carries the eye across a wide row.
-fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
+/// and modified time.
+fn row_commands(cmds: &mut Vec<DrawCmd>, engine: &dyn Engine, v: &GridView, index: usize) {
+    let px = v.px();
     let l = v.layout;
     let e = &v.entries[index];
     let (x, y) = l.tile_origin(index, v.scroll_row);
     let w = l.tile_w;
-    let (rx, ry) = chrome_corner_radii(w, l.tile_h, v.cell_pw, v.cell_ph);
+    let row = Rect {
+        x,
+        y,
+        w,
+        h: l.tile_h,
+    };
     let selected = index == v.cursor;
-    let mut cmds: Vec<DrawCmd> = Vec::new();
-
-    if selected {
-        cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(Color {
-                a: 0.9,
-                ..accent_color()
-            }),
-            segments: rounded_rect_path(x, y, x + w, y + l.tile_h, rx, ry),
-        });
-    } else if index % 2 == 1 {
-        cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(Color { a: 0.5, ..tile_color() }),
-            segments: rounded_rect_path(x, y, x + w, y + l.tile_h, rx, ry),
-        });
-    }
+    engine.list_row_plate(cmds, px, row, index % 2 == 1, selected);
     if v.marks.contains(&e.path) {
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(MARK_COLOR),
-            rects: vec![Rect {
-                x: x + 0.15,
-                y: y + 0.1,
-                w: 0.3,
-                h: (l.tile_h - 0.2).max(0.4),
-            }],
-        });
+        engine.list_row_mark(cmds, px, row);
     }
 
     // A square picture box at the left, as tall as the row.
     let icon_w = (l.tile_h * v.cell_ph / v.cell_pw.max(1.0)).max(1.0);
     let icon_x = x + 0.7;
-    cmds.extend(picture(v, e, (icon_x, y + 0.05, icon_w, l.tile_h - 0.1), 0.82));
+    picture(cmds, engine, v, e, (icon_x, y + 0.05, icon_w, l.tile_h - 0.1), 0.82);
 
     // One text baseline, centered when the row is more than a row tall.
     let ty = y + (l.tile_h - 1.0) * 0.5;
-    let meta_ink = if selected {
-        active_text()
-    } else {
-        dim_text()
-    };
     // Columns are laid out from the right; the name takes what is left.
     let mut right = x + w - 0.5;
     if w >= LIST_DATE_MIN_W {
-        cmds.push(text(right, ty, Align::Right, meta_ink, false, e.mtime_label()));
+        let s = e.mtime_label();
+        engine.list_text(cmds, px, right, ty, Align::Right, &s, ListInk::Meta, selected);
         right -= LIST_DATE_COLS;
     }
     if w >= LIST_SIZE_MIN_W {
-        cmds.push(text(right, ty, Align::Right, meta_ink, false, e.size_label()));
+        let s = e.size_label();
+        engine.list_text(cmds, px, right, ty, Align::Right, &s, ListInk::Meta, selected);
         right -= LIST_SIZE_COLS;
     }
 
@@ -445,48 +302,36 @@ fn row_commands(v: &GridView, index: usize) -> Vec<DrawCmd> {
     } else {
         elide(&e.name, name_w)
     };
-    let ink = if selected {
-        active_text()
-    } else if e.is_dir() {
-        accent_text()
-    } else {
-        title_text()
-    };
-    cmds.push(text(name_x, ty, Align::Left, ink, selected, label));
-    cmds
+    let name = ListInk::Name { is_dir: e.is_dir() };
+    engine.list_text(cmds, px, name_x, ty, Align::Left, &label, name, selected);
 }
 
 /// An entry's picture fitted into `area`: its thumbnail once a decoder
 /// has one, else the file-type icon at `icon_frac` of the box.
 fn picture(
+    cmds: &mut Vec<DrawCmd>,
+    engine: &dyn Engine,
     v: &GridView,
     e: &Entry,
     area: (f32, f32, f32, f32),
     icon_frac: f32,
-) -> Vec<DrawCmd> {
+) {
+    let px = v.px();
     match v.thumbs.slot(&e.path, stamp_of(e.size, e.mtime)) {
-        Some(Slot::Ready { image_id, w, h }) => vec![DrawCmd::DrawImage {
-            target_rect: fit(area, *w, *h, v.cell_pw, v.cell_ph),
-            image_id: image_id.clone(),
-            source_rect: None,
-        }],
-        _ => icons::draw(
-            e.media(),
+        Some(Slot::Ready { image_id, w, h }) => {
+            let r = fit(area, *w, *h, v.cell_pw, v.cell_ph);
+            engine.thumbnail(cmds, px, r, image_id.clone());
+        }
+        _ => engine.file_icon(
+            cmds,
+            px,
+            file_kind(e.media()),
             IconBox::centered(area, icon_frac, v.cell_pw, v.cell_ph),
             e.is_link,
-            e.kind == crate::entry::Kind::Broken,
+            e.kind == Kind::Broken,
         ),
     }
 }
-
-/// Marked-entry badge — a warm tone that reads as "chosen by hand",
-/// distinct from the accent the cursor uses.
-const MARK_COLOR: Color = Color {
-    r: 0.95,
-    g: 0.76,
-    b: 0.33,
-    a: 1.0,
-};
 
 /// Fit a `w × h` pixel image inside `(x, y, w, h)` cells, preserving its
 /// visual aspect ratio on this cell grid and centering it.
@@ -521,17 +366,15 @@ pub struct StatusView<'a> {
 }
 
 pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::status_commands(v, vge_ui::aero::Px { w: cell_pw, h: cell_ph });
-    }
-    let a = v.area;
-    let (rx, ry) = chrome_corner_radii(a.w, a.h, cell_pw, cell_ph);
-    let mut cmds = vec![DrawCmd::FillPath {
-        fill: surface_style(),
-        segments: rounded_rect_path(a.x, a.y, a.x + a.w, a.y + a.h, rx, ry),
-    }];
+    let px = Px {
+        w: cell_pw,
+        h: cell_ph,
+    };
+    status_commands_in(style::engine(), v, px)
+}
 
+fn status_commands_in(engine: &dyn Engine, v: &StatusView, px: Px) -> Vec<DrawCmd> {
+    let a = v.area;
     // Right side first, so the path knows how much room it has left.
     let mut right = String::new();
     if let Some((n, what)) = v.clip {
@@ -554,66 +397,19 @@ pub fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCm
         if v.total == 0 { 0 } else { v.index + 1 },
         v.total
     ));
-    cmds.push(text(
-        a.x + a.w - 1.0,
-        a.y,
-        Align::Right,
-        dim_text(),
-        false,
-        right.clone(),
-    ));
 
     // Left: a message while there is one, else the current path.
     let room = (a.w as usize).saturating_sub(text_cells(&right) as usize + 3);
-    let (left, color, bold) = match (v.busy, v.message) {
-        (Some(busy), _) => (format!("{busy}…"), accent_text(), true),
-        (None, Some((msg, failed))) => (
-            msg.to_string(),
-            if failed { error_color() } else { title_text() },
-            true,
-        ),
-        (None, None) => (v.cwd.display().to_string(), title_text(), false),
+    let (left, kind) = match (v.busy, v.message) {
+        (Some(busy), _) => (format!("{busy}…"), StatusLeft::Busy),
+        (None, Some((msg, true))) => (msg.to_string(), StatusLeft::Failed),
+        (None, Some((msg, false))) => (msg.to_string(), StatusLeft::Message),
+        (None, None) => (v.cwd.display().to_string(), StatusLeft::Path),
     };
-    cmds.push(text(
-        a.x + 1.0,
-        a.y,
-        Align::Left,
-        color,
-        bold,
-        elide_front(&left, room),
-    ));
+    let left = elide_front(&left, room);
+    let mut cmds = Vec::new();
+    engine.status_bar(&mut cmds, px, rect(a), &left, kind, &right);
     cmds
-}
-
-/// The accent as text ink. A `Style::Ref` cannot be used for text fills
-/// we also shade, so this resolves it concretely.
-fn accent_text() -> Color {
-    let c = accent_color();
-    // Lift it toward the foreground so it stays legible as small text —
-    // toward white on a dark theme, toward the ink on a light one.
-    let f = theme::host_fg().unwrap_or(Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
-    });
-    Color {
-        r: (c.r * 0.55 + f.r * 0.45).min(1.0),
-        g: (c.g * 0.55 + f.g * 0.45).min(1.0),
-        b: (c.b * 0.55 + f.b * 0.45).min(1.0),
-        a: 1.0,
-    }
-}
-
-fn text(x: f32, y: f32, align: Align, fill: Color, bold: bool, s: String) -> DrawCmd {
-    DrawCmd::DrawText {
-        origin: Point { x, y },
-        align,
-        fill: Style::Flat(fill),
-        font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
-        font_scale: 1.0,
-        text: s,
-    }
 }
 
 /// Clip `s` to `max` grid columns, marking the cut with `…`. Columns,
@@ -624,7 +420,17 @@ pub use vge_ui::measure::{elide, elide_front};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::Kind;
+    use vge_ui::style::flat::Flat;
+
+    // These check what vfm lays out, so they pin the engine rather than
+    // take whichever one `VETER_STYLE` names.
+    fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
+        grid_commands_in(&Flat, v)
+    }
+
+    fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
+        status_commands_in(&Flat, v, Px { w: cell_pw, h: cell_ph })
+    }
     use std::time::SystemTime;
 
     fn entry(name: &str, dir: bool) -> Entry {
@@ -846,11 +652,55 @@ mod tests {
             message: Some(("deleting: nope", true)),
             busy: None,
         };
-        let cmds = status_commands(&v, 9.0, 20.0);
-        let DrawCmd::DrawText { text, fill, .. } = &cmds[2] else {
-            panic!("expected the left text");
+        let left = |v: &StatusView| {
+            status_commands(v, 9.0, 20.0)
+                .into_iter()
+                .rev()
+                .find_map(|c| match c {
+                    DrawCmd::DrawText { text, fill, .. } => Some((text, fill)),
+                    _ => None,
+                })
+                .expect("the left text")
         };
+        let (text, failed) = left(&v);
         assert_eq!(text, "deleting: nope");
-        assert_eq!(*fill, Style::Flat(COLOR_ERROR));
+        // A failure takes its own ink, not a plain message's.
+        let (_, plain) = left(&StatusView {
+            message: Some(("deleted", false)),
+            ..v
+        });
+        assert_ne!(failed, plain);
+    }
+
+    /// Rows must sit where `column_row_at` expects them under every
+    /// engine, so a click lands on the row it looks like it lands on.
+    #[test]
+    fn column_rows_sit_at_the_same_place_under_every_engine() {
+        let area = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 14.0,
+            h: 8.0,
+        };
+        let entries = [entry("a", false), entry("b", true)];
+        let v = ColumnView {
+            area,
+            entries: &entries,
+            selected: Some(1),
+            error: None,
+        };
+        let px = Px { w: 12.0, h: 28.0 };
+        let origins = |engine: &dyn Engine| -> Vec<(f32, f32)> {
+            column_commands_in(engine, &v, px)
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCmd::DrawText { origin, .. } => Some((origin.x, origin.y)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let flat = origins(&Flat);
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat, origins(&vge_ui::style::aero::Aero));
     }
 }

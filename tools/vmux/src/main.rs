@@ -24,9 +24,6 @@
 //! drawn with VGE elements. Keystrokes go to the focused pane's PTY
 //! master directly — no input crosses the PRT wire (§9.1).
 
-#[cfg(feature = "aero")]
-mod aero;
-
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -64,21 +61,17 @@ use ses_protocol::{
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
-use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{
-    Align, Command as VgeCommand, CreateElementBody, DrawCmd, FontStyle, OriginAnchor, Style,
-};
+use vge_protocol::codec::Point;
+use vge_protocol::command::{Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor};
 use vge_protocol::encode::build_envelope as build_vge_envelope;
 use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PROBE};
 
 use vge_ui::edit::{EditOutcome, LineEditor};
-use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
+use vge_ui::modal::{ModalIds, ScrollModal};
+use vge_ui::paint::Px;
+use vge_ui::style::{self, PaneChrome, TabBar, TabbarMetrics};
 use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
-use vge_ui::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
-use vge_ui::theme::{
-    self, accent_style, active_text, activity_style, dim_text, scrollbar, surface_style,
-    title_text, title_thumb_style,
-};
+use vge_ui::theme;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
 
@@ -502,14 +495,8 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
                 }
             })
             .collect();
-        cmds.push(DrawCmd::DrawLines {
-            stroke: accent_style(),
-            line_width: 0.1,
-            lines,
-        });
+        style::engine().separators(&mut cmds, lines);
     }
-    #[cfg(feature = "aero")]
-    aero::restyle_separators(&mut cmds);
     CreateElementBody {
         id: SEPARATORS_ELEMENT_ID.to_string(),
         commands: cmds,
@@ -1107,36 +1094,10 @@ const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
 const TABBAR_CHEVRON_W: f32 = 2.0;
-/// The tab bar's size and spacing: how many rows it takes off the top
-/// of the host, and the cells it puts around and between tabs. The one
-/// place they are decided, so pane bounds, mouse routing, the layout
-/// and the hit-test all agree with what is drawn.
-#[derive(Clone, Copy, Debug)]
-struct TabbarMetrics {
-    /// Rows reserved for the bar; panes start below them.
-    rows: u32,
-    /// Cells left clear before the first tab and after the last.
-    margin: f32,
-    /// Cells between neighbouring tabs.
-    gap: f32,
-    /// Cells around a label inside its name rect, both sides together.
-    name_pad: f32,
-}
-
-/// The stock bar: one row, tabs abutting, a space either side of a label.
-const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
-    rows: 1,
-    margin: 0.0,
-    gap: 0.0,
-    name_pad: 2.0,
-};
-
+/// The tab bar's size and spacing, as the style engine has it — read by
+/// pane bounds, mouse routing, the layout and its hit-test alike.
 fn tabbar_metrics() -> TabbarMetrics {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::TABBAR_METRICS;
-    }
-    TABBAR_METRICS
+    style::engine().metrics().tabbar
 }
 
 /// Marker prefixed to a zoomed pane's title. Two columns wide, so with
@@ -1489,185 +1450,29 @@ fn build_tabbar_commands(
 ) -> CreateElementBody {
     let host_wf = host_w as f32;
     let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        let px = vge_ui::aero::Px { w: cell_pw, h: cell_ph };
-        return aero::tabbar(&layout, active, host_wf, px, activity);
-    }
-
-    // No bar background — row 0 of the host vt100 is left untouched
-    // (vmux never writes there) so the terminal's default cell color
-    // shows through, matching whatever theme the user runs veter in.
-    let mut cmds: Vec<DrawCmd> = Vec::new();
-
-    // Solid rule separating the tab row from the pane area at row 1.
-    // A stroked line is centred on its path, so positioning it at y = 1.0
-    // would straddle the boundary and the tab fills (which span [0, 1.0])
-    // would overpaint its top half — the line then reads ~half as thick
-    // under every tab. We want `RULE_W` of *visible* rule below y = 1.0,
-    // so the bottom edge sits at 1.0 + RULE_W. Abutting the top edge
-    // exactly at y = 1.0 leaves an anti-aliasing seam where the background
-    // bleeds through between the fills and the rule, so we extend the
-    // stroke up by `SEAM_OVERLAP` into the fills (drawn after the rule, so
-    // they paint over the sliver): the overlap closes the seam without
-    // thinning the visible rule.
-    const RULE_W: f32 = 0.1;
-    const SEAM_OVERLAP: f32 = 0.04;
-    let stroke_w = RULE_W + SEAM_OVERLAP;
-    let rule_y = 1.0 + (RULE_W - SEAM_OVERLAP) / 2.0;
-    cmds.push(DrawCmd::DrawLines {
-        stroke: accent_style(),
-        line_width: stroke_w,
-        lines: vec![(
-            Point { x: 0.0, y: rule_y },
-            Point { x: host_wf, y: rule_y },
-        )],
-    });
-
-    // Session-name segment: a dim rounded block pinned at x = 0,
-    // showing the `vsd` session this vmux lives in.
-    if let Some((label, w)) = &layout.session_seg {
-        let (rx, ry) = chrome_corner_radii(*w, 1.0, cell_pw, cell_ph);
-        cmds.push(DrawCmd::FillPath {
-            fill: surface_style(),
-            segments: rounded_rect_path_corners(
-                0.0, 0.0, *w, 1.0, rx, ry,
-                true,  // TL rounded
-                false, // TR (meets the first tab / chevron)
-                false, // BR
-                false, // BL (sits on the row-1 rule)
-            ),
-        });
-        cmds.push(DrawCmd::DrawText {
-            origin: Point { x: 0.0, y: 0.0 },
-            align: Align::Left,
-            fill: Style::Flat(title_text()),
-            font_style: FontStyle(0x01),
-            font_scale: 1.0,
-            text: format!(" {label} "),
-        });
-    }
-
-    // Left overflow chevron — tabs clipped off the start of the bar.
-    if layout.has_left {
-        cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: layout.session_w(),
-                y: 0.0,
-            },
-            align: Align::Left,
-            fill: accent_style(),
-            font_style: FontStyle(0x00),
-            font_scale: 1.0,
-            text: " ‹".to_string(),
-        });
-    }
-
-    for slot in &layout.slots {
-        let i = slot.index;
-        let x = slot.x0;
-        let num_w = slot.num_w;
-        let name_w = slot.name_w;
-        let num_text = format!(" {} ", i + 1);
-        let name_text = format!(" {} ", slot.label);
-        let is_active = i == active;
-
-        // Number sub-rect ("tag"), top-left corner rounded. Always the dim
-        // modal background — activity lights up the name rect instead, so
-        // the tag stays a stable anchor at the head of every pill.
-        let has_activity = activity.get(i).copied().unwrap_or(false);
-        let (num_rx, num_ry) = chrome_corner_radii(num_w, 1.0, cell_pw, cell_ph);
-        cmds.push(DrawCmd::FillPath {
-            fill: surface_style(),
-            segments: rounded_rect_path_corners(
-                x,
-                0.0,
-                x + num_w,
-                1.0,
-                num_rx,
-                num_ry,
-                true,  // TL rounded
-                false, // TR (meets the name rect, kept square)
-                false, // BR
-                false, // BL (sits on the row-1 rule)
-            ),
-        });
-        // The tag always sits on the surface, so it takes the surface's
-        // text colour. `active_text` is picked against the *accent* —
-        // near-black under every pastel-accented scheme — and vanished
-        // into a dark surface.
-        cmds.push(DrawCmd::DrawText {
-            origin: Point { x, y: 0.0 },
-            align: Align::Left,
-            fill: Style::Flat(title_text()),
-            font_style: FontStyle(0x00),
-            font_scale: 1.0,
-            text: num_text,
-        });
-
-        // Name sub-rect — the body of the pill. Full accent on the active
-        // tab; the muted activity shade when an inactive tab has unseen
-        // background activity, so the whole pill lights up rather than just
-        // the tag. Top-right corner rounded so the silhouette reads as a tab.
-        let name_x0 = x + num_w;
-        let name_bg = if is_active {
-            Some(accent_style())
-        } else if has_activity {
-            Some(activity_style())
-        } else {
-            None
-        };
-        if let Some(name_fill) = name_bg {
-            let (name_rx, name_ry) = chrome_corner_radii(name_w, 1.0, cell_pw, cell_ph);
-            cmds.push(DrawCmd::FillPath {
-                fill: name_fill,
-                segments: rounded_rect_path_corners(
-                    name_x0,
-                    0.0,
-                    name_x0 + name_w,
-                    1.0,
-                    name_rx,
-                    name_ry,
-                    false, // TL (meets the number rect)
-                    true,  // TR rounded
-                    false, // BR (sits on the row-1 rule)
-                    false, // BL
-                ),
-            });
-        }
-        // Text picked against whichever fill the pill body has (full
-        // accent, or the muted activity shade); dim only on a bare
-        // pill. Bold still marks the active tab specifically.
-        cmds.push(DrawCmd::DrawText {
-            origin: Point { x: name_x0, y: 0.0 },
-            align: Align::Left,
-            fill: Style::Flat(if is_active {
-                active_text()
-            } else if has_activity {
-                theme::activity_text()
-            } else {
-                dim_text()
-            }),
-            font_style: FontStyle(if is_active { 0x01 } else { 0x00 }),
-            font_scale: 1.0,
-            text: name_text,
-        });
-    }
-
-    // Right overflow chevron — tabs clipped off the end of the bar.
-    if layout.has_right {
-        cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: host_wf - TABBAR_CHEVRON_W,
-                y: 0.0,
-            },
-            align: Align::Left,
-            fill: accent_style(),
-            font_style: FontStyle(0x00),
-            font_scale: 1.0,
-            text: "› ".to_string(),
-        });
-    }
+    let bar = TabBar {
+        width: host_wf,
+        session: layout.session_seg.as_ref().map(|(l, w)| (l.as_str(), *w)),
+        tabs: layout
+            .slots
+            .iter()
+            .map(|s| style::Tab {
+                index: s.index,
+                x0: s.x0,
+                num_w: s.num_w,
+                name_w: s.name_w,
+                label: &s.label,
+                active: s.index == active,
+                activity: activity.get(s.index).copied().unwrap_or(false),
+            })
+            .collect(),
+        left_chevron: layout
+            .has_left
+            .then_some(layout.session_w() + tabbar_metrics().margin),
+        right_chevron: layout.has_right.then_some(host_wf - TABBAR_CHEVRON_W),
+    };
+    let mut cmds = Vec::new();
+    style::engine().tab_bar(&mut cmds, Px { w: cell_pw, h: cell_ph }, &bar);
 
     CreateElementBody {
         id: TABBAR_ELEMENT_ID.to_string(),
@@ -1684,16 +1489,8 @@ fn build_tabbar_commands(
     }
 }
 
-/// State the chrome needs to render a scrollbar thumb on the right
-/// border of a pane. `history_depth` is the number of rows in the
-/// portal's scrollback ring; `offset` is the current scroll offset
-/// (0 = live region). When this is `Some`, the thumb is drawn over the
-/// outline's right edge.
-#[derive(Clone, Copy)]
-struct ScrollIndicator {
-    offset: u32,
-    history_depth: u32,
-}
+/// Where a pane is scrolled to, for the scroll thumb its chrome draws.
+type ScrollIndicator = style::PaneScroll;
 
 /// Build chrome draw-commands for one pane. Element origin is the
 /// pane's top-left in host cells; commands are pane-relative.
@@ -1710,96 +1507,16 @@ fn build_chrome_commands(
     cell_ph: f32,
     scroll: Option<ScrollIndicator>,
 ) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        let px = vge_ui::aero::Px { w: cell_pw, h: cell_ph };
-        return aero::pane_chrome(rect, title, focused, show_title, px, scroll);
-    }
-    let pw = rect.w as f32;
-    let ph = rect.h as f32;
-    let mut cmds: Vec<DrawCmd> = Vec::new();
-
-    // Title text in the top-right portal cell, right-aligned, with
-    // a semi-transparent rounded "thumb" behind it (no stroke). Drawn
-    // at higher draw_order than the portal so it overlays shell text.
-    // 0.5-cell inset from the right edge keeps the thumb clear of any
-    // separator on the pane boundary. Both thumb and text are nudged
-    // down by 1/4 of a cell so the thumb doesn't visually fuse with the
-    // top edge of the pane.
-    if show_title && !title.is_empty() {
-        let text_w = vge_ui::measure::text_cells(title);
-        let top_pad = 0.25;
-        let text_origin_x = pw - 1.0;
-        let text_origin_y = top_pad;
-        let pad_x = 0.5;
-        let thumb_x0 = text_origin_x - text_w - pad_x;
-        let thumb_x1 = text_origin_x + pad_x;
-        let thumb_y0 = text_origin_y;
-        let thumb_y1 = text_origin_y + 1.0;
-        // Same slight rounding as the modal/tab chrome, with rx
-        // compensated for anisotropic cells.
-        let (rx, ry) =
-            chrome_corner_radii(thumb_x1 - thumb_x0, thumb_y1 - thumb_y0, cell_pw, cell_ph);
-        // Focused pane gets the translucent accent thumb; inactive panes
-        // use the dim surface fill — the same color as an inactive tab's
-        // number cell — so focus reads as an accent highlight.
-        cmds.push(DrawCmd::FillPath {
-            fill: if focused {
-                title_thumb_style()
-            } else {
-                surface_style()
-            },
-            segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
-        });
-        cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: text_origin_x,
-                y: text_origin_y,
-            },
-            align: Align::Right,
-            fill: Style::Flat(title_text()),
-            font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
-            font_scale: 1.0,
-            text: title.to_string(),
-        });
-    }
-
-    // Scrollbar thumb at the right edge of the pane. Drawn in cell
-    // units; sized by visible_rows / (visible_rows + history_depth)
-    // and positioned by offset. Track starts below the title row so the
-    // thumb never collides with the scroll-indicator title that sits in
-    // the top-right cell while we're scrolling.
-    if let Some(s) = scroll {
-        let portal_rows = ph.max(1.0);
-        let total = portal_rows + s.history_depth as f32;
-        let track_x = pw - 1.30;
-        let track_w = 0.35;
-        let track_y0 = 1.25;
-        let track_y1 = (ph - 0.5).max(track_y0 + 1.0);
-        let track_h = (track_y1 - track_y0).max(1.0);
-
-        let thumb_h_norm = (portal_rows / total).clamp(0.05, 1.0);
-        let thumb_h = (thumb_h_norm * track_h).max(0.6);
-        let available = (track_h - thumb_h).max(0.0);
-        // 0 offset = bottom (live); offset = history_depth = top.
-        let thumb_norm = if s.history_depth == 0 {
-            1.0
-        } else {
-            (s.history_depth.saturating_sub(s.offset) as f32) / s.history_depth as f32
-        };
-        let thumb_y = track_y0 + thumb_norm * available;
-
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(scrollbar()),
-            rects: vec![Rect {
-                x: track_x,
-                y: thumb_y,
-                w: track_w,
-                h: thumb_h,
-            }],
-        });
-    }
-
+    let mut cmds = Vec::new();
+    let pane = PaneChrome {
+        w: rect.w as f32,
+        h: rect.h as f32,
+        title,
+        focused,
+        show_title,
+        scroll,
+    };
+    style::engine().pane_chrome(&mut cmds, Px { w: cell_pw, h: cell_ph }, &pane);
     cmds
 }
 
@@ -3936,55 +3653,53 @@ impl State {
     /// after) for whichever overlay the current mode wants up — rename
     /// prompt or help — or empty if no modal should be visible.
     fn build_modal_elements(&self) -> Vec<CreateElementBody> {
-        #[cfg(feature = "aero")]
-        if vge_ui::aero::enabled() {
-            return aero::modal_elements(self);
-        }
+        let engine = style::engine();
+        let px = Px {
+            w: self.cell_pw,
+            h: self.cell_ph,
+        };
         match &self.mode {
             Mode::Rename { target, editor } => {
                 let title = match target {
                     RenameTarget::Pane(_) => "Rename pane",
                     RenameTarget::Tab(_) => "Rename tab",
                 };
-                vec![prompt_element(
+                vec![engine.prompt(
                     MODAL_ELEMENT_ID,
                     self.host_w,
                     self.host_h,
                     title,
                     &editor.buffer,
-                    self.cell_pw,
-                    self.cell_ph,
+                    px,
                     Some(editor.cursor),
                     MODAL_DRAW_ORDER,
                 )]
             }
-            Mode::Help { offset, .. } => help_modal().elements(
+            Mode::Help { offset, .. } => engine.scroll_modal(
+                help_modal(),
                 MODAL_IDS,
                 self.host_w,
                 self.host_h,
                 *offset,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 MODAL_DRAW_ORDER,
             ),
-            Mode::ConfirmQuit => vec![prompt_element(
+            Mode::ConfirmQuit => vec![engine.prompt(
                 MODAL_ELEMENT_ID,
                 self.host_w,
                 self.host_h,
                 "Quit vmux?",
                 "y = quit     n = cancel",
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 None,
                 MODAL_DRAW_ORDER,
             )],
-            Mode::Picker(picker) => picker_element(
+            Mode::Picker(picker) => engine.picker(
                 MODAL_ELEMENT_ID,
                 self.host_w,
                 self.host_h,
                 &picker.ui,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 MODAL_DRAW_ORDER,
             ),
             // Resize shows its cue in the focused pane's title, not a
@@ -4939,9 +4654,7 @@ fn parse_cli_args() -> Result<CliOptions> {
         match arg.as_str() {
             "--accent" | "-A" => opts.accent = Some(parse_accent_color(&take(&mut args)?)?),
             "--prefix" | "-P" => opts.prefix = Some(parse_prefix_key(&take(&mut args)?)?),
-            // Unlisted in `--help` on purpose; see `aero.rs`.
-            #[cfg(feature = "aero")]
-            "--style" => vge_ui::aero::select(&take(&mut args)?).map_err(|e| anyhow!(e))?,
+            "--style" => style::select(&take(&mut args)?).map_err(|e| anyhow!(e))?,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -4959,9 +4672,8 @@ fn parse_cli_args() -> Result<CliOptions> {
             other if other.starts_with("--prefix=") => {
                 opts.prefix = Some(parse_prefix_key(&other["--prefix=".len()..])?);
             }
-            #[cfg(feature = "aero")]
             other if other.starts_with("--style=") => {
-                vge_ui::aero::select(&other["--style=".len()..]).map_err(|e| anyhow!(e))?
+                style::select(&other["--style=".len()..]).map_err(|e| anyhow!(e))?
             }
             other => bail!("unknown argument: {other} (try --help)"),
         }

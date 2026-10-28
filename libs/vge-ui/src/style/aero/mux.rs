@@ -1,19 +1,13 @@
-//! Frutiger Aero chrome for vmux's own surfaces — the tab bar, pane
-//! titles, separators and scrollbars, plus which Aero modal each mode
-//! puts up. The primitives, palette, modals and the style switch are
-//! shared with `vfm` and live in `vge_ui::aero`; see there for how the
-//! style is selected and how to drop it.
+//! Aero parts for a multiplexer: the tab bar, pane titles and scroll
+//! thumbs, and the dividers between panes.
 
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, CreateElementBody, DrawCmd, OriginAnchor, Style};
-use vge_ui::aero::*;
-use vge_ui::measure::text_cells;
+use vge_protocol::command::{Align, DrawCmd, Style};
 
-use super::{
-    CHROME_DRAW_ORDER, MODAL_DRAW_ORDER, MODAL_ELEMENT_ID, MODAL_IDS, Mode, PaneRect, RenameTarget,
-    ScrollIndicator, State, TABBAR_CHEVRON_W, TABBAR_ELEMENT_ID, TabbarLayout, TabbarMetrics,
-    help_modal,
-};
+use super::{GEL_AMBER, GEL_AQUA, GEL_GREEN, bubble, frost, gel, gloss, orb, scroll_thumb, smoke};
+use crate::measure::text_cells;
+use crate::paint::{Px, hash, hex, pill, text, unit, vgrad, white};
+use crate::style::{PaneChrome, TabBar, TabbarMetrics};
 
 /// A two-row bar, so a tab is a capsule with air above and below it:
 /// the label sits on the bar's centre line with half a row clear either
@@ -32,37 +26,11 @@ const CAP_Y1: f32 = BAR_H - 0.3;
 /// The text row, centred on the bar.
 const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
 
-/// The tab bar element — the Aero stand-in for `build_tabbar_commands`,
-/// drawn over the same [`TabbarLayout`] so clicks still land where the
-/// tabs are painted.
-pub fn tabbar(
-    layout: &TabbarLayout,
-    active: usize,
-    host_w: f32,
-    px: Px,
-    activity: &[bool],
-) -> CreateElementBody {
-    CreateElementBody {
-        id: TABBAR_ELEMENT_ID.to_string(),
-        commands: tabbar_commands(layout, active, host_w, px, activity),
-        origin: Point { x: 0.0, y: 0.0 },
-        is_visible: true,
-        draw_order: CHROME_DRAW_ORDER,
-        parent: None,
-        size: None,
-        transform: None,
-        anchor: OriginAnchor::Viewport,
-    }
-}
-
-fn tabbar_commands(
-    layout: &TabbarLayout,
-    active: usize,
-    host_w: f32,
-    px: Px,
-    activity: &[bool],
-) -> Vec<DrawCmd> {
-    let mut cmds = Vec::new();
+/// The tab bar: a two-row sky with the tabs as capsules on it — green
+/// gel for the active one, amber for one with unseen output, frosted
+/// glass for the rest.
+pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
+    let host_w = bar.width;
     let band = |y: f32, h: f32| Rect {
         x: 0.0,
         y,
@@ -94,19 +62,14 @@ fn tabbar_commands(
     // Bubbles in the free stretch after the last tab, some rising out
     // of the glow. Seeded by absolute column so they hold still while
     // tabs come and go.
-    let free_x0 = layout
-        .slots
+    let session_w = bar.session.map(|(_, w)| w).unwrap_or(0.0);
+    let free_x0 = bar
+        .tabs
         .last()
-        .map(|s| s.x0 + s.num_w + s.name_w)
-        .unwrap_or(layout.session_w())
+        .map(|t| t.x0 + t.num_w + t.name_w)
+        .unwrap_or(session_w)
         + 1.0;
-    let free_x1 = host_w
-        - if layout.has_right {
-            TABBAR_CHEVRON_W
-        } else {
-            0.0
-        }
-        - 0.5;
+    let free_x1 = bar.right_chevron.unwrap_or(host_w) - 0.5;
     for col in 0..host_w as u32 {
         let h = hash(col.wrapping_add(0x5eed));
         if !h.is_multiple_of(3) {
@@ -118,21 +81,21 @@ fn tabbar_commands(
         if cx - px.x(r) < free_x0 || cx + px.x(r) > free_x1 {
             continue;
         }
-        bubble(&mut cmds, px, cx, cy, r);
+        bubble(cmds, px, cx, cy, r);
     }
 
     let navy = hex(0x06264d, 0.75);
-    if let Some((label, w)) = &layout.session_seg {
-        let (x0, x1) = (0.3, *w - 0.1);
+    if let Some((label, w)) = bar.session {
+        let (x0, x1) = (0.3, w - 0.1);
         cmds.push(DrawCmd::OutlineFillPath {
             fill: vgrad(CAP_Y0, CAP_Y1, white(1.0), hex(0x9fb3c8, 1.0)),
             stroke: Style::Flat(hex(0x5f7a96, 0.9)),
             line_width: px.line(1.0),
             segments: pill(px, x0, CAP_Y0, x1, CAP_Y1),
         });
-        gloss(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, 0.5);
+        gloss(cmds, px, x0, CAP_Y0, x1, CAP_Y1, 0.5);
         text(
-            &mut cmds,
+            cmds,
             px,
             (x0 + x1) * 0.5,
             TEXT_Y,
@@ -144,11 +107,11 @@ fn tabbar_commands(
         );
     }
 
-    if layout.has_left {
+    if let Some(x) = bar.left_chevron {
         text(
-            &mut cmds,
+            cmds,
             px,
-            layout.session_w() + TABBAR_METRICS.margin,
+            x,
             TEXT_Y,
             Align::Left,
             " ‹",
@@ -158,20 +121,20 @@ fn tabbar_commands(
         );
     }
 
-    for slot in &layout.slots {
+    for slot in &bar.tabs {
         let i = slot.index;
         let x = slot.x0;
         let (x0, x1) = (x, x + slot.num_w + slot.name_w);
-        let is_active = i == active;
-        let has_activity = activity.get(i).copied().unwrap_or(false);
+        let is_active = slot.active;
+        let has_activity = slot.activity;
         let shadow = if is_active {
-            gel(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_GREEN);
+            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_GREEN);
             hex(0x154a0c, 0.85)
         } else if has_activity {
-            gel(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_AMBER);
+            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_AMBER);
             hex(0x6b3300, 0.85)
         } else {
-            frost(&mut cmds, px, x0, CAP_Y0, x1, CAP_Y1);
+            frost(cmds, px, x0, CAP_Y0, x1, CAP_Y1);
             navy
         };
 
@@ -179,7 +142,7 @@ fn tabbar_commands(
         // centred over `num_w`.
         let num_cx = x + 0.4 + slot.num_w * 0.5;
         orb(
-            &mut cmds,
+            cmds,
             px,
             num_cx - slot.num_w * 0.42,
             CAP_Y0 + 0.22,
@@ -187,7 +150,7 @@ fn tabbar_commands(
             CAP_Y1 - 0.22,
         );
         text(
-            &mut cmds,
+            cmds,
             px,
             num_cx,
             TEXT_Y,
@@ -198,23 +161,23 @@ fn tabbar_commands(
             Some(hex(0x06264d, 0.9)),
         );
         text(
-            &mut cmds,
+            cmds,
             px,
             x + slot.num_w + slot.name_w * 0.5,
             TEXT_Y,
             Align::Center,
-            &slot.label,
+            slot.label,
             white(1.0),
             is_active,
             Some(shadow),
         );
     }
 
-    if layout.has_right {
+    if let Some(x) = bar.right_chevron {
         text(
-            &mut cmds,
+            cmds,
             px,
-            host_w - TABBAR_CHEVRON_W,
+            x,
             TEXT_Y,
             Align::Left,
             "› ",
@@ -223,28 +186,18 @@ fn tabbar_commands(
             Some(navy),
         );
     }
-    cmds
 }
 
-/// A pane's chrome — the Aero stand-in for `build_chrome_commands`,
-/// with the same title and scrollbar geometry.
-pub fn pane_chrome(
-    rect: PaneRect,
-    title: &str,
-    focused: bool,
-    show_title: bool,
-    px: Px,
-    scroll: Option<ScrollIndicator>,
-) -> Vec<DrawCmd> {
-    let pw = rect.w as f32;
-    let ph = rect.h as f32;
-    let mut cmds = Vec::new();
-    if show_title && !title.is_empty() {
+/// A pane's title — aqua gel when focused, smoked glass otherwise —
+/// and its scroll thumb, an aqua capsule.
+pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {
+    let (pw, ph, title, focused) = (pane.w, pane.h, pane.title, pane.focused);
+    if pane.show_title && !title.is_empty() {
         let text_x = pw - 1.0;
         let y0 = 0.25;
         let x0 = text_x - text_cells(title) - 0.5;
         pane_title(
-            &mut cmds,
+            cmds,
             px,
             x0,
             y0,
@@ -255,7 +208,7 @@ pub fn pane_chrome(
             focused,
         );
     }
-    if let Some(s) = scroll {
+    if let Some(s) = pane.scroll {
         let portal_rows = ph.max(1.0);
         let total = portal_rows + s.history_depth as f32;
         let track_y0 = 1.25;
@@ -270,9 +223,8 @@ pub fn pane_chrome(
             (s.history_depth.saturating_sub(s.offset) as f32) / s.history_depth as f32
         };
         let thumb_y = track_y0 + thumb_norm * available;
-        scroll_thumb(&mut cmds, px, pw - 1.30, thumb_y, 0.35, thumb_h);
+        scroll_thumb(cmds, px, pw - 1.30, thumb_y, 0.35, thumb_h);
     }
-    cmds
 }
 
 /// The pane title: an aqua gel capsule on the focused pane, smoked
@@ -308,80 +260,16 @@ fn pane_title(
     );
 }
 
-/// Pane separators: each stock rule becomes a soft aqua glow under a
-/// bright core. Takes the stock commands, so the separator geometry
-/// stays `build_separators_body`'s alone.
-pub fn restyle_separators(cmds: &mut Vec<DrawCmd>) {
-    if !enabled() {
-        return;
-    }
-    let mut out = Vec::with_capacity(cmds.len() * 2);
-    for cmd in cmds.drain(..) {
-        match cmd {
-            DrawCmd::DrawLines { lines, .. } => {
-                out.push(DrawCmd::DrawLines {
-                    stroke: Style::Flat(hex(0x3fb8ff, 0.25)),
-                    line_width: 0.35,
-                    lines: lines.clone(),
-                });
-                out.push(DrawCmd::DrawLines {
-                    stroke: Style::Flat(hex(0xaef0ff, 0.95)),
-                    line_width: 0.1,
-                    lines,
-                });
-            }
-            other => out.push(other),
-        }
-    }
-    *cmds = out;
-}
-
-/// The modal for whatever the current mode wants up — the Aero stand-in
-/// for `State::build_modal_elements`.
-pub fn modal_elements(state: &State) -> Vec<CreateElementBody> {
-    let px = Px {
-        w: state.cell_pw,
-        h: state.cell_ph,
-    };
-    let (w, h) = (state.host_w, state.host_h);
-    match &state.mode {
-        Mode::Rename { target, editor } => {
-            let title = match target {
-                RenameTarget::Pane(_) => "Rename pane",
-                RenameTarget::Tab(_) => "Rename tab",
-            };
-            vec![prompt_element(
-                MODAL_ELEMENT_ID,
-                w,
-                h,
-                title,
-                &editor.buffer,
-                px,
-                Some(editor.cursor),
-                MODAL_DRAW_ORDER,
-            )]
-        }
-        Mode::Help { offset, .. } => {
-            scroll_elements(help_modal(), MODAL_IDS, w, h, *offset, px, MODAL_DRAW_ORDER)
-        }
-        Mode::ConfirmQuit => vec![prompt_element(
-            MODAL_ELEMENT_ID,
-            w,
-            h,
-            "Quit vmux?",
-            "y = quit     n = cancel",
-            px,
-            None,
-            MODAL_DRAW_ORDER,
-        )],
-        Mode::Picker(picker) => vec![picker_element(
-            MODAL_ELEMENT_ID,
-            w,
-            h,
-            &picker.ui,
-            px,
-            MODAL_DRAW_ORDER,
-        )],
-        Mode::Normal | Mode::Prefix | Mode::Resize { .. } => Vec::new(),
-    }
+/// The dividers: each a soft aqua glow under a bright core.
+pub(super) fn separators(cmds: &mut Vec<DrawCmd>, lines: Vec<(Point, Point)>) {
+    cmds.push(DrawCmd::DrawLines {
+        stroke: Style::Flat(hex(0x3fb8ff, 0.25)),
+        line_width: 0.35,
+        lines: lines.clone(),
+    });
+    cmds.push(DrawCmd::DrawLines {
+        stroke: Style::Flat(hex(0xaef0ff, 0.95)),
+        line_width: 0.1,
+        lines,
+    });
 }

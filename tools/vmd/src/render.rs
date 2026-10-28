@@ -1,28 +1,21 @@
 //! Rows → VGE draw commands.
 //!
 //! Layout works in em and knows nothing about the terminal; this is
-//! where em becomes cells (one multiply by the zoom) and roles become
-//! colours. Nothing here holds state: the page is rebuilt from the
+//! where em becomes cells (one multiply by the zoom). What each part
+//! looks like — and the colour each role's text takes — is the style
+//! engine's ([`vge_ui::style`]); this module only decides where the
+//! parts go. Nothing here holds state: the page is rebuilt from the
 //! visible slice of rows on every scroll tick, which is bounded by the
 //! pane height rather than the document length — a 10,000-line file
 //! costs exactly what a one-screen one does.
-//!
-//! The page is deliberately *not* given a ground of its own. The
-//! terminal's background is the paper, so a themed veter, a light
-//! scheme and a plain xterm all read correctly without vmd choosing a
-//! colour for any of them.
 
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
+use vge_protocol::command::{Align, DrawCmd, FontStyle, Style};
 use vge_ui::measure::{elide, text_cells};
-use vge_ui::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
-use vge_ui::theme;
+use vge_ui::paint::Px;
+use vge_ui::style::{self, DocChrome, DocFrame, DocRole, Engine, Figure};
 
 use crate::layout::{Body, Deco, Layout, Role, Row, Run};
-
-#[cfg(feature = "aero")]
-#[path = "aero.rs"]
-pub(crate) mod aero;
 
 /// Thickness of a block quote's bar, in cells before zoom.
 const BAR_W: f32 = 0.22;
@@ -77,6 +70,24 @@ impl View {
     fn x_of(&self, x_em: f32) -> f32 {
         self.content_x + x_em * self.zoom
     }
+
+    fn px(&self) -> Px {
+        Px {
+            w: self.cell_pw,
+            h: self.cell_ph,
+        }
+    }
+
+    /// Where the page sits, as the engine draws the parts around it.
+    pub fn frame(&self) -> DocFrame {
+        DocFrame {
+            cols: self.cols,
+            rows: self.rows,
+            content_x: self.content_x,
+            content_y: self.content_y,
+            content_h: self.content_h,
+        }
+    }
 }
 
 /// Whether a picture is on screen yet, so the page can draw a plate and
@@ -96,38 +107,19 @@ pub trait Pictures {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Colours
+// Text
 // ─────────────────────────────────────────────────────────────────────
 
-/// Body text on a terminal that publishes no theme.
-const COLOR_TEXT: Color = Color {
-    r: 0.86,
-    g: 0.87,
-    b: 0.90,
-    a: 1.0,
-};
-
-fn text_color() -> Color {
-    theme::host_fg().unwrap_or(COLOR_TEXT)
-}
-
-fn alpha(c: Color, a: f32) -> Color {
-    Color { a, ..c }
-}
-
-fn role_color(role: Role) -> Color {
+fn doc_role(role: Role) -> DocRole {
     match role {
-        Role::Body => text_color(),
-        // A colour spine down the document: h1 takes the accent, the
-        // levels under it step down through the text colours, so depth
-        // reads even where the size difference is small.
-        Role::Heading(1) => theme::accent_color(),
-        Role::Heading(l) if l <= 4 => theme::title_text(),
-        Role::Heading(_) => theme::dim_text(),
-        Role::Dim | Role::Marker => theme::dim_text(),
-        Role::Code => text_color(),
-        Role::Link | Role::Accent => theme::accent_color(),
-        Role::Warn => theme::warn_color().unwrap_or(theme::accent_color()),
+        Role::Body => DocRole::Body,
+        Role::Heading(l) => DocRole::Heading(l),
+        Role::Dim => DocRole::Dim,
+        Role::Code => DocRole::Code,
+        Role::Link => DocRole::Link,
+        Role::Marker => DocRole::Marker,
+        Role::Accent => DocRole::Accent,
+        Role::Warn => DocRole::Warn,
     }
 }
 
@@ -159,28 +151,52 @@ pub fn page(
     pictures: &dyn Pictures,
     search: Search<'_>,
 ) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::page(layout, view, pictures, search);
-    }
+    let engine = style::engine();
     let mut cmds = Vec::new();
     for (i, row) in visible(layout, view) {
         let y = view.y_of(row.top);
         let h = row.height * view.zoom;
-        decoration(&mut cmds, row, view, y, h);
-        quote_bars(&mut cmds, row, view, y, h);
+        decoration(&mut cmds, engine, row, view, y, h);
+        quote_bars(&mut cmds, engine, row, view, y, h);
         match &row.body {
-            Body::Rule { weight } => rule(&mut cmds, row, view, y, h, *weight),
-            Body::Image(img) => picture(&mut cmds, img, row, view, y, h, pictures),
+            Body::Rule { weight } => engine.rule(
+                &mut cmds,
+                Rect {
+                    x: view.x_of(row.x),
+                    y,
+                    w: row.width * view.zoom,
+                    h,
+                },
+                *weight * view.zoom,
+            ),
+            Body::Image(img) => picture(&mut cmds, engine, img, row, view, y, h, pictures),
             Body::Runs(runs) => {
                 for (j, run) in runs.iter().enumerate() {
-                    if !search.query.is_empty() {
-                        highlight(&mut cmds, run, view, y, h, &search, i, j);
+                    // Washes and marks hug left-aligned runs only; a
+                    // right-aligned one (a table's number column) has no
+                    // left edge to measure from.
+                    if run.align == Align::Left {
+                        if !search.query.is_empty() {
+                            highlight(&mut cmds, engine, run, view, y, h, &search, i, j);
+                        }
+                        if run.role == Role::Code && !matches!(row.deco, Deco::Plate { .. }) {
+                            let x0 = view.x_of(run.x) - CHIP_PAD * view.zoom;
+                            let x1 = view.x_of(run.x + run.width()) + CHIP_PAD * view.zoom;
+                            engine.code_chip(&mut cmds, view.px(), x0, x1, y, h, view.zoom);
+                        }
+                        if let Role::Heading(level) = run.role {
+                            engine.heading_mark(
+                                &mut cmds,
+                                level,
+                                view.x_of(run.x),
+                                run.width() * view.zoom,
+                                y,
+                                h,
+                                view.zoom,
+                            );
+                        }
                     }
-                    if run.role == Role::Code && !matches!(row.deco, Deco::Plate { .. }) {
-                        chip(&mut cmds, run, view, y, h);
-                    }
-                    cmds.push(text(run, view, y, h));
+                    cmds.push(text(engine, run, view, y, h));
                 }
             }
         }
@@ -205,84 +221,45 @@ fn visible<'a>(layout: &'a Layout, view: &View) -> impl Iterator<Item = (usize, 
         .take_while(move |(_, r)| r.top <= bottom)
 }
 
-fn decoration(cmds: &mut Vec<DrawCmd>, row: &Row, view: &View, y: f32, h: f32) {
+fn decoration(cmds: &mut Vec<DrawCmd>, engine: &dyn Engine, row: &Row, view: &View, y: f32, h: f32) {
     let x0 = view.x_of(row.x);
     let x1 = view.x_of(row.x + row.width);
+    let band = Rect {
+        x: x0,
+        y,
+        w: x1 - x0,
+        h,
+    };
     match row.deco {
         Deco::None => {}
         Deco::Plate { first, last } => {
-            let (rx, ry) = chrome_corner_radii(x1 - x0, h.max(1.0), view.cell_pw, view.cell_ph);
-            cmds.push(DrawCmd::FillPath {
-                fill: Style::Flat(theme::inset_bg()),
-                segments: rounded_rect_path_corners(
-                    x0,
-                    y,
-                    x1,
-                    y + h,
-                    rx,
-                    ry,
-                    first,
-                    first,
-                    last,
-                    last,
-                ),
-            });
+            engine.code_plate(cmds, view.px(), x0, x1, y, h, first, last, view.zoom)
         }
-        Deco::TableHead => cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(alpha(theme::accent_color(), 0.18)),
-            rects: vec![Rect {
-                x: x0,
-                y,
-                w: x1 - x0,
-                h,
-            }],
-        }),
-        Deco::TableBand => cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(alpha(text_color(), 0.05)),
-            rects: vec![Rect {
-                x: x0,
-                y,
-                w: x1 - x0,
-                h,
-            }],
-        }),
+        Deco::TableHead => engine.table_band(cmds, band, true),
+        Deco::TableBand => engine.table_band(cmds, band, false),
     }
 }
 
-fn quote_bars(cmds: &mut Vec<DrawCmd>, row: &Row, view: &View, y: f32, h: f32) {
+fn quote_bars(cmds: &mut Vec<DrawCmd>, engine: &dyn Engine, row: &Row, view: &View, y: f32, h: f32) {
     for bar in &row.quotes {
-        let color = match bar.alert {
-            Some(a) if a.is_warning() => theme::warn_color().unwrap_or(theme::accent_color()),
-            _ => theme::accent_color(),
-        };
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(alpha(color, 0.75)),
-            rects: vec![Rect {
+        let warning = bar.alert.is_some_and(|a| a.is_warning());
+        engine.quote_bar(
+            cmds,
+            Rect {
                 x: view.x_of(bar.x + BAR_GAP - BAR_W),
                 y,
                 w: BAR_W * view.zoom,
                 h,
-            }],
-        });
+            },
+            warning,
+        );
     }
-}
-
-fn rule(cmds: &mut Vec<DrawCmd>, row: &Row, view: &View, y: f32, h: f32, weight: f32) {
-    let w = (weight * view.zoom).max(0.02);
-    cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(alpha(text_color(), 0.22)),
-        rects: vec![Rect {
-            x: view.x_of(row.x),
-            y: y + (h - w) * 0.5,
-            w: row.width * view.zoom,
-            h: w,
-        }],
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
 fn picture(
     cmds: &mut Vec<DrawCmd>,
+    engine: &dyn Engine,
     img: &crate::layout::ImageBox,
     row: &Row,
     view: &View,
@@ -299,68 +276,28 @@ fn picture(
         w: img.w * view.zoom,
         h,
     };
-    match pictures.picture(img) {
-        Picture::Ready(id) => cmds.push(DrawCmd::DrawImage {
-            target_rect: rect,
-            image_id: id,
-            source_rect: None,
-        }),
-        // Decoding, or gone: hold the space with the plate the picture
-        // will fill, so nothing under it jumps when it lands.
+    let label;
+    let content = match pictures.picture(img) {
+        Picture::Ready(id) => Figure::Image(id),
         state => {
-            let (rx, ry) = chrome_corner_radii(rect.w, rect.h, view.cell_pw, view.cell_ph);
-            cmds.push(DrawCmd::FillPath {
-                fill: Style::Flat(theme::inset_bg()),
-                segments: rounded_rect_path(
-                    rect.x,
-                    rect.y,
-                    rect.x + rect.w,
-                    rect.y + rect.h,
-                    rx,
-                    ry,
-                ),
-            });
-            let label = match state {
+            let alt = match state {
                 Picture::Pending => img.alt.clone(),
                 _ => format!("{}  (unreadable)", img.alt),
             };
             let budget = (rect.w / view.zoom).max(1.0) as usize;
-            cmds.push(DrawCmd::DrawText {
-                origin: Point {
-                    x: rect.x + rect.w * 0.5,
-                    y: rect.y + (rect.h - view.zoom) * 0.5,
-                },
-                align: Align::Center,
-                fill: Style::Flat(theme::dim_text()),
-                font_style: FontStyle(0),
-                font_scale: view.zoom,
-                text: elide(&label, budget),
-            });
+            label = elide(&alt, budget);
+            Figure::Placeholder { label: &label }
         }
-    }
+    };
+    engine.figure(cmds, view.px(), rect, content, view.zoom);
 }
 
-/// The plate behind an inline `code` span, which has no code block to
-/// sit on.
-fn chip(cmds: &mut Vec<DrawCmd>, run: &Run, view: &View, y: f32, h: f32) {
-    if run.align != Align::Left {
-        return;
-    }
-    let x0 = view.x_of(run.x) - CHIP_PAD * view.zoom;
-    let x1 = view.x_of(run.x + run.width()) + CHIP_PAD * view.zoom;
-    let inset = 0.06 * view.zoom;
-    let (rx, ry) = chrome_corner_radii(x1 - x0, h, view.cell_pw, view.cell_ph);
-    cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(alpha(theme::inset_bg(), 0.85)),
-        segments: rounded_rect_path(x0, y + inset, x1, y + h - inset, rx, ry),
-    });
-}
-
-/// Wash behind every occurrence of the query inside `run`, brighter for
-/// the one the reader is on.
+/// A search mark on every occurrence of the query inside `run`, the
+/// one the reader is on marked as current.
 #[allow(clippy::too_many_arguments)]
 fn highlight(
     cmds: &mut Vec<DrawCmd>,
+    engine: &dyn Engine,
     run: &Run,
     view: &View,
     y: f32,
@@ -369,9 +306,6 @@ fn highlight(
     row: usize,
     index: usize,
 ) {
-    if run.align != Align::Left {
-        return;
-    }
     for (start, len) in matches_in(&run.text, search.query) {
         let before = text_cells(&run.text[..start]) * run.scale;
         let width = text_cells(&run.text[start..start + len]) * run.scale;
@@ -382,18 +316,16 @@ fn highlight(
                 start,
                 len,
             });
-        cmds.push(DrawCmd::FillRectangles {
-            fill: Style::Flat(alpha(
-                theme::accent_color(),
-                if active { 0.65 } else { 0.28 },
-            )),
-            rects: vec![Rect {
-                x: view.x_of(run.x + before),
-                y: y + 0.05 * view.zoom,
-                w: width * view.zoom,
-                h: h - 0.1 * view.zoom,
-            }],
-        });
+        engine.search_hit(
+            cmds,
+            view.px(),
+            view.x_of(run.x + before),
+            width * view.zoom,
+            y,
+            h,
+            view.zoom,
+            active,
+        );
     }
 }
 
@@ -422,7 +354,7 @@ pub fn matches_in(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     out
 }
 
-fn text(run: &Run, view: &View, y: f32, h: f32) -> DrawCmd {
+fn text(engine: &dyn Engine, run: &Run, view: &View, y: f32, h: f32) -> DrawCmd {
     let scale = run.scale * view.zoom;
     DrawCmd::DrawText {
         // Centre the glyph box in the row: the leading is a property of
@@ -433,7 +365,7 @@ fn text(run: &Run, view: &View, y: f32, h: f32) -> DrawCmd {
             y: y + (h - scale) * 0.5,
         },
         align: run.align,
-        fill: Style::Flat(role_color(run.role)),
+        fill: Style::Flat(engine.doc_ink(doc_role(run.role))),
         font_style: font_bits(run),
         font_scale: scale.clamp(0.05, 63.0),
         text: run.text.clone(),
@@ -444,143 +376,21 @@ fn text(run: &Run, view: &View, y: f32, h: f32) -> DrawCmd {
 // Chrome
 // ─────────────────────────────────────────────────────────────────────
 
-pub struct Chrome<'a> {
-    pub title: &'a str,
-    /// Section the top of the viewport is inside.
-    pub section: Option<&'a str>,
-    /// Left half of the status line — a message, or the key hints.
-    pub status: &'a str,
-    /// True when `status` is an error and should take the warm tone.
-    pub status_warn: bool,
-    /// Fraction of the document above the viewport, 0..=1.
-    pub progress: f32,
-    /// Fraction of the document the viewport shows, 0..=1.
-    pub visible: f32,
-}
+pub type Chrome<'a> = DocChrome<'a>;
 
 /// The header bar, status line and scrollbar — everything outside the
 /// page's clip.
 pub fn chrome(c: &Chrome<'_>, view: &View) -> Vec<DrawCmd> {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return aero::chrome(c, view);
-    }
     let mut cmds = Vec::new();
-    let surface = theme::modal_bg();
-    let last_row = (view.rows - 1.0).max(0.0);
-
-    cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(surface),
-        rects: vec![
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: view.cols,
-                h: 1.0,
-            },
-            Rect {
-                x: 0.0,
-                y: last_row,
-                w: view.cols,
-                h: 1.0,
-            },
-        ],
-    });
-    // A hairline under the header, in the accent, so the bar reads as
-    // chrome rather than as the first line of the document.
-    cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(alpha(theme::accent_color(), 0.55)),
-        rects: vec![Rect {
-            x: 0.0,
-            y: 1.0 - 0.06,
-            w: view.cols,
-            h: 0.06,
-        }],
-    });
-
-    let half = (view.cols as usize).saturating_sub(4) / 2;
-    cmds.push(bar_text(
-        1.0,
-        0.0,
-        Align::Left,
-        theme::title_text(),
-        0x01,
-        elide(c.title, half.max(8)),
-    ));
-    if let Some(section) = c.section.filter(|s| !s.is_empty()) {
-        cmds.push(bar_text(
-            view.cols - 1.0,
-            0.0,
-            Align::Right,
-            theme::dim_text(),
-            0,
-            elide(section, half.max(8)),
-        ));
-    }
-
-    let status_color = if c.status_warn {
-        theme::warn_color().unwrap_or(theme::accent_color())
-    } else {
-        theme::dim_text()
-    };
-    cmds.push(bar_text(
-        1.0,
-        last_row,
-        Align::Left,
-        status_color,
-        0,
-        elide(c.status, (view.cols as usize).saturating_sub(8)),
-    ));
-    cmds.push(bar_text(
-        view.cols - 1.0,
-        last_row,
-        Align::Right,
-        theme::dim_text(),
-        0,
-        format!("{:>3}%", (c.progress * 100.0).round() as i32),
-    ));
-
-    scrollbar(&mut cmds, c, view);
+    style::engine().doc_chrome(&mut cmds, view.px(), &view.frame(), c);
     cmds
 }
 
-fn bar_text(x: f32, y: f32, align: Align, fill: Color, bits: u8, text: String) -> DrawCmd {
-    DrawCmd::DrawText {
-        origin: Point { x, y },
-        align,
-        fill: Style::Flat(fill),
-        font_style: FontStyle(bits),
-        font_scale: 1.0,
-        text,
-    }
-}
-
-fn scrollbar(cmds: &mut Vec<DrawCmd>, c: &Chrome<'_>, view: &View) {
-    if c.visible >= 1.0 {
-        return;
-    }
-    let track_y = view.content_y;
-    let track_h = view.content_h;
-    if track_h <= 0.0 {
-        return;
-    }
-    let x = view.cols - 1.0;
-    cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(alpha(text_color(), 0.08)),
-        rects: vec![Rect {
-            x,
-            y: track_y,
-            w: 1.0,
-            h: track_h,
-        }],
-    });
-    let thumb_h = (track_h * c.visible).max(1.0);
-    let thumb_y = track_y + (track_h - thumb_h) * c.progress.clamp(0.0, 1.0);
-    let (rx, ry) = chrome_corner_radii(1.0, thumb_h, view.cell_pw, view.cell_ph);
-    cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(theme::scrollbar()),
-        segments: rounded_rect_path(x + 0.25, thumb_y, x + 0.75, thumb_y + thumb_h, rx, ry),
-    });
+/// What sits under the page, in screen cells — its own element.
+pub fn ground(view: &View) -> Vec<DrawCmd> {
+    let mut cmds = Vec::new();
+    style::engine().doc_ground(&mut cmds, view.px(), &view.frame());
+    cmds
 }
 
 #[cfg(test)]

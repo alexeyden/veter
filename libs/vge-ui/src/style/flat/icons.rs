@@ -1,16 +1,17 @@
-//! File-type icons, drawn as VGE vectors.
+//! Flat file-type icons, drawn as VGE vectors in the host theme's
+//! accent and text colours.
 //!
 //! Every icon is composed inside a unit box and scaled into the tile's
 //! picture area, so a tile looks the same at every zoom level. Cell
 //! anisotropy is handled by the caller passing the box it wants filled;
 //! the shapes themselves are laid out in that box's own coordinates.
 
-use vge_protocol::codec::{Point, Rect};
+use vge_protocol::codec::Point;
 use vge_protocol::command::{Color, DrawCmd, Style};
 use vge_protocol::path::{PathNode, PathSegment};
-use vge_ui::theme::{self, accent_color, darken};
 
-use crate::entry::Media;
+use crate::style::{FileKind, IconBox};
+use crate::theme::{self, accent_color, darken};
 
 /// Primary icon stroke/fill on a terminal that publishes no theme —
 /// light enough to read on the dark tile.
@@ -43,56 +44,6 @@ fn ink_dim() -> Color {
         theme::dim_text()
     } else {
         INK_DIM
-    }
-}
-
-/// The box an icon is drawn into, in absolute cell coordinates.
-#[derive(Debug, Clone, Copy)]
-pub struct IconBox {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-
-impl IconBox {
-    /// A box of `frac` of `area`'s smaller dimension, centered in it.
-    /// `cell_pw/cell_ph` keep the result visually square.
-    pub fn centered(
-        area: (f32, f32, f32, f32),
-        frac: f32,
-        cell_pw: f32,
-        cell_ph: f32,
-    ) -> IconBox {
-        let (ax, ay, aw, ah) = area;
-        // Square in pixels: pick the side that fits both ways.
-        let px = (aw * cell_pw).min(ah * cell_ph) * frac;
-        let w = px / cell_pw.max(1.0);
-        let h = px / cell_ph.max(1.0);
-        IconBox {
-            x: ax + (aw - w) * 0.5,
-            y: ay + (ah - h) * 0.5,
-            w,
-            h,
-        }
-    }
-
-    /// Map unit-box coordinates (0..1) into the box.
-    fn p(&self, u: f32, v: f32) -> Point {
-        Point {
-            x: self.x + u * self.w,
-            y: self.y + v * self.h,
-        }
-    }
-
-    /// Map a unit-box rectangle into the box.
-    fn r(&self, u: f32, v: f32, uw: f32, vh: f32) -> Rect {
-        Rect {
-            x: self.x + u * self.w,
-            y: self.y + v * self.h,
-            w: uw * self.w,
-            h: vh * self.h,
-        }
     }
 }
 
@@ -145,21 +96,31 @@ fn ellipse(b: &IconBox, fill: Style, cu: f32, cv: f32, ru: f32, rv: f32) -> Draw
     }
 }
 
-/// The icon for `media`, drawn into `b`. `is_link` adds the little
+/// The icon for `kind`, drawn into `b`. `is_link` adds the little
 /// shortcut arrow every file manager puts on a symlink.
-pub fn draw(media: Media, b: IconBox, is_link: bool, broken: bool) -> Vec<DrawCmd> {
-    let mut cmds = match media {
-        Media::Dir => folder(&b),
-        Media::Image => picture(&b),
-        Media::Video => film(&b),
-        Media::Audio => note(&b),
-        Media::Text => page(&b, true),
-        Media::Archive => archive(&b),
-        Media::Binary => page(&b, false),
+pub(super) fn draw(kind: FileKind, b: IconBox, is_link: bool, broken: bool) -> Vec<DrawCmd> {
+    let mut cmds = match kind {
+        FileKind::Dir => folder(&b),
+        FileKind::Image => picture(&b),
+        FileKind::Video => film(&b),
+        FileKind::Audio => note(&b),
+        FileKind::Text => page(&b, true),
+        FileKind::Archive => archive(&b),
+        FileKind::Binary => page(&b, false),
     };
     if broken {
-        cmds.push(strip(&b, flat(ink_dim()), 0.08, &[(0.15, 0.15), (0.85, 0.85)]));
-        cmds.push(strip(&b, flat(ink_dim()), 0.08, &[(0.85, 0.15), (0.15, 0.85)]));
+        cmds.push(strip(
+            &b,
+            flat(ink_dim()),
+            0.08,
+            &[(0.15, 0.15), (0.85, 0.85)],
+        ));
+        cmds.push(strip(
+            &b,
+            flat(ink_dim()),
+            0.08,
+            &[(0.85, 0.15), (0.15, 0.85)],
+        ));
     } else if is_link {
         cmds.push(poly(
             &b,
@@ -211,7 +172,11 @@ fn page(b: &IconBox, ruled: bool) -> Vec<DrawCmd> {
             ],
         ),
         // The fold, in the tile's own shade so it reads as a crease.
-        poly(b, flat(ink_dim()), &[(0.66, 0.08), (0.84, 0.28), (0.66, 0.28)]),
+        poly(
+            b,
+            flat(ink_dim()),
+            &[(0.66, 0.08), (0.84, 0.28), (0.66, 0.28)],
+        ),
     ];
     if ruled {
         for (i, v) in [0.44_f32, 0.58, 0.72].iter().enumerate() {
@@ -232,7 +197,13 @@ fn picture(b: &IconBox) -> Vec<DrawCmd> {
         poly(
             b,
             flat(ink()),
-            &[(0.14, 0.78), (0.42, 0.46), (0.60, 0.66), (0.72, 0.54), (0.86, 0.78)],
+            &[
+                (0.14, 0.78),
+                (0.42, 0.46),
+                (0.60, 0.66),
+                (0.72, 0.54),
+                (0.86, 0.78),
+            ],
         ),
     ]
 }
@@ -250,7 +221,11 @@ fn film(b: &IconBox) -> Vec<DrawCmd> {
         cmds.push(rect(b, flat(darken(accent, 0.6)), 0.81, v, 0.08, 0.10));
     }
     // Play triangle.
-    cmds.push(poly(b, flat(accent), &[(0.42, 0.34), (0.66, 0.50), (0.42, 0.66)]));
+    cmds.push(poly(
+        b,
+        flat(accent),
+        &[(0.42, 0.34), (0.66, 0.50), (0.42, 0.66)],
+    ));
     cmds
 }
 
@@ -259,7 +234,11 @@ fn note(b: &IconBox) -> Vec<DrawCmd> {
     let accent = accent_color();
     vec![
         rect(b, flat(ink()), 0.52, 0.14, 0.07, 0.52),
-        poly(b, flat(ink()), &[(0.52, 0.14), (0.84, 0.22), (0.84, 0.34), (0.52, 0.26)]),
+        poly(
+            b,
+            flat(ink()),
+            &[(0.52, 0.14), (0.84, 0.22), (0.84, 0.34), (0.52, 0.26)],
+        ),
         ellipse(b, flat(accent), 0.40, 0.68, 0.15, 0.12),
     ]
 }
@@ -283,28 +262,9 @@ mod tests {
     }
 
     #[test]
-    fn icon_box_is_square_in_pixels_and_centered() {
-        let b = IconBox::centered(area(), 0.8, 9.0, 20.0);
-        assert!((b.w * 9.0 - b.h * 20.0).abs() < 1e-3, "square in pixels");
-        // Centered within the area on both axes.
-        assert!(((b.x - 10.0) - (12.0 - b.w - (b.x - 10.0))).abs() < 1e-3);
-        assert!(((b.y - 4.0) - (5.0 - b.h - (b.y - 4.0))).abs() < 1e-3);
-        // And it fits.
-        assert!(b.w <= 12.0 && b.h <= 5.0);
-    }
-
-    #[test]
     fn every_media_kind_draws_something() {
         let b = IconBox::centered(area(), 0.8, 9.0, 20.0);
-        for m in [
-            Media::Dir,
-            Media::Image,
-            Media::Video,
-            Media::Audio,
-            Media::Text,
-            Media::Archive,
-            Media::Binary,
-        ] {
+        for m in FileKind::ALL {
             assert!(!draw(m, b, false, false).is_empty(), "{m:?}");
         }
     }
@@ -312,15 +272,15 @@ mod tests {
     #[test]
     fn link_and_broken_badges_add_marks() {
         let b = IconBox::centered(area(), 0.8, 9.0, 20.0);
-        let plain = draw(Media::Text, b, false, false).len();
-        assert_eq!(draw(Media::Text, b, true, false).len(), plain + 1);
-        assert_eq!(draw(Media::Text, b, false, true).len(), plain + 2);
+        let plain = draw(FileKind::Text, b, false, false).len();
+        assert_eq!(draw(FileKind::Text, b, true, false).len(), plain + 1);
+        assert_eq!(draw(FileKind::Text, b, false, true).len(), plain + 2);
     }
 
     #[test]
     fn shapes_stay_inside_their_box() {
         let b = IconBox::centered(area(), 0.8, 9.0, 20.0);
-        for cmd in draw(Media::Image, b, true, false) {
+        for cmd in draw(FileKind::Image, b, true, false) {
             let pts: Vec<Point> = match cmd {
                 DrawCmd::FillPolygon { points, .. } => points,
                 DrawCmd::DrawLineStrip { points, .. } => points,

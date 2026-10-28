@@ -362,6 +362,45 @@ impl<P> Picker<P> {
     }
 }
 
+/// What a style engine reads off a picker to draw it — every
+/// [`Picker`], whatever its payload, without the engine being generic
+/// over it.
+pub trait PickerView {
+    fn title(&self) -> &str;
+    fn editor(&self) -> &LineEditor;
+    /// Every item, matching or not — the box is sized over all of them
+    /// so it holds still while filtering.
+    fn item_count(&self) -> usize;
+    /// An item's label and right-aligned hint.
+    fn item(&self, index: usize) -> (&str, &str);
+    /// Indices of the items passing the filter, in display order.
+    fn matches(&self) -> &[usize];
+    /// The selection, as an index into [`PickerView::matches`].
+    fn selected(&self) -> usize;
+}
+
+impl<P> PickerView for Picker<P> {
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn editor(&self) -> &LineEditor {
+        &self.editor
+    }
+    fn item_count(&self) -> usize {
+        self.items.len()
+    }
+    fn item(&self, index: usize) -> (&str, &str) {
+        let it = &self.items[index];
+        (&it.label, &it.hint)
+    }
+    fn matches(&self) -> &[usize] {
+        &self.matches
+    }
+    fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

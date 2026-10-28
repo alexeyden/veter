@@ -21,7 +21,7 @@ use vge_protocol::command::{
 };
 
 use crate::measure::{prefix_cells, text_cells};
-use crate::picker::Picker;
+use crate::picker::PickerView;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
 use crate::theme::{
     accent_color, accent_style, active_text, dim_text, modal_text, scrollbar, surface_style,
@@ -169,11 +169,11 @@ pub fn prompt_element(
 /// Layout top to bottom: title strip (row 0), the filter / command input
 /// with a caret (row 1), then the filtered rows with the selected one
 /// highlighted. A scrollbar appears when matches overflow.
-pub fn picker_element<P>(
+pub fn picker_element(
     id: &str,
     host_w: u32,
     host_h: u32,
-    picker: &Picker<P>,
+    picker: &dyn PickerView,
     cell_pw: f32,
     cell_ph: f32,
     draw_order: i32,
@@ -181,13 +181,13 @@ pub fn picker_element<P>(
     // Rows available for the list (everything but the title + input rows
     // and a little vertical margin), capped so a huge list stays compact.
     let avail = (host_h.saturating_sub(4)).max(1) as usize;
-    let visible_rows = picker.matches.len().max(1).min(avail).min(PICKER_MAX_ROWS);
+    let visible_rows = picker.matches().len().max(1).min(avail).min(PICKER_MAX_ROWS);
 
     // Window the matches so the selection stays on screen.
-    let total = picker.matches.len();
+    let total = picker.matches().len();
     let max_scroll = total.saturating_sub(visible_rows);
-    let scroll = (if picker.selected >= visible_rows {
-        picker.selected - visible_rows + 1
+    let scroll = (if picker.selected() >= visible_rows {
+        picker.selected() - visible_rows + 1
     } else {
         0
     })
@@ -197,10 +197,11 @@ pub fn picker_element<P>(
     // gap + hint), within the host. Taken over *all* items (not just the
     // current matches) so the box keeps a stable width while filtering;
     // the input line can still widen it when a long command is typed.
-    let input_line = format!("> {}", picker.editor.buffer);
-    let mut max_w = text_cells(&picker.title).max(text_cells(&input_line));
-    for it in &picker.items {
-        max_w = max_w.max(text_cells(&it.label) + 3.0 + text_cells(&it.hint));
+    let input_line = format!("> {}", picker.editor().buffer);
+    let mut max_w = text_cells(picker.title()).max(text_cells(&input_line));
+    for i in 0..picker.item_count() {
+        let (label, hint) = picker.item(i);
+        max_w = max_w.max(text_cells(label) + 3.0 + text_cells(hint));
     }
     let inner_w = max_w.max(26.0);
     let box_w = (inner_w + 4.0).min(host_w.saturating_sub(2) as f32);
@@ -210,13 +211,13 @@ pub fn picker_element<P>(
     // item count, which is stable across filtering) so the input row
     // never moves as matches shrink — the box only grows/shrinks
     // downward.
-    let max_rows = picker.items.len().max(1).min(avail).min(PICKER_MAX_ROWS);
+    let max_rows = picker.item_count().max(1).min(avail).min(PICKER_MAX_ROWS);
     let max_box_h = (2 + max_rows) as f32;
     let origin_x = ((host_w as f32 - box_w) * 0.5).floor();
     let origin_y = ((host_h as f32 - max_box_h) * 0.5).floor();
     let (rx, ry) = chrome_corner_radii(box_w, box_h, cell_pw, cell_ph);
 
-    let mut cmds = open_chrome(box_w, box_h, &picker.title, rx, ry);
+    let mut cmds = open_chrome(box_w, box_h, picker.title(), rx, ry);
     cmds.push(DrawCmd::DrawText {
         origin: Point { x: 1.0, y: 1.0 },
         align: Align::Left,
@@ -226,7 +227,7 @@ pub fn picker_element<P>(
         text: input_line,
     });
     // Caret bar — "> " is 2 cells, then as many as the typed text takes.
-    let caret_x = 1.0 + 2.0 + picker.editor.cursor_cells();
+    let caret_x = 1.0 + 2.0 + picker.editor().cursor_cells();
     cmds.push(caret_bar(caret_x, 1.1, 1.9));
 
     for j in 0..visible_rows {
@@ -234,9 +235,9 @@ pub fn picker_element<P>(
         if m >= total {
             break;
         }
-        let it = &picker.items[picker.matches[m]];
+        let (label, hint) = picker.item(picker.matches()[m]);
         let y = 2.0 + j as f32;
-        let selected = m == picker.selected;
+        let selected = m == picker.selected();
         if selected {
             cmds.push(DrawCmd::FillRectangles {
                 fill: title_thumb_style(),
@@ -256,9 +257,9 @@ pub fn picker_element<P>(
             fill: Style::Flat(modal_text()),
             font_style: FontStyle(if selected { 0x01 } else { 0x00 }),
             font_scale: 1.0,
-            text: it.label.clone(),
+            text: label.to_string(),
         });
-        if !it.hint.is_empty() {
+        if !hint.is_empty() {
             cmds.push(DrawCmd::DrawText {
                 origin: Point {
                     x: box_w - 1.5,
@@ -268,7 +269,7 @@ pub fn picker_element<P>(
                 fill: Style::Flat(dim_text()),
                 font_style: FontStyle(0x00),
                 font_scale: 1.0,
-                text: it.hint.clone(),
+                text: hint.to_string(),
             });
         }
     }
@@ -624,7 +625,7 @@ impl ScrollModal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::{FilterMode, PickerItem};
+    use crate::picker::{FilterMode, Picker, PickerItem};
 
     const IDS: ModalIds<'static> = ModalIds {
         root: "m",

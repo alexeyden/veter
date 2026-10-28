@@ -22,7 +22,6 @@
 mod clip;
 mod config;
 mod entry;
-mod icons;
 mod layout;
 mod ops;
 mod open;
@@ -51,8 +50,10 @@ use vge_render::tty::{
 use vge_render::{Encoding, choose_encoding, encode_payload, is_ssh_session, run_probe};
 use vge_ui::edit::{EditOutcome, LineEditor, NAME_MAX_CHARS};
 use vge_ui::input::{Button, Dir, Event, InputParser, Nav};
-use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
+use vge_ui::modal::{ModalIds, ScrollModal};
+use vge_ui::paint::Px;
 use vge_ui::picker::{FilterMode, Picker, PickerItem, PickerOutcome};
+use vge_ui::style;
 use vge_ui::theme;
 
 use config::{Config, ResolvedOpen};
@@ -1244,12 +1245,7 @@ impl App {
     // ── rendering ────────────────────────────────────────────────────
 
     fn backdrop_commands(&self) -> Vec<DrawCmd> {
-        #[cfg(feature = "aero")]
-        if vge_ui::aero::enabled() {
-            let px = vge_ui::aero::Px { w: self.cell_pw, h: self.cell_ph };
-            return render::aero::backdrop(&self.layout, px);
-        }
-        render::backdrop(&self.layout)
+        render::backdrop(&self.layout, self.cell_pw, self.cell_ph)
     }
 
     fn column_commands(&self, i: usize) -> Vec<DrawCmd> {
@@ -1314,50 +1310,44 @@ impl App {
 
     /// The modal elements for the current mode.
     fn modal_elements(&self) -> Vec<CreateElementBody> {
-        #[cfg(feature = "aero")]
-        if vge_ui::aero::enabled() {
-            return render::aero::modal_elements(self);
-        }
+        let engine = style::engine();
+        let px = Px {
+            w: self.cell_pw,
+            h: self.cell_ph,
+        };
+        let id = MODAL_IDS.root;
         match &self.mode {
             Mode::Normal => Vec::new(),
-            Mode::Prompt { kind, editor } => vec![prompt_element(
-                MODAL_IDS.root,
+            Mode::Prompt { kind, editor } => vec![engine.prompt(
+                id,
                 self.cols,
                 self.rows,
                 kind.title(),
                 &editor.buffer,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 Some(editor.cursor),
                 ORDER_MODAL,
             )],
-            Mode::Confirm { title, .. } => vec![prompt_element(
-                MODAL_IDS.root,
+            Mode::Confirm { title, .. } => vec![engine.prompt(
+                id,
                 self.cols,
                 self.rows,
                 title,
                 "y = yes     n = cancel",
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 None,
                 ORDER_MODAL,
             )],
-            Mode::Palette(picker) => picker_element(
-                MODAL_IDS.root,
-                self.cols,
-                self.rows,
-                picker,
-                self.cell_pw,
-                self.cell_ph,
-                ORDER_MODAL,
-            ),
-            Mode::Overlay { modal, offset } => modal.elements(
+            Mode::Palette(picker) => {
+                engine.picker(id, self.cols, self.rows, picker, px, ORDER_MODAL)
+            }
+            Mode::Overlay { modal, offset } => engine.scroll_modal(
+                modal,
                 MODAL_IDS,
                 self.cols,
                 self.rows,
                 *offset,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 ORDER_MODAL,
             ),
         }
@@ -1589,15 +1579,12 @@ fn parse_args() -> Result<Option<Args>> {
                 return Ok(None);
             }
             "-a" | "--hidden" => hidden = true,
-            // Unlisted in `--help` on purpose; see `vge_ui::aero`.
-            #[cfg(feature = "aero")]
             "--style" => {
                 let v = it.next().ok_or_else(|| anyhow!("--style needs a value"))?;
-                vge_ui::aero::select(&v).map_err(|e| anyhow!(e))?;
+                style::select(&v).map_err(|e| anyhow!(e))?;
             }
-            #[cfg(feature = "aero")]
             s if s.starts_with("--style=") => {
-                vge_ui::aero::select(&s["--style=".len()..]).map_err(|e| anyhow!(e))?;
+                style::select(&s["--style=".len()..]).map_err(|e| anyhow!(e))?;
             }
             "-l" | "--list" => view = View::List,
             "-A" | "--accent" => {

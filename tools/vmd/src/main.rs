@@ -38,8 +38,10 @@ use vge_render::tty::{
 use vge_render::{Encoding, choose_encoding, encode_payload, is_ssh_session, run_probe};
 use vge_ui::edit::{COMMAND_MAX_CHARS, EditOutcome, LineEditor};
 use vge_ui::input::{Button, Dir, Event, InputParser, Nav};
-use vge_ui::modal::{ModalIds, ScrollModal, picker_element, prompt_element};
+use vge_ui::modal::{ModalIds, ScrollModal};
+use vge_ui::paint::Px;
 use vge_ui::picker::{FilterMode, Picker, PickerItem, PickerOutcome};
+use vge_ui::style;
 use vge_ui::theme;
 
 use doc::Doc;
@@ -58,6 +60,9 @@ const MESSAGE_TTL: Duration = Duration::from_secs(4);
 /// to collide with.
 const ID_PREFIX: &str = "vmd.";
 const ID_PAGE: &str = "vmd.page";
+/// Whatever the engine puts under the page — under Aero, its wallpaper
+/// and sheet; under flat, nothing.
+const ID_GROUND: &str = "vmd.ground";
 const ID_CHROME: &str = "vmd.chrome";
 const MODAL_IDS: ModalIds<'static> = ModalIds {
     root: "vmd.modal",
@@ -72,15 +77,10 @@ const ORDER_CHROME: i32 = 20;
 const ORDER_MODAL: i32 = 100;
 
 /// Rows the page viewport keeps clear above and below itself, inside
-/// the header and the status line. Only Aero has any: its page sits
-/// on a sheet that stops short of the bars, and the clip has to stop
-/// where the sheet does.
+/// the header and the status line — the engine's: a page on a sheet
+/// that stops short of the bars has its clip stop where the sheet does.
 fn page_inset() -> f32 {
-    #[cfg(feature = "aero")]
-    if vge_ui::aero::enabled() {
-        return render::aero::PAGE_INSET;
-    }
-    0.0
+    style::engine().metrics().page_inset
 }
 
 /// Reading measure in em, when the pane is wider than one. Prose gets
@@ -918,48 +918,34 @@ impl App {
     }
 
     fn modal_elements(&self) -> Vec<CreateElementBody> {
-        #[cfg(feature = "aero")]
-        if vge_ui::aero::enabled() {
-            return render::aero::modal_elements(self);
-        }
+        let engine = style::engine();
+        let px = Px {
+            w: self.cell_pw,
+            h: self.cell_ph,
+        };
+        let id = MODAL_IDS.root;
         match &self.mode {
             Mode::Normal => Vec::new(),
-            Mode::Search(editor) => vec![prompt_element(
-                MODAL_IDS.root,
+            Mode::Search(editor) => vec![engine.prompt(
+                id,
                 self.cols,
                 self.rows,
                 "Search",
                 &editor.buffer,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 Some(editor.cursor),
                 ORDER_MODAL,
             )],
-            Mode::Outline(picker) => picker_element(
-                MODAL_IDS.root,
-                self.cols,
-                self.rows,
-                picker,
-                self.cell_pw,
-                self.cell_ph,
-                ORDER_MODAL,
-            ),
-            Mode::Links(picker) => picker_element(
-                MODAL_IDS.root,
-                self.cols,
-                self.rows,
-                picker,
-                self.cell_pw,
-                self.cell_ph,
-                ORDER_MODAL,
-            ),
-            Mode::Help { modal, offset } => modal.elements(
+            Mode::Outline(picker) | Mode::Links(picker) => {
+                engine.picker(id, self.cols, self.rows, picker, px, ORDER_MODAL)
+            }
+            Mode::Help { modal, offset } => engine.scroll_modal(
+                modal,
                 MODAL_IDS,
                 self.cols,
                 self.rows,
                 *offset,
-                self.cell_pw,
-                self.cell_ph,
+                px,
                 ORDER_MODAL,
             ),
         }
@@ -1004,11 +990,7 @@ impl App {
                 }),
                 REQ_ID_NO_RESPONSE,
             ));
-            #[cfg(feature = "aero")]
-            if vge_ui::aero::enabled() {
-                let ground = render::aero::ground(&view);
-                cmds.push(create(render::aero::ID_GROUND, ground, ORDER_PAGE - 1));
-            }
+            cmds.push(create(ID_GROUND, render::ground(&view), ORDER_PAGE - 1));
             cmds.push(create(ID_CHROME, self.chrome_commands(), ORDER_CHROME));
             self.dirty = Dirty {
                 modal: true,
@@ -1017,11 +999,7 @@ impl App {
         }
 
         if self.dirty.ground {
-            #[cfg(feature = "aero")]
-            if vge_ui::aero::enabled() {
-                let ground = render::aero::ground(&self.view());
-                cmds.push(update(render::aero::ID_GROUND, ground));
-            }
+            cmds.push(update(ID_GROUND, render::ground(&self.view())));
         }
         if self.dirty.page {
             cmds.push(update(ID_PAGE, self.page_commands()));
@@ -1317,11 +1295,9 @@ fn parse_args() -> Result<Option<Args>> {
                     .map_err(|_| anyhow!("--zoom wants a number"))?
                     .clamp(ZOOM_MIN, ZOOM_MAX);
             }
-            // Deliberately absent from `--help`.
-            #[cfg(feature = "aero")]
             a if a == "--style" || a.starts_with("--style=") => {
                 let v = value("--style", a)?;
-                vge_ui::aero::select(&v).map_err(|e| anyhow!(e))?;
+                style::select(&v).map_err(|e| anyhow!(e))?;
             }
             a if a == "-A" || a == "--accent" || a.starts_with("--accent=") => {
                 let v = value("--accent", a)?;
@@ -1785,7 +1761,9 @@ and the line after it.
             .expect("a row with the link");
         let run = row.runs().iter().find(|r| r.link.is_some()).unwrap();
         let col = (view.content_x + run.x * view.zoom + 1.0) as u16;
-        let screen_row = (view.content_y + row.top * view.zoom) as u16;
+        // Aimed at the row's middle: an engine that insets the page
+        // puts its top edge mid-cell.
+        let screen_row = (view.content_y + (row.top + row.height * 0.5) * view.zoom) as u16;
         assert_eq!(a.link_at(col, screen_row), Some(0));
         // A click past the end of the run hits nothing.
         let past = (view.content_x + (run.x + run.width()) * view.zoom + 5.0) as u16;

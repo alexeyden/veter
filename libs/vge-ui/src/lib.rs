@@ -6,26 +6,28 @@
 //! ([`edit`]), the filterable list picker behind the command palette
 //! ([`picker`]), the modal builders those two render through
 //! ([`modal`]), the cell-width rule they lay out with ([`measure`]),
-//! and a key + SGR-mouse input parser ([`input`]).
+//! and a key + SGR-mouse input parser ([`input`]). What all of it looks
+//! like is decided by the style engine in force ([`style`]), out of the
+//! shared primitives in [`paint`].
 //!
 //! Like `vge-render`, this crate is a pure consumer of `vge-protocol`:
 //! it builds `CreateElementBody` / `DrawCmd` values and parses input
 //! bytes. It owns no terminal state and performs no I/O — the consuming
 //! binary decides when to send what.
 
-#[cfg(feature = "aero")]
-pub mod aero;
 pub mod edit;
 pub mod input;
 pub mod measure;
 pub mod modal;
+pub mod paint;
 pub mod picker;
 pub mod shape;
+pub mod style;
 pub mod theme;
 
 pub use edit::{EditOutcome, LineEditor};
 pub use input::{Button, Dir, Event, InputParser};
 pub use measure::{elide, elide_front, prefix_cells, text_cells};
 pub use modal::{ModalIds, ScrollModal, picker_element, prompt_element};
-pub use picker::{FilterMode, Picker, PickerItem, PickerOutcome};
+pub use picker::{FilterMode, Picker, PickerItem, PickerOutcome, PickerView};
 pub use shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
