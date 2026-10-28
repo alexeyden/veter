@@ -3,7 +3,7 @@
 //! fixed, and the host theme reaches it only through the accent.
 //!
 //! This module holds the materials every part is made of (gel, frost,
-//! smoke, orbs, bubbles, scroll thumbs), the window pieces the modals
+//! smoke, bubbles, scroll thumbs), the window pieces the modals
 //! are built from, and the modals themselves; each client family's
 //! parts live in a child module ([`mux`], [`doc`], [`browser`]).
 
@@ -499,27 +499,6 @@ pub fn smoke(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32
         segments: pill(px, x0, y0, x1, y1),
     });
     gloss(cmds, px, x0, y0, x1, y1, 0.22);
-}
-
-/// A glossy blue orb, lit from the top left.
-pub fn orb(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
-    let shape = pill(px, x0, y0, x1, y1);
-    let (w, h) = (x1 - x0, y1 - y0);
-    cmds.push(DrawCmd::OutlineFillPath {
-        fill: radial(
-            Point {
-                x: x0 + w * 0.35,
-                y: y0 + h * 0.3,
-            },
-            Point { x: x1, y: y1 },
-            hex(0x8fd0ff, 1.0),
-            hex(0x0b5fc4, 1.0),
-        ),
-        stroke: Style::Flat(hex(0x06326e, 0.9)),
-        line_width: px.line(1.0),
-        segments: shape,
-    });
-    gloss(cmds, px, x0, y0, x1, y1, 0.4);
 }
 
 /// A soap bubble, unless the user's `aero.bubbles` turned them off —

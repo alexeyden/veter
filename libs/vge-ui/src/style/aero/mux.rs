@@ -5,7 +5,7 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, DrawCmd, Style};
 use vge_protocol::path::{PathNode, PathSegment};
 
-use super::{GEL_AQUA, Gel, bubble, gel, gloss, orb, scroll_thumb, smoke};
+use super::{GEL_AQUA, Gel, bubble, gel, gloss, scroll_thumb, smoke};
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
@@ -160,16 +160,21 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             navy
         };
 
-        // The number rides in an orb at the head of the tab, both
-        // centred over `num_w`.
+        // The number sits in a socket pressed into the head of the
+        // tab, centred over `num_w` and darkened from the tab's own
+        // colour, so it reads as moulded into the tab rather than as a
+        // badge stuck on it.
         let num_cx = x + 0.4 + slot.num_w * 0.5;
-        orb(
+        let well = if is_active { active.shade } else { FROST_SHADE };
+        let hw = slot.num_w * 0.38;
+        socket(
             cmds,
             px,
-            num_cx - slot.num_w * 0.42,
-            TEXT_Y + 0.08,
-            num_cx + slot.num_w * 0.42,
-            TEXT_Y + 0.92,
+            num_cx - hw,
+            TEXT_Y + 0.1,
+            num_cx + hw,
+            TEXT_Y + 0.9,
+            well,
         );
         text(
             cmds,
@@ -180,7 +185,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             &format!("{}", i + 1),
             white(1.0),
             true,
-            Some(hex(0x06264d, 0.9)),
+            Some(hex(well, 0.7)),
         );
         text(
             cmds,
@@ -207,6 +212,29 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             true,
             Some(navy),
         );
+    }
+}
+
+/// The deep tone of a frosted tab, which its number's socket is
+/// darkened toward: the blue of the sky the glass sits on.
+const FROST_SHADE: u32 = 0x0a2a5e;
+
+/// A socket pressed into a tab: a hollow darkened toward `shade`, with
+/// the lip's shadow along its top and a light catching its lower edge.
+fn socket(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, shade: u32) {
+    cmds.push(DrawCmd::OutlineFillPath {
+        fill: vgrad(y0, y1, hex(shade, 0.5), hex(shade, 0.18)),
+        stroke: vgrad(y0, y1, hex(0x000000, 0.45), white(0.6)),
+        line_width: px.line(1.0),
+        segments: pill(px, x0, y0, x1, y1),
+    });
+    let (ix0, ix1) = (x0 + px.x(1.0), x1 - px.x(1.0));
+    let (iy0, iy1) = (y0 + px.y(1.0), y1 - px.y(1.0));
+    if ix1 > ix0 && iy1 > iy0 {
+        cmds.push(DrawCmd::FillPath {
+            fill: vgrad(y0, y0 + px.y(4.0), hex(0x000000, 0.3), hex(0x000000, 0.0)),
+            segments: pill(px, ix0, iy0, ix1, iy1),
+        });
     }
 }
 
