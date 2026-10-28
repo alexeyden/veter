@@ -147,10 +147,23 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
         let is_active = slot.active;
         let has_activity = slot.activity;
         // An inactive tab stands on the bar's bright lip; the active
-        // one covers it, open to the panes below.
+        // one runs down over it and carries the lip in its own tone.
         let y1 = BAR_H - px.y(1.0);
         let shadow = if is_active {
             gel_tab(cmds, px, x0, ACTIVE_Y0, x1, BAR_H, &active);
+            // The bar's lip carries on under the active tab in the
+            // gel's own light tone, so the tab sits on the same edge as
+            // the rest rather than breaking it.
+            let lip = px.y(1.0);
+            cmds.push(DrawCmd::FillRectangles {
+                fill: Style::Flat(hex(active.glow, 0.95)),
+                rects: vec![Rect {
+                    x: x0,
+                    y: BAR_H - lip,
+                    w: x1 - x0,
+                    h: lip,
+                }],
+            });
             hex(active.shade, 0.85)
         } else {
             frost_tab(cmds, px, x0, TAB_Y0, x1, y1);
