@@ -128,7 +128,9 @@ pub(super) fn column_row(
     selected: bool,
 ) {
     if selected {
-        let (rx, ry) = chrome_corner_radii(a.w, a.h, px.w, px.h);
+        // Cornered for the bar, not the column it sits in, or a large
+        // `flat.rounding` overruns its height.
+        let (rx, ry) = chrome_corner_radii(a.w - 1.0, 0.9, px.w, px.h);
         cmds.push(DrawCmd::FillPath {
             fill: title_thumb_style(),
             segments: rounded_rect_path(a.x + 0.5, y + 0.05, a.x + a.w - 0.5, y + 0.95, rx, ry),
@@ -201,7 +203,7 @@ pub(super) fn tile_plate(cmds: &mut Vec<DrawCmd>, px: Px, t: Rect, img_h: f32, s
 }
 
 pub(super) fn tile_mark(cmds: &mut Vec<DrawCmd>, px: Px, t: Rect) {
-    let (rx, ry) = chrome_corner_radii(t.w, t.h, px.w, px.h);
+    let (rx, ry) = chrome_corner_radii(1.0, 0.8, px.w, px.h);
     cmds.push(DrawCmd::FillPath {
         fill: Style::Flat(MARK_COLOR),
         segments: rounded_rect_path(t.x + 0.3, t.y + 0.2, t.x + 1.3, t.y + 1.0, rx, ry),

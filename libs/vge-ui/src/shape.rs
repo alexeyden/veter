@@ -18,11 +18,28 @@ pub const CHROME_CORNER_RY: f32 = 0.175;
 /// Compute an `(rx, ry)` pair in cell units that yields a visually
 /// circular arc given the host's pixel-per-cell ratios. Clamps so a
 /// corner never exceeds 40% of the rect's smaller dimension (which would
-/// let arcs collapse into each other on narrow shapes).
+/// let arcs collapse into each other on narrow shapes). Scaled by the
+/// user's `flat.rounding` ([`crate::style::Settings`]), since every
+/// flat part is cornered through here.
 pub fn chrome_corner_radii(width: f32, height: f32, cell_pw: f32, cell_ph: f32) -> (f32, f32) {
-    let ry = CHROME_CORNER_RY.min(height * 0.4);
-    let rx = (CHROME_CORNER_RY * cell_ph / cell_pw.max(f32::EPSILON)).min(width * 0.4);
-    (rx, ry)
+    corner_radii(
+        width,
+        height,
+        cell_pw,
+        cell_ph,
+        crate::style::settings().rounding,
+    )
+}
+
+fn corner_radii(width: f32, height: f32, cell_pw: f32, cell_ph: f32, rounding: f32) -> (f32, f32) {
+    // In pixels, so the clamp keeps the corner a circle: clamping each
+    // axis on its own would leave a one-row bar's corner wider than it
+    // is tall once the radius outgrows the bar, and the bar pointed.
+    let pw = cell_pw.max(f32::EPSILON);
+    let r = (CHROME_CORNER_RY * rounding * cell_ph)
+        .min(height * 0.4 * cell_ph)
+        .min(width * 0.4 * pw);
+    (r / pw, r / cell_ph.max(f32::EPSILON))
 }
 
 /// Build a closed rectangle path with selectable rounded corners.
@@ -55,6 +72,10 @@ pub fn rounded_rect_path_corners(
     br: bool,
     bl: bool,
 ) -> Vec<PathSegment> {
+    // A zero radius is a square corner, not a degenerate arc — which
+    // is what `flat.rounding = 0` asks every corner for.
+    let round = rx > 0.0 && ry > 0.0;
+    let (tl, tr, br, bl) = (tl && round, tr && round, br && round, bl && round);
     let arc = |dst: Point| PathNode::ArcEllipseTo {
         large: false,
         sweep: false,
@@ -111,6 +132,32 @@ mod tests {
         let (rx, ry) = chrome_corner_radii(10.0, 4.0, 10.0, 20.0);
         assert!((ry - CHROME_CORNER_RY).abs() < 1e-6);
         assert!((rx - CHROME_CORNER_RY * 2.0).abs() < 1e-6);
+    }
+
+    /// `flat.rounding` scales the radius; at zero the corners are
+    /// square, with no arcs at all.
+    #[test]
+    fn rounding_scales_the_corners() {
+        let (rx, ry) = corner_radii(10.0, 4.0, 10.0, 20.0, 2.0);
+        assert!((ry - CHROME_CORNER_RY * 2.0).abs() < 1e-6);
+        assert!((rx - CHROME_CORNER_RY * 4.0).abs() < 1e-6);
+        assert_eq!(corner_radii(10.0, 4.0, 10.0, 20.0, 0.0), (0.0, 0.0));
+        let segs = rounded_rect_path(0.0, 0.0, 4.0, 2.0, 0.0, 0.0);
+        assert!(
+            !segs[0]
+                .nodes
+                .iter()
+                .any(|n| matches!(n, PathNode::ArcEllipseTo { .. }))
+        );
+    }
+
+    /// A radius bigger than a one-row bar allows is clamped as a circle:
+    /// the corner stays as wide as it is tall, in pixels.
+    #[test]
+    fn a_clamped_corner_stays_round() {
+        let (rx, ry) = corner_radii(20.0, 1.0, 10.0, 20.0, 4.0);
+        assert!((ry - 0.4).abs() < 1e-6, "{ry}");
+        assert!((rx * 10.0 - ry * 20.0).abs() < 1e-4, "{rx} {ry}");
     }
 
     #[test]

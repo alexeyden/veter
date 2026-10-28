@@ -8,7 +8,7 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, Style};
 
 use super::icons::shadow;
-use super::{GEL_AMBER, INK, bubble, gel, scroll_thumb, track};
+use super::{GEL_AMBER, INK, bubble, gel, glass_alpha, scroll_thumb, track};
 use crate::measure::text_cells;
 use crate::paint::{Px, ellipse, hash, hex, radial, rr, text, unit, vgrad, white};
 use crate::style::{ListInk, StatusLeft};
@@ -92,7 +92,12 @@ pub(super) fn backdrop(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
 /// sheen along its top, a bright inner rim and a cool outer one.
 pub(super) fn glass_pane(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
     cmds.push(DrawCmd::OutlineFillPath {
-        fill: vgrad(y0, y1, hex(0xe6f2fb, 0.62), hex(0xcfe4f5, 0.5)),
+        fill: vgrad(
+            y0,
+            y1,
+            hex(0xe6f2fb, glass_alpha(0.62)),
+            hex(0xcfe4f5, glass_alpha(0.5)),
+        ),
         stroke: Style::Flat(white(0.9)),
         line_width: px.line(1.0),
         segments: rr(px, x0, y0, x1, y1, PANE_R),

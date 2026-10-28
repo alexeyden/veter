@@ -2313,6 +2313,7 @@ mod tests {
             swatches: Vec::new(),
             colors: None,
             style: String::new(),
+            style_options: Vec::new(),
         }
     }
 
@@ -2432,6 +2433,7 @@ mod tests {
             swatches: Vec::new(),
             colors: None,
             style: String::new(),
+            style_options: Vec::new(),
         });
         assert_eq!(
             portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),

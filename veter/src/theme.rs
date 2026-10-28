@@ -693,6 +693,7 @@ impl Theme {
             }),
             // The engine is `[style]`'s, laid over by the config.
             style: String::new(),
+            style_options: Vec::new(),
         }
     }
 }

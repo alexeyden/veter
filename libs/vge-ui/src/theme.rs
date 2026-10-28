@@ -239,8 +239,9 @@ pub fn set_host_theme(c: HostColors) {
 /// probe's tail, or a `HostThemeChanged`): the accent for this depth,
 /// the eight surface/text colours when present, the named swatches a
 /// `--accent <name>` resolves against, and the style engine they were
-/// picked for ([`crate::style::adopt`]). True when that changed the
-/// engine in force, which a client has to lay out again for.
+/// picked for ([`crate::style::adopt`]) with the user's settings for
+/// it. True when that changed the engine in force, which a client has
+/// to lay out again for; changed settings are only a repaint.
 pub fn adopt_host_theme(theme: &HostTheme) -> bool {
     set_host_accent(unpack(u32::from_be_bytes(theme.accent)));
     if let Some(quads) = theme.colors {
@@ -259,6 +260,7 @@ pub fn adopt_host_theme(theme: &HostTheme) -> bool {
             })
             .collect();
     }
+    crate::style::adopt_settings(&theme.style_options);
     crate::style::adopt(&theme.style)
 }
 

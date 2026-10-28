@@ -1078,6 +1078,9 @@ u8 swatch_count      ; the probe carries them (§10)
 Swatch × count
 string style         ; optional, only after the swatches — the style
                      ; engine, as the probe carries it (§10)
+u8 option_count      ; optional, only after the style — the engines'
+(string key,         ; settings, as the probe carries them (§10)
+ string value) × count
 ```
 
 The host's `host.*` palette (VGE §7.3) has changed. Emitted only when
@@ -1096,11 +1099,12 @@ The accent is the one *this* engine's depth resolves to, so a client
 never does depth arithmetic — the same rule as the probe (§10). The
 eight theme colours are carried whole, with `host.text.on_accent` the
 one for that same accent, as in the probe, and the accent rotation,
-swatches and style name follow on the same terms. Each part is
+swatches, style name and style options follow on the same terms. Each part is
 all-or-nothing: a body that stops after the accent carries no theme
 colours, exactly as in the probe. A client that resolved a color name against the old
 swatches resolves it again against the new ones, and a client whose
-style engine was picked by the host switches to the one named here.
+style engine was picked by the host switches to the one named here
+and redraws with the options given.
 
 The id is empty because a theme belongs to the terminal, not to a
 pane. A client that dispatches events by portal id must not treat the
@@ -1341,6 +1345,9 @@ Swatch × accent_count           // the accent rotation, starting at the
 u8  swatch_count
 Swatch × swatch_count           // the theme's named swatches
 string style                    // the style engine: `flat`, `aero`
+u8  option_count
+(string key, string value) × option_count
+                                // the style engines' settings
 
 Swatch:
   string name                   // empty for an accent given as a literal
@@ -1376,10 +1383,21 @@ its user override it; a name a client does not know is treated as
 `flat`. The engine also decides what text sits on its materials, so
 a client drawing with one MAY ignore a swatch's `text`.
 
-All three are positional and all-or-nothing, like the block before
+The **style options** are the user's settings for the style engines,
+each keyed `<engine>.<key>` with its value as text — `flat.rounding =
+0.5`, `aero.bubbles = false`. The host publishes every engine's
+settings, not only those of the engine it names, so a client whose
+user overrode the engine still draws that one the way the user set it
+up. What a key means is the engine's business, not this protocol's:
+a client ignores a key it does not know, or a value it cannot read,
+and draws that setting its stock way. A setting changes how chrome is
+painted, never how much room it takes.
+
+All four are positional and all-or-nothing, like the block before
 them: they can follow only the eight colors, the swatch list only the
-accent list, the style only the swatch list, and a body that stops
-part-way through one carries neither it nor anything after it.
+accent list, the style only the swatch list, the options only the
+style, and a body that stops part-way through one carries neither it
+nor anything after it.
 
 **VGE inside a portal.** When `vge_in_portal` is set, every portal
 owns a private VGE engine that operates in the portal's cell

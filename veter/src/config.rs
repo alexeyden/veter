@@ -16,8 +16,9 @@
 //!    theme's own value.
 //!  * `[style]` — the style engine (`flat` or `aero`) the clients
 //!    inside veter draw their chrome with, published with the palette
-//!    in the PRT probe; under `aero`, `[style.aero] accents` is the
-//!    accent rotation, in Aero's own colours.
+//!    in the PRT probe, and each engine's settings: `[style.flat]
+//!    rounding`, and `[style.aero]`'s accent rotation (in Aero's own
+//!    colours), `bubbles` and `glass`.
 //!  * `[font]` — the primary family and the fallback families tried for
 //!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
@@ -364,6 +365,7 @@ impl Default for SearchKeysConfig {
 pub struct StyleConfig {
     /// `flat` or `aero`.
     pub name: String,
+    pub flat: FlatStyleConfig,
     pub aero: AeroStyleConfig,
 }
 
@@ -371,7 +373,25 @@ impl Default for StyleConfig {
     fn default() -> Self {
         Self {
             name: "flat".to_string(),
+            flat: FlatStyleConfig::default(),
             aero: AeroStyleConfig::default(),
+        }
+    }
+}
+
+/// `[style.flat]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FlatStyleConfig {
+    /// Corner rounding, as a multiple of the stock radius: `0` is
+    /// square.
+    pub rounding: f32,
+}
+
+impl Default for FlatStyleConfig {
+    fn default() -> Self {
+        Self {
+            rounding: vge_ui::style::Settings::DEFAULT.rounding,
         }
     }
 }
@@ -383,20 +403,53 @@ pub struct AeroStyleConfig {
     /// The accent rotation, outermost first: Aero colour names (`green`,
     /// `aqua`, `violet`, `pink`, …) or hex values.
     pub accents: Vec<String>,
+    /// Whether the skies, bars and frames carry bubbles.
+    pub bubbles: bool,
+    /// How milky the frosted panes and the reading sheet are, as a
+    /// multiple of the stock opacity.
+    pub glass: f32,
 }
 
 impl Default for AeroStyleConfig {
     fn default() -> Self {
+        let stock = vge_ui::style::Settings::DEFAULT;
         Self {
             accents: vge_ui::style::aero::DEFAULT_ACCENTS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            bubbles: stock.bubbles,
+            glass: stock.glass,
         }
     }
 }
 
 impl StyleConfig {
+    /// Every engine's settings, whichever one is named — a client
+    /// whose `--style` picks the other engine still draws it the
+    /// user's way. Out-of-range values are reported and clamped.
+    pub fn settings(&self) -> vge_ui::style::Settings {
+        let asked = vge_ui::style::Settings {
+            rounding: self.flat.rounding,
+            bubbles: self.aero.bubbles,
+            glass: self.aero.glass,
+        };
+        let settings = asked.clamped();
+        if settings.rounding != asked.rounding {
+            eprintln!(
+                "veter: config: [style.flat] rounding {} is out of range; using {}",
+                asked.rounding, settings.rounding
+            );
+        }
+        if settings.glass != asked.glass {
+            eprintln!(
+                "veter: config: [style.aero] glass {} is out of range; using {}",
+                asked.glass, settings.glass
+            );
+        }
+        settings
+    }
+
     /// The palette veter publishes into the reserved `host.*` VGE style
     /// namespace (`doc/vector-graphics-extension.md` §7.3) and reports
     /// in the PRT probe: the theme's, with the engine named and — under
@@ -416,6 +469,7 @@ impl StyleConfig {
             "flat"
         });
         palette.style = engine.to_string();
+        palette.style_options = self.settings().to_options();
         if engine == "aero" {
             let gel = |name: &str, rgb: u32| veter_host::vge::HostSwatch {
                 name: name.to_string(),
@@ -1195,6 +1249,31 @@ mod tests {
             green.color()
         );
         assert_eq!(palette.swatches.len(), vge_ui::style::aero::GELS.len());
+    }
+
+    /// Both engines' settings are published, whichever is named, and
+    /// reach a client as they were written.
+    #[test]
+    fn every_engines_settings_are_published() {
+        let cfg: Config = toml::from_str(
+            "[style.flat]\nrounding = 0.0\n[style.aero]\nbubbles = false\nglass = 0.5\n",
+        )
+        .unwrap();
+        let palette = cfg.style.host_palette(&cfg.theme());
+        assert_eq!(palette.style, "flat");
+        assert_eq!(
+            vge_ui::style::Settings::from_options(&palette.style_options),
+            vge_ui::style::Settings {
+                rounding: 0.0,
+                bubbles: false,
+                glass: 0.5,
+            }
+        );
+        let wild: Config = toml::from_str("[style.aero]\nglass = 7.0\n").unwrap();
+        assert_eq!(
+            wild.style.settings().glass,
+            vge_ui::style::Settings::MAX_GLASS
+        );
     }
 
     /// `[style.aero] accents` takes names and hex alike, and skips what

@@ -13,7 +13,7 @@
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 
-use super::{INK, bubble, scroll_thumb, track};
+use super::{INK, bubble, glass_alpha, scroll_thumb, track};
 use crate::measure::{elide, text_cells};
 use crate::paint::{Px, ellipse, hash, hex, hgrad, radial, rr, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
@@ -121,7 +121,12 @@ pub(super) fn ground(cmds: &mut Vec<DrawCmd>, p: Px, view: &DocFrame) {
         return;
     }
     cmds.push(DrawCmd::OutlineFillPath {
-        fill: vgrad(y0, y1, hex(0xf7fbfe, 0.94), hex(0xe8f2fa, 0.9)),
+        fill: vgrad(
+            y0,
+            y1,
+            hex(0xf7fbfe, glass_alpha(0.94)),
+            hex(0xe8f2fa, glass_alpha(0.9)),
+        ),
         stroke: Style::Flat(white(0.9)),
         line_width: p.line(1.0),
         segments: rr(p, x0, y0, x1, y1, SHEET_R),

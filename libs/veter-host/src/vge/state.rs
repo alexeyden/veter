@@ -746,6 +746,8 @@ pub struct HostThemePalette {
     /// what the accents and swatches above were picked for. Empty names
     /// none.
     pub style: String,
+    /// The engines' settings, `<engine>.<key>` → value (PRT §10).
+    pub style_options: Vec<(String, String)>,
 }
 
 impl HostThemePalette {
@@ -792,6 +794,7 @@ impl HostThemePalette {
                 .collect(),
             swatches: self.swatches.iter().map(HostSwatch::to_wire).collect(),
             style: self.style.clone(),
+            style_options: self.style_options.clone(),
         })
     }
 
@@ -819,6 +822,7 @@ impl HostThemePalette {
             swatches: theme.swatches.iter().map(HostSwatch::from_wire).collect(),
             colors,
             style: theme.style.clone(),
+            style_options: theme.style_options.clone(),
         }
     }
 
@@ -2923,6 +2927,7 @@ mod tests {
             swatches: Vec::new(),
             colors: None,
             style: String::new(),
+            style_options: Vec::new(),
         }
     }
 

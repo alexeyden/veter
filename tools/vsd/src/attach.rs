@@ -888,6 +888,7 @@ mod theme_announcement_tests {
             }],
             colors: Some(colors),
             style: "aero".into(),
+            style_options: vec![("aero.glass".into(), "0.5".into())],
         };
 
         let bytes = theme_announcement(&palette);
@@ -912,6 +913,11 @@ mod theme_announcement_tests {
         assert_eq!(theme.colors, Some(colors.to_rgba8()));
         assert_eq!(theme.swatches[0].name, "orange", "a --accent name can re-resolve");
         assert_eq!(theme.style, "aero", "a client switches to the renderer's engine");
+        assert_eq!(
+            theme.style_options,
+            [("aero.glass".to_string(), "0.5".to_string())],
+            "and draws it with the renderer's settings"
+        );
         assert!(r.at_end(), "exactly one frame");
     }
 
@@ -1821,6 +1827,7 @@ mod tests {
                     accents: Vec::new(),
                     swatches: Vec::new(),
                     style: String::new(),
+                    style_options: Vec::new(),
                 }),
             }),
             winsize: None,

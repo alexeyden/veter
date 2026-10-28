@@ -28,6 +28,7 @@
 pub mod aero;
 pub mod flat;
 
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use vge_protocol::codec::{Point, Rect};
@@ -568,6 +569,115 @@ pub fn engine() -> &'static dyn Engine {
     }
 }
 
+// ── Settings ───────────────────────────────────────────────────────────
+
+/// The user's settings for the engines, configured in veter's
+/// `[style.<engine>]` and published beside the engine's name as
+/// `<engine>.<key>` options (PRT §10). Every engine's travel whichever
+/// one is in force, so a client whose `--style` picks another engine
+/// still draws that one the user's way. None of them changes
+/// [`Metrics`]: a change is a repaint, never a new layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    /// `flat.rounding` — the corner radius of flat chrome, as a multiple
+    /// of the stock one: `0` is square, `2` twice as round.
+    pub rounding: f32,
+    /// `aero.bubbles` — whether Aero scatters bubbles over its skies,
+    /// bars and frames.
+    pub bubbles: bool,
+    /// `aero.glass` — how milky Aero's frosted panes and reading sheet
+    /// are, as a multiple of the stock opacity: below `1` more of the
+    /// wallpaper shows through, above it they turn solid.
+    pub glass: f32,
+}
+
+impl Settings {
+    pub const DEFAULT: Self = Self {
+        rounding: 1.0,
+        bubbles: true,
+        glass: 1.0,
+    };
+    /// How far `rounding` reaches; past it every corner is already as
+    /// round as the shape allows.
+    pub const MAX_ROUNDING: f32 = 4.0;
+    pub const MAX_GLASS: f32 = 2.0;
+
+    /// The settings `options` name, the stock value for any it does not
+    /// or names unreadably. Values are clamped into range.
+    pub fn from_options(options: &[(String, String)]) -> Self {
+        let mut s = Self::DEFAULT;
+        for (key, value) in options {
+            let value = value.trim();
+            match key.as_str() {
+                "flat.rounding" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        s.rounding = v;
+                    }
+                }
+                "aero.bubbles" => {
+                    if let Ok(v) = value.parse() {
+                        s.bubbles = v;
+                    }
+                }
+                "aero.glass" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        s.glass = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        s.clamped()
+    }
+
+    /// What a host publishes for these settings.
+    pub fn to_options(&self) -> Vec<(String, String)> {
+        let s = self.clamped();
+        [
+            ("flat.rounding", s.rounding.to_string()),
+            ("aero.bubbles", s.bubbles.to_string()),
+            ("aero.glass", s.glass.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// Into range; a NaN is the stock value.
+    pub fn clamped(self) -> Self {
+        let clamp = |v: f32, max: f32, stock: f32| {
+            if v.is_nan() { stock } else { v.clamp(0.0, max) }
+        };
+        Self {
+            rounding: clamp(self.rounding, Self::MAX_ROUNDING, 1.0),
+            bubbles: self.bubbles,
+            glass: clamp(self.glass, Self::MAX_GLASS, 1.0),
+        }
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+static SETTINGS: RwLock<Settings> = RwLock::new(Settings::DEFAULT);
+
+/// The settings in force.
+pub fn settings() -> Settings {
+    SETTINGS.read().map_or(Settings::DEFAULT, |s| *s)
+}
+
+/// Adopt the settings a host published. True when they changed, which
+/// is a repaint.
+pub fn adopt_settings(options: &[(String, String)]) -> bool {
+    let next = Settings::from_options(options);
+    SETTINGS
+        .write()
+        .is_ok_and(|mut s| std::mem::replace(&mut *s, next) != next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +704,25 @@ mod tests {
         assert!(adopt("vista"));
         assert_eq!(engine().name(), "flat");
         assert!(!adopt(""));
+    }
+
+    /// The settings survive the trip through the host's options, and
+    /// what cannot be read is the stock value rather than a refusal.
+    #[test]
+    fn settings_round_trip_through_options() {
+        let s = Settings {
+            rounding: 0.0,
+            bubbles: false,
+            glass: 0.6,
+        };
+        assert_eq!(Settings::from_options(&s.to_options()), s);
+        assert_eq!(Settings::from_options(&[]), Settings::DEFAULT);
+        let odd = |k: &str, v: &str| Settings::from_options(&[(k.into(), v.into())]);
+        assert_eq!(odd("aero.bubbles", "maybe"), Settings::DEFAULT);
+        assert_eq!(odd("aero.sparkle", "1"), Settings::DEFAULT);
+        assert_eq!(odd("flat.rounding", "NaN"), Settings::DEFAULT);
+        assert_eq!(odd("flat.rounding", "-3").rounding, 0.0);
+        assert_eq!(odd("aero.glass", "9").glass, Settings::MAX_GLASS);
     }
 
     #[test]

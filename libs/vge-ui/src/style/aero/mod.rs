@@ -473,6 +473,12 @@ pub fn gel(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, 
     gloss(cmds, px, x0, y0, x1, y1, 0.42);
 }
 
+/// The opacity of a glass body the wallpaper shows through: the stock
+/// `alpha`, scaled by the user's `aero.glass`.
+pub(super) fn glass_alpha(alpha: f32) -> f32 {
+    (alpha * crate::style::settings().glass).min(1.0)
+}
+
 /// Frosted glass: a translucent white body with a bright rim.
 pub fn frost(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
     cmds.push(DrawCmd::OutlineFillPath {
@@ -516,7 +522,12 @@ pub fn orb(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) 
     gloss(cmds, px, x0, y0, x1, y1, 0.4);
 }
 
+/// A soap bubble, unless the user's `aero.bubbles` turned them off —
+/// every bubble Aero draws goes through here.
 pub fn bubble(cmds: &mut Vec<DrawCmd>, px: Px, cx: f32, cy: f32, r: f32) {
+    if !crate::style::settings().bubbles {
+        return;
+    }
     let (rx, ry) = (px.x(r), px.y(r));
     let shape = ellipse(cx, cy, rx, ry);
     cmds.push(DrawCmd::FillPath {

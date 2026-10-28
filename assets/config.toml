@@ -127,14 +127,25 @@
 # publishes it with the palette, so every client agrees, at any nesting
 # depth and through vsd sessions; a client's `--style` overrides it.
 #
+# Each engine has settings of its own. veter publishes both engines'
+# whichever one is named, so a client whose `--style` picks the other
+# still draws it your way.
+#
 # Under "aero" the accents are Aero's own gel colours rather than the
 # theme's: `accents` is the rotation by nesting depth, outermost first —
 # red, orange, yellow, green, aqua, blue, pink, violet, or a hex value.
 [style]
 # name = "flat"
 #
+# [style.flat]
+# rounding = 1.0     # corner radius, as a multiple of the stock one:
+#                    # 0 is square, up to 4
+#
 # [style.aero]
 # accents = ["green", "aqua", "violet", "pink"]
+# bubbles = true     # bubbles over the skies, bars and window frames
+# glass = 1.0        # how milky the frosted panes and vmd's reading
+#                    # sheet are: lower shows more wallpaper, up to 2
 
 # ---------------------------------------------------------------------------
 # Fonts

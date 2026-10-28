@@ -64,6 +64,12 @@ pub struct HostTheme {
     /// (`flat`, `aero`), which the colours above are picked for. Empty
     /// when the host names none. Only after `swatches`.
     pub style: String,
+    /// The user's settings for the style engines, `<engine>.<key>` →
+    /// value, every engine's whichever one `style` names — so a client
+    /// that overrides the engine still draws it the user's way. What
+    /// the keys mean is the engines' business; a client ignores one it
+    /// does not know. Only after `style`.
+    pub style_options: Vec<(String, String)>,
 }
 
 impl HostTheme {
@@ -84,6 +90,11 @@ impl HostTheme {
             }
         }
         w.str(&self.style);
+        w.u8(self.style_options.len().min(u8::MAX as usize) as u8);
+        for (key, value) in self.style_options.iter().take(u8::MAX as usize) {
+            w.str(key);
+            w.str(value);
+        }
     }
 
     /// Inverse of [`Self::encode`]. Errors only when the accent itself
@@ -96,6 +107,7 @@ impl HostTheme {
             accents: Vec::new(),
             swatches: Vec::new(),
             style: String::new(),
+            style_options: Vec::new(),
         };
         let mut quads = [[0u8; 4]; 8];
         for slot in &mut quads {
@@ -113,9 +125,17 @@ impl HostTheme {
         theme.accents = accents;
         let Some(swatches) = list() else { return Ok(theme) };
         theme.swatches = swatches;
-        if let Ok(style) = r.string() {
-            theme.style = style.to_string();
-        }
+        let Ok(style) = r.string() else {
+            return Ok(theme);
+        };
+        theme.style = style.to_string();
+        let options = (|| -> Option<Vec<(String, String)>> {
+            let n = r.u8().ok()?;
+            (0..n)
+                .map(|_| Some((r.string().ok()?.to_string(), r.string().ok()?.to_string())))
+                .collect()
+        })();
+        theme.style_options = options.unwrap_or_default();
         Ok(theme)
     }
 }
@@ -439,6 +459,7 @@ mod tests {
             accents: vec![swatch("blue", 1, 2), swatch("", 3, 4)],
             swatches: vec![swatch("orange", 5, 6)],
             style: "aero".into(),
+            style_options: vec![("aero.bubbles".into(), "false".into())],
         }
     }
 
@@ -472,6 +493,7 @@ mod tests {
             accents: Vec::new(),
             swatches: Vec::new(),
             style: String::new(),
+            style_options: Vec::new(),
             ..full_theme()
         };
         let pb3 = ProbeBody {
@@ -481,8 +503,8 @@ mod tests {
         };
         assert_eq!(pb3.encode().len(), 29);
 
-        // + the eight theme colours, and two empty swatch lists:
-        // and an empty style name: 29 + 32 + 2 + 1 = 64.
+        // + the eight theme colours, two empty swatch lists, an empty
+        // style name and no options: 29 + 32 + 2 + 1 + 1 = 65.
         let pb5 = ProbeBody {
             theme: Some(HostTheme {
                 colors: full_theme().colors,
@@ -490,7 +512,7 @@ mod tests {
             }),
             ..pb3
         };
-        assert_eq!(pb5.encode().len(), 64);
+        assert_eq!(pb5.encode().len(), 65);
 
         // A theme without vge_features cannot be encoded (no gap): it
         // is silently dropped, length stays at the 24-byte prefix.
@@ -543,16 +565,24 @@ mod tests {
         assert!(t.accents.is_empty() && t.swatches.is_empty());
 
         // Cut inside the swatch list: the accents stand. (The style
-        // name, `aero`, is the last five bytes.)
-        let t = theme(bytes.len() - 5 - 3).unwrap();
+        // name, `aero`, takes five bytes, and the one option after it
+        // twenty: a count, `aero.bubbles` and `false`.)
+        const OPTIONS: usize = 1 + 13 + 6;
+        let t = theme(bytes.len() - OPTIONS - 5 - 3).unwrap();
         assert_eq!(t.accents, full_theme().accents);
         assert!(t.swatches.is_empty());
 
         // Cut inside the style name: the swatches stand, the host names
         // no style.
-        let t = theme(bytes.len() - 2).unwrap();
+        let t = theme(bytes.len() - OPTIONS - 2).unwrap();
         assert_eq!(t.swatches, full_theme().swatches);
         assert_eq!(t.style, "");
+
+        // Cut inside the options: the style stands, with no options —
+        // never half of them.
+        let t = theme(bytes.len() - 2).unwrap();
+        assert_eq!(t.style, "aero");
+        assert!(t.style_options.is_empty());
 
         // A pre-VGE host's 24-byte body.
         let back = ProbeBody::decode(&bytes[..24]).unwrap();
@@ -591,6 +621,7 @@ mod tests {
             accents: Vec::new(),
             swatches: Vec::new(),
             style: String::new(),
+            style_options: Vec::new(),
             ..full_theme()
         };
         let body = host_theme_changed_body("", &only);

@@ -1225,6 +1225,7 @@ mod tests {
                 accents: Vec::new(),
                 swatches: Vec::new(),
                 style: String::new(),
+                style_options: Vec::new(),
             }),
         }
         .encode();
