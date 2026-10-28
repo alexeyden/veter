@@ -224,7 +224,7 @@ pub fn start(
     if attached.swap(true, Ordering::AcqRel) {
         // Race-free check: if the flag was already true, refuse.
         // `stdin` / `stdout` / `master_writer` drop here → fds close.
-        return Err(anyhow!("session `{session_name}` is already attached"));
+        return Err(anyhow!("session `{session_name}` is already attached (`vsd attach -d {session_name}` takes it over)"));
     }
     // From here on, any error path must reset `attached` to false
     // before returning so the session isn't stuck looking attached.

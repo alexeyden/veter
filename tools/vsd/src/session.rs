@@ -25,6 +25,7 @@ use std::ffi::CString;
 use crate::attach;
 use crate::engines::{spawn_worker, EngineState};
 use crate::ipc::{Request, Response, SessionInfo};
+use veter_host::handoff;
 use crate::runtime;
 
 /// Default winsize before the renderer attaches and reports its
@@ -99,19 +100,7 @@ fn install_sigterm_handler() -> Result<OwnedFd> {
 /// session never came up (in which case the CLI's wait-for-socket
 /// poll times out and reports the error from the log file).
 pub fn run(name: String, argv: Vec<String>) -> Result<()> {
-    runtime::validate_name(&name)?;
-    runtime::ensure_runtime_dir()?;
-
-    let sock_path = runtime::socket_path(&name);
-    // Refuse to start if another session by this name is alive; if
-    // the socket file is a leftover from a crash, probe_socket
-    // unlinked it so the bind below succeeds.
-    match runtime::probe_socket(&sock_path) {
-        runtime::SocketProbe::Alive => {
-            bail!("session `{name}` already exists at {}", sock_path.display());
-        }
-        runtime::SocketProbe::Missing | runtime::SocketProbe::Stale => {}
-    }
+    let sock_path = claim_name(&name)?;
 
     let argv = if argv.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -126,7 +115,7 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
     let (master_fd, child_pid) = spawn_inner_pty(&argv)
         .with_context(|| format!("spawning inner program for session `{name}`"))?;
 
-    let engines = match spawn_worker(&master_fd, name.clone()) {
+    let engines = match spawn_worker(&master_fd, EngineState::new(name.clone())) {
         Ok(e) => e,
         Err(e) => {
             // Reap the child we just spawned so it doesn't become a
@@ -137,36 +126,132 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
         }
     };
 
-    let listener = match UnixListener::bind(&sock_path) {
-        Ok(l) => l,
+    let (listener, socket_guard) = match bind_socket(&sock_path) {
+        Ok(bound) => bound,
         Err(e) => {
             let _ = kill(child_pid, Signal::SIGKILL);
             let _ = waitpid(child_pid, None);
-            return Err(e).context(format!("binding {}", sock_path.display()));
+            return Err(e);
         }
     };
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&sock_path)
-        .with_context(|| format!("stat {}", sock_path.display()))?
-        .permissions();
-    perms.set_mode(0o600);
-    let _ = std::fs::set_permissions(&sock_path, perms);
 
-    let session = SessionState {
-        name,
-        master: master_fd,
-        child: child_pid,
-        created_at: Instant::now(),
-        attached: Arc::new(AtomicBool::new(false)),
-        child_reaped: AtomicBool::new(false),
-        engines,
+    serve(
+        SessionState {
+            name,
+            master: master_fd,
+            child: Child::Spawned(child_pid),
+            created_at: Instant::now(),
+            attached: Arc::new(AtomicBool::new(false)),
+            child_reaped: AtomicBool::new(false),
+            engines,
+        },
+        listener,
+        socket_guard,
+    )
+}
+
+/// Run a session over a pty some terminal already owns (`vsd adopt`,
+/// `doc/session-manager.md` §2.5). Asks the terminal listening at
+/// `from` for its master and a snapshot of its engines, and tells it
+/// whether to go on showing the session (`reattach`) once it has let go.
+///
+/// Until the verdict goes back the terminal still holds the pty and has
+/// only paused reading it, so every failure up to that point is
+/// reported to it — it resumes and nothing is lost. The order below is
+/// what keeps that true: everything that can fail happens before the
+/// worker reads its first byte.
+pub fn run_adopted(name: String, from: PathBuf, reattach: bool) -> Result<()> {
+    let sock_path = claim_name(&name)?;
+
+    let stream = UnixStream::connect(&from)
+        .with_context(|| format!("connecting to the terminal at {}", from.display()))?;
+    // The terminal drains what it has already read before answering,
+    // which under a flood is a while, but not this long.
+    stream.set_read_timeout(Some(HANDOFF_TIMEOUT))?;
+    handoff::Request::Adopt { session: name.clone(), reattach }
+        .write_to(&mut &stream)
+        .context("asking the terminal for its pty")?;
+    let (master, h) = handoff::recv_handoff(&stream)
+        .context("reading the terminal's handoff")?
+        .map_err(|reason| anyhow!("the terminal refused: {reason}"))?;
+
+    let refuse = |e: anyhow::Error| {
+        let _ = handoff::send_verdict(&mut &stream, Err(&format!("{e:#}")));
+        e
     };
 
-    // SocketGuard unlinks the socket on Drop so any shutdown path —
-    // explicit Kill, child exit, panic — leaves the runtime dir
-    // clean.
-    let _socket_guard = SocketGuard::new(sock_path.clone());
+    let child = adopt_child(Pid::from_raw(h.child_pid as i32)).map_err(refuse)?;
+    let mut state = EngineState::new(name.clone());
+    // Metrics and size first: a restored portal inherits the metrics of
+    // the engine it lands in, and the restore puts the grid back to the
+    // receiving size, which has to be the terminal's.
+    state.vge.set_dimensions(h.cell_px, h.scale);
+    state.prt.set_metrics(h.cell_px, h.scale);
+    state.resize(h.rows, h.cols);
+    veter_host::pipeline::restore(
+        &mut state.parser,
+        &mut state.vge,
+        &mut state.prt,
+        &h.vt,
+        &h.vge,
+        &h.prt,
+    )
+    .map_err(|reason| refuse(anyhow!("cannot restore the terminal's snapshot: {reason:?}")))?;
+    let (listener, socket_guard) = bind_socket(&sock_path).map_err(refuse)?;
+    let engines = spawn_worker(&master, state)
+        .context("spawning per-session worker thread")
+        .map_err(refuse)?;
 
+    handoff::send_verdict(&mut &stream, Ok(())).context("confirming the handoff")?;
+    drop(stream);
+
+    serve(
+        SessionState {
+            name,
+            master,
+            child,
+            created_at: Instant::now(),
+            attached: Arc::new(AtomicBool::new(false)),
+            child_reaped: AtomicBool::new(false),
+            engines,
+        },
+        listener,
+        socket_guard,
+    )
+}
+
+/// How long `run_adopted` waits on the terminal at each step.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Validate `name` and make sure no live session holds it. Returns the
+/// socket path to bind; a crashed session's leftover is unlinked.
+fn claim_name(name: &str) -> Result<PathBuf> {
+    runtime::validate_name(name)?;
+    runtime::ensure_runtime_dir()?;
+
+    let sock_path = runtime::socket_path(name);
+    match runtime::probe_socket(&sock_path) {
+        runtime::SocketProbe::Alive => {
+            bail!("session `{name}` already exists at {}", sock_path.display());
+        }
+        runtime::SocketProbe::Missing | runtime::SocketProbe::Stale => {}
+    }
+    Ok(sock_path)
+}
+
+/// Bind the session's socket owner-only. The guard unlinks it on any
+/// shutdown path — explicit Kill, child exit, panic.
+fn bind_socket(sock_path: &std::path::Path) -> Result<(UnixListener, SocketGuard)> {
+    let listener = UnixListener::bind(sock_path)
+        .with_context(|| format!("binding {}", sock_path.display()))?;
+    let guard = SocketGuard::new(sock_path.to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
+    Ok((listener, guard))
+}
+
+/// Serve `session` until its child exits, a `Kill` arrives, or SIGTERM.
+fn serve(session: SessionState, listener: UnixListener, _socket_guard: SocketGuard) -> Result<()> {
     let result = accept_loop(&listener, &session);
 
     // If the inner child exited while a renderer was attached, the
@@ -190,6 +275,27 @@ pub fn run(name: String, argv: Vec<String>) -> Result<()> {
     result
 }
 
+/// The program on the session's pty.
+enum Child {
+    /// Forked by this process (`vsd new`), so ours to wait for.
+    Spawned(Pid),
+    /// Inherited with a terminal's pty (`vsd adopt`). It is still the
+    /// terminal's child — or init's, once the terminal exits — so
+    /// `waitpid` cannot see it; a pidfd can, and unlike the bare pid it
+    /// cannot come to name some other process once this one is reaped.
+    Adopted(OwnedFd),
+}
+
+fn adopt_child(pid: Pid) -> Result<Child> {
+    // SAFETY: plain syscall; a non-negative return is a fresh fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("pidfd_open({pid})"));
+    }
+    Ok(Child::Adopted(unsafe { OwnedFd::from_raw_fd(fd as i32) }))
+}
+
 /// State kept by the session process for the lifetime of its socket.
 struct SessionState {
     name: String,
@@ -197,7 +303,7 @@ struct SessionState {
     /// `dup(2)` for reads; this fd stays alive so closing it tears
     /// down the slave on session shutdown.
     master: OwnedFd,
-    child: Pid,
+    child: Child,
     created_at: Instant,
     /// True iff a renderer is currently attached. Flipped atomically
     /// by the attach handler thread.
@@ -224,24 +330,49 @@ impl SessionState {
         if self.child_reaped.load(Ordering::Acquire) {
             return false;
         }
-        match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => true,
-            // Either it exited (and this call reaped it) or it is not
-            // ours to wait for. Either way the pid is no longer a
-            // handle on our child.
-            Ok(_) | Err(_) => {
-                self.child_reaped.store(true, Ordering::Release);
-                false
+        let alive = match &self.child {
+            Child::Spawned(pid) => {
+                // Either it exited (and this call reaped it) or it is
+                // not ours to wait for. Either way the pid is no longer
+                // a handle on our child.
+                matches!(
+                    waitpid(*pid, Some(WaitPidFlag::WNOHANG)),
+                    Ok(WaitStatus::StillAlive)
+                )
             }
+            Child::Adopted(pidfd) => {
+                // A pidfd turns readable once the process has exited.
+                use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+                use std::os::fd::AsFd;
+                let mut fds = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+                !matches!(poll(&mut fds, PollTimeout::ZERO), Ok(n) if n > 0)
+            }
+        };
+        if !alive {
+            self.child_reaped.store(true, Ordering::Release);
         }
+        alive
     }
 
     fn shutdown(&self) {
         if self.child_reaped.load(Ordering::Acquire) {
             return;
         }
-        let _ = kill(self.child, Signal::SIGTERM);
-        let _ = waitpid(self.child, Some(WaitPidFlag::WNOHANG));
+        match &self.child {
+            Child::Spawned(pid) => {
+                let _ = kill(*pid, Signal::SIGTERM);
+                let _ = waitpid(*pid, Some(WaitPidFlag::WNOHANG));
+            }
+            Child::Adopted(pidfd) => unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            },
+        }
         self.child_reaped.store(true, Ordering::Release);
     }
 }
@@ -351,7 +482,10 @@ fn handle_connection(
         }
     };
     match req {
-        Request::Attach => {
+        Request::Attach { steal } => {
+            if steal && session.attached.load(Ordering::Acquire) {
+                take_over_attach(session);
+            }
             let master = match dup_owned(&session.master) {
                 Ok(fd) => fd,
                 Err(e) => {
@@ -396,6 +530,26 @@ fn handle_connection(
         Request::Status => {
             let _ = Response::Status(session.info()).write_to(&mut stream);
         }
+    }
+}
+
+/// End the attach in progress so another can take its place
+/// (`vsd attach -d`).
+///
+/// This is the same wake a `Kill` gives the attach handler, and the
+/// handler answers it with the ordinary detach: the old renderer gets
+/// `DetachNotify` and with it the screen it showed before attaching,
+/// and its `vsd attach` exits. Blocks the accept loop until the
+/// handler has let go, bounded by the teardown budget; if it has not
+/// by then, the attach that follows is refused as usual.
+fn take_over_attach(session: &SessionState) {
+    {
+        let guard = session.engines.lock().unwrap_or_else(|e| e.into_inner());
+        guard.signal_attach_shutdown();
+    }
+    let deadline = Instant::now() + crate::attach::TEARDOWN_BUDGET;
+    while session.attached.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

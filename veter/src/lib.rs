@@ -16,6 +16,7 @@
 //! `App` event-loop handler) stay in `src/main.rs`.
 
 pub mod clipboard;
+pub mod handoff;
 pub mod hints;
 pub mod prt;
 pub mod pty;

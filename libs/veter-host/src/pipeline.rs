@@ -192,6 +192,25 @@ pub fn drive_chunk<CB: vt100::Callbacks>(
     walk
 }
 
+/// Install a snapshot taken by another process — a terminal handing its
+/// pty to a session (`crate::handoff`) — outside of any byte stream.
+///
+/// The receiving grid is put back to its own size afterwards, as with
+/// every restore, so size it to the sender's first if the snapshot's
+/// geometry is the one wanted.
+pub fn restore<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    vge: &mut VgeEngine,
+    prt: &mut PrtEngine,
+    vt_bytes: &[u8],
+    vge_bytes: &[u8],
+    prt_bytes: &[u8],
+) -> Result<(), RejectReason> {
+    let decoded = decode(vge, prt, vt_bytes, vge_bytes, prt_bytes)?;
+    install(parser, vge, prt, decoded);
+    Ok(())
+}
+
 /// One set of engine snapshots, decoded and not yet installed.
 struct Decoded {
     vt: vt100::ScreenSnapshot,

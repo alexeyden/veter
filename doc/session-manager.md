@@ -232,9 +232,11 @@ attach. `vsd attach NAME` on a nonexistent session errors out.
 
 ```text
 vsd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
-vsd attach NAME                # attach the calling terminal
+vsd attach [-d] NAME           # attach the calling terminal; -d takes it from another
 vsd list                       # enumerate live sessions
 vsd kill NAME                  # tear down NAME
+vsd adopt [-k] [--from PID] NAME   # turn a running veter window into NAME (§2.5)
+vsd adopt --list                   # the windows it could take, and what runs in them
 ```
 
 `new` (without `-a`) returns once the session's socket is responding
@@ -250,7 +252,11 @@ vsd --session NAME [argv ...]              # detached session backend
 vsd --foreground-session NAME [argv ...]   # non-detached, for debugging
 ```
 
-These are hidden from `--help`; users only invoke the four
+`adopt` re-execs into `--session NAME --adopt-from SOCKET
+[--adopt-reattach]` instead, which takes the pty over rather than
+spawning a program.
+
+These are hidden from `--help`; users only invoke the
 subcommands above.
 
 ### 2.4 Stdio handover
@@ -273,8 +279,106 @@ CLI process), which means:
   the user was in before the attach.
 
 If a session is already attached when a second `attach` request
-arrives, the session refuses with `Err("session already attached")`.
-Multi-attach is not in v1 (§7).
+arrives, the session refuses it, and the error names `-d`. With
+`vsd attach -d` the session ends the attach in progress first. It
+uses the same wake a `Kill` gives the attach handler, which answers
+it with the ordinary detach: the old renderer receives `DetachNotify`
+and gets back the screen it showed before attaching, and its
+`vsd attach` exits. The session waits up to the teardown budget for
+the handler to let go and then attaches the new terminal. This is
+tmux's `attach -d`, and it covers the window left attached at a desk
+that someone now wants from another machine. Multi-attach is not in
+v1 (§7).
+
+### 2.5 Adopting a running terminal
+
+A veter window started without `vsd` can be turned into a session
+after the fact, without interrupting anything running in it. The
+motivating case: the user forgot `vsd` at their desk and now wants
+that window's programs from another machine over ssh.
+
+It works because the processes on a pty never see who holds the
+master. Their controlling terminal is the *slave*, and the kernel
+hangs them up only when the last fd on the master closes. So veter
+hands its master to a new session process over `SCM_RIGHTS`, together
+with a snapshot of the engines that have been parsing it, and the
+session carries on reading where veter stopped. No `ptrace`, no
+`reptyr`: veter cooperates.
+
+Every veter window listens on `$XDG_RUNTIME_DIR/veter/<pid>.sock`
+(the directory is `0700`). `vsd adopt NAME` picks the one window
+listening there, or the one named with `--from PID`, and starts a
+detached session process.
+
+With several windows open, a pid is not something a person
+recognises; what they left running in each window is. `vsd adopt
+--list` prints that, and so does the error when `--from` is needed.
+Each window answers a `Describe` request on the same socket with
+what only it knows: its title, its grid, and its child. The CLI reads
+everything else from `/proc`. Every terminal session below the child
+is a pane, whose leader's `tpgid` names the job in its foreground. A
+foreground job that has terminal sessions of its own below it is a
+multiplexer, and it is listed by its panes instead. That process connects to the window and
+asks for its pty. The exchange is `veter_host::handoff`:
+
+1. **session → veter**: the session name, and whether the window
+   should go on showing it.
+2. **veter** stops its pty reader between reads (it waits in `poll`
+   on a stop pipe, so no chunk is taken mid-flight). It runs
+   everything already read through the engines and flushes the
+   replies that output was owed. Then it snapshots the vt100, VGE
+   and PRT engines in the VSS binary format (§4.3).
+3. **veter → session**: the master fd, the child's pid, the grid
+   size, the cell metrics and the three snapshot parts.
+4. **session**: opens a pidfd on the child, restores the snapshot
+   into fresh engines sized to veter's grid, binds `<NAME>.sock`, and
+   only then starts its worker reading the master. Anything that can
+   fail happens before that first read.
+5. **session → veter**: the verdict. On a refusal, or if the session
+   simply goes away, veter restarts its reader on the master it still
+   holds, and nothing was lost. On success veter lets go of the pty
+   *without* the SIGHUP it normally sends on close, and keeps a
+   thread to reap the child, which is still veter's.
+
+Whatever the child writes between steps 2 and 5 waits in the kernel's
+pty buffer and reaches the session's reader in order. Neither side
+drops or doubles a byte.
+
+Afterwards one terminal shows the session, and `adopt` picks it from
+where it runs:
+
+- **From anywhere else** (an ssh shell, another window), the calling
+  terminal attaches and the window closes. That is the case the
+  command exists for.
+- **From inside the window being adopted**, the caller can't attach:
+  its terminal is one of the things being handed over, so the session
+  would become its own renderer. The window keeps showing the
+  programs instead. It respawns its pty running `vsd attach NAME`,
+  and that attach's snapshot replaces the engines' old state, so
+  nothing blanks in between. `vsd` decides this by walking its own
+  parent chain to the window's pid.
+
+`-k` asks for the second outcome from outside too.
+
+The session watches its adopted child through the pidfd rather than
+`waitpid`. The child is not the session's child, and once reaped its
+bare pid could name an unrelated process. `kill` signals it the same
+way, with `pidfd_send_signal`.
+
+Known gaps:
+
+- **`vmux` doesn't learn that it is now in a session.** It sends the
+  SES probe once, at startup, so its tab bar shows no session name
+  and `prefix-D` detach refuses. The daemon-level detach chord still
+  works. Closing the gap needs an unsolicited SES event telling the
+  client its session changed, the SES counterpart of PRT's
+  `HostThemeChanged`.
+- **Programs keep the environment they started with**, which carries
+  no session marker.
+- **One renderer at a time** (§2.4). A window that kept showing the
+  session holds its only attach. `vsd attach -d` from elsewhere takes
+  it over.
+- **In-flight VFT transfers** in the window are not carried over.
 
 ## 3. veter (the local renderer)
 

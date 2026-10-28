@@ -1,7 +1,7 @@
 // Modules live in the library face (see `src/lib.rs`); the binary
 // re-imports them for in-file references. vsd and other workspace
 // crates pull the same code through `veter::*`.
-use veter::{clipboard, hints, prt, pty, renderer, search, ses, vft, vge, vss};
+use veter::{clipboard, handoff, hints, prt, pty, renderer, search, ses, vft, vge, vss};
 
 mod config;
 use config::{HostAction, SearchAction, SelectionAction};
@@ -845,6 +845,15 @@ struct App {
     /// Bytes from the PTY reader thread. Bounded — see
     /// [`PTY_QUEUE_CHUNKS`].
     rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Write end of the reader thread's stop pipe. A byte here makes it
+    /// exit before its next read, leaving whatever the child writes from
+    /// then on in the kernel's buffer — which is what lets a handoff
+    /// (`App::hand_off`) give the pty to a `vsd` session without either
+    /// side losing or doubling a byte.
+    reader_stop: Option<std::os::fd::OwnedFd>,
+    /// Where a `vsd adopt` asks for this window's pty. `None` if the
+    /// socket could not be set up, which costs only that.
+    handoff: Option<handoff::Listener>,
     vge: Option<vge::VgeEngine>,
     prt: Option<prt::PrtEngine>,
     vft: Option<vft::VftEngine>,
@@ -2535,6 +2544,8 @@ impl App {
             pty: None,
             term_renderer: None,
             rx: None,
+            reader_stop: None,
+            handoff: None,
             vge: None,
             prt: None,
             vft: None,
@@ -5139,6 +5150,215 @@ impl App {
     }
 
     /// Process PTY output, for up to [`PTY_DRAIN_BUDGET`] of wall clock.
+    /// Start the thread that reads the child's output off `reader_fd`
+    /// into [`App::rx`].
+    ///
+    /// Bounded, and that bound is load-bearing: with an unbounded
+    /// channel the reader empties the PTY as fast as the kernel fills
+    /// it, so nothing upstream ever feels the main loop's
+    /// `PTY_DRAIN_BUDGET`. A `vsend` upload — which has no window of
+    /// its own and writes at whatever speed the pipe accepts — then
+    /// outruns the drain, and everything it outruns piles up here, in
+    /// RAM, unbounded: the screen falls minutes behind the child, one
+    /// pane's flood delays every other pane's output (it is all one
+    /// stream), and a large enough transfer is an OOM. Blocking the
+    /// reader instead fills the PTY buffer, which blocks vmux's write,
+    /// which trips its own backpressure, which stops it reading the
+    /// flooding pane — real end-to-end flow control, with the
+    /// on-screen lag bounded by this queue rather than by the size of
+    /// the file.
+    ///
+    /// It waits in `poll` rather than `read` so [`App::reader_stop`]
+    /// can end it between reads: a thread blocked in `read` would take
+    /// the next chunk with it, and a handoff needs that chunk left for
+    /// the session.
+    fn spawn_pty_reader(&mut self, reader_fd: std::os::fd::OwnedFd) {
+        use std::os::fd::AsFd;
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+
+        let (tx, rx) = mpsc::sync_channel(PTY_QUEUE_CHUNKS);
+        let (stop_rx, stop_tx) = nix::unistd::pipe().expect("Failed to create reader stop pipe");
+        let proxy = self.proxy.clone();
+        let wake_pending = self.pty_wake_pending.clone();
+
+        let stats = self.reader_stats.clone();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::from(reader_fd);
+            // Sized for the flood, not the keystroke: a client uploading
+            // an image writes megabytes, and a 4 KiB buffer turned that
+            // into one allocation, one channel send and one event-loop
+            // wakeup per 4 KiB. Short reads still return short.
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                // The two places this thread can wait, timed apart:
+                // in `read` because the child had nothing to say, or
+                // in `send` because the queue was full and the main
+                // loop would not take it. Which one dominates is the
+                // difference between a slow producer and a slow
+                // renderer, and nothing on the main thread can tell.
+                let read = stats.timed(&stats.read_done, &stats.read_since, || {
+                    let mut fds = [
+                        PollFd::new(file.as_fd(), PollFlags::POLLIN),
+                        PollFd::new(stop_rx.as_fd(), PollFlags::POLLIN),
+                    ];
+                    loop {
+                        match poll(&mut fds, PollTimeout::NONE) {
+                            Err(nix::errno::Errno::EINTR) => continue,
+                            Err(e) => return Err(std::io::Error::from(e)),
+                            Ok(_) => break,
+                        }
+                    }
+                    // Stopping wins over data that arrived alongside it.
+                    if fds[1].revents().is_some_and(|r| !r.is_empty()) {
+                        return Ok(None);
+                    }
+                    file.read(&mut buf).map(Some)
+                });
+                match read {
+                    Ok(None) | Ok(Some(0)) => break,
+                    Ok(Some(n)) => {
+                        let chunk = buf[..n].to_vec();
+                        let sent =
+                            stats.timed(&stats.send_done, &stats.send_since, || {
+                                tx.send(chunk)
+                            });
+                        stats.chunks.fetch_add(1, Ordering::Relaxed);
+                        if sent.is_err() {
+                            break;
+                        }
+                        // One outstanding wakeup at a time; the data is
+                        // already in the channel, and the pass this
+                        // wakeup triggers drains whatever has piled up.
+                        if !wake_pending.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.send_event(());
+                        }
+                    }
+                    Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
+                    Err(_) => break,
+                }
+            }
+            // Drop sender so the main thread sees Disconnected, then wake it up
+            drop(tx);
+            let _ = proxy.send_event(());
+        });
+        self.rx = Some(rx);
+        self.reader_stop = Some(stop_tx);
+    }
+
+    /// Answer a `vsd` process on the handoff socket: describe this
+    /// window, or give its pty to the session that asked for it
+    /// (`doc/session-manager.md` §2.5). Returns true when the window
+    /// should close.
+    ///
+    /// The processes on the pty never notice: their terminal is the
+    /// slave, and the kernel hangs them up only when the *last* master
+    /// fd closes, which it doesn't — the session holds a copy before we
+    /// drop ours. What has to be exact is the byte stream. The reader
+    /// stops between reads, everything it already read is run through
+    /// the engines, and only then are they snapshotted; whatever the
+    /// child writes after that waits in the kernel for the session's
+    /// reader. Until the session confirms, it can still fail, and the
+    /// reader picks up where it left off.
+    fn hand_off(&mut self, asked: handoff::Asked) -> bool {
+        use veter_host::handoff::{recv_verdict, send_handoff, send_refusal, Handoff};
+
+        let handoff::Asked { mut stream, request } = asked;
+        let (session, reattach) = match request {
+            veter_host::handoff::Request::Describe => {
+                if let (Some(pty), Some(parser)) = (&self.pty, &self.parser) {
+                    let (rows, cols) = parser.screen().size();
+                    let _ = veter_host::handoff::Description {
+                        child_pid: pty.child().as_raw() as u32,
+                        rows,
+                        cols,
+                        title: self.window_title.clone(),
+                    }
+                    .write_to(&mut stream);
+                }
+                return false;
+            }
+            veter_host::handoff::Request::Adopt { session, reattach } => (session, reattach),
+        };
+        if self.pty.is_none() || self.parser.is_none() {
+            let _ = send_refusal(&stream, "this window has no pty");
+            return false;
+        }
+
+        if let Some(stop) = self.reader_stop.take() {
+            let _ = nix::unistd::write(&stop, &[0]);
+        }
+        loop {
+            let pass = self.process_pty_output();
+            if !pass.alive {
+                break;
+            }
+            if !pass.backlog {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Replies the drained output was owed go out now, ahead of the
+        // handoff, rather than to a pty that is no longer ours.
+        self.drain_pending_clipboard();
+        self.drain_pending_window_title();
+        self.drain_terminal_requests();
+
+        let (Some(pty), Some(parser), Some(vge), Some(prt)) =
+            (&self.pty, &self.parser, &self.vge, &self.prt)
+        else {
+            unreachable!("checked above");
+        };
+        let (rows, cols) = parser.screen().size();
+        let snapshot = Handoff {
+            child_pid: pty.child().as_raw() as u32,
+            rows,
+            cols,
+            cell_px: vge.cell_px(),
+            scale: vge.scale_factor(),
+            vt: parser.screen().binary_snapshot(),
+            vge: vge.binary_snapshot(),
+            prt: prt.binary_snapshot(),
+        };
+        let verdict = send_handoff(&stream, pty.master(), &snapshot)
+            .and_then(|()| stream.set_read_timeout(Some(Duration::from_secs(15))))
+            .and_then(|()| recv_verdict(&mut &stream))
+            .unwrap_or_else(|e| Err(format!("session went away: {e}")));
+        if let Err(reason) = verdict {
+            eprintln!("veter: handoff to `{session}` failed, keeping the pty: {reason}");
+            let fd = pty.dup_master().expect("Failed to dup master fd");
+            self.spawn_pty_reader(fd);
+            return false;
+        }
+
+        let cell_px = vge.cell_px();
+        self.pty.take().expect("checked above").release();
+        if !reattach {
+            return true;
+        }
+        // Go on showing the programs we just gave away, the way any
+        // terminal shows a session. The attach's snapshot replaces
+        // every engine wholesale, so the old state can stay until then
+        // and the window never blanks.
+        let vsd = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("vsd")))
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vsd".into());
+        let argv = vec![vsd, "attach".into(), session.clone()];
+        match pty::Pty::new(rows, cols, cell_px, Some(argv)) {
+            Ok(pty) => {
+                let fd = pty.dup_master().expect("Failed to dup master fd");
+                self.pty = Some(pty);
+                self.spawn_pty_reader(fd);
+                false
+            }
+            Err(e) => {
+                eprintln!("veter: handed off to `{session}`, but cannot attach to it: {e}");
+                true
+            }
+        }
+    }
+
     fn process_pty_output(&mut self) -> PtyPass {
         let rx = match &self.rx {
             Some(r) => r,
@@ -5434,72 +5654,14 @@ impl ApplicationHandler for App {
         let pty = pty::Pty::new(term_rows, term_cols, cell_px, self.entry_command.clone())
             .expect("Failed to create PTY");
 
-        // Start PTY reader thread.
-        //
-        // Bounded, and that bound is load-bearing: with an unbounded
-        // channel the reader empties the PTY as fast as the kernel
-        // fills it, so nothing upstream ever feels the main loop's
-        // `PTY_DRAIN_BUDGET`. A `vsend` upload — which has no window of
-        // its own and writes at whatever speed the pipe accepts — then
-        // outruns the drain, and everything it outruns piles up here,
-        // in RAM, unbounded: the screen falls minutes behind the child,
-        // one pane's flood delays every other pane's output (it is all
-        // one stream), and a large enough transfer is an OOM. Blocking
-        // the reader instead fills the PTY buffer, which blocks vmux's
-        // write, which trips its own backpressure, which stops it
-        // reading the flooding pane — real end-to-end flow control,
-        // with the on-screen lag bounded by this queue rather than by
-        // the size of the file.
-        let (tx, rx) = mpsc::sync_channel(PTY_QUEUE_CHUNKS);
         let reader_fd = pty.dup_master().expect("Failed to dup master fd");
+        self.spawn_pty_reader(reader_fd);
         let proxy = self.proxy.clone();
-        let wake_pending = self.pty_wake_pending.clone();
-
-        let stats = self.reader_stats.clone();
-        std::thread::spawn(move || {
-            let mut file = std::fs::File::from(reader_fd);
-            // Sized for the flood, not the keystroke: a client uploading
-            // an image writes megabytes, and a 4 KiB buffer turned that
-            // into one allocation, one channel send and one event-loop
-            // wakeup per 4 KiB. Short reads still return short.
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                // The two places this thread can wait, timed apart:
-                // in `read` because the child had nothing to say, or
-                // in `send` because the queue was full and the main
-                // loop would not take it. Which one dominates is the
-                // difference between a slow producer and a slow
-                // renderer, and nothing on the main thread can tell.
-                let read = stats.timed(&stats.read_done, &stats.read_since, || {
-                    file.read(&mut buf)
-                });
-                match read {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = buf[..n].to_vec();
-                        let sent =
-                            stats.timed(&stats.send_done, &stats.send_since, || {
-                                tx.send(chunk)
-                            });
-                        stats.chunks.fetch_add(1, Ordering::Relaxed);
-                        if sent.is_err() {
-                            break;
-                        }
-                        // One outstanding wakeup at a time; the data is
-                        // already in the channel, and the pass this
-                        // wakeup triggers drains whatever has piled up.
-                        if !wake_pending.swap(true, Ordering::AcqRel) {
-                            let _ = proxy.send_event(());
-                        }
-                    }
-                    Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
-                    Err(_) => break,
-                }
-            }
-            // Drop sender so the main thread sees Disconnected, then wake it up
-            drop(tx);
+        self.handoff = handoff::listen(move || {
             let _ = proxy.send_event(());
-        });
+        })
+        .map_err(|e| eprintln!("veter: no handoff socket, `vsd adopt` won't find this window: {e}"))
+        .ok();
 
         self.window = Some(window);
         self.gl_surface = Some(gl_surface);
@@ -5508,7 +5670,6 @@ impl ApplicationHandler for App {
         self.parser = Some(parser);
         self.pty = Some(pty);
         self.term_renderer = Some(term_renderer);
-        self.rx = Some(rx);
         self.vge = Some(vge_engine);
         self.prt = Some(prt_engine);
         self.vft = Some(vft_engine);
@@ -6193,6 +6354,13 @@ impl ApplicationHandler for App {
         // Cleared before the drain, so bytes arriving mid-pass queue a
         // fresh wakeup instead of being stranded in the channel.
         self.pty_wake_pending.store(false, Ordering::Release);
+        let asked = self.handoff.as_ref().and_then(|h| h.requests.try_recv().ok());
+        if let Some(asked) = asked
+            && self.hand_off(asked)
+        {
+            event_loop.exit();
+            return;
+        }
         let drain_start = Instant::now();
         let bytes_before = self.trace.bytes;
         let pass = self.process_pty_output();

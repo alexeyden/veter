@@ -391,16 +391,19 @@ impl EngineState {
 }
 
 /// Dup the master fd twice (one read handle, one write handle) and
-/// spawn the per-session worker. Returns the shared engine handle so
+/// spawn the per-session worker over `state` — fresh for `vsd new`,
+/// already restored from the terminal's snapshot for `vsd adopt`, which
+/// is why it is built by the caller: nothing may be read off the master
+/// before the snapshot it continues is in place. Returns the shared engine handle so
 /// the attach path can lock it to serialize a snapshot or to forward
 /// live output.
 pub fn spawn_worker(
     master: &OwnedFd,
-    session_name: String,
+    state: EngineState,
 ) -> Result<Arc<Mutex<EngineState>>> {
     let reader_fd = dup_owned(master).context("dup(master) for worker reader")?;
     let writer_fd = dup_owned(master).context("dup(master) for worker writer")?;
-    let engines = Arc::new(Mutex::new(EngineState::new(session_name)));
+    let engines = Arc::new(Mutex::new(state));
     let engines_for_worker = Arc::clone(&engines);
     std::thread::Builder::new()
         .name("vsd-worker".into())

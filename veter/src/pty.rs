@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -27,6 +27,9 @@ pub struct Pty {
     /// bounds the producer; until then a runaway download grows this
     /// queue instead of stalling the loop.
     writer_tx: Sender<Vec<u8>>,
+    /// Whether dropping this hangs the child up. Cleared by
+    /// [`Pty::release`], once a `vsd` session holds the master too.
+    owns_child: bool,
 }
 
 /// Pixel dimensions for `TIOCSWINSZ` from a grid size and the cell
@@ -165,6 +168,7 @@ impl Pty {
                     master,
                     child,
                     writer_tx,
+                    owns_child: true,
                 })
             }
         }
@@ -196,6 +200,32 @@ impl Pty {
         }
     }
 
+    /// The child: the session leader on the slave.
+    pub fn child(&self) -> Pid {
+        self.child
+    }
+
+    pub fn master(&self) -> BorrowedFd<'_> {
+        self.master.as_fd()
+    }
+
+    /// Let go of the pty without hanging the child up — another process
+    /// holds the master now (`veter_host::handoff`), so closing ours
+    /// closes nothing the child can see. Bytes already queued for the
+    /// child still go out: the writer thread drains its channel before
+    /// it notices the sender is gone.
+    ///
+    /// The child stays ours to reap, so a thread waits for it; a
+    /// terminal never otherwise outlives its child, and without one the
+    /// child would sit as a zombie until this window closed.
+    pub fn release(mut self) {
+        self.owns_child = false;
+        let child = self.child;
+        std::thread::spawn(move || {
+            let _ = nix::sys::wait::waitpid(child, None);
+        });
+    }
+
     pub fn dup_master(&self) -> io::Result<OwnedFd> {
         let fd = nix::unistd::dup(self.master.as_raw_fd())
             .map_err(io::Error::other)?;
@@ -205,6 +235,9 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        if !self.owns_child {
+            return;
+        }
         let _ = kill(self.child, Signal::SIGHUP);
     }
 }

@@ -21,6 +21,7 @@ ses-protocol = { path = "../../protocol/ses" }
 vt100 = { path = "../../vendored/vt100" }
 rgb = "0.8"
 libc = "0.2"
+nix = { version = "0.29", features = ["socket", "uio"] }
 # VGE decodes uploaded WebP/PNG images into RGBA8 for storage; the
 # engine needs to do this without any GUI involvement so headless
 # vsd can keep state authoritative across attaches.

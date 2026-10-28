@@ -34,8 +34,12 @@ pub enum Request {
     /// snapshot, then splices bytes between the renderer and the
     /// inner PTY. Reply: `Ok` on success (client stays blocked on the
     /// socket until the session ends the attach) or `Err(msg)` if the
-    /// session is already attached.
-    Attach,
+    /// session is already attached and `steal` is false.
+    ///
+    /// With `steal`, a renderer already attached is detached first —
+    /// the ordinary detach, so it gets its own screen back and its
+    /// `vsd attach` exits — and this one takes its place.
+    Attach { steal: bool },
     /// Terminate this session: SIGTERM the inner PTY child, unlink
     /// the socket, exit the session process. Idempotent — a second
     /// `Kill` won't reach anyone because the socket is gone.
@@ -83,7 +87,10 @@ impl Request {
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let mut body = Vec::new();
         match self {
-            Request::Attach => body.push(REQ_ATTACH),
+            Request::Attach { steal } => {
+                body.push(REQ_ATTACH);
+                body.push(u8::from(*steal));
+            }
             Request::Kill => body.push(REQ_KILL),
             Request::Status => body.push(REQ_STATUS),
         }
@@ -97,7 +104,9 @@ impl Request {
         }
         let kind = body[0];
         match kind {
-            REQ_ATTACH => Ok(Request::Attach),
+            REQ_ATTACH => Ok(Request::Attach {
+                steal: body.get(1).is_some_and(|&b| b != 0),
+            }),
             REQ_KILL => Ok(Request::Kill),
             REQ_STATUS => Ok(Request::Status),
             _ => Err(invalid(&format!("unknown request kind 0x{kind:02X}"))),
@@ -254,10 +263,12 @@ mod tests {
 
     #[test]
     fn attach_round_trip() {
-        assert!(matches!(
-            roundtrip_request(Request::Attach),
-            Request::Attach
-        ));
+        for steal in [false, true] {
+            assert!(matches!(
+                roundtrip_request(Request::Attach { steal }),
+                Request::Attach { steal: s } if s == steal
+            ));
+        }
     }
 
     #[test]

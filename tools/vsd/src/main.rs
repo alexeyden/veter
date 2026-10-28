@@ -4,9 +4,11 @@
 //!
 //! ```text
 //!   vsd new [-a] NAME [argv ...]   # spawn a new session; -a attaches afterwards
-//!   vsd attach NAME                # attach the calling terminal
+//!   vsd attach [-d] NAME           # attach the calling terminal; -d takes it from another
 //!   vsd list                       # enumerate live sessions
 //!   vsd kill NAME                  # tear down NAME
+//!   vsd adopt [-k] NAME            # turn a running veter window into NAME
+//!   vsd adopt --list               # the veter windows it could take
 //! ```
 //!
 //! The subcommands are short-lived CLI calls that talk to per-session
@@ -35,6 +37,7 @@ mod engines;
 mod fdpass;
 mod ipc;
 mod probe;
+mod procinfo;
 mod runtime;
 mod session;
 
@@ -57,6 +60,17 @@ struct Cli {
     /// foreground (no detachment). Useful for `gdb` / `cargo run`.
     #[arg(long, value_name = "NAME", hide = true, conflicts_with = "session")]
     foreground_session: Option<String>,
+
+    /// Internal: with `--session`, take over the pty of the terminal
+    /// listening on this socket instead of spawning a program
+    /// (used by `adopt`).
+    #[arg(long, value_name = "SOCKET", hide = true)]
+    adopt_from: Option<PathBuf>,
+
+    /// Internal: with `--adopt-from`, have the terminal attach to the
+    /// session in its own window once it has handed the pty over.
+    #[arg(long, hide = true, requires = "adopt_from")]
+    adopt_reattach: bool,
 
     /// argv for `--session` / `--foreground-session`. Ignored
     /// otherwise.
@@ -84,12 +98,42 @@ enum Cmd {
     },
     /// Attach the calling terminal to NAME. Errors if the session
     /// doesn't exist.
-    Attach { name: String },
+    Attach {
+        /// If another terminal is attached, detach it and take its
+        /// place instead of refusing.
+        #[arg(short = 'd', long = "detach-other")]
+        steal: bool,
+        name: String,
+    },
     /// Enumerate live sessions.
     List,
     /// Tear down NAME (SIGTERM its inner program, unlink its socket).
     /// Idempotent on a missing session.
     Kill { name: String },
+    /// Move a running veter window's programs into a new session NAME,
+    /// without interrupting them.
+    ///
+    /// Run from anywhere else — an ssh shell, another window — this
+    /// terminal attaches and the window closes. Run from inside the
+    /// window being adopted, the window goes on showing the programs,
+    /// now attached to the session, since a terminal inside the
+    /// session cannot also be the one showing it.
+    Adopt {
+        /// Leave the window showing the session and don't attach here.
+        #[arg(short, long)]
+        keep_window: bool,
+        /// The veter process to take over. Needed only when more than
+        /// one is running.
+        #[arg(long, value_name = "PID")]
+        from: Option<u32>,
+        /// List the running veter windows and what each is running,
+        /// instead of adopting one.
+        #[arg(short, long, conflicts_with_all = ["keep_window", "from"])]
+        list: bool,
+        /// Session name.
+        #[arg(required_unless_present = "list")]
+        name: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -97,11 +141,11 @@ fn main() -> Result<()> {
 
     // Internal session-backend modes — invoked by `new` re-execing
     // self. These never return through the CLI dispatcher below.
-    if let Some(name) = cli.session {
-        return session::run(name, cli.session_argv);
-    }
-    if let Some(name) = cli.foreground_session {
-        return session::run(name, cli.session_argv);
+    if let Some(name) = cli.session.or(cli.foreground_session) {
+        return match cli.adopt_from {
+            Some(from) => session::run_adopted(name, from, cli.adopt_reattach),
+            None => session::run(name, cli.session_argv),
+        };
     }
 
     let cmd = cli
@@ -109,9 +153,16 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("missing subcommand (use --help)"))?;
     match cmd {
         Cmd::New { attach, name, argv } => cmd_new(attach, name, argv),
-        Cmd::Attach { name } => run_attach(&name),
+        Cmd::Attach { steal, name } => run_attach(&name, steal),
         Cmd::List => cmd_list(),
         Cmd::Kill { name } => cmd_kill(&name),
+        Cmd::Adopt { list: true, .. } => {
+            render_terminal_table(&veter_host::handoff::list_terminals());
+            Ok(())
+        }
+        Cmd::Adopt { keep_window, from, name, .. } => {
+            cmd_adopt(keep_window, from, name.expect("clap requires NAME without --list"))
+        }
     }
 }
 
@@ -129,32 +180,91 @@ fn cmd_new(attach: bool, name: String, argv: Vec<String>) -> Result<()> {
     }
 
     let log_path = runtime::log_path(&name);
-    spawn_detached_session(&name, &argv, &log_path)
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if !argv.is_empty() {
+        args.push("--".into());
+        args.extend(argv.into_iter().map(Into::into));
+    }
+    spawn_detached_session(&name, &args, &log_path)
         .with_context(|| format!("spawning session process for `{name}`"))?;
+    wait_for_session(&name, Duration::from_secs(3))?;
+    if attach {
+        return run_attach(&name, false);
+    }
+    Ok(())
+}
 
-    // Poll for the socket to appear. 50ms × 60 = 3s deadline; a
-    // session process should bind well within that.
-    let deadline = Instant::now() + Duration::from_secs(3);
+/// Poll for a just-spawned session's socket to appear.
+fn wait_for_session(name: &str, budget: Duration) -> Result<()> {
+    let sock = runtime::socket_path(name);
+    let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         match runtime::probe_socket(&sock) {
-            runtime::SocketProbe::Alive => {
-                if attach {
-                    return run_attach(&name);
-                }
-                return Ok(());
-            }
+            runtime::SocketProbe::Alive => return Ok(()),
             runtime::SocketProbe::Missing | runtime::SocketProbe::Stale => {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
     bail!(
-        "session `{name}` failed to come up within 3s; check {}",
-        log_path.display()
+        "session `{name}` failed to come up within {}s; check {}",
+        budget.as_secs(),
+        runtime::log_path(name).display()
     )
 }
 
-/// Re-exec this binary with `--session NAME [argv...]` in a
+/// `vsd adopt` — find the veter window, then start a session process
+/// that asks it for its pty (`doc/session-manager.md` §2.5).
+fn cmd_adopt(keep_window: bool, from: Option<u32>, name: String) -> Result<()> {
+    use veter_host::handoff;
+
+    runtime::validate_name(&name)?;
+    runtime::ensure_runtime_dir()?;
+    if let runtime::SocketProbe::Alive = runtime::probe_socket(&runtime::socket_path(&name)) {
+        bail!("session `{name}` already exists");
+    }
+
+    let terminals = handoff::list_terminals();
+    let (pid, socket) = match from {
+        Some(pid) => terminals
+            .into_iter()
+            .find(|(p, _)| *p == pid)
+            .ok_or_else(|| anyhow!("no veter with pid {pid} is listening"))?,
+        None => match terminals.as_slice() {
+            [] => bail!("no running veter to adopt from"),
+            [only] => only.clone(),
+            many => {
+                render_terminal_table(many);
+                bail!("{} veter windows are running; pick one with --from PID", many.len());
+            }
+        },
+    };
+
+    // Attaching from inside the window would make the session its own
+    // renderer: our terminal is one of the things being handed over.
+    let inside = procinfo::is_descendant(std::process::id(), pid);
+    let attach = !keep_window && !inside;
+    if inside && !keep_window {
+        eprintln!("vsd: running inside that window, so it keeps showing `{name}`");
+    }
+
+    let mut args: Vec<std::ffi::OsString> = vec!["--adopt-from".into(), socket.into()];
+    if !attach {
+        args.push("--adopt-reattach".into());
+    }
+    let log_path = runtime::log_path(&name);
+    spawn_detached_session(&name, &args, &log_path)
+        .with_context(|| format!("spawning session process for `{name}`"))?;
+    // Longer than `new`'s: the terminal drains what it has already read
+    // before it snapshots, and the snapshot then crosses a socket.
+    wait_for_session(&name, Duration::from_secs(12))?;
+    if attach {
+        return run_attach(&name, false);
+    }
+    Ok(())
+}
+
+/// Re-exec this binary with `--session NAME [args...]` in a
 /// double-forked detached process. Stdio is redirected to the
 /// session's log file. The child calls `setsid(2)` so it leaves the
 /// parent's process group and isn't reaped if our controlling tty
@@ -162,7 +272,7 @@ fn cmd_new(attach: bool, name: String, argv: Vec<String>) -> Result<()> {
 /// this CLI invocation.
 fn spawn_detached_session(
     name: &str,
-    argv: &[String],
+    args: &[std::ffi::OsString],
     log_path: &std::path::Path,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
@@ -190,9 +300,7 @@ fn spawn_detached_session(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    if !argv.is_empty() {
-        cmd.arg("--").args(argv);
-    }
+    cmd.args(args);
     // SAFETY: pre_exec runs in the child between fork and exec; it
     // must only call async-signal-safe functions. setsid(2) is.
     unsafe {
@@ -210,7 +318,7 @@ fn spawn_detached_session(
 /// `vsd attach NAME` — connect to the session's socket, hand
 /// stdio over `SCM_RIGHTS`, then block on the socket until the
 /// session ends the attach.
-fn run_attach(name: &str) -> Result<()> {
+fn run_attach(name: &str, steal: bool) -> Result<()> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
 
@@ -219,7 +327,7 @@ fn run_attach(name: &str) -> Result<()> {
     let mut stream = UnixStream::connect(&sock).with_context(|| {
         format!("connecting to session `{name}` at {}", sock.display())
     })?;
-    Request::Attach
+    Request::Attach { steal }
         .write_to(&mut stream)
         .context("writing attach request")?;
 
@@ -301,6 +409,34 @@ fn render_session_table(infos: &[SessionInfo]) {
             if s.alive { "yes" } else { "no" },
             if s.attached { "yes" } else { "no" },
         );
+    }
+}
+
+/// One row per veter window: what it is, and what runs in it. The
+/// window supplies what only it knows (title, grid, its child); the
+/// rest is `/proc`.
+fn render_terminal_table(terminals: &[(u32, PathBuf)]) {
+    if terminals.is_empty() {
+        println!("(no veter windows)");
+        return;
+    }
+    println!("{:<8}  {:>7}  {:>7}  {:<24}  RUNNING", "PID", "AGE", "SIZE", "TITLE");
+    for (pid, path) in terminals {
+        let age = procinfo::age_secs(*pid).map(format_age).unwrap_or_else(|| "?".into());
+        let (size, title, running) = match veter_host::handoff::describe(path) {
+            Ok(d) => (
+                format!("{}x{}", d.cols, d.rows),
+                d.title,
+                procinfo::foreground_jobs(d.child_pid, 40).join(", "),
+            ),
+            Err(e) => ("?".into(), String::new(), format!("(no answer: {e})")),
+        };
+        let title: String = if title.chars().count() > 24 {
+            title.chars().take(23).chain(['…']).collect()
+        } else {
+            title
+        };
+        println!("{pid:<8}  {age:>7}  {size:>7}  {title:<24}  {running}");
     }
 }
 
