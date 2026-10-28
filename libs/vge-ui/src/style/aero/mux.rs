@@ -3,32 +3,48 @@
 
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, DrawCmd, Style};
+use vge_protocol::path::{PathNode, PathSegment};
 
-use super::{GEL_AMBER, GEL_AQUA, Gel, bubble, frost, gel, gloss, orb, scroll_thumb, smoke};
+use super::{GEL_AQUA, Gel, bubble, gel, gloss, orb, scroll_thumb, smoke};
 use crate::measure::text_cells;
-use crate::paint::{Px, hash, hex, pill, text, unit, vgrad, white};
+use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
+use crate::shape::rounded_rect_path_corners;
 use crate::style::{PaneChrome, TabBar, TabbarMetrics};
 
-/// A two-row bar, so a tab is a capsule with air above and below it:
-/// the label sits on the bar's centre line with half a row clear either
-/// way, and the capsules stand apart from each other and the edges.
+/// A two-row bar of tabs standing on its bottom edge, Windows XP
+/// fashion: the label sits on the bar's centre line, the active tab
+/// rises a little above the rest and runs down into the panes, and the
+/// tabs stand close together.
 pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
     rows: 2,
-    margin: 0.6,
-    gap: 0.8,
+    margin: 0.5,
+    gap: 0.3,
     name_pad: 4.0,
 };
 /// The bar's height in cells.
 const BAR_H: f32 = TABBAR_METRICS.rows as f32;
-/// Top and bottom of a tab capsule.
+/// Top and bottom of the session capsule.
 const CAP_Y0: f32 = 0.3;
 const CAP_Y1: f32 = BAR_H - 0.3;
+/// Where a tab's top edge sits: the active one higher than the rest.
+const TAB_Y0: f32 = 0.38;
+const ACTIVE_Y0: f32 = 0.18;
+/// The radius of a tab's two top corners, in pixels.
+const TAB_R: f32 = 6.0;
+/// The orange along the top of a tab with unseen output, Windows XP's
+/// hot-tab strip: a darker edge on the tab's own outline, a solid band
+/// `HILITE_SOLID` pixels deep under it, fading out into the tab's body
+/// by `HILITE_FADE`.
+const HILITE_EDGE: u32 = 0xd96a0a;
+const HILITE: u32 = 0xffb43c;
+const HILITE_SOLID: f32 = 2.5;
+const HILITE_FADE: f32 = 9.0;
 /// The text row, centred on the bar.
 const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
 
-/// The tab bar: a two-row sky with the tabs as capsules on it — the
-/// accent's gel for the active one, amber for one with unseen output, frosted
-/// glass for the rest.
+/// The tab bar: a two-row sky with the tabs standing on its bottom
+/// edge — the accent's gel for the active one, frosted glass for the
+/// rest, and an orange strip along the top of one with unseen output.
 pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
     let host_w = bar.width;
     let band = |y: f32, h: f32| Rect {
@@ -130,27 +146,30 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
         let (x0, x1) = (x, x + slot.num_w + slot.name_w);
         let is_active = slot.active;
         let has_activity = slot.activity;
+        // An inactive tab stands on the bar's bright lip; the active
+        // one covers it, open to the panes below.
+        let y1 = BAR_H - px.y(1.0);
         let shadow = if is_active {
-            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &active);
+            gel_tab(cmds, px, x0, ACTIVE_Y0, x1, BAR_H, &active);
             hex(active.shade, 0.85)
-        } else if has_activity {
-            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_AMBER);
-            hex(GEL_AMBER.shade, 0.85)
         } else {
-            frost(cmds, px, x0, CAP_Y0, x1, CAP_Y1);
+            frost_tab(cmds, px, x0, TAB_Y0, x1, y1);
+            if has_activity {
+                hilite(cmds, px, x0, TAB_Y0, x1, y1);
+            }
             navy
         };
 
-        // The number rides in an orb at the head of the capsule, both
+        // The number rides in an orb at the head of the tab, both
         // centred over `num_w`.
         let num_cx = x + 0.4 + slot.num_w * 0.5;
         orb(
             cmds,
             px,
             num_cx - slot.num_w * 0.42,
-            CAP_Y0 + 0.22,
+            TEXT_Y + 0.08,
             num_cx + slot.num_w * 0.42,
-            CAP_Y1 - 0.22,
+            TEXT_Y + 0.92,
         );
         text(
             cmds,
@@ -189,6 +208,134 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             Some(navy),
         );
     }
+}
+
+/// A tab's outline: square at the bottom, `TAB_R` round at the top.
+fn tab_path(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PathSegment> {
+    let rx = px.x(TAB_R).min((x1 - x0) * 0.5);
+    let ry = px.y(TAB_R).min(y1 - y0);
+    rounded_rect_path_corners(x0, y0, x1, y1, rx, ry, true, true, false, false)
+}
+
+/// The same outline left open along the bottom, for the rim: a tab's
+/// bottom edge is where it meets the bar, not a line of its own.
+fn tab_rim(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PathSegment> {
+    let rx = px.x(TAB_R).min((x1 - x0) * 0.5);
+    let ry = px.y(TAB_R).min(y1 - y0);
+    let arc = |x: f32, y: f32| PathNode::ArcEllipseTo {
+        large: false,
+        sweep: true,
+        rx,
+        ry,
+        rotation: 0.0,
+        dst: Point { x, y },
+    };
+    vec![PathSegment {
+        start: Point { x: x0, y: y1 },
+        nodes: vec![
+            PathNode::VerticalLineTo { y: y0 + ry },
+            arc(x0 + rx, y0),
+            PathNode::HorizontalLineTo { x: x1 - rx },
+            arc(x1, y0 + ry),
+            PathNode::VerticalLineTo { y: y1 },
+        ],
+    }]
+}
+
+/// The sheen over a tab's upper half, the tab's own shape.
+fn tab_sheen(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, a: f32) {
+    let (sx0, sx1, sy0) = (x0 + px.x(2.0), x1 - px.x(2.0), y0 + px.y(1.5));
+    let sy1 = y0 + (y1 - y0) * 0.5;
+    if sx1 <= sx0 || sy1 <= sy0 {
+        return;
+    }
+    cmds.push(DrawCmd::FillPath {
+        fill: vgrad(sy0, sy1, white(a), white(a * 0.05)),
+        segments: tab_path(px, sx0, sy0, sx1, sy1),
+    });
+}
+
+/// A gel tab: [`gel`]'s material on a tab's outline.
+fn gel_tab(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, g: &Gel) {
+    let shape = tab_path(px, x0, y0, x1, y1);
+    cmds.push(DrawCmd::FillPath {
+        fill: vgrad(y0, y1, hex(g.top, 1.0), hex(g.bottom, 1.0)),
+        segments: shape.clone(),
+    });
+    let cx = (x0 + x1) / 2.0;
+    cmds.push(DrawCmd::FillPath {
+        fill: radial(
+            Point { x: cx, y: y1 },
+            Point {
+                x: cx + (x1 - x0) * 0.35,
+                y: y1,
+            },
+            hex(g.glow, 0.5),
+            hex(g.glow, 0.0),
+        ),
+        segments: shape,
+    });
+    cmds.push(DrawCmd::DrawLinePath {
+        stroke: Style::Flat(hex(g.rim, 0.9)),
+        line_width: px.line(1.0),
+        segments: tab_rim(px, x0, y0, x1, y1),
+    });
+    tab_sheen(cmds, px, x0, y0, x1, y1, 0.42);
+}
+
+/// A frosted glass tab, for one that is neither active nor busy.
+fn frost_tab(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
+    cmds.push(DrawCmd::FillPath {
+        fill: vgrad(y0, y1, white(0.26), white(0.06)),
+        segments: tab_path(px, x0, y0, x1, y1),
+    });
+    cmds.push(DrawCmd::DrawLinePath {
+        stroke: Style::Flat(white(0.55)),
+        line_width: px.line(1.0),
+        segments: tab_rim(px, x0, y0, x1, y1),
+    });
+    tab_sheen(cmds, px, x0, y0, x1, y1, 0.28);
+}
+
+/// The orange strip along the top of a tab with unseen output. It is
+/// cut from the tab's own outline rather than laid across it, so it
+/// rounds over the corners with the tab, and it fades into the body
+/// instead of ending in a hard edge.
+fn hilite(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
+    let fade = (y0 + px.y(HILITE_FADE)).min(y1);
+    cmds.push(DrawCmd::FillPath {
+        fill: vgrad(
+            y0 + px.y(HILITE_SOLID),
+            fade,
+            hex(HILITE, 0.95),
+            hex(HILITE, 0.0),
+        ),
+        segments: tab_path(px, x0, y0, x1, fade),
+    });
+    // The darker edge over the rim, across the top and round both
+    // corners, stopping where the corners straighten out.
+    let rx = px.x(TAB_R).min((x1 - x0) * 0.5);
+    let ry = px.y(TAB_R).min(y1 - y0);
+    let arc = |x: f32, y: f32| PathNode::ArcEllipseTo {
+        large: false,
+        sweep: true,
+        rx,
+        ry,
+        rotation: 0.0,
+        dst: Point { x, y },
+    };
+    cmds.push(DrawCmd::DrawLinePath {
+        stroke: Style::Flat(hex(HILITE_EDGE, 1.0)),
+        line_width: px.line(1.5),
+        segments: vec![PathSegment {
+            start: Point { x: x0, y: y0 + ry },
+            nodes: vec![
+                arc(x0 + rx, y0),
+                PathNode::HorizontalLineTo { x: x1 - rx },
+                arc(x1, y0 + ry),
+            ],
+        }],
+    });
 }
 
 /// A pane's title — aqua gel when focused, smoked glass otherwise —
