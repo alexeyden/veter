@@ -3174,6 +3174,7 @@ dependencies = [
  "veter-version",
  "vft-protocol",
  "vge-protocol",
+ "vge-ui",
  "vt100",
  "winit",
 ]

@@ -113,6 +113,7 @@ Options:
   -z, --zoom <FACTOR>  initial text size (1.0 = the terminal's own)
   -A, --accent <COLOR> chrome accent: a name (the terminal theme's colour
                        for it), or #rgb / #rrggbb / #rrggbbaa
+      --style <NAME>   style engine (flat, aero) instead of the terminal's
   -h, --help           show this help
   -V, --version        show the version
 ";

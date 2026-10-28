@@ -237,9 +237,11 @@ pub fn set_host_theme(c: HostColors) {
 
 /// Adopt everything a host reports about its palette (PRT §10: the
 /// probe's tail, or a `HostThemeChanged`): the accent for this depth,
-/// the eight surface/text colours when present, and the named swatches
-/// a `--accent <name>` resolves against.
-pub fn adopt_host_theme(theme: &HostTheme) {
+/// the eight surface/text colours when present, the named swatches a
+/// `--accent <name>` resolves against, and the style engine they were
+/// picked for ([`crate::style::adopt`]). True when that changed the
+/// engine in force, which a client has to lay out again for.
+pub fn adopt_host_theme(theme: &HostTheme) -> bool {
     set_host_accent(unpack(u32::from_be_bytes(theme.accent)));
     if let Some(quads) = theme.colors {
         set_host_theme(HostColors::from_rgba8(quads));
@@ -257,6 +259,7 @@ pub fn adopt_host_theme(theme: &HostTheme) {
             })
             .collect();
     }
+    crate::style::adopt(&theme.style)
 }
 
 /// The host's swatch called `name`: its fill and its text.
@@ -602,10 +605,10 @@ fn is_swatch_token(t: &str) -> bool {
 }
 
 /// The swatch an alias stands for: veter publishes one name per hue.
-fn canonical_name(name: &str) -> &str {
+pub fn canonical_name(name: &str) -> &str {
     match name {
         "pink" => "magenta",
-        "teal" => "cyan",
+        "teal" | "aqua" => "cyan",
         "violet" => "purple",
         "gray" | "white" => "grey",
         other => other,

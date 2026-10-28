@@ -4628,6 +4628,8 @@ Options:
                          theme's own colour for it
   -P, --prefix <KEY>     prefix key (default Ctrl+Space). Accepts C-a,
                          ctrl+a, ^a, or a bare letter; 'space' for Ctrl+Space
+      --style <NAME>     draw with this style engine (flat, aero) instead
+                         of the one the terminal names
   -h, --help             print this help and exit
   -V, --version          print the version and the commit it was built from
 
@@ -5178,6 +5180,7 @@ fn handle_stdin_chunk(
     // Set by `EVT_HOST_THEME_CHANGED`: every colour we derived
     // ourselves is stale and the whole chrome has to be re-emitted.
     let mut theme_dirty = false;
+    let mut style_changed = false;
 
     // PRT host frames: scan for RawReply events (forward to the matching
     // pane's PTY) and Ok responses to our scroll commands (carry the
@@ -5308,8 +5311,12 @@ fn handle_stdin_chunk(
                 //
                 // A `--accent` on the command line still wins: it is
                 // checked ahead of the host's in `theme::accent_color`.
+                //
+                // The palette names the style engine too, and a renderer
+                // drawing with another one moves the panes: the engines'
+                // tab bars are not the same height.
                 if let Ok((_, host)) = prt_protocol::envelope::parse_host_theme_changed(body) {
-                    theme::adopt_host_theme(&host);
+                    style_changed |= theme::adopt_host_theme(&host);
                     theme_dirty = true;
                 }
             } else if ft == prt_protocol::frame::RSP_OK
@@ -5352,6 +5359,12 @@ fn handle_stdin_chunk(
     // whole chrome is re-emitted from the values just adopted. Done
     // after the title/activity flush so a single pass carries both when
     // an attach coincides with either.
+    if style_changed {
+        let env = state.relayout_and_render()?;
+        if !env.is_empty() {
+            write_all_stdout(&env)?;
+        }
+    }
     if theme_dirty {
         let env = state.repaint_all_chrome();
         if !env.is_empty() {

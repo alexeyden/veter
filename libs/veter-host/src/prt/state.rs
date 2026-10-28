@@ -2312,6 +2312,7 @@ mod tests {
             accents: slots(&[c(1.0, 0.0, 0.0), c(0.0, 1.0, 0.0), c(0.0, 0.0, 1.0)]),
             swatches: Vec::new(),
             colors: None,
+            style: String::new(),
         }
     }
 
@@ -2430,6 +2431,7 @@ mod tests {
             accents: slots(&[c(0.0, 0.0, 1.0), c(1.0, 1.0, 0.0)]),
             swatches: Vec::new(),
             colors: None,
+            style: String::new(),
         });
         assert_eq!(
             portal_accent_rgb(&engine.state.current().content("p").unwrap().vge),

@@ -119,6 +119,24 @@
 # warn_text      = "#e88282"
 
 # ---------------------------------------------------------------------------
+# Style
+# ---------------------------------------------------------------------------
+# The style engine the programs inside veter (vmux, vfm, vmd) draw their
+# chrome with: "flat" (plain fills in the theme's own colours) or "aero"
+# (Frutiger Aero — glossy gels, frosted glass, sky and bubbles). veter
+# publishes it with the palette, so every client agrees, at any nesting
+# depth and through vsd sessions; a client's `--style` overrides it.
+#
+# Under "aero" the accents are Aero's own gel colours rather than the
+# theme's: `accents` is the rotation by nesting depth, outermost first —
+# red, orange, yellow, green, aqua, blue, pink, violet, or a hex value.
+[style]
+# name = "flat"
+#
+# [style.aero]
+# accents = ["green", "aqua", "violet", "pink"]
+
+# ---------------------------------------------------------------------------
 # Fonts
 # ---------------------------------------------------------------------------
 # `family` is the primary face, resolved by Fontconfig — a real family name

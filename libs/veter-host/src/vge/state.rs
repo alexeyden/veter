@@ -742,6 +742,10 @@ pub struct HostThemePalette {
     /// The rest of the namespace. `None` when the host publishes only
     /// accents — a client then falls back to its own chrome colours.
     pub colors: Option<HostThemeColors>,
+    /// The style engine clients are asked to draw with (PRT §10) —
+    /// what the accents and swatches above were picked for. Empty names
+    /// none.
+    pub style: String,
 }
 
 impl HostThemePalette {
@@ -787,6 +791,7 @@ impl HostThemePalette {
                 .map(|i| self.accents[(from + i) % n].to_wire())
                 .collect(),
             swatches: self.swatches.iter().map(HostSwatch::to_wire).collect(),
+            style: self.style.clone(),
         })
     }
 
@@ -813,6 +818,7 @@ impl HostThemePalette {
             accents,
             swatches: theme.swatches.iter().map(HostSwatch::from_wire).collect(),
             colors,
+            style: theme.style.clone(),
         }
     }
 
@@ -2916,6 +2922,7 @@ mod tests {
             ],
             swatches: Vec::new(),
             colors: None,
+            style: String::new(),
         }
     }
 

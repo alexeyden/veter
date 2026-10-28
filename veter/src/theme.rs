@@ -691,6 +691,8 @@ impl Theme {
                 text_on_accent: self.text_on_accent().to_command_color(),
                 warn: self.warn_border().to_command_color(),
             }),
+            // The engine is `[style]`'s, laid over by the config.
+            style: String::new(),
         }
     }
 }

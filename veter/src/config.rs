@@ -6,7 +6,7 @@
 //! defaults — the exact values that were hardcoded before this module
 //! existed — logged to stderr but never fatal.
 //!
-//! Six things are configurable:
+//! Seven things are configurable:
 //!
 //!  * `[theme]` — every colour: the grid palette, the terminal's
 //!    default fore/background, the accents published into the reserved
@@ -14,6 +14,10 @@
 //!    chrome. `name` picks one of the built-ins in [`veter::theme`] or
 //!    a user file under `themes/`, and any other key overrides that
 //!    theme's own value.
+//!  * `[style]` — the style engine (`flat` or `aero`) the clients
+//!    inside veter draw their chrome with, published with the palette
+//!    in the PRT probe; under `aero`, `[style.aero] accents` is the
+//!    accent rotation, in Aero's own colours.
 //!  * `[font]` — the primary family and the fallback families tried for
 //!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
@@ -348,6 +352,114 @@ impl Default for SearchKeysConfig {
     }
 }
 
+/// `[style]` — the style engine the clients draw with.
+///
+/// The host picks the colours and the engine picks the materials made
+/// of them, so the two are published together (PRT §10). Under `flat`
+/// the colours are the theme's; under `aero` the accent rotation and
+/// the swatches are Aero's gel colours, since the theme's would clash
+/// with a palette that is otherwise fixed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StyleConfig {
+    /// `flat` or `aero`.
+    pub name: String,
+    pub aero: AeroStyleConfig,
+}
+
+impl Default for StyleConfig {
+    fn default() -> Self {
+        Self {
+            name: "flat".to_string(),
+            aero: AeroStyleConfig::default(),
+        }
+    }
+}
+
+/// `[style.aero]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AeroStyleConfig {
+    /// The accent rotation, outermost first: Aero colour names (`green`,
+    /// `aqua`, `violet`, `pink`, …) or hex values.
+    pub accents: Vec<String>,
+}
+
+impl Default for AeroStyleConfig {
+    fn default() -> Self {
+        Self {
+            accents: vge_ui::style::aero::DEFAULT_ACCENTS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+}
+
+impl StyleConfig {
+    /// The palette veter publishes into the reserved `host.*` VGE style
+    /// namespace (`doc/vector-graphics-extension.md` §7.3) and reports
+    /// in the PRT probe: the theme's, with the engine named and — under
+    /// Aero — Aero's colours in place of the theme's accents and
+    /// swatches. An unknown engine or accent is reported and skipped.
+    ///
+    /// Accent slot N maps to `host.accent.{N+1}`; the contextual
+    /// `host.accent` rotates through them by portal nesting depth, so a
+    /// top-level vmux, a vmux nested inside it, and one nested again
+    /// render their chrome in slots 0/1/2. The rest of the namespace —
+    /// the ground, the text, the surfaces a modal is built from — does
+    /// not rotate; there is one terminal behind every portal.
+    pub fn host_palette(&self, theme: &Theme) -> veter_host::vge::HostThemePalette {
+        let mut palette = theme.host_palette();
+        let engine = vge_ui::style::canonical(&self.name).unwrap_or_else(|e| {
+            eprintln!("veter: config: [style] {e}; using flat");
+            "flat"
+        });
+        palette.style = engine.to_string();
+        if engine == "aero" {
+            let gel = |name: &str, rgb: u32| veter_host::vge::HostSwatch {
+                name: name.to_string(),
+                fill: vge_ui::theme::unpack(rgb << 8 | 0xff),
+                // Aero writes white on every gel; its own text, not
+                // the theme's.
+                text: vge_ui::theme::unpack(0xffff_ffff),
+            };
+            let mut accents: Vec<_> = self
+                .aero
+                .accents
+                .iter()
+                .filter_map(|a| {
+                    let name = vge_ui::theme::canonical_name(a.trim());
+                    if let Some(g) = vge_ui::style::aero::gel_named(name) {
+                        return Some(gel(name, g.color()));
+                    }
+                    match vge_ui::theme::parse_accent_color(a) {
+                        Ok(rgba) => Some(gel("", rgba >> 8)),
+                        Err(_) => {
+                            eprintln!("veter: config: [style.aero] unknown accent '{a}'; skipping");
+                            None
+                        }
+                    }
+                })
+                .collect();
+            if accents.is_empty() {
+                accents = AeroStyleConfig::default()
+                    .accents
+                    .iter()
+                    .filter_map(|n| vge_ui::style::aero::gel_named(n).map(|g| (n, g)))
+                    .map(|(n, g)| gel(vge_ui::theme::canonical_name(n), g.color()))
+                    .collect();
+            }
+            palette.accents = accents;
+            palette.swatches = vge_ui::style::aero::GELS
+                .iter()
+                .map(|(name, g)| gel(name, g.color()))
+                .collect();
+        }
+        palette
+    }
+}
+
 /// `[hints]` — which detectors hint mode runs, in priority order.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -612,6 +724,7 @@ pub struct Config {
     /// schema is [`veter::theme::Theme`]'s own rather than a second
     /// copy of it here. Resolved by [`Config::theme`].
     pub theme: toml::Table,
+    pub style: StyleConfig,
     pub font: FontConfig,
     pub search: SearchColors,
     pub keys: KeyBindingsConfig,
@@ -1055,5 +1168,51 @@ mod tests {
         let pgup = Chord::parse("Shift+PageUp").unwrap();
         assert!(pgup.matches(&Key::Named(NamedKey::PageUp), &ModifiersState::SHIFT));
         assert!(!pgup.matches(&Key::Named(NamedKey::PageUp), &ModifiersState::empty()));
+    }
+
+    /// With no `[style]`, the palette is the theme's and names `flat`.
+    #[test]
+    fn the_default_style_is_flat_on_the_themes_colours() {
+        let cfg = Config::default();
+        let theme = cfg.theme();
+        let palette = cfg.style.host_palette(&theme);
+        assert_eq!(palette.style, "flat");
+        assert_eq!(palette.accents.len(), theme.host_palette().accents.len());
+    }
+
+    /// Under Aero the accents and swatches are Aero's gels, named, so a
+    /// client maps each back to its gel exactly.
+    #[test]
+    fn aero_publishes_its_own_colours() {
+        let cfg: Config = toml::from_str("[style]\nname = \"aero\"\n").unwrap();
+        let palette = cfg.style.host_palette(&cfg.theme());
+        assert_eq!(palette.style, "aero");
+        let names: Vec<_> = palette.accents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["green", "cyan", "purple", "magenta"]);
+        let green = vge_ui::style::aero::gel_named("green").unwrap();
+        assert_eq!(
+            vge_ui::theme::pack(palette.accents[0].fill) >> 8,
+            green.color()
+        );
+        assert_eq!(palette.swatches.len(), vge_ui::style::aero::GELS.len());
+    }
+
+    /// `[style.aero] accents` takes names and hex alike, and skips what
+    /// it cannot read rather than publishing nothing.
+    #[test]
+    fn aero_accents_take_names_and_hex() {
+        let cfg: Config = toml::from_str(
+            "[style]\nname = \"aero\"\n[style.aero]\naccents = [\"blue\", \"#804020\", \"nope\"]\n",
+        )
+        .unwrap();
+        let palette = cfg.style.host_palette(&cfg.theme());
+        assert_eq!(palette.accents.len(), 2);
+        assert_eq!(palette.accents[0].name, "blue");
+        assert_eq!(vge_ui::theme::pack(palette.accents[1].fill), 0x80_40_20_ff);
+
+        let none: Config =
+            toml::from_str("[style]\nname = \"aero\"\n[style.aero]\naccents = [\"nope\"]\n")
+                .unwrap();
+        assert_eq!(none.style.host_palette(&none.theme()).accents.len(), 4);
     }
 }

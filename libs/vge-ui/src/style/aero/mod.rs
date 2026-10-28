@@ -308,11 +308,14 @@ impl Engine for Aero {
 
 /// A gel colourway: body gradient, the inner glow rising from the
 /// bottom, and the rim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gel {
     pub top: u32,
     pub bottom: u32,
     pub glow: u32,
     pub rim: u32,
+    /// The drop shadow under text on the gel.
+    pub shade: u32,
 }
 
 pub const GEL_GREEN: Gel = Gel {
@@ -320,19 +323,115 @@ pub const GEL_GREEN: Gel = Gel {
     bottom: 0x2e9e1f,
     glow: 0xe8ff9a,
     rim: 0x1d6312,
+    shade: 0x154a0c,
 };
 pub const GEL_AMBER: Gel = Gel {
     top: 0xffc54a,
     bottom: 0xe57a00,
     glow: 0xfff3b0,
     rim: 0x8a4300,
+    shade: 0x6b3300,
 };
 pub const GEL_AQUA: Gel = Gel {
     top: 0x6fd3f7,
     bottom: 0x0a86d8,
     glow: 0x8ff6ff,
     rim: 0x0b4f8f,
+    shade: 0x06264d,
 };
+
+pub const GEL_RED: Gel = Gel {
+    top: 0xff8a7a,
+    bottom: 0xd42a1e,
+    glow: 0xffc9b8,
+    rim: 0x7a120b,
+    shade: 0x5a0d08,
+};
+pub const GEL_YELLOW: Gel = Gel {
+    top: 0xffea70,
+    bottom: 0xd9ab00,
+    glow: 0xfffbc4,
+    rim: 0x7a5e00,
+    shade: 0x5c4600,
+};
+pub const GEL_BLUE: Gel = Gel {
+    top: 0x86b8ff,
+    bottom: 0x1d5fd6,
+    glow: 0xc6deff,
+    rim: 0x0d3478,
+    shade: 0x0a2a5e,
+};
+pub const GEL_PINK: Gel = Gel {
+    top: 0xff9ad6,
+    bottom: 0xd2338f,
+    glow: 0xffd3ee,
+    rim: 0x7a1352,
+    shade: 0x5c0d3a,
+};
+pub const GEL_VIOLET: Gel = Gel {
+    top: 0xc6a2ff,
+    bottom: 0x7a3fd6,
+    glow: 0xe6d6ff,
+    rim: 0x40177a,
+    shade: 0x2d1060,
+};
+
+/// Aero's own colours, by the canonical swatch names (`theme`'s
+/// aliases apply: `aqua` and `teal` are cyan, `pink` magenta, `violet`
+/// purple). A host drawing with Aero publishes these as its swatches,
+/// and picks its accent rotation from them.
+pub const GELS: [(&str, Gel); 8] = [
+    ("red", GEL_RED),
+    ("orange", GEL_AMBER),
+    ("yellow", GEL_YELLOW),
+    ("green", GEL_GREEN),
+    ("cyan", GEL_AQUA),
+    ("blue", GEL_BLUE),
+    ("magenta", GEL_PINK),
+    ("purple", GEL_VIOLET),
+];
+
+/// The accent rotation a host drawing with Aero uses unless told
+/// otherwise: a green top level, aqua one portal in, then violet and
+/// pink.
+pub const DEFAULT_ACCENTS: [&str; 4] = ["green", "aqua", "violet", "pink"];
+
+impl Gel {
+    /// The one colour that stands for this gel on the wire: its deep
+    /// tone, which is what the eye takes for the gel's colour.
+    pub const fn color(&self) -> u32 {
+        self.bottom
+    }
+
+    /// The gel for a published colour: the one of [`GELS`] it stands
+    /// for, or one derived from it — lighter on top, a pale glow, a dark
+    /// rim — for a colour that is not Aero's own.
+    pub fn for_color(c: Color) -> Gel {
+        let rgb = crate::theme::pack(c) >> 8;
+        if let Some((_, g)) = GELS.iter().find(|(_, g)| g.color() == rgb) {
+            return *g;
+        }
+        let towards = |t: u32, k: f32| {
+            let ch = |v: f32, w: u32| {
+                ((v + (w as f32 / 255.0 - v) * k).clamp(0.0, 1.0) * 255.0).round() as u32
+            };
+            (ch(c.r, t >> 16 & 0xff) << 16) | (ch(c.g, t >> 8 & 0xff) << 8) | ch(c.b, t & 0xff)
+        };
+        Gel {
+            top: towards(0xffffff, 0.45),
+            bottom: rgb,
+            glow: towards(0xffffff, 0.8),
+            rim: towards(0x000000, 0.45),
+            shade: towards(0x000000, 0.7),
+        }
+    }
+}
+
+/// The gel called `name`, aliases and all.
+pub fn gel_named(name: &str) -> Option<&'static Gel> {
+    let name = crate::theme::canonical_name(name);
+    GELS.iter().find(|(n, _)| *n == name).map(|(_, g)| g)
+}
 
 /// The upper-half sheen every glossy thing carries: a white wash that
 /// ends in a hard edge at the middle.
@@ -895,6 +994,33 @@ mod tests {
         track: "m-track",
         thumb: "m-thumb",
     };
+
+    /// A host publishes each gel by its colour, and the client has to
+    /// get the very same gel back from it — that is what keeps a
+    /// default Aero tab bar identical to one drawn from the gel itself.
+    #[test]
+    fn every_gel_comes_back_from_its_published_colour() {
+        for (name, g) in &GELS {
+            let c = crate::theme::unpack(g.color() << 8 | 0xff);
+            assert_eq!(Gel::for_color(c), *g, "{name}");
+        }
+        assert_eq!(gel_named("aqua"), Some(&GEL_AQUA));
+        assert_eq!(gel_named("violet"), Some(&GEL_VIOLET));
+        assert_eq!(gel_named("pink"), Some(&GEL_PINK));
+        for name in DEFAULT_ACCENTS {
+            assert!(gel_named(name).is_some(), "{name}");
+        }
+    }
+
+    /// A colour that is not one of Aero's still makes a gel: lighter
+    /// on top than at the bottom, rimmed darker.
+    #[test]
+    fn a_foreign_colour_derives_a_gel_of_its_own() {
+        let g = Gel::for_color(crate::theme::unpack(0x80_40_20_ff));
+        assert_eq!(g.bottom, 0x804020);
+        let lum = |c: u32| (c >> 16 & 0xff) + (c >> 8 & 0xff) + (c & 0xff);
+        assert!(lum(g.top) > lum(g.bottom) && lum(g.rim) < lum(g.bottom));
+    }
 
     /// A scrolling overlay scrolls through the stock `scroll_commands`,
     /// so the Aero build has to put the same ids at the same origins.

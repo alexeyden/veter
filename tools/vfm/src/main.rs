@@ -1546,6 +1546,7 @@ options:
                         terminal's themed accent. A name (red, orange, …)
                         takes the terminal theme's own colour for it
   -c, --config PATH     config file (default: ~/.config/vfm/config.toml)
+      --style NAME      style engine (flat, aero); overrides the terminal's
   -h, --help            show this help
   -V, --version         show the version and the commit it was built from
 ";

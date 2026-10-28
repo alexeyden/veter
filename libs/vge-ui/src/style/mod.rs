@@ -10,6 +10,15 @@
 //! theme, and [`aero`], Frutiger Aero — gel, frosted glass, sky and
 //! bubbles.
 //!
+//! The host picks the colours and the engine: it publishes both in the
+//! PRT probe (`doc/portal-extension.md` §10), so every client in a
+//! terminal — at any nesting depth, across `vsd` reattaches — draws
+//! with the same one, and a client's `--style` overrides it. The
+//! engine turns the host's colours into its materials (flat fills, or
+//! Aero gels) and picks the text drawn over them; what it never takes
+//! from the accent are the activity and warning colours and the icons,
+//! which are its own.
+//!
 //! Parts are named for their meaning, not for how one engine happens to
 //! render them, so a third engine is free to do anything with them.
 //! Where two clients drew the same kind of thing differently, the part
@@ -19,7 +28,7 @@
 pub mod aero;
 pub mod flat;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
@@ -30,7 +39,7 @@ use crate::picker::PickerView;
 
 /// One style engine.
 pub trait Engine: Sync {
-    /// The name `--style` and `VETER_STYLE` select it by.
+    /// The name the host and `--style` select it by.
     fn name(&self) -> &'static str;
 
     /// The geometry this engine needs — the clients build their layout
@@ -508,40 +517,52 @@ pub enum StatusLeft {
 
 // ── Selection ──────────────────────────────────────────────────────────
 
-const UNSET: u8 = 0;
-const FLAT: u8 = 1;
-const AERO: u8 = 2;
+const FLAT: u8 = 0;
+const AERO: u8 = 1;
 
-static STYLE: AtomicU8 = AtomicU8::new(UNSET);
+static STYLE: AtomicU8 = AtomicU8::new(FLAT);
+/// Set once a client's own `--style` has picked the engine, which the
+/// host's choice then no longer overrides.
+static CHOSEN: AtomicBool = AtomicBool::new(false);
 
-/// Pick the engine by name — a client's `--style`, which outranks
-/// `VETER_STYLE`.
+/// Pick the engine by name — a client's `--style`, which outranks the
+/// one the host names.
 pub fn select(name: &str) -> Result<(), String> {
     STYLE.store(parse(name)?, Ordering::Relaxed);
+    CHOSEN.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Take the engine the host names (PRT §10: the probe's theme tail, or
+/// a `HostThemeChanged`), unless `--style` already picked one. A name
+/// this crate does not know, and an empty one, is flat. True when the
+/// engine in force changed — a client then has to lay out again, since
+/// the engines' [`Metrics`] differ.
+pub fn adopt(name: &str) -> bool {
+    if CHOSEN.load(Ordering::Relaxed) {
+        return false;
+    }
+    let next = parse(name).unwrap_or(FLAT);
+    STYLE.swap(next, Ordering::Relaxed) != next
 }
 
 fn parse(name: &str) -> Result<u8, String> {
     match name {
         "aero" => Ok(AERO),
-        "flat" | "default" | "stock" => Ok(FLAT),
-        other => Err(format!("unknown style: {other}")),
+        "flat" => Ok(FLAT),
+        other => Err(format!("unknown style: {other} (flat, aero)")),
     }
 }
 
-/// The engine in force. Without a `--style`, `VETER_STYLE` decides on
-/// first use; an unknown value there falls back to flat rather than
-/// refusing to start.
+/// The canonical name of the engine called `name`, for a host that
+/// validates a configured style before publishing it.
+pub fn canonical(name: &str) -> Result<&'static str, String> {
+    parse(name).map(|s| if s == AERO { "aero" } else { "flat" })
+}
+
+/// The engine in force: flat until the host or `--style` names another.
 pub fn engine() -> &'static dyn Engine {
-    let mut s = STYLE.load(Ordering::Relaxed);
-    if s == UNSET {
-        s = std::env::var("VETER_STYLE")
-            .ok()
-            .and_then(|v| parse(&v).ok())
-            .unwrap_or(FLAT);
-        STYLE.store(s, Ordering::Relaxed);
-    }
-    match s {
+    match STYLE.load(Ordering::Relaxed) {
         AERO => &aero::Aero,
         _ => &flat::Flat,
     }
@@ -562,11 +583,24 @@ mod tests {
         assert!(b.w <= 12.0 && b.h <= 5.0);
     }
 
+    /// The host's choice is taken whenever it changes the engine, and
+    /// an unknown name is flat rather than a refusal to draw.
+    #[test]
+    fn the_host_names_the_engine() {
+        adopt("flat");
+        assert!(adopt("aero"));
+        assert_eq!(engine().name(), "aero");
+        assert!(!adopt("aero"), "no change, nothing to lay out again");
+        assert!(adopt("vista"));
+        assert_eq!(engine().name(), "flat");
+        assert!(!adopt(""));
+    }
+
     #[test]
     fn style_names_parse() {
         assert_eq!(parse("aero").unwrap(), AERO);
         assert_eq!(parse("flat").unwrap(), FLAT);
-        assert_eq!(parse("default").unwrap(), FLAT);
         assert!(parse("vista").is_err());
+        assert_eq!(canonical("aero"), Ok("aero"));
     }
 }

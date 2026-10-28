@@ -4,7 +4,7 @@
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, DrawCmd, Style};
 
-use super::{GEL_AMBER, GEL_AQUA, GEL_GREEN, bubble, frost, gel, gloss, orb, scroll_thumb, smoke};
+use super::{GEL_AMBER, GEL_AQUA, Gel, bubble, frost, gel, gloss, orb, scroll_thumb, smoke};
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, text, unit, vgrad, white};
 use crate::style::{PaneChrome, TabBar, TabbarMetrics};
@@ -26,8 +26,8 @@ const CAP_Y1: f32 = BAR_H - 0.3;
 /// The text row, centred on the bar.
 const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
 
-/// The tab bar: a two-row sky with the tabs as capsules on it — green
-/// gel for the active one, amber for one with unseen output, frosted
+/// The tab bar: a two-row sky with the tabs as capsules on it — the
+/// accent's gel for the active one, amber for one with unseen output, frosted
 /// glass for the rest.
 pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
     let host_w = bar.width;
@@ -121,6 +121,9 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
         );
     }
 
+    // The active tab is the accent's gel — the one place the host's
+    // colour shows, and what tells one nesting level from the next.
+    let active = Gel::for_color(crate::theme::accent_color());
     for slot in &bar.tabs {
         let i = slot.index;
         let x = slot.x0;
@@ -128,11 +131,11 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
         let is_active = slot.active;
         let has_activity = slot.activity;
         let shadow = if is_active {
-            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_GREEN);
-            hex(0x154a0c, 0.85)
+            gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &active);
+            hex(active.shade, 0.85)
         } else if has_activity {
             gel(cmds, px, x0, CAP_Y0, x1, CAP_Y1, &GEL_AMBER);
-            hex(0x6b3300, 0.85)
+            hex(GEL_AMBER.shade, 0.85)
         } else {
             frost(cmds, px, x0, CAP_Y0, x1, CAP_Y1);
             navy

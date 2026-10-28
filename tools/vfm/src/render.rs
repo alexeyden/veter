@@ -423,7 +423,7 @@ mod tests {
     use vge_ui::style::flat::Flat;
 
     // These check what vfm lays out, so they pin the engine rather than
-    // take whichever one `VETER_STYLE` names.
+    // take whichever one the host or `--style` names.
     fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
         grid_commands_in(&Flat, v)
     }

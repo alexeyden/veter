@@ -1076,6 +1076,8 @@ u8 accent_count      ; optional, only after the eight — the accent
 Swatch × count       ; rotation and the named swatches, exactly as
 u8 swatch_count      ; the probe carries them (§10)
 Swatch × count
+string style         ; optional, only after the swatches — the style
+                     ; engine, as the probe carries it (§10)
 ```
 
 The host's `host.*` palette (VGE §7.3) has changed. Emitted only when
@@ -1093,11 +1095,12 @@ told, and redraws them.
 The accent is the one *this* engine's depth resolves to, so a client
 never does depth arithmetic — the same rule as the probe (§10). The
 eight theme colours are carried whole, with `host.text.on_accent` the
-one for that same accent, as in the probe, and the accent rotation
-and swatches follow on the same terms. Each part is all-or-nothing: a
-body that stops after the accent carries no theme colours, exactly as
-in the probe. A client that resolved a color name against the old
-swatches resolves it again against the new ones.
+one for that same accent, as in the probe, and the accent rotation,
+swatches and style name follow on the same terms. Each part is
+all-or-nothing: a body that stops after the accent carries no theme
+colours, exactly as in the probe. A client that resolved a color name against the old
+swatches resolves it again against the new ones, and a client whose
+style engine was picked by the host switches to the one named here.
 
 The id is empty because a theme belongs to the terminal, not to a
 pane. A client that dispatches events by portal id must not treat the
@@ -1337,6 +1340,7 @@ Swatch × accent_count           // the accent rotation, starting at the
                                 // probing engine's own slot
 u8  swatch_count
 Swatch × swatch_count           // the theme's named swatches
+string style                    // the style engine: `flat`, `aero`
 
 Swatch:
   string name                   // empty for an accent given as a literal
@@ -1361,10 +1365,21 @@ theme. A host that publishes swatches SHOULD include at least `red`,
 `orange`, `yellow`, `green`, `cyan`, `blue`, `magenta` and `purple`. A
 name it does not publish falls back to the client's own color.
 
-Both lists are positional and all-or-nothing, like the block before
+The **style** names the style engine the host asks its clients to
+draw their chrome with — how they turn the colors above into
+materials: `flat` (plain fills, every color as published) or `aero`
+(Frutiger Aero gels and glass). The colors are picked *for* that
+engine: under `aero` the accent rotation and the swatches are the
+engine's own gel colors rather than the terminal theme's. Empty means
+the host names none, which a client treats as `flat`. A client MAY let
+its user override it; a name a client does not know is treated as
+`flat`. The engine also decides what text sits on its materials, so
+a client drawing with one MAY ignore a swatch's `text`.
+
+All three are positional and all-or-nothing, like the block before
 them: they can follow only the eight colors, the swatch list only the
-accent list, and a body that stops part-way through one carries
-neither it nor anything after it.
+accent list, the style only the swatch list, and a body that stops
+part-way through one carries neither it nor anything after it.
 
 **VGE inside a portal.** When `vge_in_portal` is set, every portal
 owns a private VGE engine that operates in the portal's cell

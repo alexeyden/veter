@@ -66,24 +66,6 @@ fn window_title_for(title: &str) -> String {
     }
 }
 
-/// The host palette published into the reserved `host.*` VGE style
-/// namespace (`doc/vector-graphics-extension.md` §7.3).
-///
-/// Accent slot N maps to `host.accent.{N+1}`; the contextual
-/// `host.accent` rotates through them by portal nesting depth, so a
-/// top-level vmux, a vmux nested inside it, and one nested again render
-/// their chrome in slots 0/1/2. `host.text.on_accent` rotates with it,
-/// being text over that accent. The rest of the namespace — the ground,
-/// the text, the surfaces a modal is built from — does not rotate;
-/// there is one terminal behind every portal, and a client's chrome
-/// should belong to it.
-///
-/// The colours come from the resolved theme (`Config::theme`), which
-/// is where the accents are decided.
-fn host_palette(theme: &veter::theme::Theme) -> vge::HostThemePalette {
-    theme.host_palette()
-}
-
 /// Run a user-defined selection command (`config.selection_commands`) on
 /// the selected `selection` text. The command runs via `$SHELL -c`, with
 /// the selection exported as `$VETER_SELECTION` and passed as positional
@@ -5611,7 +5593,8 @@ impl ApplicationHandler for App {
         // engine's reserved `host.*` namespace (depth 0). vmux and other
         // clients reference `host.accent` instead of hardcoding colors;
         // per-portal engines get their own depth-keyed copy on creation.
-        vge_engine.seed_host_styles(host_palette(&self.theme), 0);
+        let palette = self.config.style.host_palette(&self.theme);
+        vge_engine.seed_host_styles(palette.clone(), 0);
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -5639,7 +5622,7 @@ impl ApplicationHandler for App {
         // Same palette as the top-level VGE engine, inherited by every
         // per-portal VGE engine PRT spawns; each portal keys its
         // contextual `host.accent` on its own nesting depth.
-        prt_engine.set_host_palette(host_palette(&self.theme));
+        prt_engine.set_host_palette(palette);
 
         // Create PTY and parser. Host-direct children (programs not
         // wrapped by a portal) reach the host vt100, so install a

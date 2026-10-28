@@ -887,6 +887,7 @@ mod theme_announcement_tests {
                 text: color(0.0, 0.0, 0.0),
             }],
             colors: Some(colors),
+            style: "aero".into(),
         };
 
         let bytes = theme_announcement(&palette);
@@ -910,6 +911,7 @@ mod theme_announcement_tests {
         assert_eq!(theme.accent, [255, 0, 0, 255]);
         assert_eq!(theme.colors, Some(colors.to_rgba8()));
         assert_eq!(theme.swatches[0].name, "orange", "a --accent name can re-resolve");
+        assert_eq!(theme.style, "aero", "a client switches to the renderer's engine");
         assert!(r.at_end(), "exactly one frame");
     }
 
@@ -1818,6 +1820,7 @@ mod tests {
                     colors: None,
                     accents: Vec::new(),
                     swatches: Vec::new(),
+                    style: String::new(),
                 }),
             }),
             winsize: None,

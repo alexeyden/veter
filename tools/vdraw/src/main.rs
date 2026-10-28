@@ -1224,6 +1224,7 @@ mod tests {
                 colors: None,
                 accents: Vec::new(),
                 swatches: Vec::new(),
+                style: String::new(),
             }),
         }
         .encode();

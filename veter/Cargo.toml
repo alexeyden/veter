@@ -20,6 +20,9 @@ path = "src/main.rs"
 veter-version = { path = "../libs/veter-version" }
 veter-host = { path = "../libs/veter-host" }
 vge-protocol = { path = "../protocol/vge" }
+# The style engines' names and Aero's gel colours, which the host
+# publishes for its clients (`[style]`, PRT §10).
+vge-ui = { path = "../libs/vge-ui" }
 prt-protocol = { path = "../protocol/prt" }
 vft-protocol = { path = "../protocol/vft" }
 vt100 = { path = "../vendored/vt100" }

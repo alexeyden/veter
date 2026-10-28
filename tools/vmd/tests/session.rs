@@ -180,8 +180,6 @@ fn run(path: &std::path::Path) -> (Terminal, std::process::Child) {
         .stdout(open_slave())
         .stderr(open_slave())
         .env("TERM", "xterm-256color")
-        // The geometry checked below is the flat engine's.
-        .env("VETER_STYLE", "flat")
         .spawn()
         .expect("spawn vmd");
 

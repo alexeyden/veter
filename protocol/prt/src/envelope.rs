@@ -60,6 +60,10 @@ pub struct HostTheme {
     /// The theme's named swatches (`host.swatch.<name>`). Only after
     /// `accents`.
     pub swatches: Vec<Swatch>,
+    /// The style engine the host asks its clients to draw with
+    /// (`flat`, `aero`), which the colours above are picked for. Empty
+    /// when the host names none. Only after `swatches`.
+    pub style: String,
 }
 
 impl HostTheme {
@@ -79,6 +83,7 @@ impl HostTheme {
                 s.encode(w);
             }
         }
+        w.str(&self.style);
     }
 
     /// Inverse of [`Self::encode`]. Errors only when the accent itself
@@ -90,6 +95,7 @@ impl HostTheme {
             colors: None,
             accents: Vec::new(),
             swatches: Vec::new(),
+            style: String::new(),
         };
         let mut quads = [[0u8; 4]; 8];
         for slot in &mut quads {
@@ -105,8 +111,10 @@ impl HostTheme {
         };
         let Some(accents) = list() else { return Ok(theme) };
         theme.accents = accents;
-        if let Some(swatches) = list() {
-            theme.swatches = swatches;
+        let Some(swatches) = list() else { return Ok(theme) };
+        theme.swatches = swatches;
+        if let Ok(style) = r.string() {
+            theme.style = style.to_string();
         }
         Ok(theme)
     }
@@ -430,6 +438,7 @@ mod tests {
             colors: Some(std::array::from_fn(|i| [i as u8, 2, 3, 4])),
             accents: vec![swatch("blue", 1, 2), swatch("", 3, 4)],
             swatches: vec![swatch("orange", 5, 6)],
+            style: "aero".into(),
         }
     }
 
@@ -462,6 +471,7 @@ mod tests {
             colors: None,
             accents: Vec::new(),
             swatches: Vec::new(),
+            style: String::new(),
             ..full_theme()
         };
         let pb3 = ProbeBody {
@@ -472,7 +482,7 @@ mod tests {
         assert_eq!(pb3.encode().len(), 29);
 
         // + the eight theme colours, and two empty swatch lists:
-        // 29 + 32 + 2 = 63.
+        // and an empty style name: 29 + 32 + 2 + 1 = 64.
         let pb5 = ProbeBody {
             theme: Some(HostTheme {
                 colors: full_theme().colors,
@@ -480,7 +490,7 @@ mod tests {
             }),
             ..pb3
         };
-        assert_eq!(pb5.encode().len(), 63);
+        assert_eq!(pb5.encode().len(), 64);
 
         // A theme without vge_features cannot be encoded (no gap): it
         // is silently dropped, length stays at the 24-byte prefix.
@@ -532,10 +542,17 @@ mod tests {
         assert_eq!(t.colors, full_theme().colors);
         assert!(t.accents.is_empty() && t.swatches.is_empty());
 
-        // Cut inside the swatch list: the accents stand.
-        let t = theme(bytes.len() - 3).unwrap();
+        // Cut inside the swatch list: the accents stand. (The style
+        // name, `aero`, is the last five bytes.)
+        let t = theme(bytes.len() - 5 - 3).unwrap();
         assert_eq!(t.accents, full_theme().accents);
         assert!(t.swatches.is_empty());
+
+        // Cut inside the style name: the swatches stand, the host names
+        // no style.
+        let t = theme(bytes.len() - 2).unwrap();
+        assert_eq!(t.swatches, full_theme().swatches);
+        assert_eq!(t.style, "");
 
         // A pre-VGE host's 24-byte body.
         let back = ProbeBody::decode(&bytes[..24]).unwrap();
@@ -573,6 +590,7 @@ mod tests {
             colors: None,
             accents: Vec::new(),
             swatches: Vec::new(),
+            style: String::new(),
             ..full_theme()
         };
         let body = host_theme_changed_body("", &only);
