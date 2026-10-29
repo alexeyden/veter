@@ -16,14 +16,14 @@
 //!     replaces vssh via `execvp`. `ControlPersist=60` is the
 //!     backstop if the interactive ssh never starts.
 //!
-//! Phase 2 caveat: if the user passes a trailing remote command on
-//! the vssh CLI, our master-open appends `true` after it (a harmless
-//! second statement for any shell). Phase 3 will resolve host/user
-//! via `ssh -G` and construct a clean master-open call that ignores
-//! the trailing command.
+//! A remote command on the vssh command line is the interactive ssh's
+//! alone: the master and every call through it run with the options and
+//! the destination only (`command_start`), so a probe or an install is
+//! never handed to the user's command as its arguments.
 
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -59,13 +59,64 @@ pub fn compression_opts(ssh_args: &[OsString]) -> &'static [&'static str] {
     }
 }
 
+/// Lightweight ssh-style argv scanner. Returns where the remote command
+/// starts in the user's `ssh_args`, or `None` when there is none — the
+/// args before it are the options and the destination, which is what
+/// vssh's own calls through the master need: anything after the host
+/// is a command, and a command of the user's in front of the probe
+/// turns `sh -c '…'` into arguments of it. We track ssh's
+/// short options that take a value so we don't mistake an option's
+/// argument for the host or the command.
+///
+/// We don't need to be 100% accurate on every obscure ssh flag — the
+/// failure mode for `exec_ssh` is "we don't inject when we could have"
+/// (user manually fixes PATH) or "we inject when we shouldn't" (user
+/// passes `--no-fix-path`). The single goal is to make the common cases
+/// (`vssh host`, `vssh -p 2222 user@host`, `vssh -J jump host`,
+/// `vssh host my-cmd ...`) all work right.
+pub fn command_start(ssh_args: &[OsString]) -> Option<usize> {
+    // OpenSSH short options that consume the *next* argv as their
+    // value. Sourced from ssh(1) on OpenSSH 9.x.
+    const TAKES_ARG: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
+
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = ssh_args[i].as_bytes();
+        if arg == b"--" {
+            // After `--`, the next arg is the host, anything after is
+            // the command.
+            return (i + 2 < ssh_args.len()).then_some(i + 2);
+        }
+        if arg.len() == 2 && arg[0] == b'-' && TAKES_ARG.contains(&arg[1]) {
+            i += 2;
+            continue;
+        }
+        if arg.len() > 1 && arg[0] == b'-' {
+            // Standalone short flag (`-t`, `-v`, `-4`, …) or short
+            // option fused with its value (`-p2222`). Both consume
+            // only this one argv element.
+            i += 1;
+            continue;
+        }
+        // First positional: this is the host. A command follows iff
+        // there's anything after.
+        return (i + 1 < ssh_args.len()).then_some(i + 1);
+    }
+    None
+}
+
 pub struct Master {
     ssh_args: Vec<OsString>,
     control_path: String,
 }
 
 impl Master {
-    pub fn open(ssh_args: Vec<OsString>) -> Result<Self> {
+    /// `ssh_args` are the user's, remote command and all; the master
+    /// keeps only the options and the destination (see [`command_start`]).
+    pub fn open(mut ssh_args: Vec<OsString>) -> Result<Self> {
+        if let Some(start) = command_start(&ssh_args) {
+            ssh_args.truncate(start);
+        }
         let control_path = control_path_template()?;
         let cp_opt = format!("ControlPath={control_path}");
         log::debug!("opening ControlMaster (ControlPath={control_path})");
@@ -189,5 +240,64 @@ mod tests {
         assert!(opts(&["-C", "host"]).is_empty());
         assert!(opts(&["-o", "Compression=no", "host"]).is_empty());
         assert!(opts(&["-ocompression=no", "host"]).is_empty());
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn assert_no_command(args: &[OsString]) {
+        assert_eq!(command_start(args), None, "{args:?}");
+    }
+
+    fn assert_command(args: &[OsString]) {
+        assert!(command_start(args).is_some(), "{args:?}");
+    }
+
+    #[test]
+    fn the_command_starts_after_the_host() {
+        assert_eq!(command_start(&os(&["host", "echo", "hi"])), Some(1));
+        assert_eq!(command_start(&os(&["-p", "22", "host", "uptime"])), Some(3));
+        assert_eq!(command_start(&os(&["--", "host", "cmd"])), Some(2));
+    }
+
+    #[test]
+    fn bare_host_has_no_command() {
+        assert_no_command(&os(&["host"]));
+        assert_no_command(&os(&["user@host"]));
+    }
+
+    #[test]
+    fn option_with_value_then_bare_host() {
+        assert_no_command(&os(&["-p", "2222", "host"]));
+        assert_no_command(&os(&["-J", "jump", "host"]));
+        assert_no_command(&os(&["-i", "/tmp/key", "host"]));
+        assert_no_command(&os(&["-o", "User=foo", "-L", "8080:localhost:80", "host"]));
+    }
+
+    #[test]
+    fn standalone_flags_then_host() {
+        assert_no_command(&os(&["-t", "host"]));
+        assert_no_command(&os(&["-v", "-v", "-4", "host"]));
+    }
+
+    #[test]
+    fn fused_short_flag_with_value() {
+        // `-p2222` style — single argv, no following value.
+        assert_no_command(&os(&["-p2222", "host"]));
+    }
+
+    #[test]
+    fn host_then_command() {
+        assert_command(&os(&["host", "ls"]));
+        assert_command(&os(&["host", "ls", "-la"]));
+        assert_command(&os(&["-p", "22", "host", "uptime"]));
+    }
+
+    #[test]
+    fn double_dash_separator() {
+        // `vssh -- host cmd` — `--` ends options.
+        assert_command(&os(&["--", "host", "cmd"]));
+        assert_no_command(&os(&["--", "host"]));
     }
 }
