@@ -41,6 +41,24 @@ fn control_path_template() -> Result<String> {
     Ok(template)
 }
 
+/// `-o Compression=yes`, unless the user already chose. OpenSSH defaults
+/// to no compression, and what a veter session sends compresses very
+/// well: chrome redraws repeat themselves (a vmux tab switch is ~2 KB
+/// raw and ~40 B through ssh's zlib stream once it has been seen), as
+/// does ordinary shell output. It has to be on the master: every
+/// session multiplexed over it shares the master's transport.
+pub fn compression_opts(ssh_args: &[OsString]) -> &'static [&'static str] {
+    let chosen = ssh_args.iter().any(|a| {
+        let a = a.to_string_lossy();
+        a == "-C" || a.to_ascii_lowercase().contains("compression=")
+    });
+    if chosen {
+        &[]
+    } else {
+        &["-o", "Compression=yes"]
+    }
+}
+
 pub struct Master {
     ssh_args: Vec<OsString>,
     control_path: String,
@@ -56,6 +74,7 @@ impl Master {
             .arg("-o")
             .arg(&cp_opt)
             .args(["-o", "ControlPersist=60"])
+            .args(compression_opts(&ssh_args))
             .args(&ssh_args)
             .arg("true")
             .status()
@@ -148,5 +167,27 @@ impl Drop for Master {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(args: &[&str]) -> &'static [&'static str] {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        compression_opts(&args)
+    }
+
+    #[test]
+    fn compression_is_on_unless_the_user_chose() {
+        assert_eq!(opts(&["host"]), ["-o", "Compression=yes"]);
+        assert_eq!(
+            opts(&["-c", "aes128-ctr", "host"]),
+            ["-o", "Compression=yes"]
+        );
+        assert!(opts(&["-C", "host"]).is_empty());
+        assert!(opts(&["-o", "Compression=no", "host"]).is_empty());
+        assert!(opts(&["-ocompression=no", "host"]).is_empty());
     }
 }

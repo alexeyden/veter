@@ -9,6 +9,8 @@ use nix::unistd::execvp;
 /// Wires up two things on top of the user's ssh args:
 ///   * `-o ControlPath=…` so the interactive shell reuses the
 ///     already-authenticated ControlMaster.
+///   * `-o Compression=yes` (see [`crate::ssh::compression_opts`]), in
+///     case the master is gone by now and this ssh connects afresh.
 ///   * If `fix_path` is set AND the user did not pass their own
 ///     remote command, appends `-t exec env PATH=$HOME/.local/bin:$PATH
 ///     "$SHELL" -l` so the remote login shell sees `~/.local/bin` on
@@ -30,6 +32,10 @@ pub fn exec_ssh(
             CString::new(format!("ControlPath={cp}"))
                 .context("ControlPath contains interior NUL")?,
         );
+    }
+
+    for o in crate::ssh::compression_opts(ssh_args) {
+        argv.push(CString::new(*o).unwrap());
     }
 
     let inject = fix_path && !user_provided_remote_command(ssh_args);
