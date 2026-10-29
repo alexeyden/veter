@@ -275,6 +275,25 @@ pub trait Engine: Sync {
     /// hint and the chips.
     fn search_panel(&self, cmds: &mut Vec<DrawCmd>, px: Px, panel: &SearchPanel<'_>);
 
+    /// A jump label: the one cell at `(x, y)`, covering what is under
+    /// it, holding `label`. The host picks `fill` per key, so labels
+    /// stay apart, and `ink` to read on it; the engine makes a material
+    /// of them.
+    #[allow(clippy::too_many_arguments)]
+    fn jump_label(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        y: f32,
+        label: &str,
+        fill: Color,
+        ink: Color,
+    );
+
+    /// The thumb of the terminal's own scrollback scrollbar, in cells.
+    fn scroll_thumb(&self, cmds: &mut Vec<DrawCmd>, px: Px, thumb: Rect);
+
     // ── Modals ────────────────────────────────────────────────────
 
     /// A one-line prompt or confirm box, centred on the host. `caret`
@@ -912,6 +931,41 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A jump label stays in its one cell, the glyph at the cell's
+    /// top — it covers exactly the character it replaces — and the
+    /// scrollbar thumb draws something under both engines.
+    #[test]
+    fn every_engine_keeps_a_jump_label_in_its_cell() {
+        let inks = test_inks();
+        let px = Px { w: 8.0, h: 16.0 };
+        for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+            let mut cmds = Vec::new();
+            engine.jump_label(&mut cmds, px, 5.0, 3.0, "k", inks.accent, inks.text);
+            let texts = texts(&cmds);
+            assert_eq!(texts.len(), texts.iter().filter(|(t, _)| *t == "k").count());
+            let (_, at) = texts.last().expect("the label");
+            assert!((5.0..6.0).contains(&at.x), "{}: at {at:?}", engine.name());
+            assert_eq!(at.y, 3.0, "{}", engine.name());
+            for c in &cmds {
+                if let DrawCmd::FillRectangles { rects, .. } = c {
+                    for r in rects {
+                        assert!(r.x >= 5.0 && r.x + r.w <= 6.0 && r.y >= 3.0 && r.y + r.h <= 4.0);
+                    }
+                }
+            }
+
+            let mut thumb = Vec::new();
+            let rect = Rect {
+                x: 79.0,
+                y: 2.0,
+                w: 0.75,
+                h: 6.0,
+            };
+            engine.scroll_thumb(&mut thumb, px, rect);
+            assert!(!thumb.is_empty(), "{}", engine.name());
         }
     }
 

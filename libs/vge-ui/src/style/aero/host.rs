@@ -3,16 +3,21 @@
 //! a red one for the destructive answer and for nothing found.
 
 use vge_protocol::codec::Rect;
-use vge_protocol::command::{Align, DrawCmd, Style};
+use vge_protocol::command::{Align, Color, DrawCmd, Style};
 
 use super::{
-    GEL_RED, Gel, INK, bubble, caret, field, frame_glass, frost, gel, panel, rims, shadow,
+    GEL_RED, Gel, INK, bubble, caret, field, frame_glass, frost, gel, gel_rr, panel, rims, shadow,
 };
 use crate::paint::{Px, hex, pill, text, white};
 use crate::style::{ButtonKind, ChipKind, Dialog, FieldText, SearchPanel};
 
 /// The navy a white label on the window glass is shadowed with.
 const GLASS_SHADE: u32 = 0x06264d;
+
+/// How far a jump label's cap reaches past its cell on either side,
+/// and its corner — in pixels.
+const JUMP_OVERHANG: f32 = 2.0;
+const JUMP_RADIUS: f32 = 4.0;
 
 pub(super) fn dialog(cmds: &mut Vec<DrawCmd>, px: Px, d: &Dialog<'_>) {
     // A navy wash rather than black, so the terminal behind reads as
@@ -141,4 +146,33 @@ pub(super) fn search_panel(cmds: &mut Vec<DrawCmd>, px: Px, p: &SearchPanel<'_>)
         );
     }
     rims(cmds, px, p.w, p.h);
+}
+
+/// A gel key cap: the key's colour as a gel, a little wider than its
+/// cell — a one-cell capsule pinches the letter between its ends — and
+/// opaque, so it hides the character under it.
+pub(super) fn jump_label(cmds: &mut Vec<DrawCmd>, px: Px, x: f32, y: f32, s: &str, fill: Color) {
+    let g = Gel::for_color(fill);
+    let over = px.x(JUMP_OVERHANG);
+    gel_rr(
+        cmds,
+        px,
+        x - over,
+        y,
+        x + 1.0 + over,
+        y + 1.0,
+        JUMP_RADIUS,
+        &g,
+    );
+    text(
+        cmds,
+        px,
+        x + 0.5,
+        y,
+        Align::Center,
+        s,
+        white(1.0),
+        true,
+        Some(hex(g.shade, 0.85)),
+    );
 }

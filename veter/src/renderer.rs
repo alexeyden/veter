@@ -3043,16 +3043,28 @@ impl TerminalRenderer {
             let bar_width = 6.0;
             let bar_x = cols as f32 * self.cell_width - bar_width - 2.0;
 
-            let mut path = Path::new();
-            path.rounded_rect(bar_x, thumb_y, bar_width, thumb_height, 3.0);
-            canvas.fill_path(&path, &Paint::color(Color::rgba(255, 255, 255, 90)));
+            // Painted by the style engine, in cells from the grid's origin.
+            let (cw, ch) = (self.cell_width, self.cell_height);
+            let thumb = vge::codec::Rect {
+                x: bar_x / cw,
+                y: thumb_y / ch,
+                w: bar_width / cw,
+                h: thumb_height / ch,
+            };
+            let mut cmds = Vec::new();
+            vge_ui::style::engine().scroll_thumb(
+                &mut cmds,
+                vge_ui::paint::Px { w: cw, h: ch },
+                thumb,
+            );
+            crate::vge::render::render_chrome(canvas, self, &cmds, 0.0, 0.0);
         }
     }
 }
 
-/// A femtovg colour as a VGE one, for chrome colours the renderer holds
-/// in femtovg's form.
-fn femto_to_command(c: Color) -> vge::Color {
+/// A femtovg colour as a VGE one, for chrome colours held in femtovg's
+/// form that a style engine paints.
+pub fn femto_to_command(c: Color) -> vge::Color {
     vge::Color {
         r: c.r,
         g: c.g,

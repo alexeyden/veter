@@ -160,6 +160,47 @@ pub(super) fn search_panel(cmds: &mut Vec<DrawCmd>, px: Px, p: &SearchPanel<'_>)
     }
 }
 
+pub(super) fn jump_label(
+    cmds: &mut Vec<DrawCmd>,
+    x: f32,
+    y: f32,
+    s: &str,
+    fill: Color,
+    ink: Color,
+) {
+    cmds.push(DrawCmd::FillRectangles {
+        fill: Style::Flat(fill),
+        rects: vec![Rect {
+            x,
+            y,
+            w: 1.0,
+            h: 1.0,
+        }],
+    });
+    text(cmds, x, y, Align::Left, s, ink);
+}
+
+/// A slim white thumb: it has to read over whatever the grid holds.
+pub(super) fn scroll_thumb(cmds: &mut Vec<DrawCmd>, px: Px, thumb: Rect) {
+    let Rect { x, y, w, h } = thumb;
+    cmds.push(DrawCmd::FillPath {
+        fill: Style::Flat(Color {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 90.0 / 255.0,
+        }),
+        segments: rr(
+            px,
+            x,
+            y,
+            x + w,
+            y + h,
+            3.0 * crate::style::settings().rounding,
+        ),
+    });
+}
+
 /// The panels' corner, in pixels.
 fn panel_radius(px: Px) -> f32 {
     px.h * PANEL_R * crate::style::settings().rounding

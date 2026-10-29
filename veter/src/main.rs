@@ -1860,12 +1860,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
         caret,
         hint,
         chips: &chip_parts,
-        current_match: vge::Color {
-            r: current_match.r,
-            g: current_match.g,
-            b: current_match.b,
-            a: current_match.a,
-        },
+        current_match: renderer::femto_to_command(current_match),
         inks: &inks,
     };
     let px = vge_ui::paint::Px {
@@ -1921,51 +1916,40 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
         (info.origin_x_px, info.origin_y_px, top, sb, rows)
     };
     let viewport_top = top - scrollback as i64;
-    let ascent = tr.ascent();
 
     // Each label is drawn twice over: lowercase where its word ends,
     // and — when there is somewhere distinct to put it — uppercase where
     // its *line* ends. Same colour for both, since they act on the same
-    // match; the case of the glyph is what says which one you get.
-    let draw_one = |tr: &mut renderer::TerminalRenderer,
-                        canvas: &mut femtovg::Canvas<T>,
-                        ch: char,
-                        colour_key: char,
-                        line: i64,
-                        col: u16| {
+    // match; the case of the glyph is what says which one you get. The
+    // style engine paints them, in the leaf's cells; veter picks each
+    // key's colour.
+    let engine = vge_ui::style::engine();
+    let px = vge_ui::paint::Px {
+        w: cell_w,
+        h: cell_h,
+    };
+    let mut cmds = Vec::new();
+    let mut draw_one = |ch: char, colour_key: char, line: i64, col: u16| {
         let row_i = line - viewport_top;
         if row_i < 0 || row_i >= rows as i64 {
             return;
         }
-        let x = origin_x + col as f32 * cell_w;
-        let y = origin_y + row_i as f32 * cell_h;
-
-        let (bg_color, fg_color) = jump_label_colors(colour_key);
-        let mut bg = femtovg::Path::new();
-        bg.rect(x, y, cell_w, cell_h);
-        canvas.fill_path(&bg, &femtovg::Paint::color(bg_color));
-
+        let (fill, ink) = jump_label_colors(colour_key);
         let mut buf = [0u8; 4];
         let label = ch.encode_utf8(&mut buf);
-        // Baseline at `y + ascent` centres the glyph vertically: the cell is
-        // exactly `ceil(ascent + descent)` tall, so the font em-box fills it
-        // like any other terminal cell (see renderer's `cy + ascent`).
-        tr.draw_vge_text(
-            canvas,
-            x,
-            y + ascent,
+        engine.jump_label(
+            &mut cmds,
+            px,
+            col as f32,
+            row_i as f32,
             label,
-            fg_color,
-            vge::command::Align::Left,
-            vge::command::FontStyle::default(),
-            1.0,
+            renderer::femto_to_command(fill),
+            renderer::femto_to_command(ink),
         );
     };
 
     for label_info in &search.labels {
         draw_one(
-            tr,
-            canvas,
             label_info.ch,
             label_info.ch,
             label_info.anchor_line,
@@ -1973,10 +1957,11 @@ fn draw_jump_labels<T: femtovg::Renderer, CB: vt100::Callbacks>(
         );
         if let Some((line, col)) = label_info.line_anchor {
             for upper in label_info.ch.to_uppercase() {
-                draw_one(tr, canvas, upper, label_info.ch, line, col);
+                draw_one(upper, label_info.ch, line, col);
             }
         }
     }
+    vge::render::render_chrome(canvas, tr, &cmds, origin_x, origin_y);
 }
 
 /// Distinct, readable background colour for a jump label with key `ch`,

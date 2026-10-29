@@ -292,6 +292,23 @@ impl Engine for Flat {
         host::search_panel(cmds, px, panel);
     }
 
+    fn jump_label(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        _px: Px,
+        x: f32,
+        y: f32,
+        label: &str,
+        fill: Color,
+        ink: Color,
+    ) {
+        host::jump_label(cmds, x, y, label, fill, ink);
+    }
+
+    fn scroll_thumb(&self, cmds: &mut Vec<DrawCmd>, px: Px, thumb: Rect) {
+        host::scroll_thumb(cmds, px, thumb);
+    }
+
     fn prompt(
         &self,
         id: &str,

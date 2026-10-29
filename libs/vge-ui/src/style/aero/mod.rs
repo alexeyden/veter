@@ -276,6 +276,24 @@ impl Engine for Aero {
         host::search_panel(cmds, px, panel);
     }
 
+    fn jump_label(
+        &self,
+        cmds: &mut Vec<DrawCmd>,
+        px: Px,
+        x: f32,
+        y: f32,
+        label: &str,
+        fill: Color,
+        // A gel carries its own white ink.
+        _ink: Color,
+    ) {
+        host::jump_label(cmds, px, x, y, label, fill);
+    }
+
+    fn scroll_thumb(&self, cmds: &mut Vec<DrawCmd>, px: Px, thumb: Rect) {
+        scroll_thumb(cmds, px, thumb.x, thumb.y, thumb.w, thumb.h);
+    }
+
     fn prompt(
         &self,
         id: &str,
