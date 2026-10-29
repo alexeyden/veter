@@ -8,7 +8,7 @@ use vge_protocol::command::{Align, DrawCmd, FontStyle, Style};
 use crate::measure::text_cells;
 use crate::paint::Px;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
-use crate::style::{PaneChrome, TabBar};
+use crate::style::{PaneChrome, TabBar, TabBarParts};
 use crate::theme::{
     accent_style, active_text, activity_style, activity_text, dim_text, scrollbar, surface_style,
     title_text, title_thumb_style,
@@ -17,7 +17,10 @@ use crate::theme::{
 /// The tab bar: a rule along the bottom of the row in the accent, each
 /// tab a number tag on the surface and a name rect that fills with the
 /// accent when active and with the activity shade on unseen output.
-pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
+pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
+    let mut ground = Vec::new();
+    let mut tabs = Vec::with_capacity(bar.tabs.len());
+    let cmds = &mut ground;
     // No bar background — row 0 of the host vt100 is left untouched
     // (vmux never writes there) so the terminal's default cell color
     // shows through, matching whatever theme the user runs veter in.
@@ -84,6 +87,8 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
     }
 
     for slot in &bar.tabs {
+        let mut tab = Vec::new();
+        let cmds = &mut tab;
         let i = slot.index;
         let x = slot.x0;
         let num_w = slot.num_w;
@@ -172,6 +177,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             font_scale: 1.0,
             text: name_text,
         });
+        tabs.push(tab);
     }
 
     // Right overflow chevron — tabs clipped off the end of the bar.
@@ -185,6 +191,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             text: "› ".to_string(),
         });
     }
+    TabBarParts { ground, tabs }
 }
 
 /// A pane's title, on a translucent accent thumb when focused and the

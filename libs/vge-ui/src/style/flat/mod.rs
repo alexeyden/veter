@@ -13,7 +13,7 @@ use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
 
 use super::{
     DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
-    StatusLeft, TabBar, TabbarMetrics,
+    StatusLeft, TabBar, TabBarParts, TabbarMetrics,
 };
 use crate::modal::{self, ModalIds, ScrollModal};
 use crate::paint::Px;
@@ -42,8 +42,8 @@ impl Engine for Flat {
         &METRICS
     }
 
-    fn tab_bar(&self, cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
-        mux::tab_bar(cmds, px, bar);
+    fn tab_bar(&self, px: Px, bar: &TabBar<'_>) -> TabBarParts {
+        mux::tab_bar(px, bar)
     }
 
     fn pane_chrome(&self, cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {

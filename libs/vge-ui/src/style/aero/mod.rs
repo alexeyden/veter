@@ -17,7 +17,7 @@ use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd, OriginAnch
 
 use super::{
     DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
-    StatusLeft, TabBar,
+    StatusLeft, TabBar, TabBarParts,
 };
 use crate::measure::{prefix_cells, text_cells};
 use crate::modal::{ModalIds, ScrollModal};
@@ -42,8 +42,8 @@ impl Engine for Aero {
         &METRICS
     }
 
-    fn tab_bar(&self, cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
-        mux::tab_bar(cmds, px, bar);
+    fn tab_bar(&self, px: Px, bar: &TabBar<'_>) -> TabBarParts {
+        mux::tab_bar(px, bar)
     }
 
     fn pane_chrome(&self, cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {

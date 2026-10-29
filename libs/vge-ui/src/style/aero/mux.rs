@@ -9,7 +9,7 @@ use super::{GEL_AQUA, Gel, bubble, gel, gloss, scroll_thumb, smoke};
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
-use crate::style::{PaneChrome, TabBar, TabbarMetrics};
+use crate::style::{PaneChrome, TabBar, TabBarParts, TabbarMetrics};
 
 /// A two-row bar of tabs standing on its bottom edge, Windows XP
 /// fashion: the label sits on the bar's centre line, the active tab
@@ -48,7 +48,10 @@ const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
 /// The tab bar: a two-row sky with the tabs standing on its bottom
 /// edge — the accent's gel for the active one, frosted glass for the
 /// rest, and an orange strip along the top of one with unseen output.
-pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
+pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
+    let mut ground = Vec::new();
+    let mut tabs = Vec::with_capacity(bar.tabs.len());
+    let cmds = &mut ground;
     let host_w = bar.width;
     let band = |y: f32, h: f32| Rect {
         x: 0.0,
@@ -143,9 +146,9 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
     // The active tab is the accent's gel — the one place the host's
     // colour shows, and what tells one nesting level from the next.
     let active = Gel::for_color(crate::theme::accent_color());
-    // The active tab goes last, so its shadow falls on its neighbours.
-    let (front, rest): (Vec<_>, Vec<_>) = bar.tabs.iter().partition(|t| t.active);
-    for slot in rest.into_iter().chain(front) {
+    for slot in &bar.tabs {
+        let mut tab = Vec::new();
+        let cmds = &mut tab;
         let i = slot.index;
         let x = slot.x0;
         let (x0, x1) = (x, x + slot.num_w + slot.name_w);
@@ -217,6 +220,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             is_active,
             Some(shadow),
         );
+        tabs.push(tab);
     }
 
     if let Some(x) = bar.right_chevron {
@@ -232,6 +236,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
             Some(navy),
         );
     }
+    TabBarParts { ground, tabs }
 }
 
 /// The deep tone of a frosted tab, which its number's socket is

@@ -25,7 +25,7 @@
 //! master directly — no input crosses the PRT wire (§9.1).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -62,7 +62,9 @@ use ses_protocol::{
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
 use vge_protocol::codec::Point;
-use vge_protocol::command::{Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor};
+use vge_protocol::command::{
+    Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, UpdateCommandsBody,
+};
 use vge_protocol::encode::build_envelope as build_vge_envelope;
 use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PROBE};
 
@@ -1081,7 +1083,23 @@ const MODAL_IDS: ModalIds<'static> = ModalIds {
     track: MODAL_TRACK_ID,
     thumb: MODAL_THUMB_ID,
 };
+/// The tab bar is a group: this element holds no commands of its own,
+/// only the ground ([`TABBAR_GROUND_ID`]) and one child per visible tab
+/// ([`tab_element_id`]), so a tab switch updates the two tabs it touches
+/// rather than resending the bar.
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
+const TABBAR_GROUND_ID: &str = "vmux-tabbar.ground";
+/// Draw orders under the tab bar group: the ground, then the tabs, with
+/// the active one above its neighbours — it may paint onto them (Aero's
+/// shadow).
+const TABBAR_GROUND_ORDER: i32 = 0;
+const TABBAR_TAB_ORDER: i32 = 1;
+const TABBAR_ACTIVE_ORDER: i32 = 2;
+
+/// A tab's element id, by tab index.
+fn tab_element_id(index: usize) -> String {
+    format!("vmux-tabbar.tab{index}")
+}
 /// Cap on the window title we hand the host, in characters. A pane's
 /// OSC title is whatever the inner program said; the host clamps too,
 /// but there's no point putting a kilobyte on the wire.
@@ -1275,7 +1293,7 @@ struct TabSlot {
 /// Geometry of one tab-bar render: the visible tabs with their row-0
 /// placement, the optional session segment, and which overflow
 /// chevrons are shown. Computed once by [`compute_tabbar_layout`] and
-/// shared by the draw path ([`build_tabbar_commands`]) and the click
+/// shared by the draw path ([`build_tabbar`]) and the click
 /// hit-test ([`tabbar_hit`]) so the two can never disagree about where
 /// a tab sits.
 struct TabbarLayout {
@@ -1438,7 +1456,7 @@ fn tabbar_hit(layout: &TabbarLayout, host_w: u32, col: f32) -> Option<TabbarHit>
 ///
 /// The rule along row 1 separates the bar from the pane area below;
 /// active tab fills sit flush on top of it.
-fn build_tabbar_commands(
+fn build_tabbar(
     labels: &[String],
     active: usize,
     scroll: &mut usize,
@@ -1447,7 +1465,7 @@ fn build_tabbar_commands(
     cell_ph: f32,
     session: Option<&str>,
     activity: &[bool],
-) -> CreateElementBody {
+) -> TabbarParts {
     let host_wf = host_w as f32;
     let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
     let bar = TabBar {
@@ -1471,21 +1489,139 @@ fn build_tabbar_commands(
             .then_some(layout.session_w() + tabbar_metrics().margin),
         right_chevron: layout.has_right.then_some(host_wf - TABBAR_CHEVRON_W),
     };
-    let mut cmds = Vec::new();
-    style::engine().tab_bar(&mut cmds, Px { w: cell_pw, h: cell_ph }, &bar);
+    let parts = style::engine().tab_bar(
+        Px {
+            w: cell_pw,
+            h: cell_ph,
+        },
+        &bar,
+    );
+    TabbarParts {
+        ground: parts.ground,
+        tabs: bar
+            .tabs
+            .iter()
+            .zip(parts.tabs)
+            .map(|(t, cmds)| (t.index, t.active, cmds))
+            .collect(),
+    }
+}
 
-    CreateElementBody {
-        id: TABBAR_ELEMENT_ID.to_string(),
-        commands: cmds,
-        origin: Point { x: 0.0, y: 0.0 },
-        is_visible: true,
-        // Tab bar lives at row 0, no portals there, so any draw_order
-        // works; pick CHROME so it can't be obscured by future chrome.
-        draw_order: CHROME_DRAW_ORDER,
-        parent: None,
-        size: None,
-        transform: None,
-        anchor: OriginAnchor::Viewport,
+/// One render of the tab bar: the ground, and each visible tab as its
+/// index, whether it is the active one, and its commands.
+struct TabbarParts {
+    ground: Vec<DrawCmd>,
+    tabs: Vec<(usize, bool, Vec<DrawCmd>)>,
+}
+
+/// What the host holds for the tab bar, so a render sends only what
+/// changed: the ground's commands, and each tab element's draw order and
+/// commands by tab index. An unchanged bar — a pane retitling itself to
+/// the label it already had — sends nothing at all.
+#[derive(Default)]
+struct TabbarSent {
+    ground: Vec<DrawCmd>,
+    tabs: BTreeMap<usize, (i32, Vec<DrawCmd>)>,
+}
+
+impl TabbarSent {
+    /// The commands that take the host from `sent` (`None`: nothing yet)
+    /// to `parts`, and what it then holds.
+    fn diff(sent: Option<TabbarSent>, parts: TabbarParts) -> (Vec<(VgeCommand, u32)>, TabbarSent) {
+        let mut cmds = Vec::new();
+        let child = |id: String, commands: Vec<DrawCmd>, draw_order: i32| {
+            VgeCommand::CreateElement(CreateElementBody {
+                id,
+                commands,
+                origin: Point { x: 0.0, y: 0.0 },
+                is_visible: true,
+                draw_order,
+                parent: Some(TABBAR_ELEMENT_ID.to_string()),
+                size: None,
+                transform: None,
+                anchor: OriginAnchor::Viewport,
+            })
+        };
+        let update = |id: String, commands: Vec<DrawCmd>| {
+            VgeCommand::UpdateCommands(UpdateCommandsBody { id, commands })
+        };
+        let mut sent = match sent {
+            Some(sent) => {
+                if sent.ground != parts.ground {
+                    cmds.push((update(TABBAR_GROUND_ID.into(), parts.ground.clone()), 0));
+                }
+                sent
+            }
+            None => {
+                cmds.push((
+                    VgeCommand::CreateElement(CreateElementBody {
+                        id: TABBAR_ELEMENT_ID.to_string(),
+                        commands: Vec::new(),
+                        origin: Point { x: 0.0, y: 0.0 },
+                        is_visible: true,
+                        // Tab bar lives at row 0, no portals there, so any
+                        // draw_order works; pick CHROME so it can't be
+                        // obscured by future chrome.
+                        draw_order: CHROME_DRAW_ORDER,
+                        parent: None,
+                        size: None,
+                        transform: None,
+                        anchor: OriginAnchor::Viewport,
+                    }),
+                    0,
+                ));
+                cmds.push((
+                    child(
+                        TABBAR_GROUND_ID.into(),
+                        parts.ground.clone(),
+                        TABBAR_GROUND_ORDER,
+                    ),
+                    0,
+                ));
+                TabbarSent::default()
+            }
+        };
+        sent.ground = parts.ground;
+
+        let mut tabs = BTreeMap::new();
+        for (index, active, commands) in parts.tabs {
+            let order = if active {
+                TABBAR_ACTIVE_ORDER
+            } else {
+                TABBAR_TAB_ORDER
+            };
+            let id = tab_element_id(index);
+            match sent.tabs.remove(&index) {
+                None => cmds.push((child(id, commands.clone(), order), 0)),
+                Some((was_order, was)) => {
+                    if was != commands {
+                        cmds.push((update(id.clone(), commands.clone()), 0));
+                    }
+                    if was_order != order {
+                        cmds.push((
+                            VgeCommand::UpdateDrawOrder {
+                                id,
+                                draw_order: order,
+                            },
+                            0,
+                        ));
+                    }
+                }
+            }
+            tabs.insert(index, (order, commands));
+        }
+        // Tabs scrolled off the bar, or closed.
+        for index in std::mem::take(&mut sent.tabs).into_keys() {
+            cmds.push((
+                VgeCommand::DeleteElement {
+                    id: tab_element_id(index),
+                    by_prefix: false,
+                },
+                0,
+            ));
+        }
+        sent.tabs = tabs;
+        (cmds, sent)
     }
 }
 
@@ -2354,11 +2490,11 @@ struct State {
     /// Pane ids the host last saw as visible. Used to emit minimal
     /// `UpdateVisibility` deltas across tab switches.
     visible_panes: HashSet<String>,
-    /// True once the tab bar VGE element has been created on the host.
-    tabbar_created: bool,
+    /// What the host holds for the tab bar; `None` until it is created.
+    tabbar_sent: Option<TabbarSent>,
     /// Index of the leftmost tab currently drawn in the tab bar. When
     /// the tabs don't all fit on row 0 the bar scrolls; this offset is
-    /// nudged so the active tab stays visible (see `build_tabbar_commands`).
+    /// nudged so the active tab stays visible (see `build_tabbar`).
     tab_scroll: usize,
     /// True once the separators VGE element has been created on the
     /// host. Tracked so the first relayout emits a CreateElement (not a
@@ -2413,7 +2549,7 @@ impl State {
             modal_visible: false,
             last_focus_sent: None,
             visible_panes: HashSet::new(),
-            tabbar_created: false,
+            tabbar_sent: None,
             tab_scroll: 0,
             separators_created: false,
             pending_scrolls: HashMap::new(),
@@ -3530,32 +3666,9 @@ impl State {
         vge_cmds.push((VgeCommand::CreateElement(sep_body), 0));
         self.separators_created = true;
 
-        // Tab bar: re-create on every relayout so tab adds/removes,
-        // active-tab changes, and renames all show up. Cheap — single
-        // small VGE element.
-        let tabbar_labels = self.tabbar_labels();
-        let tabbar_activity = self.tab_activity_flags();
-        let tabbar_body = build_tabbar_commands(
-            &tabbar_labels,
-            self.active_tab,
-            &mut self.tab_scroll,
-            self.host_w,
-            self.cell_pw,
-            self.cell_ph,
-            self.session_name.as_deref(),
-            &tabbar_activity,
-        );
-        if self.tabbar_created {
-            vge_cmds.push((
-                VgeCommand::DeleteElement {
-                    id: TABBAR_ELEMENT_ID.into(),
-                    by_prefix: false,
-                },
-                0,
-            ));
-        }
-        vge_cmds.push((VgeCommand::CreateElement(tabbar_body), 0));
-        self.tabbar_created = true;
+        // Tab bar: whatever of it changed — tab adds/removes, the
+        // active-tab change, renames.
+        vge_cmds.extend(self.tabbar_commands());
 
         // Re-emit modal on top, if active.
         let modal_elements = self.build_modal_elements();
@@ -4042,9 +4155,22 @@ impl State {
     /// rename changes the active pane's effective title without
     /// otherwise affecting layout.
     fn render_tabbar(&mut self) -> Vec<u8> {
+        let cmds = self.tabbar_commands();
+        let mut out = if cmds.is_empty() {
+            Vec::new()
+        } else {
+            build_vge_envelope(&cmds)
+        };
+        out.extend(self.window_title_update());
+        out
+    }
+
+    /// The VGE commands that bring the host's tab bar up to date, and
+    /// nothing for the parts it already shows ([`TabbarSent::diff`]).
+    fn tabbar_commands(&mut self) -> Vec<(VgeCommand, u32)> {
         let labels = self.tabbar_labels();
         let activity = self.tab_activity_flags();
-        let body = build_tabbar_commands(
+        let parts = build_tabbar(
             &labels,
             self.active_tab,
             &mut self.tab_scroll,
@@ -4054,21 +4180,9 @@ impl State {
             self.session_name.as_deref(),
             &activity,
         );
-        let mut cmds = Vec::new();
-        if self.tabbar_created {
-            cmds.push((
-                VgeCommand::DeleteElement {
-                    id: TABBAR_ELEMENT_ID.into(),
-                    by_prefix: false,
-                },
-                0,
-            ));
-        }
-        cmds.push((VgeCommand::CreateElement(body), 0));
-        self.tabbar_created = true;
-        let mut out = build_vge_envelope(&cmds);
-        out.extend(self.window_title_update());
-        out
+        let (cmds, sent) = TabbarSent::diff(self.tabbar_sent.take(), parts);
+        self.tabbar_sent = Some(sent);
+        cmds
     }
 }
 
@@ -7323,10 +7437,88 @@ mod tests {
         // and the scroll offset advanced to reach the active tab.
         let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let body = build_tabbar_commands(&labels, 29, &mut scroll, 80, 8.0, 16.0, None, &[]);
-        assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
+        let parts = build_tabbar(&labels, 29, &mut scroll, 80, 8.0, 16.0, None, &[]);
         assert!(scroll > 0, "the bar must scroll to reveal the last tab");
-        assert!(!body.commands.is_empty());
+        assert!(parts.tabs.iter().any(|(i, active, _)| *i == 29 && *active));
+    }
+
+    fn tabbar_ops(cmds: &[(VgeCommand, u32)]) -> Vec<String> {
+        cmds.iter()
+            .map(|(c, _)| match c {
+                VgeCommand::CreateElement(b) => format!("create {}", b.id),
+                VgeCommand::UpdateCommands(b) => format!("update {}", b.id),
+                VgeCommand::UpdateDrawOrder { id, draw_order } => {
+                    format!("order {id} {draw_order}")
+                }
+                VgeCommand::DeleteElement { id, .. } => format!("delete {id}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn four_tabs(active: usize, activity: &[bool]) -> TabbarParts {
+        let labels: Vec<String> = ["one", "two", "three", "four"].map(String::from).to_vec();
+        let mut scroll = 0;
+        build_tabbar(&labels, active, &mut scroll, 120, 8.0, 16.0, None, activity)
+    }
+
+    /// The first render builds the group, the ground and every tab; a
+    /// render of the same bar sends nothing — a pane retitling itself to
+    /// the label it already had costs no bytes.
+    #[test]
+    fn an_unchanged_tab_bar_sends_nothing() {
+        let (first, sent) = TabbarSent::diff(None, four_tabs(0, &[]));
+        assert_eq!(
+            tabbar_ops(&first),
+            [
+                "create vmux-tabbar",
+                "create vmux-tabbar.ground",
+                "create vmux-tabbar.tab0",
+                "create vmux-tabbar.tab1",
+                "create vmux-tabbar.tab2",
+                "create vmux-tabbar.tab3",
+            ]
+        );
+        let (again, _) = TabbarSent::diff(Some(sent), four_tabs(0, &[]));
+        assert!(again.is_empty(), "{:?}", tabbar_ops(&again));
+    }
+
+    /// Switching tabs repaints the two it touches and raises the new
+    /// active one over its neighbours; the ground and the other tabs are
+    /// left alone.
+    #[test]
+    fn a_tab_switch_updates_only_the_two_tabs() {
+        let (_, sent) = TabbarSent::diff(None, four_tabs(0, &[]));
+        let (switch, _) = TabbarSent::diff(Some(sent), four_tabs(2, &[]));
+        assert_eq!(
+            tabbar_ops(&switch),
+            [
+                "update vmux-tabbar.tab0",
+                "order vmux-tabbar.tab0 1",
+                "update vmux-tabbar.tab2",
+                "order vmux-tabbar.tab2 2",
+            ]
+        );
+    }
+
+    /// Unseen output in a background tab repaints that tab alone.
+    #[test]
+    fn activity_updates_only_its_tab() {
+        let (_, sent) = TabbarSent::diff(None, four_tabs(0, &[]));
+        let (busy, _) = TabbarSent::diff(Some(sent), four_tabs(0, &[false, false, false, true]));
+        assert_eq!(tabbar_ops(&busy), ["update vmux-tabbar.tab3"]);
+    }
+
+    /// A tab scrolled off the bar (or closed) loses its element.
+    #[test]
+    fn a_tab_leaving_the_bar_is_deleted() {
+        let (_, sent) = TabbarSent::diff(None, four_tabs(0, &[]));
+        let labels: Vec<String> = ["one", "two", "three"].map(String::from).to_vec();
+        let mut scroll = 0;
+        let three = build_tabbar(&labels, 0, &mut scroll, 120, 8.0, 16.0, None, &[]);
+        let (ops, sent) = TabbarSent::diff(Some(sent), three);
+        assert!(tabbar_ops(&ops).contains(&"delete vmux-tabbar.tab3".to_string()));
+        assert_eq!(sent.tabs.len(), 3);
     }
 
     #[test]
@@ -7393,7 +7585,7 @@ mod tests {
         // still build and keep the active tab visible.
         let labels: Vec<String> = (0..12).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let body = build_tabbar_commands(
+        let parts = build_tabbar(
             &labels,
             11,
             &mut scroll,
@@ -7403,8 +7595,8 @@ mod tests {
             Some("session"),
             &[],
         );
-        assert_eq!(body.id.as_str(), TABBAR_ELEMENT_ID);
-        assert!(!body.commands.is_empty());
+        assert!(!parts.ground.is_empty());
+        assert!(parts.tabs.iter().any(|(i, active, _)| *i == 11 && *active));
     }
 
     // ── layout resize ──────────────────────────────────────────────────

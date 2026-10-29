@@ -49,8 +49,9 @@ pub trait Engine: Sync {
 
     // ── Multiplexer ────────────────────────────────────────────────
 
-    /// The tab bar, across the top [`TabbarMetrics::rows`] rows.
-    fn tab_bar(&self, cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>);
+    /// The tab bar, across the top [`TabbarMetrics::rows`] rows, in
+    /// the pieces a client updates one at a time.
+    fn tab_bar(&self, px: Px, bar: &TabBar<'_>) -> TabBarParts;
 
     /// A pane's own chrome — its title and scroll thumb — in
     /// pane-relative cells.
@@ -344,6 +345,20 @@ pub struct TabBar<'a> {
     pub left_chevron: Option<f32>,
     /// Where the `›` goes, when tabs are clipped off the end.
     pub right_chevron: Option<f32>,
+}
+
+/// The tab bar as [`Engine::tab_bar`] paints it, split where a change
+/// usually stops: switching tabs repaints two of them and leaves the
+/// ground alone. Every part is in the bar's own coordinates.
+#[derive(Debug, Default)]
+pub struct TabBarParts {
+    /// Everything that is not a tab: the bar's background and rule, the
+    /// session segment, the overflow chevrons. Drawn under the tabs.
+    pub ground: Vec<DrawCmd>,
+    /// Each tab's own commands, parallel to [`TabBar::tabs`]. A tab may
+    /// paint past its own rect — Aero's active tab casts a shadow on its
+    /// neighbours — so a client draws the active one above the rest.
+    pub tabs: Vec<Vec<DrawCmd>>,
 }
 
 /// One tab: a number rect `[x0, x0 + num_w)` and a name rect after it.
