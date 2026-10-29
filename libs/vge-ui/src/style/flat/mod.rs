@@ -13,8 +13,8 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
 
 use super::{
-    Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
-    SearchPanel, StatusLeft, TabBar, TabBarParts, TabbarMetrics,
+    Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics,
+    PaneChrome, SearchPanel, StatusLeft, TabBar, TabBarParts, TabbarMetrics,
 };
 use crate::modal::{self, ModalIds, ScrollModal};
 use crate::paint::Px;

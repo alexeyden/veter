@@ -15,10 +15,11 @@ mod mux;
 
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd, OriginAnchor, Style};
+use vge_protocol::path::{PathNode, PathSegment};
 
 use super::{
-    Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
-    SearchPanel, StatusLeft, TabBar, TabBarParts,
+    Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics,
+    PaneChrome, SearchPanel, StatusLeft, TabBar, TabBarParts,
 };
 use crate::measure::{prefix_cells, text_cells};
 use crate::modal::{ModalIds, ScrollModal};
@@ -442,28 +443,91 @@ pub fn gel_named(name: &str) -> Option<&'static Gel> {
     GELS.iter().find(|(n, _)| *n == name).map(|(_, g)| g)
 }
 
-/// The upper-half sheen every glossy thing carries: a white wash that
+/// How far inside its shape's edge a sheen starts, in pixels: clear of
+/// the one-pixel rim.
+const GLOSS_INSET: f32 = 1.5;
+
+/// The upper-half sheen every glossy capsule carries: a white wash that
 /// ends in a hard edge at the middle.
 pub fn gloss(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, a: f32) {
-    let gx0 = x0 + px.x(2.0);
-    let gx1 = x1 - px.x(2.0);
-    let gy0 = y0 + px.y(1.5);
-    let gy1 = y0 + (y1 - y0) * 0.5;
-    if gx1 <= gx0 {
+    gloss_rr(cmds, px, x0, y0, x1, y1, pill_radius(px, x0, y0, x1, y1), a);
+}
+
+/// [`gloss`] on a rounded rectangle of corner `r` pixels. The sheen is
+/// the top half of the same shape shrunk by [`GLOSS_INSET`] — corners
+/// concentric with the outer ones — so it never crosses the rim, which
+/// a smaller capsule of its own did at the top corners, where its
+/// tighter curve stood outside the outer one.
+#[allow(clippy::too_many_arguments)]
+pub fn gloss_rr(
+    cmds: &mut Vec<DrawCmd>,
+    px: Px,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    a: f32,
+) {
+    let (gx0, gx1) = (x0 + px.x(GLOSS_INSET), x1 - px.x(GLOSS_INSET));
+    let gy0 = y0 + px.y(GLOSS_INSET);
+    let mid = y0 + (y1 - y0) * 0.5;
+    if gx1 <= gx0 || mid <= gy0 {
         return;
     }
+    let r = (r - GLOSS_INSET).max(0.0);
+    let rx = px.x(r).min((gx1 - gx0) * 0.5);
+    let ry = px.y(r).min(mid - gy0);
+    let arc = |x: f32, y: f32| PathNode::ArcEllipseTo {
+        large: false,
+        sweep: true,
+        rx,
+        ry,
+        rotation: 0.0,
+        dst: Point { x, y },
+    };
     cmds.push(DrawCmd::FillPath {
-        fill: vgrad(gy0, gy1, white(a), white(a * 0.05)),
-        segments: pill(px, gx0, gy0, gx1, gy1),
+        fill: vgrad(gy0, mid, white(a), white(a * 0.05)),
+        segments: vec![PathSegment {
+            start: Point { x: gx0, y: mid },
+            nodes: vec![
+                PathNode::VerticalLineTo { y: gy0 + ry },
+                arc(gx0 + rx, gy0),
+                PathNode::HorizontalLineTo { x: gx1 - rx },
+                arc(gx1, gy0 + ry),
+                PathNode::VerticalLineTo { y: mid },
+                PathNode::ClosePath,
+            ],
+        }],
     });
 }
 
+/// The corner, in pixels, that makes `x0..x1 × y0..y1` a capsule.
+fn pill_radius(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+    ((x1 - x0) * px.w).min((y1 - y0) * px.h) / 2.0
+}
+
 pub fn gel(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, g: &Gel) {
-    let shape = pill(px, x0, y0, x1, y1);
-    cmds.push(DrawCmd::OutlineFillPath {
+    gel_rr(cmds, px, x0, y0, x1, y1, pill_radius(px, x0, y0, x1, y1), g);
+}
+
+/// [`gel`] on a rounded rectangle of corner `r` pixels: the body, the
+/// glow and the sheen, then the rim — last, over all three, since a fill
+/// painted after it lays its own antialiased edge across the line.
+#[allow(clippy::too_many_arguments)]
+pub fn gel_rr(
+    cmds: &mut Vec<DrawCmd>,
+    px: Px,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    g: &Gel,
+) {
+    let shape = rr(px, x0, y0, x1, y1, r);
+    cmds.push(DrawCmd::FillPath {
         fill: vgrad(y0, y1, hex(g.top, 1.0), hex(g.bottom, 1.0)),
-        stroke: Style::Flat(hex(g.rim, 0.9)),
-        line_width: px.line(1.0),
         segments: shape.clone(),
     });
     let cx = (x0 + x1) / 2.0;
@@ -477,9 +541,14 @@ pub fn gel(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32, 
             hex(g.glow, 0.5),
             hex(g.glow, 0.0),
         ),
+        segments: shape.clone(),
+    });
+    gloss_rr(cmds, px, x0, y0, x1, y1, r, 0.42);
+    cmds.push(DrawCmd::DrawLinePath {
+        stroke: Style::Flat(hex(g.rim, 0.9)),
+        line_width: px.line(1.0),
         segments: shape,
     });
-    gloss(cmds, px, x0, y0, x1, y1, 0.42);
 }
 
 /// The opacity of a glass body the wallpaper shows through: the stock
