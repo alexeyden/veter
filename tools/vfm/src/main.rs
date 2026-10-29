@@ -83,7 +83,19 @@ const ID_PREFIX: &str = "vfm.";
 
 const ID_BG: &str = "vfm.bg";
 const ID_COLS: [&str; 2] = ["vfm.col0", "vfm.col1"];
+/// The grid pane is a group: the ground ([`ID_GRID_GROUND`]) and one
+/// child per visible tile ([`tile_id`]) under it, and the scrollbar as
+/// its own commands — which a parent draws over its children. Moving the
+/// cursor then updates the two tiles it touches, not the page.
 const ID_GRID: &str = "vfm.grid";
+const ID_GRID_GROUND: &str = "vfm.grid.ground";
+const ORDER_GRID_GROUND: i32 = 0;
+const ORDER_TILE: i32 = 1;
+
+/// A visible tile's element id, by its slot on the page.
+fn tile_id(slot: usize) -> String {
+    format!("vfm.grid.t{slot}")
+}
 const ID_STATUS: &str = "vfm.status";
 const MODAL_IDS: ModalIds<'static> = ModalIds {
     root: "vfm.modal",
@@ -310,6 +322,8 @@ struct App {
     modal_live: Vec<String>,
     /// Set at startup and after a resize: the element tree is rebuilt.
     needs_rebuild: bool,
+    /// What the host holds for the grid; `None` until it is built.
+    grid_sent: Option<GridSent>,
     dirty: Dirty,
     quit: bool,
 }
@@ -362,6 +376,7 @@ impl App {
             encoding: choose_encoding(0x01, is_ssh_session(), 82.0),
             modal_live: Vec::new(),
             needs_rebuild: true,
+            grid_sent: None,
             dirty: Dirty::all(),
             quit: false,
         };
@@ -1264,8 +1279,8 @@ impl App {
         )
     }
 
-    fn grid_commands(&self) -> Vec<DrawCmd> {
-        render::grid_commands(&render::GridView {
+    fn grid_parts(&self) -> render::GridParts {
+        render::grid_parts(&render::GridView {
             layout: &self.layout,
             entries: &self.entries,
             cursor: self.cursor,
@@ -1377,9 +1392,12 @@ impl App {
             for (i, id) in ID_COLS.iter().enumerate() {
                 cmds.push(create(id, self.column_commands(i), ORDER_PANE));
             }
-            cmds.push(create(ID_GRID, self.grid_commands(), ORDER_PANE));
+            // The grid's children follow below, as the grid's update.
+            cmds.push(create(ID_GRID, Vec::new(), ORDER_PANE));
+            self.grid_sent = None;
             cmds.push(create(ID_STATUS, self.status_commands(), ORDER_PANE));
             self.dirty = Dirty {
+                grid: true,
                 modal: true,
                 ..Default::default()
             };
@@ -1394,7 +1412,9 @@ impl App {
             }
         }
         if self.dirty.grid {
-            cmds.push(update(ID_GRID, self.grid_commands()));
+            let (grid, sent) = GridSent::diff(self.grid_sent.take(), self.grid_parts());
+            cmds.extend(grid);
+            self.grid_sent = Some(sent);
         }
         if self.dirty.status {
             cmds.push(update(ID_STATUS, self.status_commands()));
@@ -1433,6 +1453,74 @@ fn create(id: &str, commands: Vec<DrawCmd>, draw_order: i32) -> (VgeCommand, u32
         }),
         REQ_ID_NO_RESPONSE,
     )
+}
+
+/// What the host holds for the grid, so a redraw sends only the parts
+/// that changed: a cursor step is two tiles, a scroll every tile whose
+/// slot now shows another entry.
+#[derive(Default)]
+struct GridSent {
+    ground: Vec<DrawCmd>,
+    tiles: Vec<Vec<DrawCmd>>,
+    overlay: Vec<DrawCmd>,
+}
+
+impl GridSent {
+    /// The commands that take the host from `sent` (`None`: the grid
+    /// element is new and empty) to `parts`, and what it then holds.
+    fn diff(
+        sent: Option<GridSent>,
+        parts: render::GridParts,
+    ) -> (Vec<(VgeCommand, u32)>, GridSent) {
+        let mut cmds = Vec::new();
+        let fresh = sent.is_none();
+        let sent = sent.unwrap_or_default();
+        if fresh {
+            cmds.push(child(
+                ID_GRID_GROUND,
+                parts.ground.clone(),
+                ORDER_GRID_GROUND,
+            ));
+        } else if sent.ground != parts.ground {
+            cmds.push(update(ID_GRID_GROUND, parts.ground.clone()));
+        }
+        for (slot, tile) in parts.tiles.iter().enumerate() {
+            match sent.tiles.get(slot) {
+                None => cmds.push(child(&tile_id(slot), tile.clone(), ORDER_TILE)),
+                Some(was) if was != tile => cmds.push(update(&tile_id(slot), tile.clone())),
+                Some(_) => {}
+            }
+        }
+        // Slots past the end of a shorter page.
+        for slot in parts.tiles.len()..sent.tiles.len() {
+            cmds.push((
+                VgeCommand::DeleteElement {
+                    id: tile_id(slot),
+                    by_prefix: false,
+                },
+                REQ_ID_NO_RESPONSE,
+            ));
+        }
+        if sent.overlay != parts.overlay {
+            cmds.push(update(ID_GRID, parts.overlay.clone()));
+        }
+        let now = GridSent {
+            ground: parts.ground,
+            tiles: parts.tiles,
+            overlay: parts.overlay,
+        };
+        (cmds, now)
+    }
+}
+
+/// A child of the grid element, in the grid's coordinates — the host
+/// screen's, since the grid sits at the origin.
+fn child(id: &str, commands: Vec<DrawCmd>, draw_order: i32) -> (VgeCommand, u32) {
+    let (mut cmd, req) = create(id, commands, draw_order);
+    if let VgeCommand::CreateElement(body) = &mut cmd {
+        body.parent = Some(ID_GRID.to_string());
+    }
+    (cmd, req)
 }
 
 fn update(id: &str, commands: Vec<DrawCmd>) -> (VgeCommand, u32) {
@@ -2410,6 +2498,61 @@ mod tests {
         let (x, y) = app.layout.tile_origin(150, app.scroll_row);
         assert_eq!(app.layout.tile_at(x + 1.0, y, app.scroll_row, 200), Some(150));
         assert!(row < app.layout.grid_rows);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn grid_ops(app: &mut App) -> Vec<String> {
+        let (cmds, sent) = GridSent::diff(app.grid_sent.take(), app.grid_parts());
+        app.grid_sent = Some(sent);
+        cmds.iter()
+            .map(|(c, _)| match c {
+                VgeCommand::CreateElement(b) => format!("create {}", b.id),
+                VgeCommand::UpdateCommands(b) => format!("update {}", b.id),
+                VgeCommand::DeleteElement { id, .. } => format!("delete {id}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A cursor step repaints the tile it left and the one it landed on,
+    /// nothing else; a scroll repaints the slots whose entry changed; a
+    /// shorter page drops the slots it no longer fills.
+    #[test]
+    fn the_grid_sends_only_the_tiles_that_changed() {
+        let d = tmpdir("grid-diff");
+        for i in 0..200 {
+            std::fs::write(d.join(format!("f{i:03}.txt")), b"x").unwrap();
+        }
+        let mut app = app_in(&d);
+        let first = grid_ops(&mut app);
+        assert_eq!(first[0], "create vfm.grid.ground");
+        let page = first
+            .iter()
+            .filter(|o| o.starts_with("create vfm.grid.t"))
+            .count();
+        assert!(page > 2, "a page of tiles");
+
+        assert!(grid_ops(&mut app).is_empty(), "nothing changed");
+
+        app.move_cursor(1);
+        assert_eq!(
+            grid_ops(&mut app),
+            ["update vfm.grid.t0", "update vfm.grid.t1"]
+        );
+
+        app.cursor_to(199);
+        let scrolled = grid_ops(&mut app);
+        assert!(scrolled.iter().all(|o| !o.starts_with("create")));
+        assert!(scrolled.len() > 2, "a scroll repaints the page");
+
+        let sub = d.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("only.txt"), b"x").unwrap();
+        app.cd(sub);
+        let short = grid_ops(&mut app);
+        assert!(short.contains(&"update vfm.grid.t0".to_string()));
+        assert!(short.contains(&"delete vfm.grid.t1".to_string()));
+        assert_eq!(app.grid_sent.as_ref().unwrap().tiles.len(), 1);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

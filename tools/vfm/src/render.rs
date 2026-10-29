@@ -168,36 +168,65 @@ impl GridView<'_> {
     }
 }
 
-pub fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
-    grid_commands_in(style::engine(), v)
+/// The grid pane in the pieces vfm updates one at a time: moving the
+/// cursor repaints two tiles and leaves the rest alone.
+#[derive(Debug, Default)]
+pub struct GridParts {
+    /// The pane's ground, under the tiles.
+    pub ground: Vec<DrawCmd>,
+    /// Each visible tile (or list row), by its slot on the page — the
+    /// first on screen is slot 0 whatever the scroll.
+    pub tiles: Vec<Vec<DrawCmd>>,
+    /// What goes over the tiles: the scrollbar, or the note that stands
+    /// in for them (an error, an empty directory).
+    pub overlay: Vec<DrawCmd>,
 }
 
-fn grid_commands_in(engine: &dyn Engine, v: &GridView) -> Vec<DrawCmd> {
+impl GridParts {
+    /// Everything in drawing order, as one list.
+    #[cfg(test)]
+    pub fn flatten(self) -> Vec<DrawCmd> {
+        let mut cmds = self.ground;
+        cmds.extend(self.tiles.into_iter().flatten());
+        cmds.extend(self.overlay);
+        cmds
+    }
+}
+
+pub fn grid_parts(v: &GridView) -> GridParts {
+    grid_parts_in(style::engine(), v)
+}
+
+fn grid_parts_in(engine: &dyn Engine, v: &GridView) -> GridParts {
     let px = v.px();
     let l = v.layout;
     let a = l.grid;
-    let mut cmds: Vec<DrawCmd> = Vec::new();
-    engine.grid_pane(&mut cmds, px, rect(a));
+    let mut parts = GridParts::default();
+    engine.grid_pane(&mut parts.ground, px, rect(a));
+    let cmds = &mut parts.overlay;
 
     if let Some(err) = v.error {
         let s = elide(err, a.w as usize - 4);
-        engine.browser_note(&mut cmds, px, a.x + 2.0, a.y + 1.0, Align::Left, &s, true);
-        return cmds;
+        engine.browser_note(cmds, px, a.x + 2.0, a.y + 1.0, Align::Left, &s, true);
+        return parts;
     }
     if v.entries.is_empty() {
         let (cx, cy) = (a.x + a.w * 0.5, a.y + a.h * 0.5);
-        engine.browser_note(&mut cmds, px, cx, cy, Align::Center, "empty directory", false);
-        return cmds;
+        engine.browser_note(cmds, px, cx, cy, Align::Center, "empty directory", false);
+        return parts;
     }
 
     let first = v.scroll_row * l.grid_cols;
     let last = (first + l.page()).min(v.entries.len());
     for index in first..last {
+        let mut tile = Vec::new();
         match l.view {
-            View::Grid => tile_commands(&mut cmds, engine, v, index),
-            View::List => row_commands(&mut cmds, engine, v, index),
+            View::Grid => tile_commands(&mut tile, engine, v, index),
+            View::List => row_commands(&mut tile, engine, v, index),
         }
+        parts.tiles.push(tile);
     }
+    let cmds = &mut parts.overlay;
 
     // Scrollbar down the right edge when the listing overflows.
     let total_rows = v.entries.len().div_ceil(l.grid_cols);
@@ -210,9 +239,9 @@ fn grid_commands_in(engine: &dyn Engine, v: &GridView) -> Vec<DrawCmd> {
         } else {
             0.0
         };
-        engine.browser_scrollbar(&mut cmds, px, rect(a), track_h, thumb_h, frac);
+        engine.browser_scrollbar(cmds, px, rect(a), track_h, thumb_h, frac);
     }
-    cmds
+    parts
 }
 
 /// One tile: plate, selection, picture (thumbnail or icon), mark, label.
@@ -425,7 +454,7 @@ mod tests {
     // These check what vfm lays out, so they pin the engine rather than
     // take whichever one the host or `--style` names.
     fn grid_commands(v: &GridView) -> Vec<DrawCmd> {
-        grid_commands_in(&Flat, v)
+        grid_parts_in(&Flat, v).flatten()
     }
 
     fn status_commands(v: &StatusView, cell_pw: f32, cell_ph: f32) -> Vec<DrawCmd> {
