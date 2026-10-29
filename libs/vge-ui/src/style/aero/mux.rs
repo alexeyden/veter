@@ -31,6 +31,9 @@ const TAB_Y0: f32 = 0.38;
 const ACTIVE_Y0: f32 = 0.18;
 /// The radius of a tab's two top corners, in pixels.
 const TAB_R: f32 = 6.0;
+/// The active tab's shadow: the deep navy of the sky it falls on, not
+/// black, which would read as dirt on the blue.
+const SHADOW: u32 = 0x06264d;
 /// The orange along the top of a tab with unseen output, Windows XP's
 /// hot-tab strip: a darker edge on the tab's own outline, a solid band
 /// `HILITE_SOLID` pixels deep under it, fading out into the tab's body
@@ -140,7 +143,9 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
     // The active tab is the accent's gel — the one place the host's
     // colour shows, and what tells one nesting level from the next.
     let active = Gel::for_color(crate::theme::accent_color());
-    for slot in &bar.tabs {
+    // The active tab goes last, so its shadow falls on its neighbours.
+    let (front, rest): (Vec<_>, Vec<_>) = bar.tabs.iter().partition(|t| t.active);
+    for slot in rest.into_iter().chain(front) {
         let i = slot.index;
         let x = slot.x0;
         let (x0, x1) = (x, x + slot.num_w + slot.name_w);
@@ -150,6 +155,7 @@ pub(super) fn tab_bar(cmds: &mut Vec<DrawCmd>, px: Px, bar: &TabBar<'_>) {
         // one runs down over it and carries the lip in its own tone.
         let y1 = BAR_H - px.y(1.0);
         let shadow = if is_active {
+            drop_shadow(cmds, px, x0, ACTIVE_Y0, x1, BAR_H);
             gel_tab(cmds, px, x0, ACTIVE_Y0, x1, BAR_H, &active);
             // The bar's lip carries on under the active tab in the
             // gel's own light tone, so the tab sits on the same edge as
@@ -281,6 +287,38 @@ fn tab_rim(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PathSegment> {
             PathNode::VerticalLineTo { y: y1 },
         ],
     }]
+}
+
+/// The soft shadow round the active tab, lifting it off the bar: rings
+/// of the tab's outline growing outward a pixel at a time, each faint,
+/// so their overlap darkens toward the tab and fades away from it.
+/// VGE has no blur; this is one, a few pixels wide.
+fn drop_shadow(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
+    for (grow, alpha) in [
+        (5.0, 0.05),
+        (4.0, 0.08),
+        (3.0, 0.12),
+        (2.0, 0.16),
+        (1.0, 0.22),
+    ] {
+        let r = TAB_R + grow;
+        let (gx, gy) = (px.x(grow), px.y(grow));
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(hex(SHADOW, alpha)),
+            segments: rounded_rect_path_corners(
+                x0 - gx,
+                y0 - gy,
+                x1 + gx,
+                y1,
+                px.x(r),
+                px.y(r),
+                true,
+                true,
+                false,
+                false,
+            ),
+        });
+    }
 }
 
 /// The sheen over a tab's upper half, the tab's own shape.
