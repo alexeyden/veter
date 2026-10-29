@@ -2143,7 +2143,6 @@ fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
 /// the buttons the user sees are exactly the ones the click lands on.
 struct ClosePromptLayout {
     panel: Rect,
-    title_center_x: f32,
     title_baseline_y: f32,
     cancel: Rect,
     quit: Rect,
@@ -2192,7 +2191,6 @@ fn close_prompt_layout(
 
     ClosePromptLayout {
         panel: (panel_x, panel_y, panel_w, panel_h),
-        title_center_x: panel_x + panel_w * 0.5,
         title_baseline_y: panel_y + pad + ascent,
         cancel: (buttons_x, buttons_y, button_w, button_h),
         quit: (buttons_x + button_w + gap, buttons_y, button_w, button_h),
@@ -2203,10 +2201,13 @@ fn close_prompt_layout(
 /// scrim, then the panel with its two buttons. Drawn last of everything
 /// so it sits above the grid, portals, VGE chrome and search bar — it is
 /// modal, and `window_event` routes keys and clicks to it while it is up.
+///
+/// The style engine paints it (`Engine::dialog`) from the layout here,
+/// which `ClosePromptLayout::hit` reads too — so a click lands on the
+/// button the engine drew there, under either engine.
 fn draw_close_prompt<T: femtovg::Renderer>(
     canvas: &mut Canvas<T>,
     tr: &mut renderer::TerminalRenderer,
-    accent: Color,
     hover: Option<PromptButton>,
     window_w_px: f32,
     window_h_px: f32,
@@ -2218,76 +2219,50 @@ fn draw_close_prompt<T: femtovg::Renderer>(
         tr.cell_height,
         tr.ascent(),
     );
-
-    let panel_bg = tr.panel_bg();
-    let panel_text = tr.panel_text();
-    let on_accent_text = tr.on_accent_text();
-    let (warn_fill, warn_border, warn_text) = tr.warn_colors();
-
-    // Scrim: dims the terminal behind the panel without hiding it, so
-    // the user can still read what they are about to close.
-    let mut scrim = femtovg::Path::new();
-    scrim.rect(0.0, 0.0, window_w_px, window_h_px);
-    canvas.fill_path(&scrim, &femtovg::Paint::color(Color::rgba(0, 0, 0, 150)));
-
-    let (px, py, pw, ph) = layout.panel;
-    let radius = tr.cell_height * 0.5;
-    let mut panel = femtovg::Path::new();
-    panel.rounded_rect(px, py, pw, ph, radius);
-    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg));
-    let mut border = femtovg::Paint::color(accent);
-    border.set_line_width(2.0);
-    canvas.stroke_path(&panel, &border);
-
-    tr.draw_vge_text(
-        canvas,
-        layout.title_center_x,
-        layout.title_baseline_y,
-        CLOSE_PROMPT_TITLE,
-        panel_text,
-        vge::command::Align::Center,
-        vge::command::FontStyle::default(),
-        1.0,
-    );
-
-    // Cancel is the safe answer and the one Enter/Esc give, so it is the
-    // filled accent button; Quit is outlined and warm-toned, an action
-    // you have to aim at. Hover lightens whichever the pointer is on.
-    for (button, rect, label) in [
-        (PromptButton::Cancel, layout.cancel, CLOSE_PROMPT_CANCEL),
-        (PromptButton::Quit, layout.quit, CLOSE_PROMPT_QUIT),
-    ] {
-        let (bx, by, bw, bh) = rect;
-        let hot = hover == Some(button);
-        let mut path = femtovg::Path::new();
-        path.rounded_rect(bx, by, bw, bh, radius * 0.6);
-        let (fill, text_color) = match button {
-            PromptButton::Cancel => (
-                if hot { lighten(accent, 0.25) } else { accent },
-                on_accent_text,
-            ),
-            PromptButton::Quit => (
-                if hot { lighten(warn_fill, 0.12) } else { warn_fill },
-                warn_text,
-            ),
-        };
-        canvas.fill_path(&path, &femtovg::Paint::color(fill));
-        if button == PromptButton::Quit {
-            let mut outline = femtovg::Paint::color(warn_border);
-            outline.set_line_width(1.0);
-            canvas.stroke_path(&path, &outline);
-        }
-        tr.draw_vge_text(
-            canvas,
-            bx + bw * 0.5,
-            by + (bh - tr.ascent()) * 0.5 + tr.ascent(),
-            label,
-            text_color,
-            vge::command::Align::Center,
-            vge::command::FontStyle::default(),
-            1.0,
-        );
-    }
+    let (cw, ch) = (tr.cell_width, tr.cell_height);
+    let (px0, py0, pw, ph) = layout.panel;
+    // Panel-relative cells, which is what the engine draws in.
+    let cells = |(x, y, w, h): (f32, f32, f32, f32)| vge::codec::Rect {
+        x: (x - px0) / cw,
+        y: (y - py0) / ch,
+        w: w / cw,
+        h: h / ch,
+    };
+    // Cancel is the safe answer and the one Enter/Esc give; Quit is the
+    // one you have to aim at.
+    let button = |which, rect, label, kind| vge_ui::style::DialogButton {
+        rect: cells(rect),
+        label,
+        kind,
+        hot: hover == Some(which),
+    };
+    let buttons = [
+        button(
+            PromptButton::Cancel,
+            layout.cancel,
+            CLOSE_PROMPT_CANCEL,
+            vge_ui::style::ButtonKind::Default,
+        ),
+        button(
+            PromptButton::Quit,
+            layout.quit,
+            CLOSE_PROMPT_QUIT,
+            vge_ui::style::ButtonKind::Danger,
+        ),
+    ];
+    let inks = tr.host_inks();
+    let dialog = vge_ui::style::Dialog {
+        w: pw / cw,
+        h: ph / ch,
+        screen: cells((0.0, 0.0, window_w_px, window_h_px)),
+        title: CLOSE_PROMPT_TITLE,
+        title_y: (layout.title_baseline_y - tr.ascent() - py0) / ch,
+        buttons: &buttons,
+        inks: &inks,
+    };
+    let mut cmds = Vec::new();
+    vge_ui::style::engine().dialog(&mut cmds, vge_ui::paint::Px { w: cw, h: ch }, &dialog);
+    vge::render::render_chrome(canvas, tr, &cmds, px0, py0);
 }
 
 /// Encode keyboard modifiers into the bits xterm-style SGR mouse
@@ -5595,6 +5570,15 @@ impl ApplicationHandler for App {
         // per-portal engines get their own depth-keyed copy on creation.
         let palette = self.config.style.host_palette(&self.theme);
         vge_engine.seed_host_styles(palette.clone(), 0);
+        // veter's own chrome is drawn by the same style engines, so it
+        // adopts what it publishes, as any client reading the probe
+        // would — the engine, its settings, the colours.
+        if let Some(theme) = palette.to_wire(0) {
+            vge_ui::theme::adopt_host_theme(&theme);
+        }
+        if let Some(accent) = palette.contextual_accent(0) {
+            term_renderer.set_chrome_accent(accent);
+        }
         // PRT engine: top-level scope (depth 0). Limits default to the
         // recommended caps from §12 (64 portals, 1024×512, 100k
         // scrollback, 1MiB writes, depth 8) and feature bits for every
@@ -6163,7 +6147,6 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
-                let accent = self.theme.accent_primary().to_femto();
                 let canvas = self.canvas.as_mut().unwrap();
                 canvas.set_size(size.width, size.height, 1.0);
                 // The window's ground is the terminal's background, so
@@ -6283,7 +6266,6 @@ impl ApplicationHandler for App {
                     draw_close_prompt(
                         canvas,
                         tr,
-                        accent,
                         close_hover,
                         size.width as f32,
                         size.height as f32,

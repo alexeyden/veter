@@ -1703,6 +1703,13 @@ pub struct TerminalRenderer {
     /// built-in default until `set_theme`.
     theme: Theme,
 
+    /// The accent veter publishes at the top level, with its text —
+    /// which under Aero is a gel's, not the theme's (`StyleConfig::
+    /// host_palette`). The chrome's accent, so veter's buttons match
+    /// what every client in it paints. `None` until `set_chrome_accent`,
+    /// and then the theme's own.
+    chrome_accent: Option<(vge::Color, vge::Color)>,
+
     /// The colour table, as OSC 4 / 10 / 11 / 12 have left it.
     pub palette: Palette,
 
@@ -1815,6 +1822,7 @@ impl TerminalRenderer {
             search_match: Color::rgb(80, 80, 30),
             selection_accent: Color::rgb(0x56, 0x79, 0x9f),
             theme: Theme::default(),
+            chrome_accent: None,
             palette: Palette::default(),
             blink_phase: true,
             blink_seen: false,
@@ -1925,6 +1933,31 @@ impl TerminalRenderer {
         self.search_match = theme.search_match().to_femto();
         self.selection_accent = theme.accent_primary().to_femto();
         self.theme = theme;
+    }
+
+    /// The theme's colours for veter's own chrome, as the style engine
+    /// takes them (`vge_ui::style::HostInks`): the engine makes
+    /// materials of them, so the chrome follows `[style]` the way every
+    /// client in the terminal does.
+    pub fn host_inks(&self) -> vge_ui::style::HostInks {
+        let t = &self.theme;
+        let (accent, on_accent) = self.chrome_accent.unwrap_or((
+            t.accent_primary().to_command_color(),
+            t.text_on_accent().to_command_color(),
+        ));
+        vge_ui::style::HostInks {
+            surface: t.surface().to_command_color(),
+            text: t.text().to_command_color(),
+            accent,
+            on_accent,
+            warn_fill: t.warn_fill().to_command_color(),
+            warn_border: t.warn_border().to_command_color(),
+            warn_text: t.warn_text().to_command_color(),
+        }
+    }
+
+    pub fn set_chrome_accent(&mut self, accent: &veter_host::vge::HostSwatch) {
+        self.chrome_accent = Some((accent.fill, accent.text));
     }
 
     /// Background of an overlay panel — the search panel, the close

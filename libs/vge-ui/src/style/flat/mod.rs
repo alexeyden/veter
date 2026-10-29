@@ -5,6 +5,7 @@
 
 mod browser;
 mod doc;
+mod host;
 mod icons;
 mod mux;
 
@@ -12,7 +13,7 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
 
 use super::{
-    DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
+    Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
     StatusLeft, TabBar, TabBarParts, TabbarMetrics,
 };
 use crate::modal::{self, ModalIds, ScrollModal};
@@ -281,6 +282,10 @@ impl Engine for Flat {
         right: &str,
     ) {
         browser::status_bar(cmds, px, area, left, left_kind, right);
+    }
+
+    fn dialog(&self, cmds: &mut Vec<DrawCmd>, px: Px, dialog: &Dialog<'_>) {
+        host::dialog(cmds, px, dialog);
     }
 
     fn prompt(

@@ -251,6 +251,41 @@ pub fn render_elements<T: Renderer>(
     }
 }
 
+/// Paint a list of commands that belong to no element — veter's own
+/// chrome, built by a `vge_ui` style engine — with its cell origin at
+/// `(ox, oy)` device pixels. Through the same `render_cmd` every
+/// element goes through, so the engines' parts look here as they do in
+/// a client; but nothing is indexed for hit-testing, since the chrome
+/// is not VGE content a pointer can select. Colours are literal: there
+/// is no style table or image table behind them.
+pub fn render_chrome<T: Renderer>(
+    canvas: &mut Canvas<T>,
+    renderer: &mut TerminalRenderer,
+    cmds: &[DrawCmd],
+    ox: f32,
+    oy: f32,
+) {
+    let (cell_w, cell_h) = (renderer.cell_width, renderer.cell_height);
+    let stroke_scale = (cell_w + cell_h) * 0.5;
+    let (styles, images) = (HashMap::new(), HashMap::new());
+    for cmd in cmds {
+        render_cmd(
+            canvas,
+            renderer,
+            cmd,
+            &styles,
+            &images,
+            ox,
+            oy,
+            cell_w,
+            cell_h,
+            stroke_scale,
+            1.0,
+            None,
+        );
+    }
+}
+
 /// Render a single top-level element. Used by the §10 unified layer
 /// walker in `prt::render` to interleave VGE elements and portals by
 /// `(draw_order, creation_seq)`.

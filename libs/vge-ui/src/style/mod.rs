@@ -263,6 +263,13 @@ pub trait Engine: Sync {
         right: &str,
     );
 
+    // ── Terminal ──────────────────────────────────────────────────
+
+    /// A modal question over the whole terminal — the host's own close
+    /// confirm — in panel-relative cells: the scrim over
+    /// [`Dialog::screen`], the panel, the title and the buttons.
+    fn dialog(&self, cmds: &mut Vec<DrawCmd>, px: Px, dialog: &Dialog<'_>);
+
     // ── Modals ────────────────────────────────────────────────────
 
     /// A one-line prompt or confirm box, centred on the host. `caret`
@@ -519,6 +526,60 @@ pub enum ListInk {
     },
 }
 
+/// The colours a terminal picked for its own chrome, from its theme.
+/// The host picks them and the engine makes materials of them: flat
+/// paints them as they are, Aero keeps its own glass and takes the
+/// accent and the warning colour as gels.
+#[derive(Clone, Copy, Debug)]
+pub struct HostInks {
+    /// A panel's fill.
+    pub surface: Color,
+    /// Text over [`Self::surface`].
+    pub text: Color,
+    pub accent: Color,
+    /// Text over [`Self::accent`].
+    pub on_accent: Color,
+    /// The warm trio for the answer that gets you nothing: fill,
+    /// outline, text.
+    pub warn_fill: Color,
+    pub warn_border: Color,
+    pub warn_text: Color,
+}
+
+/// What a [`DialogButton`] does, which is what it looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// The safe answer, the one Enter and Esc give.
+    Default,
+    /// The destructive one, which has to be aimed at.
+    Danger,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DialogButton<'a> {
+    /// In panel cells.
+    pub rect: Rect,
+    pub label: &'a str,
+    pub kind: ButtonKind,
+    /// Under the pointer.
+    pub hot: bool,
+}
+
+/// A modal question, laid out by the host: everything in cells,
+/// relative to the panel's top-left corner.
+#[derive(Clone, Copy, Debug)]
+pub struct Dialog<'a> {
+    pub w: f32,
+    pub h: f32,
+    /// The whole terminal, for the scrim — so its origin is negative.
+    pub screen: Rect,
+    pub title: &'a str,
+    /// Top of the title's row, centred across the panel.
+    pub title_y: f32,
+    pub buttons: &'a [DialogButton<'a>],
+    pub inks: &'a HostInks,
+}
+
 /// What the left half of a status line is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StatusLeft {
@@ -696,6 +757,80 @@ pub fn adopt_settings(options: &[(String, String)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both engines paint the dialog veter lays out: the title and
+    /// every button's label, each inside the panel, since veter's own
+    /// hit-test reads the same rects.
+    #[test]
+    fn every_engine_draws_the_dialog_it_is_handed() {
+        let ink = |r| Color {
+            r,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        };
+        let inks = HostInks {
+            surface: ink(0.1),
+            text: ink(0.9),
+            accent: ink(0.3),
+            on_accent: ink(0.0),
+            warn_fill: ink(0.6),
+            warn_border: ink(0.7),
+            warn_text: ink(0.8),
+        };
+        let button = |x, label, kind| DialogButton {
+            rect: Rect {
+                x,
+                y: 3.0,
+                w: 12.0,
+                h: 2.0,
+            },
+            label,
+            kind,
+            hot: false,
+        };
+        let buttons = [
+            button(2.0, "Cancel", ButtonKind::Default),
+            button(16.0, "Quit", ButtonKind::Danger),
+        ];
+        let dialog = Dialog {
+            w: 30.0,
+            h: 7.0,
+            screen: Rect {
+                x: -20.0,
+                y: -10.0,
+                w: 80.0,
+                h: 30.0,
+            },
+            title: "Close?",
+            title_y: 1.0,
+            buttons: &buttons,
+            inks: &inks,
+        };
+        let px = Px { w: 8.0, h: 16.0 };
+        for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+            let mut cmds = Vec::new();
+            engine.dialog(&mut cmds, px, &dialog);
+            let texts: Vec<(&str, Point)> = cmds
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCmd::DrawText { text, origin, .. } => Some((text.as_str(), *origin)),
+                    _ => None,
+                })
+                .collect();
+            for want in ["Close?", "Cancel", "Quit"] {
+                let (_, at) = texts
+                    .iter()
+                    .find(|(t, _)| *t == want)
+                    .unwrap_or_else(|| panic!("{}: no {want}", engine.name()));
+                assert!(
+                    (0.0..dialog.w).contains(&at.x) && (0.0..dialog.h).contains(&at.y),
+                    "{}: {want} at {at:?}",
+                    engine.name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn icon_box_is_square_in_pixels_and_centered() {
