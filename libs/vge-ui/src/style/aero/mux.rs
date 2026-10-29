@@ -294,13 +294,7 @@ fn tab_rim(px: Px, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PathSegment> {
 /// so their overlap darkens toward the tab and fades away from it.
 /// VGE has no blur; this is one, a few pixels wide.
 fn drop_shadow(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
-    for (grow, alpha) in [
-        (5.0, 0.05),
-        (4.0, 0.08),
-        (3.0, 0.12),
-        (2.0, 0.16),
-        (1.0, 0.22),
-    ] {
+    for (grow, alpha) in [(4.0, 0.04), (3.0, 0.07), (2.0, 0.11), (1.0, 0.16)] {
         let r = TAB_R + grow;
         let (gx, gy) = (px.x(grow), px.y(grow));
         cmds.push(DrawCmd::FillPath {
