@@ -1689,6 +1689,11 @@ pub struct TerminalRenderer {
     /// Text on a [`Self::search_accent`]-filled chip, picked against
     /// that accent rather than the theme's primary one.
     search_on_accent: Color,
+    /// Whether the search accent is one of its own — `[search] accent`,
+    /// or a theme that pins one — rather than the theme's primary. Only
+    /// then does the panel's style engine get it in place of the
+    /// accent veter publishes (`host_inks`), which under Aero is a gel.
+    search_accent_own: bool,
     search_bar_text: Color,
     search_current_match: Color,
     search_match: Color,
@@ -1817,6 +1822,7 @@ impl TerminalRenderer {
             pick: crate::vge::pick::PickList::new(),
             search_accent: Color::rgb(0x56, 0x79, 0x9f),
             search_on_accent: Color::rgb(0xf5, 0xf5, 0xf5),
+            search_accent_own: false,
             search_bar_text: Color::rgb(230, 230, 230),
             search_current_match: Color::rgb(220, 160, 0),
             search_match: Color::rgb(80, 80, 30),
@@ -1928,6 +1934,7 @@ impl TerminalRenderer {
         self.search_on_accent = theme
             .text_on_search_accent(theme.search_accent())
             .to_femto();
+        self.search_accent_own = theme.search_accent() != theme.accent_primary();
         self.search_bar_text = theme.search_text().to_femto();
         self.search_current_match = theme.search_current_match().to_femto();
         self.search_match = theme.search_match().to_femto();
@@ -1947,6 +1954,7 @@ impl TerminalRenderer {
         ));
         vge_ui::style::HostInks {
             surface: t.surface().to_command_color(),
+            surface_inset: t.surface_inset().to_command_color(),
             text: t.text().to_command_color(),
             accent,
             on_accent,
@@ -1956,41 +1964,20 @@ impl TerminalRenderer {
         }
     }
 
+    /// [`Self::host_inks`] for the search panel: `[search]`'s text, and
+    /// its accent when it has one of its own.
+    pub fn search_inks(&self) -> vge_ui::style::HostInks {
+        let mut inks = self.host_inks();
+        inks.text = femto_to_command(self.search_bar_text);
+        if self.search_accent_own {
+            inks.accent = femto_to_command(self.search_accent);
+            inks.on_accent = femto_to_command(self.search_on_accent);
+        }
+        inks
+    }
+
     pub fn set_chrome_accent(&mut self, accent: &veter_host::vge::HostSwatch) {
         self.chrome_accent = Some((accent.fill, accent.text));
-    }
-
-    /// Background of an overlay panel — the search panel, the close
-    /// prompt.
-    pub fn panel_bg(&self) -> Color {
-        self.theme.surface().to_femto()
-    }
-
-    /// A recessed surface inside a panel: the query field, and a chip
-    /// that is switched off.
-    pub fn panel_inset_bg(&self) -> Color {
-        self.theme.surface_inset().to_femto()
-    }
-
-    /// Primary text on [`Self::panel_bg`].
-    pub fn panel_text(&self) -> Color {
-        self.theme.text().to_femto()
-    }
-
-    /// Text on an accent-filled chip or button.
-    pub fn on_accent_text(&self) -> Color {
-        self.theme.text_on_accent().to_femto()
-    }
-
-    /// The warm trio — fill, outline, text — for the answer that gets
-    /// you nothing: the prompt's Quit button, the search panel's
-    /// `no matches`.
-    pub fn warn_colors(&self) -> (Color, Color, Color) {
-        (
-            self.theme.warn_fill().to_femto(),
-            self.theme.warn_border().to_femto(),
-            self.theme.warn_text().to_femto(),
-        )
     }
 
     pub fn set_selection_accent(&mut self, accent: Color) {
@@ -2012,28 +1999,11 @@ impl TerminalRenderer {
         other_match: Color,
     ) {
         self.search_accent = accent.to_femto();
+        self.search_accent_own = accent != self.theme.accent_primary();
         self.search_on_accent = self.theme.text_on_search_accent(accent).to_femto();
         self.search_bar_text = bar_text;
         self.search_current_match = current_match;
         self.search_match = other_match;
-    }
-
-    /// Accent tint for the search panel's chrome — its border, the caret
-    /// and the chip fills (`draw_search_bar`). Defaults to the first
-    /// theme accent, so a palette change restyles the panel;
-    /// `[search] accent` overrides it.
-    pub fn search_accent(&self) -> Color {
-        self.search_accent
-    }
-
-    /// Text on a chip filled with [`Self::search_accent`].
-    pub fn search_on_accent_text(&self) -> Color {
-        self.search_on_accent
-    }
-
-    /// Search-bar text color (for `draw_search_bar`).
-    pub fn search_bar_text(&self) -> Color {
-        self.search_bar_text
     }
 
     /// Colour of the active match in the grid. The search panel's match
@@ -3080,6 +3050,17 @@ impl TerminalRenderer {
     }
 }
 
+/// A femtovg colour as a VGE one, for chrome colours the renderer holds
+/// in femtovg's form.
+fn femto_to_command(c: Color) -> vge::Color {
+    vge::Color {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
+    }
+}
+
 #[cfg(test)]
 mod palette_tests {
     use super::*;
@@ -3673,4 +3654,3 @@ mod font_fallback_tests {
         assert!(pua.is_empty());
     }
 }
-

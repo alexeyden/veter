@@ -14,7 +14,7 @@ use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
 
 use super::{
     Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics, PaneChrome,
-    StatusLeft, TabBar, TabBarParts, TabbarMetrics,
+    SearchPanel, StatusLeft, TabBar, TabBarParts, TabbarMetrics,
 };
 use crate::modal::{self, ModalIds, ScrollModal};
 use crate::paint::Px;
@@ -286,6 +286,10 @@ impl Engine for Flat {
 
     fn dialog(&self, cmds: &mut Vec<DrawCmd>, px: Px, dialog: &Dialog<'_>) {
         host::dialog(cmds, px, dialog);
+    }
+
+    fn search_panel(&self, cmds: &mut Vec<DrawCmd>, px: Px, panel: &SearchPanel<'_>) {
+        host::search_panel(cmds, px, panel);
     }
 
     fn prompt(

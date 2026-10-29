@@ -1617,47 +1617,21 @@ impl FrameTrace {
 // ---------------------------------------------------------------------------
 //
 // The host draws two overlays of its own — the search panel and the
-// close-confirmation prompt — and they share a look: a dark rounded
-// panel with a 2px accent border, holding rounded chips. Only the accent
-// comes from the user (`[theme] accents`, or `[search] accent` for the search
-// panel), which is what makes both follow a palette change.
-
-/// Blend `color` toward white by `amount` (`0.0`..=`1.0`).
-fn lighten(color: Color, amount: f32) -> Color {
-    Color::rgbaf(
-        color.r + (1.0 - color.r) * amount,
-        color.g + (1.0 - color.g) * amount,
-        color.b + (1.0 - color.b) * amount,
-        color.a,
-    )
-}
-
-/// Blend `from` toward `to` by `amount` (`0.0`..=`1.0`).
-fn mix(from: Color, to: Color, amount: f32) -> Color {
-    Color::rgbaf(
-        from.r + (to.r - from.r) * amount,
-        from.g + (to.g - from.g) * amount,
-        from.b + (to.b - from.b) * amount,
-        from.a + (to.a - from.a) * amount,
-    )
-}
-
-/// `color` at `alpha` of its opacity, for dimmed secondary text.
-fn fade(color: Color, alpha: f32) -> Color {
-    Color::rgbaf(color.r, color.g, color.b, color.a * alpha)
-}
+// close-confirmation prompt. veter lays them out and keeps their
+// hit-testing; the style engine `[style]` names paints them
+// (`Engine::search_panel`, `Engine::dialog`) from the theme's colours
+// (`TerminalRenderer::host_inks` / `search_inks`), so they follow both
+// the engine and a palette change.
 
 /// Ghost text in an empty query field. Its length is the field's
 /// minimum width, so the field is never too narrow to show it.
 const SEARCH_PLACEHOLDER: &str = "type to search";
 
 /// One rounded pill inside the search panel — the match counter, the
-/// case toggle. `border` is `None` on a filled chip.
+/// case toggle. What it reports is what the style engine draws it as.
 struct Chip {
     label: String,
-    fill: Color,
-    border: Option<Color>,
-    text: Color,
+    kind: vge_ui::style::ChipKind,
 }
 
 /// Render the search panel, floating above the bottom edge of the window.
@@ -1684,14 +1658,6 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let cell_w = tr.cell_width;
     let cell_h = tr.cell_height;
     let ascent = tr.ascent();
-    let accent = tr.search_accent();
-    let text_color = tr.search_bar_text();
-    // The panel's own surfaces, from the theme (`renderer::TerminalRenderer`
-    // chrome accessors). Read once here so the borrow of `tr` never
-    // overlaps the draw calls below.
-    let panel_bg = tr.panel_bg();
-    let panel_inset_bg = tr.panel_inset_bg();
-    let on_accent_text = tr.search_on_accent_text();
 
     // Sized in cells, like the close prompt, so the panel keeps its
     // proportions across font sizes and HiDPI scales.
@@ -1699,8 +1665,6 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let gap = cell_w;
     let chip_h = (cell_h * 1.6).round();
     let panel_h = (chip_h + cell_h).round();
-    let radius = cell_h * 0.5;
-    let chip_radius = radius * 0.6;
     let text_w = |s: &str| s.chars().count() as f32 * cell_w;
     let chip_w = |s: &str| (text_w(s) + cell_w * 1.5).round();
 
@@ -1720,19 +1684,12 @@ fn draw_search_bar<T: femtovg::Renderer>(
             } else {
                 format!("{}/{}", search.current + 1, search.matches.len())
             },
-            fill: mix(panel_bg, accent, 0.3),
-            border: None,
-            // The counter is drawn in the current-match colour, so the
-            // number and the highlight it points at agree on screen.
-            text: tr.search_current_match(),
+            kind: vge_ui::style::ChipKind::Counter,
         });
     } else if hints_mode || !search.query.is_empty() {
-        let (fill, border, text) = tr.warn_colors();
         chips.push(Chip {
             label: if hints_mode { "no hints" } else { "no matches" }.to_string(),
-            fill,
-            border: Some(border),
-            text,
+            kind: vge_ui::style::ChipKind::Warn,
         });
     }
     // Case toggle: lit when matching is case-*sensitive*, since that is
@@ -1740,20 +1697,11 @@ fn draw_search_bar<T: femtovg::Renderer>(
     // insensitive is the default). Nothing to fold in hint mode, so the
     // chip would only be a dead control.
     if !hints_mode {
-        chips.push(if search.case_insensitive {
-            Chip {
-                label: "Aa".to_string(),
-                fill: panel_inset_bg,
-                border: Some(fade(text_color, 0.22)),
-                text: fade(text_color, 0.5),
-            }
-        } else {
-            Chip {
-                label: "Aa".to_string(),
-                fill: accent,
-                border: None,
-                text: on_accent_text,
-            }
+        chips.push(Chip {
+            label: "Aa".to_string(),
+            kind: vge_ui::style::ChipKind::Toggle {
+                on: !search.case_insensitive,
+            },
         });
     }
 
@@ -1826,40 +1774,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
     let row_y = panel_y + (panel_h - chip_h) * 0.5;
     let row_baseline = baseline(row_y, chip_h);
 
-    // Soft drop shadow. The close prompt separates itself from the grid
-    // with a scrim, which this panel must not do — the whole point is
-    // to keep the matches readable — so it lifts off the grid with a
-    // shadow instead: nested rounded rects, largest and faintest first.
-    for step in (1..=3).rev() {
-        let grow = step as f32 * 2.0;
-        let mut path = femtovg::Path::new();
-        path.rounded_rect(
-            panel_x - grow,
-            panel_y - grow + 2.0,
-            panel_w + grow * 2.0,
-            panel_h + grow * 2.0,
-            radius + grow,
-        );
-        canvas.fill_path(&path, &femtovg::Paint::color(Color::rgbaf(0.0, 0.0, 0.0, 0.1)));
-    }
-
-    let mut panel = femtovg::Path::new();
-    panel.rounded_rect(panel_x, panel_y, panel_w, panel_h, radius);
-    canvas.fill_path(&panel, &femtovg::Paint::color(panel_bg));
-    let mut border = femtovg::Paint::color(accent);
-    border.set_line_width(2.0);
-    canvas.stroke_path(&panel, &border);
-
-    // The query field, recessed so it reads as something you type into.
-    // Hint mode leaves it flat: there is nothing to type, and a recessed
-    // box that ignores the keyboard would be a lie.
     let field_x = panel_x + pad_x;
-    if !hints_mode {
-        let mut field = femtovg::Path::new();
-        field.rounded_rect(field_x, row_y, field_w, chip_h, chip_radius);
-        canvas.fill_path(&field, &femtovg::Paint::color(panel_inset_bg));
-    }
-
     let inner_x = field_x + cell_w * 0.5;
     let budget = (((field_w - cell_w) / cell_w).floor() as usize)
         .saturating_sub(1)
@@ -1882,93 +1797,88 @@ fn draw_search_bar<T: femtovg::Renderer>(
             .collect()
     };
     let caret_w = (cell_w * 0.15).max(2.0);
+    // Panel-relative cells, which is what the engine draws in.
+    let cells = |x: f32, y: f32, w: f32, h: f32| vge::codec::Rect {
+        x: (x - panel_x) / cell_w,
+        y: (y - panel_y) / cell_h,
+        w: w / cell_w,
+        h: h / cell_h,
+    };
+    let cx = |x: f32| (x - panel_x) / cell_w;
     // An empty field shows the placeholder, nudged past the caret so the
     // two don't sit on the same pixels; it is dropped rather than
     // clipped if the field ends up narrower than it (a tiny window).
-    if shown.is_empty() {
-        if SEARCH_PLACEHOLDER.chars().count() <= budget {
-            tr.draw_vge_text(
-                canvas,
-                inner_x + caret_w * 2.0,
-                row_baseline,
+    let text = if shown.is_empty() {
+        (SEARCH_PLACEHOLDER.chars().count() <= budget).then(|| {
+            (
+                cx(inner_x + caret_w * 2.0),
                 SEARCH_PLACEHOLDER,
-                fade(text_color, 0.32),
-                vge::command::Align::Left,
-                vge::command::FontStyle::default(),
-                1.0,
-            );
-        }
+                vge_ui::style::FieldText::Placeholder,
+            )
+        })
+    } else if hints_mode {
+        Some((cx(inner_x), shown.as_str(), vge_ui::style::FieldText::Label))
     } else {
-        tr.draw_vge_text(
-            canvas,
-            inner_x,
-            row_baseline,
-            &shown,
-            if hints_mode {
-                fade(text_color, 0.75)
-            } else {
-                text_color
-            },
-            vge::command::Align::Left,
-            vge::command::FontStyle::default(),
-            1.0,
-        );
-    }
-
+        Some((cx(inner_x), shown.as_str(), vge_ui::style::FieldText::Query))
+    };
     // Caret: only while the query is being typed. In navigation mode
     // there is nothing to type into, and its absence is the cue.
-    if search.editing {
+    let caret = search.editing.then(|| {
         let caret_h = cell_h * 0.9;
-        let mut caret = femtovg::Path::new();
-        caret.rounded_rect(
+        cells(
             inner_x + text_w(&shown),
             panel_y + (panel_h - caret_h) * 0.5,
             caret_w,
             caret_h,
-            caret_w * 0.5,
-        );
-        canvas.fill_path(&caret, &femtovg::Paint::color(lighten(accent, 0.35)));
-    }
+        )
+    });
 
     // Hint, then the chips, laid out from the panel's right edge back.
     let mut x = panel_x + panel_w - pad_x;
-    if show_hint {
-        x -= text_w(hint);
-        tr.draw_vge_text(
-            canvas,
-            x,
-            row_baseline,
-            hint,
-            fade(text_color, 0.4),
-            vge::command::Align::Left,
-            vge::command::FontStyle::default(),
-            1.0,
-        );
-        x -= gap;
-    }
+    let hint = show_hint.then(|| {
+        x -= text_w(hint) + gap;
+        (cx(x + gap), hint)
+    });
+    let mut chip_parts = Vec::with_capacity(chips.len());
     for chip in chips.iter().rev() {
         let w = chip_w(&chip.label);
         x -= w;
-        let mut path = femtovg::Path::new();
-        path.rounded_rect(x, row_y, w, chip_h, chip_radius);
-        canvas.fill_path(&path, &femtovg::Paint::color(chip.fill));
-        if let Some(color) = chip.border {
-            let mut stroke = femtovg::Paint::color(color);
-            stroke.set_line_width(1.0);
-            canvas.stroke_path(&path, &stroke);
-        }
-        tr.draw_vge_text(
-            canvas,
-            x + w * 0.5,
-            row_baseline,
-            &chip.label,
-            chip.text,
-            vge::command::Align::Center,
-            vge::command::FontStyle::default(),
-            1.0,
-        );
+        chip_parts.push(vge_ui::style::SearchChip {
+            rect: cells(x, row_y, w, chip_h),
+            label: &chip.label,
+            kind: chip.kind,
+        });
         x -= gap;
     }
+
+    let inks = tr.search_inks();
+    let current_match = tr.search_current_match();
+    let panel = vge_ui::style::SearchPanel {
+        w: panel_w / cell_w,
+        h: panel_h / cell_h,
+        field: cells(field_x, row_y, field_w, chip_h),
+        text,
+        // Every label centres one line in the row as the prompt's
+        // buttons do: on the font's ascent.
+        text_y: (row_baseline - ascent - panel_y) / cell_h,
+        caret,
+        hint,
+        chips: &chip_parts,
+        current_match: vge::Color {
+            r: current_match.r,
+            g: current_match.g,
+            b: current_match.b,
+            a: current_match.a,
+        },
+        inks: &inks,
+    };
+    let px = vge_ui::paint::Px {
+        w: cell_w,
+        h: cell_h,
+    };
+    let mut cmds = Vec::new();
+    vge_ui::style::engine().search_panel(&mut cmds, px, &panel);
+    vge::render::render_chrome(canvas, tr, &cmds, panel_x, panel_y);
 }
 
 /// Draw the flash-style jump labels at the end of each labelled match's

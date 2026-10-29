@@ -270,6 +270,11 @@ pub trait Engine: Sync {
     /// [`Dialog::screen`], the panel, the title and the buttons.
     fn dialog(&self, cmds: &mut Vec<DrawCmd>, px: Px, dialog: &Dialog<'_>);
 
+    /// The host's search panel, floating over the grid, in panel-relative
+    /// cells: the panel, the query field, its text and caret, the key
+    /// hint and the chips.
+    fn search_panel(&self, cmds: &mut Vec<DrawCmd>, px: Px, panel: &SearchPanel<'_>);
+
     // ── Modals ────────────────────────────────────────────────────
 
     /// A one-line prompt or confirm box, centred on the host. `caret`
@@ -534,6 +539,8 @@ pub enum ListInk {
 pub struct HostInks {
     /// A panel's fill.
     pub surface: Color,
+    /// A recessed surface inside a panel: a text field.
+    pub surface_inset: Color,
     /// Text over [`Self::surface`].
     pub text: Color,
     pub accent: Color,
@@ -577,6 +584,60 @@ pub struct Dialog<'a> {
     /// Top of the title's row, centred across the panel.
     pub title_y: f32,
     pub buttons: &'a [DialogButton<'a>],
+    pub inks: &'a HostInks,
+}
+
+/// What a [`SearchChip`] reports, which is what it looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipKind {
+    /// How many matches, and which is current.
+    Counter,
+    /// Nothing matched.
+    Warn,
+    /// A switch, lit when `on`.
+    Toggle { on: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SearchChip<'a> {
+    /// In panel cells.
+    pub rect: Rect,
+    pub label: &'a str,
+    pub kind: ChipKind,
+}
+
+/// What the query field is holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldText {
+    /// What the user typed.
+    Query,
+    /// Ghost text in an empty field.
+    Placeholder,
+    /// A label in place of a query, in a mode with nothing to type —
+    /// the field is then drawn flat, not recessed.
+    Label,
+}
+
+/// The host's search panel, laid out by the host: everything in cells,
+/// relative to the panel's top-left corner.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchPanel<'a> {
+    pub w: f32,
+    pub h: f32,
+    /// The query field. Its content says whether it is recessed.
+    pub field: Rect,
+    /// What the field shows (already fitted), from where, and what it is.
+    pub text: Option<(f32, &'a str, FieldText)>,
+    /// Top of the text row every label sits on — the field's, the
+    /// hint's, the chips'.
+    pub text_y: f32,
+    pub caret: Option<Rect>,
+    /// The key hint, left-aligned at its x.
+    pub hint: Option<(f32, &'a str)>,
+    pub chips: &'a [SearchChip<'a>],
+    /// The colour of the current match in the grid, which the counter
+    /// is drawn in so the two agree on screen.
+    pub current_match: Color,
     pub inks: &'a HostInks,
 }
 
@@ -761,23 +822,102 @@ mod tests {
     /// Both engines paint the dialog veter lays out: the title and
     /// every button's label, each inside the panel, since veter's own
     /// hit-test reads the same rects.
-    #[test]
-    fn every_engine_draws_the_dialog_it_is_handed() {
+    fn test_inks() -> HostInks {
         let ink = |r| Color {
             r,
             g: 0.5,
             b: 0.5,
             a: 1.0,
         };
-        let inks = HostInks {
+        HostInks {
             surface: ink(0.1),
+            surface_inset: ink(0.2),
             text: ink(0.9),
             accent: ink(0.3),
             on_accent: ink(0.0),
             warn_fill: ink(0.6),
             warn_border: ink(0.7),
             warn_text: ink(0.8),
+        }
+    }
+
+    fn texts(cmds: &[DrawCmd]) -> Vec<(&str, Point)> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                DrawCmd::DrawText { text, origin, .. } => Some((text.as_str(), *origin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every label of the search panel, in every state a chip and the
+    /// field can be in, lands inside the panel under both engines.
+    #[test]
+    fn every_engine_draws_the_search_panel_it_is_handed() {
+        let inks = test_inks();
+        let chip = |x, label, kind| SearchChip {
+            rect: Rect {
+                x,
+                y: 0.2,
+                w: 4.0,
+                h: 1.6,
+            },
+            label,
+            kind,
         };
+        let chips = [
+            chip(20.0, "3/9", ChipKind::Counter),
+            chip(25.0, "none", ChipKind::Warn),
+            chip(30.0, "Aa", ChipKind::Toggle { on: true }),
+            chip(35.0, "aA", ChipKind::Toggle { on: false }),
+        ];
+        let field = Rect {
+            x: 1.0,
+            y: 0.2,
+            w: 18.0,
+            h: 1.6,
+        };
+        let px = Px { w: 8.0, h: 16.0 };
+        for kind in [FieldText::Query, FieldText::Placeholder, FieldText::Label] {
+            let panel = SearchPanel {
+                w: 50.0,
+                h: 2.0,
+                field,
+                text: Some((1.5, "query", kind)),
+                text_y: 0.5,
+                caret: (kind == FieldText::Query).then_some(Rect {
+                    x: 6.5,
+                    y: 0.1,
+                    w: 0.2,
+                    h: 1.8,
+                }),
+                hint: Some((40.0, "Enter")),
+                chips: &chips,
+                current_match: inks.accent,
+                inks: &inks,
+            };
+            for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+                let mut cmds = Vec::new();
+                engine.search_panel(&mut cmds, px, &panel);
+                let texts = texts(&cmds);
+                for want in ["query", "Enter", "3/9", "none", "Aa", "aA"] {
+                    let (_, at) = texts
+                        .iter()
+                        .find(|(t, _)| *t == want)
+                        .unwrap_or_else(|| panic!("{} {kind:?}: no {want}", engine.name()));
+                    assert!(
+                        (0.0..panel.w).contains(&at.x) && (0.0..panel.h).contains(&at.y),
+                        "{} {kind:?}: {want} at {at:?}",
+                        engine.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_engine_draws_the_dialog_it_is_handed() {
+        let inks = test_inks();
         let button = |x, label, kind| DialogButton {
             rect: Rect {
                 x,
@@ -811,13 +951,7 @@ mod tests {
         for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
             let mut cmds = Vec::new();
             engine.dialog(&mut cmds, px, &dialog);
-            let texts: Vec<(&str, Point)> = cmds
-                .iter()
-                .filter_map(|c| match c {
-                    DrawCmd::DrawText { text, origin, .. } => Some((text.as_str(), *origin)),
-                    _ => None,
-                })
-                .collect();
+            let texts = texts(&cmds);
             for want in ["Close?", "Cancel", "Quit"] {
                 let (_, at) = texts
                     .iter()
