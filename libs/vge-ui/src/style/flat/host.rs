@@ -180,24 +180,15 @@ pub(super) fn jump_label(
     text(cmds, x, y, Align::Left, s, ink);
 }
 
-/// A slim white thumb: it has to read over whatever the grid holds.
+/// A slim thumb in the terminal's foreground, faded
+/// ([`crate::theme::scrollbar`]) — it has to read over whatever the grid
+/// holds, on a light scheme as on a dark one, which plain white did not.
 pub(super) fn scroll_thumb(cmds: &mut Vec<DrawCmd>, px: Px, thumb: Rect) {
     let Rect { x, y, w, h } = thumb;
+    let r = 3.0 * crate::style::settings().rounding;
     cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(Color {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 90.0 / 255.0,
-        }),
-        segments: rr(
-            px,
-            x,
-            y,
-            x + w,
-            y + h,
-            3.0 * crate::style::settings().rounding,
-        ),
+        fill: Style::Flat(crate::theme::scrollbar()),
+        segments: rr(px, x, y, x + w, y + h, r),
     });
 }
 
