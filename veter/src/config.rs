@@ -114,6 +114,35 @@ pub struct FontConfig {
     /// Symbols Nerd Font Mono advances 32px — and has to be scaled down
     /// to fit, which leaves its icons noticeably short.
     pub fallback: Vec<String>,
+    /// Size in points, as other terminals and toolkits give it: a point
+    /// is 4/3 of a logical pixel, and the output's scale factor
+    /// multiplies that. The default, 12, is the 16px veter has always
+    /// drawn at scale 1.
+    pub size: f32,
+}
+
+impl FontConfig {
+    pub const DEFAULT_SIZE: f32 = 12.0;
+    pub const MIN_SIZE: f32 = 4.0;
+    pub const MAX_SIZE: f32 = 128.0;
+
+    /// The font size in logical pixels — what a window at scale 1
+    /// draws with. An unusable `size` is reported and replaced: a
+    /// non-number by the default, anything else clamped into range.
+    pub fn size_px(&self) -> f32 {
+        let pt = if self.size.is_finite() {
+            self.size.clamp(Self::MIN_SIZE, Self::MAX_SIZE)
+        } else {
+            Self::DEFAULT_SIZE
+        };
+        if pt != self.size {
+            eprintln!(
+                "veter: config: [font] size {} is out of range; using {}",
+                self.size, pt
+            );
+        }
+        pt * 4.0 / 3.0
+    }
 }
 
 impl Default for FontConfig {
@@ -121,6 +150,7 @@ impl Default for FontConfig {
         Self {
             family: "monospace".into(),
             fallback: Vec::new(),
+            size: Self::DEFAULT_SIZE,
         }
     }
 }
@@ -1280,6 +1310,19 @@ mod tests {
             wild.style.settings().glass,
             vge_ui::style::Settings::MAX_GLASS
         );
+    }
+
+    /// `[font] size` is in points — 12, the default, is the 16px veter
+    /// always drew — and an unusable one falls back rather than
+    /// failing to start.
+    #[test]
+    fn font_size_is_points() {
+        assert_eq!(Config::default().font.size_px(), 16.0);
+        let px = |toml: &str| toml::from_str::<Config>(toml).unwrap().font.size_px();
+        assert_eq!(px("[font]\nsize = 9\n"), 12.0);
+        assert_eq!(px("[font]\nsize = 10.5\n"), 14.0);
+        assert_eq!(px("[font]\nsize = 0.5\n"), FontConfig::MIN_SIZE * 4.0 / 3.0);
+        assert_eq!(px("[font]\nsize = nan\n"), 16.0);
     }
 
     /// `[style.aero] accents` takes names and hex alike, and skips what

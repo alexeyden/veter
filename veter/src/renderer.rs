@@ -1735,7 +1735,50 @@ pub struct TerminalRenderer {
     styled_faces: [Option<Option<u16>>; 4],
 }
 
+/// The cell a face makes at `font_size` pixels: the advance of `M`
+/// wide, ascent plus descent high — matching Konsole / kitty /
+/// alacritty, which leave out the font-supplied leading; including it
+/// widens line spacing visibly versus what users expect from a
+/// terminal. Returns `(width, height, ascent)`.
+fn cell_metrics(font_ref: FontRef<'_>, font_size: f32) -> (f32, f32, f32) {
+    let metrics = font_ref.metrics(&[]).scale(font_size);
+    let glyph_metrics = font_ref.glyph_metrics(&[]).scale(font_size);
+    let m_glyph = font_ref.charmap().map('M');
+    (
+        glyph_metrics.advance_width(m_glyph).ceil(),
+        (metrics.ascent + metrics.descent).ceil(),
+        metrics.ascent,
+    )
+}
+
 impl TerminalRenderer {
+    /// Re-measure the cell for a new font size — the window's scale
+    /// factor changed. Glyphs are cached per size, so nothing has to be
+    /// flushed; the old size's entries simply stop being asked for.
+    pub fn set_font_size(&mut self, font_size: f32) {
+        if font_size == self.font_size {
+            return;
+        }
+        match FontRef::from_index(&self.font_data, self.font_index) {
+            Some(font_ref) => {
+                (self.cell_width, self.cell_height, self.ascent) =
+                    cell_metrics(font_ref, font_size);
+            }
+            // No primary face was found at startup, and the cell is the
+            // same guess `new` made.
+            None => {
+                self.cell_width = (font_size * 0.6).ceil();
+                self.cell_height = (font_size * 1.2).ceil();
+                self.ascent = font_size;
+            }
+        }
+        self.font_size = font_size;
+        eprintln!(
+            "Font: rescaled to size={} cell={}x{}",
+            font_size, self.cell_width, self.cell_height
+        );
+    }
+
     pub fn new<T: Renderer>(
         _canvas: &mut Canvas<T>,
         font_size: f32,
@@ -1776,17 +1819,7 @@ impl TerminalRenderer {
             font_index = font.index as usize;
 
             let font_ref = FontRef::from_index(&font_data, font_index).unwrap();
-            let metrics = font_ref.metrics(&[]).scale(font_size);
-            ascent = metrics.ascent;
-            // Match Konsole / kitty / alacritty: cell height excludes
-            // font-supplied leading. Including leading widens line
-            // spacing visibly versus what users expect from a terminal.
-            cell_height = (metrics.ascent + metrics.descent).ceil();
-
-            let glyph_metrics = font_ref.glyph_metrics(&[]).scale(font_size);
-            let charmap = font_ref.charmap();
-            let m_glyph = charmap.map('M');
-            cell_width = glyph_metrics.advance_width(m_glyph).ceil();
+            (cell_width, cell_height, ascent) = cell_metrics(font_ref, font_size);
 
             if let Some(name) = font_ref
                 .localized_strings()

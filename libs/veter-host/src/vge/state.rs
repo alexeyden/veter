@@ -1017,7 +1017,6 @@ impl VgeEngine {
     }
 
     /// Update reported cell pixel dimensions (e.g. on resize/HiDPI change).
-    #[allow(dead_code)]
     pub fn set_dimensions(&mut self, cell_px: (u16, u16), scale_factor: f32) {
         self.cell_px = cell_px;
         self.scale_factor = scale_factor;

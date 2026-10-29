@@ -44,6 +44,7 @@ const APP_NAME: &str = "Veter";
 /// OSC 2 doesn't reach the compositor.
 const MAX_TITLE_CHARS: usize = 256;
 
+
 /// Clean a child-supplied window title: drop control characters (a
 /// title lands in the compositor's UI, not a terminal grid) and clamp
 /// the length. An all-control or empty title comes back empty, which
@@ -942,6 +943,9 @@ struct App {
     /// search-chrome colors, host key chords, selection commands).
     /// Missing file / parse error → built-in defaults; see `config.rs`.
     config: config::Config,
+    /// `[font] size` in logical pixels, resolved (and any complaint
+    /// about it logged) once; the scale factor multiplies it.
+    font_px: f32,
     /// The colour theme resolved from `[theme]` once at startup —
     /// built-in name, user file under `themes/`, and the section's own
     /// per-key overrides, all folded together. The renderer holds its
@@ -1317,6 +1321,7 @@ fn assign_jump_labels(
 }
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// In logical pixels, so a pointer at 2x travels as far on screen.
 const DOUBLE_CLICK_RADIUS_PX: f64 = 6.0;
 
 /// How long one `App::process_pty_output` pass may spend absorbing PTY
@@ -2382,8 +2387,10 @@ impl App {
         let keys = config.key_bindings();
         let hint_config = config.hint_config();
         let theme = config.theme();
+        let font_px = config.font.size_px();
         Self {
             theme,
+            font_px,
             window: None,
             gl_surface: None,
             gl_context: None,
@@ -3100,6 +3107,78 @@ impl App {
     /// using `(draw_order, creation_seq)` to match the render ordering
     /// — i.e. the visually-topmost portal under the cursor wins.
     /// Falls back to `Host` if no portal contains the pointer.
+    /// Fit the grid to a window of `size` physical pixels: the GL
+    /// surface, the vt100 screen and the pty's winsize, in cells of
+    /// whatever size the renderer is measuring now.
+    fn apply_window_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context) {
+            surface.resize(
+                context,
+                NonZeroU32::new(size.width.max(1)).unwrap(),
+                NonZeroU32::new(size.height.max(1)).unwrap(),
+            );
+        }
+        if let Some(tr) = &self.term_renderer {
+            let (cols, rows) = tr.terminal_size(size.width, size.height);
+            if let Some(parser) = &mut self.parser {
+                parser.screen_mut().set_size(rows, cols);
+                // A vertical resize moves the live screen
+                // relative to scrollback (xterm-style push/
+                // pull); re-read the engines' line origins now
+                // rather than waiting for the next PTY chunk,
+                // or anchored elements/portals render shifted
+                // until the shell redraws.
+                if let Some(prt) = &mut self.prt {
+                    prt.after_vt100_process(parser);
+                }
+                if let Some(vge) = &mut self.vge {
+                    vge.after_vt100_process(parser);
+                }
+            }
+            if let Some(pty) = &self.pty {
+                pty.resize(rows, cols, (
+                    tr.cell_width.round() as u16,
+                    tr.cell_height.round() as u16,
+                ));
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// The window's scale factor changed: the font is `[font] size`
+    /// in logical pixels, so the cell is re-measured, every
+    /// engine at every depth learns its new pixel size, and the grid is
+    /// refitted — the same window holds a different number of cells.
+    /// VGE content is laid out in cells and follows by itself.
+    fn apply_scale_factor(&mut self, scale: f32) {
+        let Some(tr) = &mut self.term_renderer else {
+            return;
+        };
+        tr.set_font_size(self.font_px * scale);
+        let cell_px = (
+            tr.cell_width.round() as u16,
+            tr.cell_height.round() as u16,
+        );
+        if let Some(vge) = &mut self.vge {
+            vge.set_dimensions(cell_px, scale);
+        }
+        if let Some(prt) = &mut self.prt {
+            prt.rescale(cell_px, scale);
+        }
+        if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
+            self.apply_window_size(size);
+        }
+    }
+
+    /// [`DOUBLE_CLICK_RADIUS_PX`] in the physical pixels pointer
+    /// positions arrive in.
+    fn click_radius(&self) -> f64 {
+        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+        DOUBLE_CLICK_RADIUS_PX * scale
+    }
+
     fn hit_test_target(&self, pos: winit::dpi::PhysicalPosition<f64>) -> SelectionTarget {
         let (Some(prt), Some(parser), Some(tr)) =
             (self.prt.as_ref(), self.parser.as_ref(), self.term_renderer.as_ref())
@@ -5423,7 +5502,7 @@ impl ApplicationHandler for App {
         canvas.set_size(size.width, size.height, 1.0);
 
         // Initialize terminal renderer and measure cell dimensions
-        let font_size = 16.0 * window.scale_factor() as f32;
+        let font_size = self.font_px * window.scale_factor() as f32;
         let mut term_renderer = renderer::TerminalRenderer::new(
             &mut canvas,
             font_size,
@@ -5566,41 +5645,13 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::Resized(size) => {
-                if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context) {
-                    surface.resize(
-                        context,
-                        NonZeroU32::new(size.width.max(1)).unwrap(),
-                        NonZeroU32::new(size.height.max(1)).unwrap(),
-                    );
-                }
-                if let Some(tr) = &self.term_renderer {
-                    let (cols, rows) = tr.terminal_size(size.width, size.height);
-                    if let Some(parser) = &mut self.parser {
-                        parser.screen_mut().set_size(rows, cols);
-                        // A vertical resize moves the live screen
-                        // relative to scrollback (xterm-style push/
-                        // pull); re-read the engines' line origins now
-                        // rather than waiting for the next PTY chunk,
-                        // or anchored elements/portals render shifted
-                        // until the shell redraws.
-                        if let Some(prt) = &mut self.prt {
-                            prt.after_vt100_process(parser);
-                        }
-                        if let Some(vge) = &mut self.vge {
-                            vge.after_vt100_process(parser);
-                        }
-                    }
-                    if let Some(pty) = &self.pty {
-                        pty.resize(rows, cols, (
-                            tr.cell_width.round() as u16,
-                            tr.cell_height.round() as u16,
-                        ));
-                    }
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+            WindowEvent::Resized(size) => self.apply_window_size(size),
+
+            // Wayland reports a new surface at scale 1 and says which
+            // output it landed on afterwards, so this arrives on every
+            // HiDPI startup, not just when the window changes screens.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.apply_scale_factor(scale_factor as f32);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -5677,6 +5728,7 @@ impl ApplicationHandler for App {
                         let Some(pos) = self.cursor_pos else { return };
                         let target = self.hit_test_target(pos);
                         let now = Instant::now();
+                        let radius = self.click_radius();
                         let is_double =
                             self.last_click.as_ref().is_some_and(|(t, prev_target, prev_pos)| {
                                 if now.duration_since(*t) >= DOUBLE_CLICK_INTERVAL {
@@ -5687,8 +5739,7 @@ impl ApplicationHandler for App {
                                 }
                                 let dx = pos.x - prev_pos.x;
                                 let dy = pos.y - prev_pos.y;
-                                dx * dx + dy * dy
-                                    <= DOUBLE_CLICK_RADIUS_PX * DOUBLE_CLICK_RADIUS_PX
+                                dx * dx + dy * dy <= radius * radius
                             });
                         let alt = self.modifiers.alt_key();
                         // An image under the pointer is a *candidate*:
@@ -5813,8 +5864,8 @@ impl ApplicationHandler for App {
                         {
                             let dx = pos.x - press_pos.x;
                             let dy = pos.y - press_pos.y;
-                            if dx * dx + dy * dy <= DOUBLE_CLICK_RADIUS_PX * DOUBLE_CLICK_RADIUS_PX
-                            {
+                            let radius = self.click_radius();
+                            if dx * dx + dy * dy <= radius * radius {
                                 self.selection = None;
                                 self.vge_selection = Some(sel);
                                 // Deliberately not `selection_fresh`:

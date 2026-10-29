@@ -180,6 +180,8 @@
 [font]
 # family = "monospace"
 # fallback = ["Symbols Nerd Font Mono"]
+# size = 12.0          # in points, like other terminals; the display's
+#                      # scale factor multiplies it (12 is 16px at 1x)
 
 # ---------------------------------------------------------------------------
 # Search chrome colors

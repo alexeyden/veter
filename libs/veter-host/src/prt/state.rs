@@ -571,10 +571,27 @@ impl PrtEngine {
     /// arrives inherit the renderer's real metrics instead of the
     /// session-creation-time defaults. Existing portals keep the
     /// metrics they were spawned with; mid-flight reflow is not
-    /// supported.
+    /// supported — that is [`Self::rescale`].
     pub fn set_metrics(&mut self, cell_px: (u16, u16), scale_factor: f32) {
         self.cell_px = cell_px;
         self.scale_factor = scale_factor;
+    }
+
+    /// The renderer's cell changed size under every portal at once — a
+    /// window moved to an output with another scale. Unlike
+    /// [`Self::set_metrics`] this reaches the portals that already
+    /// exist, on both screens and at every depth, so what a client
+    /// probes afterwards is the cell it is actually drawn in. Portal
+    /// sizes are in cells and do not change.
+    pub fn rescale(&mut self, cell_px: (u16, u16), scale_factor: f32) {
+        self.set_metrics(cell_px, scale_factor);
+        let sets = [Some(&mut self.state.main), self.state.alt.as_mut()];
+        for set in sets.into_iter().flatten() {
+            for content in set.contents.values_mut() {
+                content.vge.set_dimensions(cell_px, scale_factor);
+                content.children.rescale(cell_px, scale_factor);
+            }
+        }
     }
 
     /// Cell metrics inherited by per-portal sub-engines spawned in
