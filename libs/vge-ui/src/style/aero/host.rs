@@ -7,6 +7,7 @@ use vge_protocol::command::{Align, Color, DrawCmd, Style};
 
 use super::{
     GEL_RED, Gel, INK, bubble, caret, field, frame_glass, frost, gel, gel_rr, panel, rims, shadow,
+    tone,
 };
 use crate::paint::{Px, hex, pill, text, white};
 use crate::style::{ButtonKind, ChipKind, Dialog, FieldText, SearchPanel};
@@ -42,7 +43,7 @@ pub(super) fn dialog(cmds: &mut Vec<DrawCmd>, px: Px, d: &Dialog<'_>) {
         d.title_y,
         Align::Center,
         d.title,
-        hex(INK, 1.0),
+        hex(tone(INK), 1.0),
         true,
         None,
     );
@@ -88,8 +89,8 @@ pub(super) fn search_panel(cmds: &mut Vec<DrawCmd>, px: Px, p: &SearchPanel<'_>)
     if let Some((x, s, kind)) = p.text {
         // Dark ink in the white field; a label sits on the glass itself.
         let (ink, bold, shade) = match kind {
-            FieldText::Query => (hex(INK, 1.0), false, None),
-            FieldText::Placeholder => (hex(INK, 0.4), false, None),
+            FieldText::Query => (hex(tone(INK), 1.0), false, None),
+            FieldText::Placeholder => (hex(tone(INK), 0.4), false, None),
             FieldText::Label => (white(0.95), true, Some(hex(GLASS_SHADE, 0.9))),
         };
         text(cmds, px, x, p.text_y, Align::Left, s, ink, bold, shade);

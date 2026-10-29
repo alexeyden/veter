@@ -33,6 +33,9 @@
 #   catppuccin-latte   the same, light
 #   gruvbox-dark       morhetz/gruvbox, dark medium
 #   nord               nordtheme/nord
+#   aero               Frutiger Aero by day — pale sky, navy ink, gel colours;
+#                      made for [style] name = "aero"
+#   aero-dark          the same at night; pair it with [style.aero] dark
 #
 # Light and dark are handled the same way: the derived chrome keys off
 # whether the background is lighter than the foreground, so a light scheme
@@ -146,6 +149,8 @@
 # bubbles = true     # bubbles over the skies, bars and window frames
 # glass = 1.0        # how milky the frosted panes and vmd's reading
 #                    # sheet are: lower shows more wallpaper, up to 2
+# dark = false       # Aero at night: a dimmed sky, smoked glass, dark
+#                    # panels and pale ink (pairs with theme "aero-dark")
 
 # ---------------------------------------------------------------------------
 # Fonts

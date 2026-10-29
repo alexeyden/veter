@@ -8,24 +8,25 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, Style};
 
 use super::icons::shadow;
-use super::{GEL_AMBER, INK, bubble, gel, glass_alpha, scroll_thumb, track};
+use super::{
+    BAR_BOTTOM, BAR_LIP, BAR_TOP, BLUE_INK, DIM_INK, GEL_AMBER, INK, Tone, bubble, gel,
+    glass_alpha, nightfall, scroll_thumb, tone, track,
+};
 use crate::measure::text_cells;
 use crate::paint::{Px, ellipse, hash, hex, radial, rr, text, unit, vgrad, white};
 use crate::style::{ListInk, StatusLeft};
 
 /// Directory names, a step bluer than file names.
-const DIR_INK: u32 = 0x0a5fa8;
-const DIM_INK: u32 = 0x4a6f93;
-const ERR_INK: u32 = 0xb3261e;
+const ERR_INK: Tone = (0xb3261e, 0xff8a7a);
 /// Corner radius of a glass pane, in pixels.
 const PANE_R: f32 = 8.0;
 
-fn ink(rgb: u32) -> Color {
-    hex(rgb, 1.0)
+fn ink(t: Tone) -> Color {
+    hex(tone(t), 1.0)
 }
 
 fn name_ink(is_dir: bool) -> Color {
-    ink(if is_dir { DIR_INK } else { INK })
+    ink(if is_dir { BLUE_INK } else { INK })
 }
 
 /// The wallpaper: a deep-to-pale sky, two green hills along the bottom,
@@ -77,6 +78,15 @@ pub(super) fn backdrop(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
             h,
         }],
     });
+    nightfall(
+        cmds,
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+        },
+    );
     // Bubbles, seeded by index so a redraw keeps them where they were.
     let count = ((w * h) / 45.0) as u32;
     for i in 0..count {
@@ -95,8 +105,8 @@ pub(super) fn glass_pane(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: 
         fill: vgrad(
             y0,
             y1,
-            hex(0xe6f2fb, glass_alpha(0.62)),
-            hex(0xcfe4f5, glass_alpha(0.5)),
+            hex(tone((0xe6f2fb, 0x16273d)), glass_alpha(0.62)),
+            hex(tone((0xcfe4f5, 0x0c1829)), glass_alpha(0.5)),
         ),
         stroke: Style::Flat(white(0.9)),
         line_width: px.line(1.0),
@@ -127,8 +137,13 @@ pub(super) fn glass_pane(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: 
 /// rim and a white inner line.
 pub(super) fn select_box(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
     cmds.push(DrawCmd::OutlineFillPath {
-        fill: vgrad(y0, y1, hex(0xf4faff, 1.0), hex(0xb3daf9, 1.0)),
-        stroke: Style::Flat(hex(0x2f7fd0, 1.0)),
+        fill: vgrad(
+            y0,
+            y1,
+            hex(tone((0xf4faff, 0x1f4f7c)), 1.0),
+            hex(tone((0xb3daf9, 0x14385c)), 1.0),
+        ),
+        stroke: Style::Flat(hex(tone((0x2f7fd0, 0x3fb8ff)), 1.0)),
         line_width: px.line(1.0),
         segments: rr(px, x0, y0, x1, y1, 3.0),
     });
@@ -223,8 +238,14 @@ pub(super) fn tile_plate(cmds: &mut Vec<DrawCmd>, px: Px, t: Rect, selected: boo
     if selected {
         select_box(cmds, px, x, y, x1, y1);
     } else {
+        // At night the same haze over a dark pane reads as a grey slab.
+        let (top, bottom) = if crate::style::settings().dark {
+            (0.1, 0.03)
+        } else {
+            (0.22, 0.06)
+        };
         cmds.push(DrawCmd::FillPath {
-            fill: vgrad(y, y1, white(0.22), white(0.06)),
+            fill: vgrad(y, y1, white(top), white(bottom)),
             segments: rr(px, x, y, x1, y1, 4.0),
         });
     }
@@ -273,7 +294,7 @@ pub(super) fn list_row_plate(cmds: &mut Vec<DrawCmd>, px: Px, r: Rect, odd: bool
         select_box(cmds, px, x + 0.15, y, x1, y1);
     } else if odd {
         cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(hex(0xcfe5f7, 0.4)),
+            fill: Style::Flat(hex(tone((0xcfe5f7, 0x2a4a6c)), 0.4)),
             segments: rr(px, x + 0.15, y, x1, y1, 3.0),
         });
     }
@@ -355,7 +376,12 @@ pub(super) fn status_bar(
             }],
         },
         DrawCmd::FillRectangles {
-            fill: vgrad(a.y, y1, hex(0x5ab8ef, 0.97), hex(0x1468b4, 0.97)),
+            fill: vgrad(
+                a.y,
+                y1,
+                hex(tone(BAR_TOP), 0.97),
+                hex(tone(BAR_BOTTOM), 0.97),
+            ),
             rects: vec![Rect {
                 x: a.x,
                 y: a.y,
@@ -373,7 +399,7 @@ pub(super) fn status_bar(
             }],
         },
         DrawCmd::FillRectangles {
-            fill: Style::Flat(hex(0xc8f6ff, 0.95)),
+            fill: Style::Flat(hex(tone(BAR_LIP), 0.95)),
             rects: vec![Rect {
                 x: a.x,
                 y: a.y,

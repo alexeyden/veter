@@ -676,7 +676,45 @@ fn modal_body(
 
 /// Corner radius of a window, in pixels.
 pub const WIN_R: f32 = 9.0;
-pub const INK: u32 = 0x0d2f52;
+/// A colour by Aero's time of day: what it is by day, and what it turns
+/// to at night, under `aero.dark`. Only the materials have two — the
+/// sky, glass, panels and ink. Gels, icons, shadows and white glints
+/// are the same at any hour.
+pub type Tone = (u32, u32);
+
+/// The colour `t` is in the settings in force.
+pub fn tone((day, night): Tone) -> u32 {
+    if crate::style::settings().dark {
+        night
+    } else {
+        day
+    }
+}
+
+/// Body text: navy on the pale panels by day, pale sky on the dark
+/// ones by night.
+pub const INK: Tone = (0x0d2f52, 0xd4e8fa);
+/// The blue glass of a bar — the tab bar, a status bar — top and bottom.
+pub(super) const BAR_TOP: Tone = (0x5ab8ef, 0x1d5a92);
+pub(super) const BAR_BOTTOM: Tone = (0x1468b4, 0x082a52);
+/// The bright lip along a bar's lower edge.
+pub(super) const BAR_LIP: Tone = (0xc8f6ff, 0x7fc4ee);
+/// Dim ink: hints, metadata, quiet headings.
+pub(super) const DIM_INK: Tone = (0x4a6f93, 0x8fadc9);
+/// Directory names and top headings, a step bluer than the body.
+pub(super) const BLUE_INK: Tone = (0x0a5fa8, 0x7cc8ff);
+
+/// Night over an outdoor scene — the sky, its hills and sun — painted
+/// by day: a navy wash that leaves it a dim, deep-blue night, under
+/// whatever glass sits on it. Nothing by day.
+pub(super) fn nightfall(cmds: &mut Vec<DrawCmd>, area: Rect) {
+    if crate::style::settings().dark {
+        cmds.push(DrawCmd::FillRectangles {
+            fill: Style::Flat(hex(0x020816, 0.66)),
+            rects: vec![area],
+        });
+    }
+}
 
 /// A soft drop shadow: a few widening, fading layers down and right.
 pub fn shadow(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
@@ -697,10 +735,19 @@ pub fn shadow(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
     }
 }
 
+/// A window frame's blue glass, top and bottom.
+const FRAME_TOP: Tone = (0x4fb0ea, 0x1b4f86);
+const FRAME_BOTTOM: Tone = (0x0f5aa0, 0x081f3d);
+
 /// The glass of a window's frame, `w × h`.
 pub fn frame_glass(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, h: f32) {
     cmds.push(DrawCmd::FillPath {
-        fill: vgrad(0.0, h, hex(0x4fb0ea, 0.94), hex(0x0f5aa0, 0.96)),
+        fill: vgrad(
+            0.0,
+            h,
+            hex(tone(FRAME_TOP), 0.94),
+            hex(tone(FRAME_BOTTOM), 0.96),
+        ),
         segments: rr(px, 0.0, 0.0, w, h, WIN_R),
     });
 }
@@ -730,8 +777,13 @@ pub fn title_bar(cmds: &mut Vec<DrawCmd>, px: Px, w: f32, title: &str) {
 /// The pale content panel the rows read dark on.
 pub fn panel(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
     cmds.push(DrawCmd::OutlineFillPath {
-        fill: vgrad(y0, y1, hex(0xf6fcff, 0.97), hex(0xd6ebf8, 0.97)),
-        stroke: Style::Flat(hex(0x0b4f8f, 0.6)),
+        fill: vgrad(
+            y0,
+            y1,
+            hex(tone((0xf6fcff, 0x1a2c44)), 0.97),
+            hex(tone((0xd6ebf8, 0x0f1d31)), 0.97),
+        ),
+        stroke: Style::Flat(hex(tone((0x0b4f8f, 0x3fb8ff)), 0.45)),
         line_width: px.line(1.0),
         segments: rr(px, x0, y0, x1, y1, 5.0),
     });
@@ -740,8 +792,13 @@ pub fn panel(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32
 /// A slightly sunken white text field.
 pub fn field(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
     cmds.push(DrawCmd::OutlineFillPath {
-        fill: vgrad(y0, y1, hex(0xe4f1fa, 1.0), white(1.0)),
-        stroke: Style::Flat(hex(0x7fb2d9, 1.0)),
+        fill: vgrad(
+            y0,
+            y1,
+            hex(tone((0xe4f1fa, 0x0a1626)), 1.0),
+            hex(tone((0xffffff, 0x13243a)), 1.0),
+        ),
+        stroke: Style::Flat(hex(tone((0x7fb2d9, 0x3a6f9e)), 1.0)),
         line_width: px.line(1.0),
         segments: rr(px, x0, y0, x1, y1, 4.0),
     });
@@ -749,7 +806,7 @@ pub fn field(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32
 
 pub fn caret(cmds: &mut Vec<DrawCmd>, px: Px, x: f32, y0: f32, y1: f32) {
     cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(hex(0x0a86d8, 1.0)),
+        fill: Style::Flat(hex(tone((0x0a86d8, 0x5ac8ff)), 1.0)),
         rects: vec![Rect {
             x: x - px.x(1.0),
             y: y0,
@@ -815,7 +872,7 @@ fn prompt_element(
         2.0,
         Align::Center,
         line,
-        hex(INK, 1.0),
+        hex(tone(INK), 1.0),
         caret_at.is_none(),
         None,
     );
@@ -869,7 +926,7 @@ fn picker_element(
     title_bar(&mut cmds, px, box_w, picker.title());
     panel(&mut cmds, px, 0.3, 1.0, box_w - 0.3, box_h + 0.05);
 
-    let ink = hex(INK, 1.0);
+    let ink = hex(tone(INK), 1.0);
     field(&mut cmds, px, 0.6, 1.1, box_w - 0.6, 1.9);
     text(
         &mut cmds,
@@ -923,7 +980,7 @@ fn picker_element(
             let hint_ink = if selected {
                 hex(0xe6f7ff, 1.0)
             } else {
-                hex(0x4a6f93, 1.0)
+                hex(tone(DIM_INK), 1.0)
             };
             let hx = if has_bar { box_w - 1.6 } else { box_w - 1.5 };
             text(
@@ -961,7 +1018,7 @@ fn picker_element(
 /// A faint recessed groove for a scrollbar thumb to ride in.
 pub fn track(cmds: &mut Vec<DrawCmd>, px: Px, x: f32, y: f32, h: f32) {
     cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(hex(0x0b4f8f, 0.12)),
+        fill: Style::Flat(hex(tone((0x0b4f8f, 0x7fc8ff)), 0.12)),
         segments: pill(px, x - 0.07, y + 0.05, x + 0.47, y + h - 0.05),
     });
 }
@@ -1005,7 +1062,12 @@ fn scroll_elements(
     let ry = px.y(WIN_R).min(0.5);
     let rx = px.x(WIN_R).min(box_w / 2.0);
     top.push(DrawCmd::FillPath {
-        fill: vgrad(0.0, box_h, hex(0x4fb0ea, 0.94), hex(0x0f5aa0, 0.96)),
+        fill: vgrad(
+            0.0,
+            box_h,
+            hex(tone(FRAME_TOP), 0.94),
+            hex(tone(FRAME_BOTTOM), 0.96),
+        ),
         segments: rounded_rect_path_corners(0.0, 0.0, box_w, 1.0, rx, ry, true, true, false, false),
     });
     title_bar(&mut top, px, box_w, &title);
@@ -1034,7 +1096,7 @@ fn scroll_elements(
     let mut lines = Vec::with_capacity(body_lines);
     for (i, line) in modal.lines.iter().enumerate().skip(1) {
         let heading = !line.is_empty() && !line.starts_with(' ');
-        let color = hex(if heading { 0x0a5fa8 } else { INK }, 1.0);
+        let color = hex(tone(if heading { BLUE_INK } else { INK }), 1.0);
         text(
             &mut lines,
             px,

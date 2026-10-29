@@ -18,7 +18,7 @@
 //!    inside veter draw their chrome with, published with the palette
 //!    in the PRT probe, and each engine's settings: `[style.flat]
 //!    rounding`, and `[style.aero]`'s accent rotation (in Aero's own
-//!    colours), `bubbles` and `glass`.
+//!    colours), `bubbles`, `glass` and `dark`.
 //!  * `[font]` — the primary family and the fallback families tried for
 //!    a character it lacks.
 //!  * `[search]` — the search-chrome colors (search bar + match
@@ -408,6 +408,9 @@ pub struct AeroStyleConfig {
     /// How milky the frosted panes and the reading sheet are, as a
     /// multiple of the stock opacity.
     pub glass: f32,
+    /// Aero at night: a dimmed sky, smoked glass, dark panels and pale
+    /// ink. Pairs with the `aero-dark` theme for the grid.
+    pub dark: bool,
 }
 
 impl Default for AeroStyleConfig {
@@ -420,6 +423,7 @@ impl Default for AeroStyleConfig {
                 .collect(),
             bubbles: stock.bubbles,
             glass: stock.glass,
+            dark: stock.dark,
         }
     }
 }
@@ -433,6 +437,7 @@ impl StyleConfig {
             rounding: self.flat.rounding,
             bubbles: self.aero.bubbles,
             glass: self.aero.glass,
+            dark: self.aero.dark,
         };
         let settings = asked.clamped();
         if settings.rounding != asked.rounding {
@@ -1256,7 +1261,7 @@ mod tests {
     #[test]
     fn every_engines_settings_are_published() {
         let cfg: Config = toml::from_str(
-            "[style.flat]\nrounding = 0.0\n[style.aero]\nbubbles = false\nglass = 0.5\n",
+            "[style.flat]\nrounding = 0.0\n[style.aero]\nbubbles = false\nglass = 0.5\ndark = true\n",
         )
         .unwrap();
         let palette = cfg.style.host_palette(&cfg.theme());
@@ -1267,6 +1272,7 @@ mod tests {
                 rounding: 0.0,
                 bubbles: false,
                 glass: 0.5,
+                dark: true,
             }
         );
         let wild: Config = toml::from_str("[style.aero]\nglass = 7.0\n").unwrap();

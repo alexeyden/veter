@@ -5,7 +5,10 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, DrawCmd, Style};
 use vge_protocol::path::{PathNode, PathSegment};
 
-use super::{GEL_AQUA, Gel, bubble, gel, gloss, scroll_thumb, smoke};
+use super::{
+    BAR_BOTTOM, BAR_LIP, BAR_TOP, GEL_AQUA, Gel, Tone, bubble, gel, gloss, scroll_thumb, smoke,
+    tone,
+};
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
@@ -64,7 +67,12 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     // upper half, a bright lip along the bottom and a glow spilling down
     // over the panes.
     cmds.push(DrawCmd::FillRectangles {
-        fill: vgrad(0.0, BAR_H, hex(0x5ab8ef, 0.97), hex(0x1468b4, 0.97)),
+        fill: vgrad(
+            0.0,
+            BAR_H,
+            hex(tone(BAR_TOP), 0.97),
+            hex(tone(BAR_BOTTOM), 0.97),
+        ),
         rects: vec![band(0.0, BAR_H)],
     });
     cmds.push(DrawCmd::FillRectangles {
@@ -73,7 +81,7 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     });
     let lip = px.y(1.0);
     cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(hex(0xc8f6ff, 0.95)),
+        fill: Style::Flat(hex(tone(BAR_LIP), 0.95)),
         rects: vec![band(BAR_H - lip, lip)],
     });
     cmds.push(DrawCmd::FillRectangles {
@@ -187,7 +195,11 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
         // colour, so it reads as moulded into the tab rather than as a
         // badge stuck on it.
         let num_cx = x + 0.4 + slot.num_w * 0.5;
-        let well = if is_active { active.shade } else { FROST_SHADE };
+        let well = if is_active {
+            active.shade
+        } else {
+            tone(FROST_SHADE)
+        };
         let hw = slot.num_w * 0.38;
         socket(
             cmds,
@@ -241,7 +253,7 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
 
 /// The deep tone of a frosted tab, which its number's socket is
 /// darkened toward: the blue of the sky the glass sits on.
-const FROST_SHADE: u32 = 0x0a2a5e;
+const FROST_SHADE: Tone = (0x0a2a5e, 0x041530);
 
 /// A socket pressed into a tab: a hollow darkened toward `shade`, with
 /// the lip's shadow along its top and a light catching its lower edge.

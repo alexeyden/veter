@@ -745,6 +745,10 @@ pub struct Settings {
     /// are, as a multiple of the stock opacity: below `1` more of the
     /// wallpaper shows through, above it they turn solid.
     pub glass: f32,
+    /// `aero.dark` — Aero at night: the sky dimmed to a deep blue, the
+    /// glass smoked, the panels dark and the ink pale. The gels, icons
+    /// and bubbles stay as they are.
+    pub dark: bool,
 }
 
 impl Settings {
@@ -752,6 +756,7 @@ impl Settings {
         rounding: 1.0,
         bubbles: true,
         glass: 1.0,
+        dark: false,
     };
     /// How far `rounding` reaches; past it every corner is already as
     /// round as the shape allows.
@@ -780,6 +785,11 @@ impl Settings {
                         s.glass = v;
                     }
                 }
+                "aero.dark" => {
+                    if let Ok(v) = value.parse() {
+                        s.dark = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -793,6 +803,7 @@ impl Settings {
             ("flat.rounding", s.rounding.to_string()),
             ("aero.bubbles", s.bubbles.to_string()),
             ("aero.glass", s.glass.to_string()),
+            ("aero.dark", s.dark.to_string()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -808,6 +819,7 @@ impl Settings {
             rounding: clamp(self.rounding, Self::MAX_ROUNDING, 1.0),
             bubbles: self.bubbles,
             glass: clamp(self.glass, Self::MAX_GLASS, 1.0),
+            dark: self.dark,
         }
     }
 }
@@ -1052,6 +1064,7 @@ mod tests {
             rounding: 0.0,
             bubbles: false,
             glass: 0.6,
+            dark: true,
         };
         assert_eq!(Settings::from_options(&s.to_options()), s);
         assert_eq!(Settings::from_options(&[]), Settings::DEFAULT);

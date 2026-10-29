@@ -725,7 +725,7 @@ pub fn indexed_extended(idx: u8) -> Rgba {
 
 /// Names the built-in table answers to, in the order `veter --help`
 /// and `assets/config.toml` list them.
-pub const BUILTIN_NAMES: [&str; 7] = [
+pub const BUILTIN_NAMES: [&str; 9] = [
     "veter",
     "tokyonight-storm",
     "tokyonight-day",
@@ -733,6 +733,8 @@ pub const BUILTIN_NAMES: [&str; 7] = [
     "catppuccin-latte",
     "gruvbox-dark",
     "nord",
+    "aero",
+    "aero-dark",
 ];
 
 /// A built-in theme by name, or `None` if the name is not one of
@@ -747,6 +749,8 @@ pub fn builtin(name: &str) -> Option<Theme> {
         "catppuccin-latte" => Some(catppuccin_latte()),
         "gruvbox-dark" | "gruvbox" => Some(gruvbox_dark()),
         "nord" => Some(nord()),
+        "aero" => Some(aero()),
+        "aero-dark" => Some(aero_dark()),
         _ => None,
     }
 }
@@ -1117,6 +1121,54 @@ fn nord() -> Theme {
     }
 }
 
+/// Frutiger Aero by day, to sit under the `aero` style: the grid is the
+/// pale sky of Aero's panels with their navy ink, and the ANSI colours
+/// are the gels' deep tones, darkened where a gel was too light to read
+/// on that sky (the amber most of all). Black and white swap ends, as
+/// in the other light schemes: "white" is text a program expects to
+/// read, so on a pale ground it is the ink's blue, and "black" the pale.
+fn aero() -> Theme {
+    Theme {
+        ansi: [
+            c(0xb8cbe0), c(0xc62a1e), c(0x2e8a1f), c(0xb86a00),
+            c(0x1d5fd6), c(0xb02a7c), c(0x0a7ab8), c(0x4a6f93),
+            c(0x8fa6bd), c(0xe0402f), c(0x3aa82a), c(0xd08300),
+            c(0x3a7ff0), c(0xd2338f), c(0x0a86d8), c(0x23394f),
+        ],
+        background: c(0xeaf4fc),
+        foreground: c(0x0d2f52),
+        cursor: Some(c(0x0a86d8)),
+        // The light-blue selection box of a Win7 explorer.
+        selection_bg: Some(c(0xb3daf9)),
+        selection_fg: None,
+        accents: [c(0x0a86d8), c(0x7a3fd6), c(0x1d5fd6)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xd42a1e, 0xe57a00, 0xc89400, 0x2e9e1f, 0x0a86d8, 0x1d5fd6, 0xd2338f, 0x7a3fd6]),
+        ..derived()
+    }
+}
+
+/// Frutiger Aero at night, to sit under `aero` with `[style.aero] dark`:
+/// the deep navy of the night panels with their pale sky ink, and the
+/// gels' bright tones for the ANSI colours.
+fn aero_dark() -> Theme {
+    Theme {
+        ansi: [
+            c(0x1a2c44), c(0xff6b5a), c(0x6fcf3f), c(0xffb43c),
+            c(0x5a9cff), c(0xf07ac4), c(0x3fb8ff), c(0xa9c8e4),
+            c(0x4a6f93), c(0xff8a7a), c(0x8fdc4f), c(0xffc54a),
+            c(0x86b8ff), c(0xff9ad6), c(0x6fd3f7), c(0xe6f2fb),
+        ],
+        background: c(0x0d1a2b),
+        foreground: c(0xd4e8fa),
+        cursor: Some(c(0x6fd3f7)),
+        selection_bg: Some(c(0x1f4f7c)),
+        selection_fg: None,
+        accents: [c(0x3fb8ff), c(0xb08aff), c(0x86b8ff)].map(Accent::from).to_vec(),
+        swatches: swatch_set([0xff6b5a, 0xff9a2e, 0xffc54a, 0x8fdc4f, 0x6fd3f7, 0x86b8ff, 0xff9ad6, 0xc6a2ff]),
+        ..derived()
+    }
+}
+
 /// What a user theme file is laid over: [`derived`], with the three
 /// required fields taken from the default so a file that leaves one out
 /// still has a grid to draw — and everything else free to derive.
@@ -1349,7 +1401,7 @@ mod tests {
     /// there. Change one on purpose, not by accident.
     #[test]
     fn the_accent_trios_are_the_ones_that_were_chosen() {
-        let want: [(&str, [u32; 3]); 7] = [
+        let want: [(&str, [u32; 3]); 9] = [
             ("veter", [0x56799f, 0x9f5685, 0x9f7c56]),
             ("tokyonight-storm", [0x7aa2f7, 0xbb9af7, 0x7dcfff]),
             ("tokyonight-day", [0x2e7de9, 0x9854f1, 0x007197]),
@@ -1357,6 +1409,8 @@ mod tests {
             ("catppuccin-latte", [0x1e66f5, 0x8839ef, 0x179299]),
             ("gruvbox-dark", [0x83a598, 0xd3869b, 0xfabd2f]),
             ("nord", [0x88c0d0, 0xb48ead, 0x81a1c1]),
+            ("aero", [0x0a86d8, 0x7a3fd6, 0x1d5fd6]),
+            ("aero-dark", [0x3fb8ff, 0xb08aff, 0x86b8ff]),
         ];
         for (name, hexes) in want {
             let got = builtin(name).unwrap().accents();

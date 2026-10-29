@@ -13,17 +13,18 @@
 use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 
-use super::{INK, bubble, glass_alpha, scroll_thumb, track};
+use super::{
+    BAR_BOTTOM, BAR_LIP, BAR_TOP, BLUE_INK, DIM_INK, INK, Tone, bubble, glass_alpha, nightfall,
+    scroll_thumb, tone, track,
+};
 use crate::measure::{elide, text_cells};
 use crate::paint::{Px, ellipse, hash, hex, hgrad, radial, rr, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
 use crate::style::{DocChrome, DocFrame, DocRole, Figure};
 
-const HEADING_INK: u32 = 0x0a5fa8;
-const SUBHEADING_INK: u32 = 0x123f6b;
-const DIM_INK: u32 = 0x4a6f93;
-const LINK_INK: u32 = 0x0a7fd0;
-const WARN_INK: u32 = 0xc0392b;
+const SUBHEADING_INK: Tone = (0x123f6b, 0xb4d8f5);
+const LINK_INK: Tone = (0x0a7fd0, 0x5ab8ff);
+const WARN_INK: Tone = (0xc0392b, 0xff8a7a);
 const AMBER: u32 = 0xe57a00;
 /// Corner radius of the reading sheet, in pixels.
 const SHEET_R: f32 = 8.0;
@@ -35,14 +36,14 @@ const SHEET_PAD: f32 = 0.15;
 
 pub(super) fn ink(role: DocRole) -> Color {
     hex(
-        match role {
+        tone(match role {
             DocRole::Body | DocRole::Code => INK,
-            DocRole::Heading(1) => HEADING_INK,
+            DocRole::Heading(1) => BLUE_INK,
             DocRole::Heading(l) if l <= 4 => SUBHEADING_INK,
             DocRole::Heading(_) | DocRole::Dim | DocRole::Marker => DIM_INK,
             DocRole::Link | DocRole::Accent => LINK_INK,
             DocRole::Warn => WARN_INK,
-        },
+        }),
         1.0,
     )
 }
@@ -104,6 +105,7 @@ pub(super) fn ground(cmds: &mut Vec<DrawCmd>, p: Px, view: &DocFrame) {
         ),
         rects: vec![band],
     });
+    nightfall(cmds, band);
     let count = ((w * h) / 40.0) as u32;
     for i in 0..count {
         let k = hash(i.wrapping_mul(2654435761).wrapping_add(0x3d));
@@ -124,8 +126,8 @@ pub(super) fn ground(cmds: &mut Vec<DrawCmd>, p: Px, view: &DocFrame) {
         fill: vgrad(
             y0,
             y1,
-            hex(0xf7fbfe, glass_alpha(0.94)),
-            hex(0xe8f2fa, glass_alpha(0.9)),
+            hex(tone((0xf7fbfe, 0x142438)), glass_alpha(0.94)),
+            hex(tone((0xe8f2fa, 0x0d1a2b)), glass_alpha(0.9)),
         ),
         stroke: Style::Flat(white(0.9)),
         line_width: p.line(1.0),
@@ -164,10 +166,10 @@ pub(super) fn code_plate(
     let r = 5.0_f32;
     let (rx, ry) = (p.x(r).min((x1 - x0) / 2.0), p.y(r).min(h / 2.0));
     cmds.push(DrawCmd::FillPath {
-        fill: Style::Flat(hex(0xdcebf7, 0.95)),
+        fill: Style::Flat(hex(tone((0xdcebf7, 0x0a1828)), 0.95)),
         segments: rounded_rect_path_corners(x0, y, x1, y + h, rx, ry, first, first, last, last),
     });
-    let rim = Style::Flat(hex(0xa9c8e4, 1.0));
+    let rim = Style::Flat(hex(tone((0xa9c8e4, 0x2c5378)), 1.0));
     let w = p.x(1.0);
     let sides = [(x0, y), (x1 - w, y)];
     cmds.push(DrawCmd::FillRectangles {
@@ -192,9 +194,14 @@ pub(super) fn code_plate(
 
 pub(super) fn table_band(cmds: &mut Vec<DrawCmd>, r: Rect, head: bool) {
     let fill = if head {
-        vgrad(r.y, r.y + r.h, hex(0xbfe6fb, 0.9), hex(0x8fcdf2, 0.9))
+        vgrad(
+            r.y,
+            r.y + r.h,
+            hex(tone((0xbfe6fb, 0x1d4a72)), 0.9),
+            hex(tone((0x8fcdf2, 0x143654)), 0.9),
+        )
     } else {
-        Style::Flat(hex(0x0a5fa8, 0.06))
+        Style::Flat(hex(tone(BLUE_INK), 0.06))
     };
     cmds.push(DrawCmd::FillRectangles {
         fill,
@@ -223,7 +230,7 @@ pub(super) fn rule(cmds: &mut Vec<DrawCmd>, r: Rect, weight: f32) {
     let mid = x0 + r.w * 0.5;
     let x1 = x0 + r.w;
     let ry = r.y + (r.h - w) * 0.5;
-    let blue = |a| hex(0x2f86d6, a);
+    let blue = |a| hex(tone((0x2f86d6, 0x4aa8ff)), a);
     for (a, b, c0, c1) in [
         (x0, mid, blue(0.0), blue(0.7)),
         (mid, x1, blue(0.7), blue(0.0)),
@@ -280,8 +287,8 @@ pub(super) fn figure(cmds: &mut Vec<DrawCmd>, p: Px, rect: Rect, content: Figure
                 fill: vgrad(
                     rect.y,
                     rect.y + rect.h,
-                    hex(0xe9f3fb, 1.0),
-                    hex(0xcfe3f4, 1.0),
+                    hex(tone((0xe9f3fb, 0x1a2c44)), 1.0),
+                    hex(tone((0xcfe3f4, 0x0f1d31)), 1.0),
                 ),
                 rects: vec![rect],
             });
@@ -291,7 +298,7 @@ pub(super) fn figure(cmds: &mut Vec<DrawCmd>, p: Px, rect: Rect, content: Figure
                     y: rect.y + (rect.h - zoom) * 0.5,
                 },
                 align: Align::Center,
-                fill: Style::Flat(hex(DIM_INK, 1.0)),
+                fill: Style::Flat(hex(tone(DIM_INK), 1.0)),
                 font_style: FontStyle(0),
                 font_scale: zoom,
                 text: label.to_string(),
@@ -316,10 +323,10 @@ pub(super) fn code_chip(
         fill: vgrad(
             y + inset,
             y + h - inset,
-            hex(0xeef6fc, 1.0),
-            hex(0xd3e6f5, 1.0),
+            hex(tone((0xeef6fc, 0x15263c)), 1.0),
+            hex(tone((0xd3e6f5, 0x0c1a2c)), 1.0),
         ),
-        stroke: Style::Flat(hex(0xa9c8e4, 1.0)),
+        stroke: Style::Flat(hex(tone((0xa9c8e4, 0x2c5378)), 1.0)),
         line_width: p.line(1.0),
         segments: rr(p, x0, y + inset, x1, y + h - inset, 4.0),
     });
@@ -397,7 +404,12 @@ fn glass_bar(cmds: &mut Vec<DrawCmd>, p: Px, w: f32, y: f32, lit_bottom: bool) {
         glow(y - 0.4, y, 0.0, 0.45)
     });
     cmds.push(DrawCmd::FillRectangles {
-        fill: vgrad(y, y + 1.0, hex(0x5ab8ef, 0.97), hex(0x1468b4, 0.97)),
+        fill: vgrad(
+            y,
+            y + 1.0,
+            hex(tone(BAR_TOP), 0.97),
+            hex(tone(BAR_BOTTOM), 0.97),
+        ),
         rects: vec![Rect {
             x: 0.0,
             y,
@@ -416,7 +428,7 @@ fn glass_bar(cmds: &mut Vec<DrawCmd>, p: Px, w: f32, y: f32, lit_bottom: bool) {
     });
     let lip = p.y(1.0);
     cmds.push(DrawCmd::FillRectangles {
-        fill: Style::Flat(hex(0xc8f6ff, 0.95)),
+        fill: Style::Flat(hex(tone(BAR_LIP), 0.95)),
         rects: vec![Rect {
             x: 0.0,
             y: if lit_bottom { y + 1.0 - lip } else { y },
