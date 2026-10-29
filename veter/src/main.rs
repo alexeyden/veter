@@ -1657,7 +1657,6 @@ fn draw_search_bar<T: femtovg::Renderer>(
 ) {
     let cell_w = tr.cell_width;
     let cell_h = tr.cell_height;
-    let ascent = tr.ascent();
 
     // Sized in cells, like the close prompt, so the panel keeps its
     // proportions across font sizes and HiDPI scales.
@@ -1768,11 +1767,7 @@ fn draw_search_bar<T: femtovg::Renderer>(
 
     let panel_x = ((window_w_px - panel_w) * 0.5).round();
     let panel_y = (window_h_px - panel_h - cell_h * 0.75).round();
-    // Baseline that centres one line of text in a box, as the prompt's
-    // buttons do.
-    let baseline = |box_y: f32, box_h: f32| box_y + (box_h - ascent) * 0.5 + ascent;
     let row_y = panel_y + (panel_h - chip_h) * 0.5;
-    let row_baseline = baseline(row_y, chip_h);
 
     let field_x = panel_x + pad_x;
     let inner_x = field_x + cell_w * 0.5;
@@ -1858,9 +1853,10 @@ fn draw_search_bar<T: femtovg::Renderer>(
         h: panel_h / cell_h,
         field: cells(field_x, row_y, field_w, chip_h),
         text,
-        // Every label centres one line in the row as the prompt's
-        // buttons do: on the font's ascent.
-        text_y: (row_baseline - ascent - panel_y) / cell_h,
+        // Every label centres its line — the cell's whole height — in
+        // the row, as the close prompt's buttons do. Centring the ascent
+        // instead left digits and capitals a couple of pixels low.
+        text_y: (row_y + (chip_h - cell_h) * 0.5 - panel_y) / cell_h,
         caret,
         hint,
         chips: &chip_parts,
