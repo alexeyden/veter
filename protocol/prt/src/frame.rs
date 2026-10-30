@@ -23,6 +23,7 @@ pub const CMD_SET_FOCUS: u8 = 0x0A;
 pub const CMD_SET_CURSOR_STYLE: u8 = 0x0B;
 pub const CMD_SET_PORTAL_SCROLLBACK: u8 = 0x0C;
 pub const CMD_FORK_PORTAL: u8 = 0x0D;
+pub const CMD_SET_STATUS: u8 = 0x0E;
 
 // §4.1 response codes (host → client, low half)
 pub const RSP_OK: u8 = 0x01;
@@ -77,6 +78,10 @@ pub const EVT_PORTAL_SCROLL_SET: u8 = 0x8D;
 /// translucent wash — which is otherwise baked into commands the host
 /// has already stored.
 pub const EVT_HOST_THEME_CHANGED: u8 = 0x8E;
+/// §8.14 — the program inside a portal set or removed a status item,
+/// with `SetStatus` (§9.4) or `OSC 9 ; 4`. Body: the portal id, then
+/// the `StatusOp` exactly as `SetStatus` carries it.
+pub const EVT_STATUS_CHANGE: u8 = 0x8F;
 
 // §4.1 error codes
 pub const ERR_UNKNOWN_COMMAND: u16 = 0x0001;
@@ -135,6 +140,20 @@ pub const EVICT_ALT_SWAP: u8 = 2;
 // §8.4 ClipboardOp ops
 pub const CLIPBOARD_SET: u8 = 0;
 pub const CLIPBOARD_QUERY: u8 = 1;
+
+// SetStatus / StatusChange (§9.4, §8.14).
+pub const STATUS_FLAG_REMOVE: u8 = 1 << 0;
+pub const STATUS_FLAG_KEY_IS_PREFIX: u8 = 1 << 1;
+pub const STATUS_LEVEL_INFO: u8 = 0;
+pub const STATUS_LEVEL_WARN: u8 = 1;
+pub const STATUS_LEVEL_ERROR: u8 = 2;
+pub const STATUS_PROGRESS_NONE: u8 = 0;
+pub const STATUS_PROGRESS_PERCENT: u8 = 1;
+pub const STATUS_PROGRESS_INDETERMINATE: u8 = 2;
+pub const MAX_STATUS_KEY_BYTES: usize = 64;
+pub const MAX_STATUS_TEXT_BYTES: usize = 256;
+/// The reserved key `OSC 9 ; 4` progress reports land on (§8.14).
+pub const STATUS_KEY_OSC_PROGRESS: &str = "osc.progress";
 
 /// Sentinel `request_id` value that asks the host to apply the
 /// command but not emit a response frame. The mirror of VGE's

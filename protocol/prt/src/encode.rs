@@ -6,7 +6,7 @@
 use crate::codec::Writer;
 use crate::command::{
     Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody, ScrollTarget,
-    UpdateOriginBody, WritePortalBody,
+    StatusOp, UpdateOriginBody, WritePortalBody,
 };
 use crate::envelope::{append_frame, wrap_c2t_envelope};
 use crate::frame::*;
@@ -122,6 +122,12 @@ pub fn set_portal_scrollback_body(id: &str, to: ScrollTarget) -> Vec<u8> {
     w.buf
 }
 
+pub fn set_status_body(op: &StatusOp) -> Vec<u8> {
+    let mut w = Writer::new();
+    op.write(&mut w);
+    w.buf
+}
+
 /// Discriminate the wire frame type of a `Command` (§3 table).
 pub fn frame_type_for(cmd: &Command) -> u8 {
     match cmd {
@@ -138,6 +144,7 @@ pub fn frame_type_for(cmd: &Command) -> u8 {
         Command::SetCursorStyle { .. } => CMD_SET_CURSOR_STYLE,
         Command::SetPortalScrollback { .. } => CMD_SET_PORTAL_SCROLLBACK,
         Command::ForkPortal(_) => CMD_FORK_PORTAL,
+        Command::SetStatus(_) => CMD_SET_STATUS,
     }
 }
 
@@ -161,6 +168,7 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::SetCursorStyle { unfocused } => set_cursor_style_body(*unfocused),
         Command::SetPortalScrollback { id, to } => set_portal_scrollback_body(id, *to),
         Command::ForkPortal(b) => fork_portal_body(b),
+        Command::SetStatus(op) => set_status_body(op),
     }
 }
 

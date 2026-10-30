@@ -253,6 +253,7 @@ be tolerated by skipping unknown trailing bytes.
 | 0x0B | SetCursorStyle     | §9.2         |
 | 0x0C | SetPortalScrollback| §9.3         |
 | 0x0D | ForkPortal         | §6.9         |
+| 0x0E | SetStatus          | §9.4         |
 
 All other frame_type values in the command range (0x01..0x7F) are
 reserved and MUST be rejected with `err_unknown_command`. Frame types
@@ -317,6 +318,8 @@ portals is not guaranteed.
 | 0x8B | PortalActivity           | §8.10        |
 | 0x8C | PortalScrollDelta        | §8.11        |
 | 0x8D | PortalScrollSet          | §8.12        |
+| 0x8E | HostThemeChanged         | §8.13        |
+| 0x8F | StatusChange             | §8.14        |
 
 Events for capabilities a client did not request via the `features`
 bitmask in §2.1 MUST NOT be emitted (the host learns the client's
@@ -1129,6 +1132,40 @@ A host whose palette cannot change after startup never emits this and
 need not set the bit; a client that does not see the bit may assume
 the palette from its probe is the one it keeps.
 
+### 8.14 StatusChange (0x8F)
+
+```
+string id
+StatusOp op          ; exactly as in SetStatus (§9.4)
+```
+
+The program inside portal `id` changed one of its status items, either
+with `SetStatus` (§9.4) or with `OSC 9 ; 4` (below). The host keeps no
+status state of its own: it validates the operation and relays it, and
+the client owns the item table — which is what keeps it across a `vsd`
+reattach, since the client is the process that outlives the renderer.
+A client SHOULD drop a portal's items when it deletes the portal.
+
+**`OSC 9 ; 4 ; <state> [; <percent>] ST`** — the progress report
+ConEmu introduced and Windows Terminal and Ghostty adopted — is read by
+the portal's vt100 and relayed as a `StatusChange` on the reserved key
+`osc.progress`, with empty text:
+
+| state | meaning       | op                                              |
+|-------|---------------|-------------------------------------------------|
+| 0     | remove        | `remove`, key `osc.progress`                    |
+| 1     | normal        | `level = info`, `progress = percent`            |
+| 2     | error         | `level = error`, `progress = percent`           |
+| 3     | indeterminate | `level = info`, `progress = indeterminate`      |
+| 4     | paused        | `level = warn`, `progress = percent`            |
+
+A missing or unparsable percent reads as 0, a percent above 100 as
+100, and an unknown state is ignored. Any other `OSC 9` (iTerm2's
+notification form) is not a status report and produces no event.
+
+Like `TitleChange`, the event is attributed to the `WritePortal` that
+carried the bytes (§8, forking).
+
 ## 9. Focus and cursor rendering
 
 ### 9.1 SetFocus (0x0A)
@@ -1254,6 +1291,65 @@ to leave. The applied-offset echo lets the indicator stop incrementing
 once the user reaches the top of the captured history;
 `history_depth` lets the client draw a scrollbar thumb sized to the
 actual history available.
+
+### 9.4 SetStatus (0x0E)
+
+Body (`StatusOp`):
+
+```
+u8     flags         ; bit 0 remove, bit 1 key_is_prefix; the rest
+                     ; reserved, MUST be 0
+string key           ; UTF-8, at most 64 bytes; may be empty
+if remove == 0:
+  u8     level       ; 0 = info, 1 = warn, 2 = error
+  u8     progress    ; 0 = none, 1 = percent, 2 = indeterminate
+  u8     percent     ; 0..=100; MUST be 0 unless progress == 1
+  string text        ; UTF-8, at most 256 bytes; may be empty
+```
+
+Sets or removes one of the sender's **status items**: a short line of
+text, optionally with a progress figure, that the client shows with the
+sender's portal — `vmux` paints it at the right of the pane's title
+strip and badges the tab when the pane is not on screen. It is the one
+command addressed to the sender's *own* scope rather than to a portal it
+created: a program has no id for the portal it runs in, and needs none,
+because the engine that processes the command is the one inside that
+portal (§5.5). That engine relays it to its parent as `StatusChange`
+(§8.14) with the portal's id.
+
+Items are keyed, so independent writers in one pane do not overwrite
+each other — an agent's activity and a download's progress are two
+items. Setting an existing key replaces the item. `remove` drops the
+key; with `key_is_prefix` it drops every key beginning with `key`, so a
+writer namespaces its keys (`claude.tool`, `claude.state`) and clears
+them in one command, and an empty prefix clears everything — the same
+convention VGE uses for element ids (VGE §6.2). `key_is_prefix` without
+`remove` is `err_bad_payload`.
+
+The key `osc.progress` is where `OSC 9 ; 4` lands (§8.14); a sender may
+write it too, and the most recent writer wins.
+
+`key` and `text` MUST NOT contain C0 controls or DEL: an item is one
+line of chrome, not a terminal stream. A body that breaks any rule
+above is `err_bad_payload`.
+
+The intended sender is not the pane's foreground program but a tool run
+beside it — `vstatus`, called from an agent's hooks or a download
+script, writing to the pane's tty. Such a sender cannot read a
+response, and one written into the pane would arrive as input to the
+foreground program, so it sends `request_id = REQ_ID_NO_RESPONSE`
+(§1.2) and does not probe first. That is the one exception to the
+probe-first rule of §2.1: a host that does not speak PRT discards the
+envelope either way, and a host that does needs nothing the probe
+negotiates.
+
+At the top level there is no portal to attach the item to. A host MAY
+show it in its own chrome; this implementation acknowledges it and
+discards it. A multiplexer nested in a portal sees its panes' items as
+`StatusChange` events and MAY re-announce the active pane's with
+`SetStatus` on its own output, as it does with titles (§8.2).
+
+Response: empty Ok.
 
 ## 10. Integration with VGE
 

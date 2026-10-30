@@ -15,14 +15,15 @@ use prt_protocol::apc::{ApcStream, Item, TerminalEvent};
 use prt_protocol::codec::Reader;
 use prt_protocol::command::{
     self, AnchorMode, Command, CreatePortalBody, CursorStyle, FocusTarget, ForkPortalBody,
-    ScrollTarget, UpdateOriginBody, WritePortalBody,
+    ScrollTarget, StatusLevel, StatusOp, StatusProgress, UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::envelope::{
     append_frame, bell_body, buffer_mode_change_body, clipboard_op_body,
     cursor_visibility_change_body, err_body, host_theme_changed_body, icon_name_change_body,
     mouse_mode_change_body,
     portal_activity_body, portal_evicted_body, portal_scroll_delta_body, portal_scroll_set_body,
-    raw_reply_body, resize_notify_body, title_change_body, working_dir_change_body,
+    raw_reply_body, resize_notify_body, status_change_body, title_change_body,
+    working_dir_change_body,
     wrap_t2c_envelope, ProbeBody,
 };
 use prt_protocol::frame::*;
@@ -295,6 +296,13 @@ pub struct PrtEngine {
     /// `EVT_CLIPBOARD_OP` emission so the host (`App`) can apply them
     /// to the system clipboard. Drained by `take_pending_clipboard_writes`.
     pending_clipboard_writes: Vec<String>,
+    /// `SetStatus` ops (§9.4) the program on this engine's stream sent
+    /// about *itself*. The command names no portal — the engine that
+    /// receives it is the one inside the sender's portal — so it is the
+    /// parent, holding that portal, that relays these as `StatusChange`
+    /// with the portal's id (`cmd_write_portal`). A top-level engine has
+    /// no parent and never queues any.
+    own_status: Vec<StatusOp>,
     /// Wakeup closure cloned into every per-portal VFT engine spawned
     /// in this scope (and inherited by sub-engines). When a per-portal
     /// VFT worker emits an event during an idle phase, it pings this
@@ -444,6 +452,7 @@ impl PrtEngine {
             scale_factor,
             pending_image_deletes: Vec::new(),
             pending_clipboard_writes: Vec::new(),
+            own_status: Vec::new(),
             vft_wakeup,
             vft_hooks,
             damage_min_interval: DEFAULT_DAMAGE_MIN_INTERVAL,
@@ -1406,6 +1415,15 @@ impl PrtEngine {
             Command::SetCursorStyle { unfocused } => self.cmd_set_cursor_style(unfocused),
             Command::SetPortalScrollback { id, to } => self.cmd_set_portal_scrollback(&id, to),
             Command::ForkPortal(b) => self.cmd_fork_portal(b),
+            Command::SetStatus(op) => {
+                // §9.4 — at the top level there is no portal to attach
+                // the item to, and bare veter shows none, so it is
+                // acknowledged and dropped.
+                if self.depth > 0 {
+                    self.own_status.push(op);
+                }
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1841,7 +1859,7 @@ impl PrtEngine {
         let scoped = hit.map(|h| crate::vge::state::ScopedHitTester::new(h, &b.id));
         let inner_hit =
             scoped.as_ref().map(|s| s as &dyn crate::vge::state::HitTester);
-        let (raw_events, old_cache, new_cache, reverse_bytes, activity) = {
+        let (raw_events, old_cache, new_cache, reverse_bytes, activity, own_status) = {
             // The whole write path acts on the buffer: bytes, engines,
             // damage and cursor queries all belong to the content, so a
             // write through either view of a forked pair lands once, in
@@ -1929,6 +1947,7 @@ impl PrtEngine {
             //    `drive_terminal_stage`.
             portal.children.after_vt100_process(&mut portal.vt);
             portal.children.flush_pending_events();
+            let own_status = std::mem::take(&mut portal.children.own_status);
 
             // 5. Snapshot polled state and detect deltas.
             let old_cache = portal.state_cache;
@@ -1976,7 +1995,7 @@ impl PrtEngine {
                 portal.pending_extended_cursor_queries = 0;
             }
 
-            (raw_events, old_cache, new_cache, reverse, activity)
+            (raw_events, old_cache, new_cache, reverse, activity, own_status)
         };
         // §9.3 — output leaves a pinned view where it is; RIS, 3J and
         // eviction are what can take its line away.
@@ -1985,6 +2004,9 @@ impl PrtEngine {
         // ---- emit events ---------------------------------------------
         if !reverse_bytes.is_empty() {
             self.emit_event(EVT_RAW_REPLY, raw_reply_body(&b.id, &reverse_bytes));
+        }
+        for op in own_status {
+            self.emit_event(EVT_STATUS_CHANGE, status_change_body(&b.id, &op));
         }
         for ev in raw_events {
             self.translate_callback_event(&b.id, ev);
@@ -2081,6 +2103,10 @@ impl PrtEngine {
                         working_dir_change_body(id, &uri),
                     );
                 }
+                // OSC 9 ; 4  →  StatusChange on `osc.progress` (§8.14).
+                else if let Some(op) = osc_progress(&params) {
+                    self.emit_event(EVT_STATUS_CHANGE, status_change_body(id, &op));
+                }
                 // Other unhandled OSC sequences: silently drop. Future
                 // events (e.g. OSC 8 hyperlinks) plug in here.
             }
@@ -2170,6 +2196,38 @@ impl Default for PrtEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `OSC 9 ; 4 ; <state> [; <percent>]` — ConEmu's progress report —
+/// as the status op §8.14 maps it to. `None` for any other `OSC 9`
+/// (iTerm2's notification form) and for a state the table lacks.
+fn osc_progress(params: &[Vec<u8>]) -> Option<StatusOp> {
+    let [nine, four, rest @ ..] = params else {
+        return None;
+    };
+    if nine != b"9" || four != b"4" {
+        return None;
+    }
+    let state = rest.first().map_or(&b""[..], |v| v.as_slice());
+    let percent = rest
+        .get(1)
+        .and_then(|p| std::str::from_utf8(p).ok()?.parse::<u32>().ok())
+        .map_or(0, |p| p.min(100) as u8);
+    let key = STATUS_KEY_OSC_PROGRESS.to_owned();
+    let set = |level, progress| StatusOp::Set {
+        key: key.clone(),
+        level,
+        progress: Some(progress),
+        text: String::new(),
+    };
+    Some(match state {
+        b"0" => StatusOp::Remove { key, prefix: false },
+        b"1" => set(StatusLevel::Info, StatusProgress::Percent(percent)),
+        b"2" => set(StatusLevel::Error, StatusProgress::Percent(percent)),
+        b"3" => set(StatusLevel::Info, StatusProgress::Indeterminate),
+        b"4" => set(StatusLevel::Warn, StatusProgress::Percent(percent)),
+        _ => return None,
+    })
 }
 
 /// Standard base64 decoder for OSC 52 set form (§8.4).
@@ -3921,6 +3979,101 @@ mod tests {
         let mut r = Reader::new(&t.body);
         assert_eq!(r.string().unwrap(), "p");
         assert_eq!(r.string().unwrap(), "windowtitle");
+    }
+
+    fn status_changes(frames: &[ParsedFrame]) -> Vec<(String, StatusOp)> {
+        frames
+            .iter()
+            .filter(|f| f.frame_type == EVT_STATUS_CHANGE)
+            .map(|f| prt_protocol::envelope::parse_status_change(&f.body).unwrap())
+            .collect()
+    }
+
+    /// A `SetStatus` envelope as `vstatus` writes it: no probe, and the
+    /// no-response sentinel, since nobody on the pane's side reads.
+    fn set_status_envelope(op: &StatusOp) -> Vec<u8> {
+        let mut frames = Vec::new();
+        append_frame(&mut frames, CMD_SET_STATUS, REQ_ID_NO_RESPONSE, &encode::set_status_body(op));
+        wrap_c2t_envelope(&frames)
+    }
+
+    #[test]
+    fn set_status_inside_a_portal_surfaces_as_status_change_with_its_id() {
+        let mut engine = PrtEngine::new();
+        let set = StatusOp::Set {
+            key: "claude.tool".into(),
+            level: StatusLevel::Info,
+            progress: None,
+            text: "Bash: cargo test".into(),
+        };
+        let clear = StatusOp::Remove { key: "claude.".into(), prefix: true };
+        let mut data = b"before ".to_vec();
+        data.extend(set_status_envelope(&set));
+        data.extend(set_status_envelope(&clear));
+        let frames = create_and_write(&mut engine, "pane", 40, 4, &data);
+        assert_eq!(
+            status_changes(&frames),
+            vec![("pane".to_string(), set), ("pane".to_string(), clear)]
+        );
+        // The sentinel holds inside the portal too: nothing came back
+        // for the pane's own side to read as input.
+        assert!(first_event(&frames, EVT_RAW_REPLY).is_none());
+    }
+
+    #[test]
+    fn set_status_at_top_level_is_acknowledged_and_dropped() {
+        let mut engine = PrtEngine::new();
+        let op = StatusOp::Set {
+            key: String::new(),
+            level: StatusLevel::Warn,
+            progress: Some(StatusProgress::Percent(5)),
+            text: "x".into(),
+        };
+        let frames = dispatch_full(&mut engine, CMD_SET_STATUS, 7, &encode::set_status_body(&op));
+        assert_eq!(frames[0].frame_type, RSP_OK);
+        assert!(status_changes(&frames).is_empty());
+        assert!(engine.own_status.is_empty());
+    }
+
+    #[test]
+    fn osc_9_4_maps_onto_the_osc_progress_key() {
+        let mut engine = PrtEngine::new();
+        let frames = create_and_write(
+            &mut engine,
+            "p",
+            10,
+            2,
+            b"\x1b]9;4;1;42\x07\x1b]9;4;2;250\x1b\\\x1b]9;4;3\x07\x1b]9;4;4;x\x07\x1b]9;4;0;0\x07",
+        );
+        let key = || STATUS_KEY_OSC_PROGRESS.to_string();
+        let set = |level, progress| StatusOp::Set {
+            key: key(),
+            level,
+            progress: Some(progress),
+            text: String::new(),
+        };
+        let ops: Vec<_> = status_changes(&frames).into_iter().map(|(id, op)| {
+            assert_eq!(id, "p");
+            op
+        }).collect();
+        assert_eq!(
+            ops,
+            vec![
+                set(StatusLevel::Info, StatusProgress::Percent(42)),
+                set(StatusLevel::Error, StatusProgress::Percent(100)),
+                set(StatusLevel::Info, StatusProgress::Indeterminate),
+                set(StatusLevel::Warn, StatusProgress::Percent(0)),
+                StatusOp::Remove { key: key(), prefix: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn osc_9_notification_and_unknown_progress_states_are_not_status() {
+        let mut engine = PrtEngine::new();
+        let frames =
+            create_and_write(&mut engine, "p", 10, 2, b"\x1b]9;build done\x07\x1b]9;4;7;10\x07");
+        assert!(status_changes(&frames).is_empty());
     }
 
     #[test]

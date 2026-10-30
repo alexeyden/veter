@@ -177,6 +177,120 @@ pub struct WritePortalBody {
     pub data: Vec<u8>,
 }
 
+/// §9.4 — how loud a status item is; the client picks the colours.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum StatusLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// §9.4 — the progress figure a status item carries, if any.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum StatusProgress {
+    /// 0..=100.
+    Percent(u8),
+    Indeterminate,
+}
+
+/// §9.4 — one change to the sender's status items. `SetStatus` carries
+/// it from a program to the engine inside its portal, and
+/// `StatusChange` (§8.14) relays it, unchanged, to the portal's client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum StatusOp {
+    /// Set (or replace) the item under `key`.
+    Set {
+        key: String,
+        level: StatusLevel,
+        progress: Option<StatusProgress>,
+        text: String,
+    },
+    /// Drop the item under `key` — or, with `prefix`, every item whose
+    /// key starts with it; an empty prefix drops them all.
+    Remove { key: String, prefix: bool },
+}
+
+/// One line of chrome: no C0 controls, no DEL (§9.4).
+fn status_str<'a>(r: &mut Reader<'a>, max: usize) -> DecodeResult<&'a str> {
+    let s = r.string()?;
+    if s.len() > max || s.chars().any(|c| c < ' ' || c == '\u{7f}') {
+        return Err(DecodeError::bad_payload());
+    }
+    Ok(s)
+}
+
+impl StatusOp {
+    pub fn key(&self) -> &str {
+        match self {
+            StatusOp::Set { key, .. } | StatusOp::Remove { key, .. } => key,
+        }
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> DecodeResult<Self> {
+        let flags = r.u8()?;
+        if flags & !(STATUS_FLAG_REMOVE | STATUS_FLAG_KEY_IS_PREFIX) != 0 {
+            return Err(DecodeError::bad_payload());
+        }
+        let key = status_str(r, MAX_STATUS_KEY_BYTES)?.to_owned();
+        let prefix = flags & STATUS_FLAG_KEY_IS_PREFIX != 0;
+        if flags & STATUS_FLAG_REMOVE != 0 {
+            return Ok(StatusOp::Remove { key, prefix });
+        }
+        if prefix {
+            return Err(DecodeError::bad_payload());
+        }
+        let level = match r.u8()? {
+            STATUS_LEVEL_INFO => StatusLevel::Info,
+            STATUS_LEVEL_WARN => StatusLevel::Warn,
+            STATUS_LEVEL_ERROR => StatusLevel::Error,
+            _ => return Err(DecodeError::bad_payload()),
+        };
+        let kind = r.u8()?;
+        let percent = r.u8()?;
+        let progress = match kind {
+            STATUS_PROGRESS_NONE if percent == 0 => None,
+            STATUS_PROGRESS_PERCENT if percent <= 100 => Some(StatusProgress::Percent(percent)),
+            STATUS_PROGRESS_INDETERMINATE if percent == 0 => Some(StatusProgress::Indeterminate),
+            _ => return Err(DecodeError::bad_payload()),
+        };
+        let text = status_str(r, MAX_STATUS_TEXT_BYTES)?.to_owned();
+        Ok(StatusOp::Set { key, level, progress, text })
+    }
+
+    pub fn write(&self, w: &mut super::codec::Writer) {
+        match self {
+            StatusOp::Remove { key, prefix } => {
+                let prefix = if *prefix { STATUS_FLAG_KEY_IS_PREFIX } else { 0 };
+                w.u8(STATUS_FLAG_REMOVE | prefix);
+                w.str(key);
+            }
+            StatusOp::Set { key, level, progress, text } => {
+                w.u8(0);
+                w.str(key);
+                w.u8(match level {
+                    StatusLevel::Info => STATUS_LEVEL_INFO,
+                    StatusLevel::Warn => STATUS_LEVEL_WARN,
+                    StatusLevel::Error => STATUS_LEVEL_ERROR,
+                });
+                let (kind, percent) = match progress {
+                    None => (STATUS_PROGRESS_NONE, 0),
+                    Some(StatusProgress::Percent(p)) => (STATUS_PROGRESS_PERCENT, *p),
+                    Some(StatusProgress::Indeterminate) => (STATUS_PROGRESS_INDETERMINATE, 0),
+                };
+                w.u8(kind);
+                w.u8(percent);
+                w.str(text);
+            }
+        }
+    }
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -197,6 +311,8 @@ pub enum Command {
     SetPortalScrollback { id: String, to: ScrollTarget },
     /// §6.9 — a second view onto an existing portal's buffer.
     ForkPortal(ForkPortalBody),
+    /// §9.4 — set or remove one of the sender's own status items.
+    SetStatus(StatusOp),
 }
 
 fn read_id(r: &mut Reader<'_>) -> DecodeResult<String> {
@@ -398,6 +514,13 @@ pub fn parse(frame_type: u8, body: &[u8]) -> Result<Command, u16> {
                 return Err(ERR_BAD_PAYLOAD);
             }
             Ok(Command::SetPortalScrollback { id, to })
+        }
+        CMD_SET_STATUS => {
+            let op = StatusOp::read(&mut r)?;
+            if !r.at_end() {
+                return Err(ERR_BAD_PAYLOAD);
+            }
+            Ok(Command::SetStatus(op))
         }
         // §3 — frame types in 0x80..=0xFF are events and MUST NOT appear
         // in client-to-host envelopes. Treat as unknown command.
@@ -606,6 +729,75 @@ mod tests {
         assert_eq!(body.new_origin_x, -3);
         assert_eq!(body.new_origin_y, 7);
         assert_eq!(body.anchor_mode, AnchorMode::Scrollback);
+    }
+
+    fn status_roundtrip(op: StatusOp) {
+        let body = crate::encode::set_status_body(&op);
+        let Command::SetStatus(back) = parse(CMD_SET_STATUS, &body).unwrap() else {
+            panic!("expected SetStatus");
+        };
+        assert_eq!(back, op);
+    }
+
+    #[test]
+    fn set_status_roundtrips_every_shape() {
+        status_roundtrip(StatusOp::Set {
+            key: "dl".into(),
+            level: StatusLevel::Warn,
+            progress: Some(StatusProgress::Percent(42)),
+            text: "ubuntu.iso — 1.2 GB".into(),
+        });
+        status_roundtrip(StatusOp::Set {
+            key: String::new(),
+            level: StatusLevel::Info,
+            progress: Some(StatusProgress::Indeterminate),
+            text: String::new(),
+        });
+        status_roundtrip(StatusOp::Set {
+            key: "claude.state".into(),
+            level: StatusLevel::Error,
+            progress: None,
+            text: "failed".into(),
+        });
+        status_roundtrip(StatusOp::Remove { key: "claude.".into(), prefix: true });
+        status_roundtrip(StatusOp::Remove { key: "dl".into(), prefix: false });
+    }
+
+    #[test]
+    fn set_status_rejects_what_section_9_4_forbids() {
+        let set = |flags: u8, key: &str, level: u8, kind: u8, pct: u8, text: &str| {
+            let mut w = Writer::new();
+            w.u8(flags);
+            w.str(key);
+            w.u8(level);
+            w.u8(kind);
+            w.u8(pct);
+            w.str(text);
+            parse(CMD_SET_STATUS, &w.buf)
+        };
+        assert!(set(0, "k", 0, 1, 100, "ok").is_ok());
+        // Reserved flag bit; prefix without remove.
+        assert_eq!(set(0x04, "k", 0, 0, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(STATUS_FLAG_KEY_IS_PREFIX, "k", 0, 0, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        // Unknown level / progress kind; percent out of range or stray.
+        assert_eq!(set(0, "k", 3, 0, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(0, "k", 0, 3, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(0, "k", 0, 1, 101, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(0, "k", 0, 0, 5, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        // Controls and oversize strings.
+        assert_eq!(set(0, "k", 0, 0, 0, "a\nb").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(0, "k", 0, 0, 0, "a\x1b[2Jb").unwrap_err(), ERR_BAD_PAYLOAD);
+        assert_eq!(set(0, "k\x7f", 0, 0, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        let long_key = "k".repeat(MAX_STATUS_KEY_BYTES + 1);
+        assert_eq!(set(0, &long_key, 0, 0, 0, "").unwrap_err(), ERR_BAD_PAYLOAD);
+        let long_text = "t".repeat(MAX_STATUS_TEXT_BYTES + 1);
+        assert_eq!(set(0, "k", 0, 0, 0, &long_text).unwrap_err(), ERR_BAD_PAYLOAD);
+        // Trailing bytes after a remove.
+        let mut w = Writer::new();
+        w.u8(STATUS_FLAG_REMOVE);
+        w.str("k");
+        w.u8(0);
+        assert_eq!(parse(CMD_SET_STATUS, &w.buf).unwrap_err(), ERR_BAD_PAYLOAD);
     }
 
     #[test]

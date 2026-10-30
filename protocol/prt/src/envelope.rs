@@ -395,6 +395,25 @@ pub fn parse_portal_scroll_set(
     Ok((id, to))
 }
 
+/// `EVT_STATUS_CHANGE` (§8.14): the id, then the op in `SetStatus`'s
+/// own encoding.
+pub fn status_change_body(id: &str, op: &crate::command::StatusOp) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.str(id);
+    op.write(&mut w);
+    w.buf
+}
+
+/// Inverse of [`status_change_body`], for clients.
+pub fn parse_status_change(
+    body: &[u8],
+) -> Result<(String, crate::command::StatusOp), crate::codec::DecodeError> {
+    let mut r = Reader::new(body);
+    let id = r.string()?.to_string();
+    let op = crate::command::StatusOp::read(&mut r)?;
+    Ok((id, op))
+}
+
 // ---- frame + envelope wrapping ----------------------------------------
 
 /// Append a single frame to an unstuffed payload buffer.
