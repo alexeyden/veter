@@ -1309,8 +1309,8 @@ if remove == 0:
 
 Sets or removes one of the sender's **status items**: a short line of
 text, optionally with a progress figure, that the client shows with the
-sender's portal — `vmux` paints it at the right of the pane's title
-strip and badges the tab when the pane is not on screen. It is the one
+sender's portal — `vmux` puts it in the tab bar, inside the pane's tab
+or at the bar's right end depending on the style engine. It is the one
 command addressed to the sender's *own* scope rather than to a portal it
 created: a program has no id for the portal it runs in, and needs none,
 because the engine that processes the command is the one inside that

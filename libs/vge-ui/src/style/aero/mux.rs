@@ -2,17 +2,19 @@
 //! thumbs, and the dividers between panes.
 
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, DrawCmd, Style};
+use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 use vge_protocol::path::{PathNode, PathSegment};
 
+use prt_protocol::command::{StatusLevel, StatusProgress};
+
 use super::{
-    BAR_BOTTOM, BAR_LIP, BAR_TOP, GEL_AQUA, Gel, Tone, bubble, gel, gloss, scroll_thumb, smoke,
-    tone,
+    BAR_BOTTOM, BAR_LIP, BAR_TOP, GEL_AMBER, GEL_AQUA, GEL_GREEN, GEL_RED, Gel, Tone, bubble, gel,
+    gloss, scroll_thumb, smoke, tone,
 };
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
-use crate::style::{PaneChrome, TabBar, TabBarParts, TabbarMetrics};
+use crate::style::{PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics};
 
 /// A two-row bar of tabs standing on its bottom edge, Windows XP
 /// fashion: the label sits on the bar's centre line, the active tab
@@ -23,6 +25,10 @@ pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
     margin: 0.5,
     gap: 0.3,
     name_pad: 4.0,
+    status: StatusPlacement::InTab {
+        scale: STATUS_SCALE,
+        max_cells: 24.0,
+    },
 };
 /// The bar's height in cells.
 const BAR_H: f32 = TABBAR_METRICS.rows as f32;
@@ -47,6 +53,13 @@ const HILITE_SOLID: f32 = 2.5;
 const HILITE_FADE: f32 = 9.0;
 /// The text row, centred on the bar.
 const TEXT_Y: f32 = (BAR_H - 1.0) * 0.5;
+/// A tab carrying a status lifts its label to make room under it…
+const STATUS_LABEL_Y: f32 = 0.3;
+/// …for the status, on a smaller line of its own…
+const STATUS_Y: f32 = 1.18;
+const STATUS_SCALE: f32 = 0.6;
+/// …above a gel strip this many pixels deep, standing on the lip.
+const STATUS_STRIP_PX: f32 = 4.0;
 
 /// The tab bar: a two-row sky with the tabs standing on its bottom
 /// edge — the accent's gel for the active one, frosted glass for the
@@ -201,20 +214,25 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             tone(FROST_SHADE)
         };
         let hw = slot.num_w * 0.38;
+        let label_y = if slot.status.is_some() {
+            STATUS_LABEL_Y
+        } else {
+            TEXT_Y
+        };
         socket(
             cmds,
             px,
             num_cx - hw,
-            TEXT_Y + 0.1,
+            label_y + 0.1,
             num_cx + hw,
-            TEXT_Y + 0.9,
+            label_y + 0.9,
             well,
         );
         text(
             cmds,
             px,
             num_cx,
-            TEXT_Y,
+            label_y,
             Align::Center,
             &format!("{}", i + 1),
             white(1.0),
@@ -225,13 +243,16 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             cmds,
             px,
             x + slot.num_w + slot.name_w * 0.5,
-            TEXT_Y,
+            label_y,
             Align::Center,
             slot.label,
             white(1.0),
             is_active,
             Some(shadow),
         );
+        if let Some(s) = slot.status {
+            tab_status(cmds, px, x0, x1, &s, shadow);
+        }
         tabs.push(tab);
     }
 
@@ -248,7 +269,75 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             Some(navy),
         );
     }
-    TabBarParts { ground, tabs }
+    // Every tab carries its own status, so there is no bar-end segment.
+    TabBarParts {
+        ground,
+        tabs,
+        status: Vec::new(),
+    }
+}
+
+/// A tab's status, under its label: the text on a small line of its
+/// own, and, for an item with a figure or a level worth seeing, a gel
+/// strip along the tab's foot as long as the progress made — green for
+/// progress, Windows XP's own, amber for a warning, red for an error.
+fn tab_status(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, x1: f32, s: &TabStatus<'_>, shadow: Color) {
+    let max = ((x1 - x0 - 1.0) / STATUS_SCALE).max(1.0) as usize;
+    let label = crate::measure::elide(&s.label(), max);
+    let cx = (x0 + x1) * 0.5;
+    cmds.push(DrawCmd::DrawText {
+        origin: Point {
+            x: cx + px.x(1.0),
+            y: STATUS_Y + px.y(1.0),
+        },
+        align: Align::Center,
+        fill: Style::Flat(shadow),
+        font_style: FontStyle(0x00),
+        font_scale: STATUS_SCALE,
+        text: label.clone(),
+    });
+    cmds.push(DrawCmd::DrawText {
+        origin: Point { x: cx, y: STATUS_Y },
+        align: Align::Center,
+        fill: Style::Flat(white(1.0)),
+        font_style: FontStyle(0x00),
+        font_scale: STATUS_SCALE,
+        text: label,
+    });
+
+    let material = match s.level {
+        StatusLevel::Info => &GEL_GREEN,
+        StatusLevel::Warn => &GEL_AMBER,
+        StatusLevel::Error => &GEL_RED,
+    };
+    let (sx0, sx1) = (x0 + 0.5, x1 - 0.5);
+    let y1 = BAR_H - px.y(1.0);
+    let y0 = y1 - px.y(STATUS_STRIP_PX);
+    match s.progress {
+        Some(StatusProgress::Percent(p)) => {
+            // The empty part of the track, so a low figure still reads
+            // as a bar with a long way to go.
+            cmds.push(DrawCmd::FillPath {
+                fill: Style::Flat(hex(0x06264d, 0.35)),
+                segments: pill(px, sx0, y0, sx1, y1),
+            });
+            let fx = sx0 + (sx1 - sx0) * f32::from(p) / 100.0;
+            if fx - sx0 >= px.x(STATUS_STRIP_PX) {
+                gel(cmds, px, sx0, y0, fx, y1, material);
+            }
+        }
+        // XP's marquee: blocks with no figure behind them.
+        Some(StatusProgress::Indeterminate) => {
+            let block = 0.6;
+            let mut bx = sx0;
+            while bx + block <= sx1 {
+                gel(cmds, px, bx, y0, bx + block, y1, material);
+                bx += block * 2.0;
+            }
+        }
+        None if s.level != StatusLevel::Info => gel(cmds, px, sx0, y0, sx1, y1, material),
+        None => {}
+    }
 }
 
 /// The deep tone of a frosted tab, which its number's socket is

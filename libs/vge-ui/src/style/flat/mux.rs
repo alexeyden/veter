@@ -2,16 +2,17 @@
 //! thumbs, and the dividers between panes — rounded fills in the host
 //! theme's accent and surfaces.
 
+use prt_protocol::command::{StatusLevel, StatusProgress};
 use vge_protocol::codec::{Point, Rect};
-use vge_protocol::command::{Align, DrawCmd, FontStyle, Style};
+use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 
 use crate::measure::text_cells;
 use crate::paint::Px;
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
-use crate::style::{PaneChrome, TabBar, TabBarParts};
+use crate::style::{BarStatus, PaneChrome, TabBar, TabBarParts, TabStatus};
 use crate::theme::{
-    accent_style, active_text, activity_style, activity_text, dim_text, scrollbar, surface_style,
-    title_text, title_thumb_style,
+    accent_color, accent_style, active_text, activity_style, activity_text, dim_text, scrollbar,
+    status_color, surface_style, title_text, title_thumb_style,
 };
 
 /// The tab bar: a rule along the bottom of the row in the accent, each
@@ -177,6 +178,9 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             font_scale: 1.0,
             text: name_text,
         });
+        if !is_active && let Some(s) = slot.status {
+            tab_status_mark(cmds, x, x + num_w + name_w, &s);
+        }
         tabs.push(tab);
     }
 
@@ -191,7 +195,129 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             text: "› ".to_string(),
         });
     }
-    TabBarParts { ground, tabs }
+    let mut status = Vec::new();
+    if let Some(seg) = bar.status {
+        status_segment(&mut status, px, bar.width, &seg);
+    }
+    TabBarParts {
+        ground,
+        tabs,
+        status,
+    }
+}
+
+/// How far a status item's tint shows: the share of a box a progress
+/// figure fills, or all of it for an item that only has a level.
+/// `None` when there is nothing to show beyond the text.
+fn status_fill(s: &TabStatus<'_>) -> Option<StatusFill> {
+    match s.progress {
+        Some(StatusProgress::Percent(p)) => Some(StatusFill::Share(f32::from(p) / 100.0)),
+        Some(StatusProgress::Indeterminate) => Some(StatusFill::Busy),
+        None if s.level != StatusLevel::Info => Some(StatusFill::Share(1.0)),
+        None => None,
+    }
+}
+
+enum StatusFill {
+    Share(f32),
+    /// No figure to show, so stripes: a static VGE frame cannot spin.
+    Busy,
+}
+
+/// The tint behind a status: the accent, translucent like a pane
+/// title's thumb, for `info`; the level's own colour otherwise.
+fn status_tint(level: StatusLevel, alpha: f32) -> Color {
+    Color {
+        a: alpha,
+        ..status_color(level).unwrap_or_else(accent_color)
+    }
+}
+
+/// The active tab's status, pinned at the right end of the bar: a
+/// surface segment that fills left to right with the tint as progress
+/// is made, like a pill-shaped progress bar, with the label over it.
+fn status_segment(cmds: &mut Vec<DrawCmd>, px: Px, width: f32, seg: &BarStatus<'_>) {
+    let (x0, x1) = (seg.x0, width);
+    let s = &seg.status;
+    let (rx, ry) = chrome_corner_radii(x1 - x0, 1.0, px.w, px.h);
+    // Rounded on top, square where it stands on the rule — the session
+    // segment's shape, mirrored.
+    let shape = |x1: f32, round_right: bool| {
+        rounded_rect_path_corners(x0, 0.0, x1, 1.0, rx, ry, true, round_right, false, false)
+    };
+    cmds.push(DrawCmd::FillPath {
+        fill: surface_style(),
+        segments: shape(x1, true),
+    });
+    match status_fill(s) {
+        Some(StatusFill::Share(share)) if share > 0.0 => {
+            let fx = x0 + (x1 - x0) * share;
+            cmds.push(DrawCmd::FillPath {
+                fill: Style::Flat(status_tint(s.level, 0.55)),
+                segments: shape(fx, share >= 1.0),
+            });
+        }
+        Some(StatusFill::Busy) => {
+            // Inset past the rounded corners rather than clipped to them.
+            let rects = (0..)
+                .map(|i| x0 + 0.6 + i as f32)
+                .take_while(|x| x + 0.5 <= x1 - 0.6)
+                .map(|x| Rect {
+                    x,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 1.0,
+                })
+                .collect();
+            cmds.push(DrawCmd::FillRectangles {
+                fill: Style::Flat(status_tint(s.level, 0.4)),
+                rects,
+            });
+        }
+        _ => {}
+    }
+    cmds.push(DrawCmd::DrawText {
+        origin: Point { x: x0, y: 0.0 },
+        align: Align::Left,
+        fill: Style::Flat(title_text()),
+        font_style: FontStyle(0x00),
+        font_scale: 1.0,
+        text: format!(" {} ", s.label()),
+    });
+}
+
+/// A background tab's status, in the one row a flat tab has: a thin bar
+/// along the foot of the pill, as long as the progress made, for an
+/// item with a figure or a level worth seeing from another tab. An
+/// `info` item with neither waits until the tab is active.
+fn tab_status_mark(cmds: &mut Vec<DrawCmd>, x0: f32, x1: f32, s: &TabStatus<'_>) {
+    const H: f32 = 0.14;
+    let (share, alpha) = match status_fill(s) {
+        Some(StatusFill::Share(share)) => (share, 0.9),
+        Some(StatusFill::Busy) => (1.0, 0.45),
+        None => return,
+    };
+    if share <= 0.0 {
+        return;
+    }
+    // `info` takes the surface's ink rather than the accent: the bar
+    // sits just above the accent rule and would merge into it.
+    let color = match status_color(s.level) {
+        Some(c) => Color { a: alpha, ..c },
+        None => Color {
+            a: alpha,
+            ..title_text()
+        },
+    };
+    cmds.push(DrawCmd::FillRectangles {
+        fill: Style::Flat(color),
+        rects: vec![Rect {
+            x: x0,
+            y: 1.0 - H,
+            w: (x1 - x0) * share,
+            h: H,
+        }],
+    });
 }
 
 /// A pane's title, on a translucent accent thumb when focused and the

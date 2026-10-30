@@ -271,6 +271,26 @@ fn host_swatch(name: &str) -> Option<(Color, Color)> {
     Some((unpack(*fill), unpack(*text)))
 }
 
+/// The colour a status item's level calls for (`doc/portal-extension.md`
+/// §9.4), or `None` for `info`, which an engine draws in its own
+/// material. The host's swatches when it publishes them, so a warning
+/// under a light scheme is that scheme's yellow; this crate's own
+/// otherwise. An error is the theme's warn tone first — the colour it
+/// already gives an error line.
+pub fn status_color(level: prt_protocol::command::StatusLevel) -> Option<Color> {
+    use prt_protocol::command::StatusLevel;
+    let swatch = |name: &str| {
+        host_swatch(name)
+            .map(|(fill, _)| fill)
+            .or_else(|| named_color(name).map(unpack))
+    };
+    match level {
+        StatusLevel::Info => None,
+        StatusLevel::Warn => swatch("yellow"),
+        StatusLevel::Error => warn_color().or_else(|| swatch("red")),
+    }
+}
+
 /// The CLI accent as it resolves right now: its fill, the text the
 /// host picked for it (a host swatch only), and the swatch's name when
 /// it is the host's. `None` with no `--accent`, and for a name that

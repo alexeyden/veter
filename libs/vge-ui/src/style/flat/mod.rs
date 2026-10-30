@@ -14,7 +14,7 @@ use vge_protocol::command::{Align, Color, CreateElementBody, DrawCmd};
 
 use super::{
     Dialog, DocChrome, DocFrame, DocRole, Engine, Figure, FileKind, IconBox, ListInk, Metrics,
-    PaneChrome, SearchPanel, StatusLeft, TabBar, TabBarParts, TabbarMetrics,
+    PaneChrome, SearchPanel, StatusLeft, StatusPlacement, TabBar, TabBarParts, TabbarMetrics,
 };
 use crate::modal::{self, ModalIds, ScrollModal};
 use crate::paint::Px;
@@ -30,6 +30,7 @@ const METRICS: Metrics = Metrics {
         margin: 0.0,
         gap: 0.0,
         name_pad: 2.0,
+        status: StatusPlacement::BarEnd,
     },
     page_inset: 0.0,
 };

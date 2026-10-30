@@ -361,6 +361,55 @@ pub struct TabbarMetrics {
     pub gap: f32,
     /// Cells around a label inside its name rect, both sides together.
     pub name_pad: f32,
+    /// Where a pane's status (`doc/portal-extension.md` §9.4) goes.
+    pub status: StatusPlacement,
+}
+
+/// Where the tab bar shows status, which decides the room the client
+/// lays out for it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StatusPlacement {
+    /// Every tab carries its own status on a second line under its
+    /// label, at `scale` of the text size. A tab widens to fit it, up to
+    /// `max_cells` wide; past that the status is elided.
+    InTab { scale: f32, max_cells: f32 },
+    /// The active tab's status is a segment pinned at the bar's right
+    /// end ([`TabBar::status`]), opposite the session name; the other
+    /// tabs carry theirs as [`Tab::status`] for whatever mark fits a
+    /// one-row tab.
+    BarEnd,
+}
+
+/// A status item as the chrome shows it: the one a client picked to
+/// stand for a tab.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabStatus<'a> {
+    pub text: &'a str,
+    pub level: prt_protocol::command::StatusLevel,
+    pub progress: Option<prt_protocol::command::StatusProgress>,
+}
+
+impl TabStatus<'_> {
+    /// What is written: the text, after the percentage when there is
+    /// one. Shared by the engines and by the client's layout so the room
+    /// it makes is the room the label takes.
+    pub fn label(&self) -> String {
+        match (self.progress, self.text.is_empty()) {
+            (Some(prt_protocol::command::StatusProgress::Percent(p)), true) => format!("{p}%"),
+            (Some(prt_protocol::command::StatusProgress::Percent(p)), false) => {
+                format!("{p}% {}", self.text)
+            }
+            _ => self.text.to_string(),
+        }
+    }
+}
+
+/// The active tab's status segment under [`StatusPlacement::BarEnd`]:
+/// from `x0` to the bar's right end.
+#[derive(Clone, Copy, Debug)]
+pub struct BarStatus<'a> {
+    pub status: TabStatus<'a>,
+    pub x0: f32,
 }
 
 /// The tab bar, laid out by the client.
@@ -376,6 +425,8 @@ pub struct TabBar<'a> {
     pub left_chevron: Option<f32>,
     /// Where the `›` goes, when tabs are clipped off the end.
     pub right_chevron: Option<f32>,
+    /// The active tab's status segment, under [`StatusPlacement::BarEnd`].
+    pub status: Option<BarStatus<'a>>,
 }
 
 /// The tab bar as [`Engine::tab_bar`] paints it, split where a change
@@ -390,6 +441,10 @@ pub struct TabBarParts {
     /// paint past its own rect — Aero's active tab casts a shadow on its
     /// neighbours — so a client draws the active one above the rest.
     pub tabs: Vec<Vec<DrawCmd>>,
+    /// The bar-end status segment ([`TabBar::status`]); empty without
+    /// one. Its own part because it is what changes most often — a
+    /// download ticks it once a percent.
+    pub status: Vec<DrawCmd>,
 }
 
 /// One tab: a number rect `[x0, x0 + num_w)` and a name rect after it.
@@ -402,6 +457,8 @@ pub struct Tab<'a> {
     pub active: bool,
     /// Unseen output in a background tab.
     pub activity: bool,
+    /// The status this tab stands for, if its panes have any.
+    pub status: Option<TabStatus<'a>>,
 }
 
 /// A pane's chrome, in pane-relative cells.
@@ -979,6 +1036,77 @@ mod tests {
             engine.scroll_thumb(&mut thumb, px, rect);
             assert!(!thumb.is_empty(), "{}", engine.name());
         }
+    }
+
+    /// A status reaches the screen under both engines, where each
+    /// engine's metrics say it goes: in the tab it belongs to, or in the
+    /// bar-end segment — and only there, so the client's layout, built
+    /// from the same metrics, made room in the right place.
+    #[test]
+    fn every_engine_draws_the_status_where_its_metrics_put_it() {
+        use prt_protocol::command::{StatusLevel, StatusProgress};
+        let px = Px { w: 8.0, h: 16.0 };
+        let status = TabStatus {
+            text: "cargo test",
+            level: StatusLevel::Warn,
+            progress: Some(StatusProgress::Percent(42)),
+        };
+        for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+            let in_tab = matches!(engine.metrics().tabbar.status, StatusPlacement::InTab { .. });
+            let tab = |index: usize, x0: f32, active: bool| Tab {
+                index,
+                x0,
+                num_w: 3.0,
+                name_w: 20.0,
+                label: "claude",
+                active,
+                activity: false,
+                status: Some(status),
+            };
+            let bar = TabBar {
+                width: 120.0,
+                session: None,
+                tabs: vec![tab(0, 0.5, true), tab(1, 24.0, false)],
+                left_chevron: None,
+                right_chevron: None,
+                status: (!in_tab).then_some(BarStatus { status, x0: 90.0 }),
+            };
+            let parts = engine.tab_bar(px, &bar);
+            let says = |cmds: &[DrawCmd]| texts(cmds).iter().any(|(t, _)| t.contains("42% cargo test"));
+            if in_tab {
+                assert!(parts.tabs.iter().all(|t| says(t)), "{}", engine.name());
+                assert!(parts.status.is_empty(), "{}", engine.name());
+            } else {
+                let at = texts(&parts.status);
+                assert!(says(&parts.status), "{}", engine.name());
+                assert!(at.iter().all(|(_, p)| p.x >= 90.0), "{}", engine.name());
+                assert!(!parts.tabs.iter().any(|t| says(t)), "{}", engine.name());
+                // The background tab still marks its progress somehow.
+                assert!(parts.tabs[1].len() > tab_bar_without_status(engine, px)[1].len());
+            }
+        }
+    }
+
+    fn tab_bar_without_status(engine: &dyn Engine, px: Px) -> Vec<Vec<DrawCmd>> {
+        let tab = |index: usize, x0: f32, active: bool| Tab {
+            index,
+            x0,
+            num_w: 3.0,
+            name_w: 20.0,
+            label: "claude",
+            active,
+            activity: false,
+            status: None,
+        };
+        let bar = TabBar {
+            width: 120.0,
+            session: None,
+            tabs: vec![tab(0, 0.5, true), tab(1, 24.0, false)],
+            left_chevron: None,
+            right_chevron: None,
+            status: None,
+        };
+        engine.tab_bar(px, &bar).tabs
     }
 
     #[test]

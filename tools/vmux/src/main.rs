@@ -45,12 +45,14 @@ use prt_protocol::apc::ApcStream as PrtApcStream;
 use prt_protocol::codec::Reader as PrtReader;
 use prt_protocol::command::{
     AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, ForkPortalBody,
-    ScrollTarget, UpdateOriginBody, WritePortalBody,
+    ScrollTarget, StatusLevel, StatusOp, StatusProgress, UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
+use prt_protocol::envelope::parse_status_change;
 use prt_protocol::frame::{
     EVT_ICON_NAME_CHANGE, EVT_MOUSE_MODE_CHANGE, EVT_PORTAL_ACTIVITY, EVT_PORTAL_SCROLL_DELTA,
-    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_TITLE_CHANGE, MARKER_T2C as PRT_MARKER_T2C,
+    EVT_PORTAL_SCROLL_SET, EVT_RAW_REPLY, EVT_STATUS_CHANGE, EVT_TITLE_CHANGE,
+    MARKER_T2C as PRT_MARKER_T2C,
 };
 
 use ses_protocol::apc::ApcStream as SesApcStream;
@@ -71,7 +73,7 @@ use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PRO
 use vge_ui::edit::{EditOutcome, LineEditor};
 use vge_ui::modal::{ModalIds, ScrollModal};
 use vge_ui::paint::Px;
-use vge_ui::style::{self, PaneChrome, TabBar, TabbarMetrics};
+use vge_ui::style::{self, BarStatus, PaneChrome, StatusPlacement, TabBar, TabStatus, TabbarMetrics};
 use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
 use vge_ui::theme;
 
@@ -1002,6 +1004,77 @@ struct Pane {
     /// Cleared when that tab is next activated. Drives the tab-bar
     /// activity marker.
     activity: bool,
+    /// Status items the inner program set (PRT §9.4, via
+    /// `EVT_STATUS_CHANGE`), oldest first — a set moves its key to the
+    /// end, so the last item is the most recently touched. Like the
+    /// OSC title they describe the *shell*, so they live on the pane
+    /// that owns the PTY and a mirror view reads them through it.
+    status: Vec<StatusItem>,
+}
+
+/// One status item (PRT §9.4) as vmux keeps it.
+#[derive(Clone, Debug, PartialEq)]
+struct StatusItem {
+    key: String,
+    level: StatusLevel,
+    progress: Option<StatusProgress>,
+    text: String,
+}
+
+impl StatusItem {
+    fn view(&self) -> TabStatus<'_> {
+        TabStatus {
+            text: &self.text,
+            level: self.level,
+            progress: self.progress,
+        }
+    }
+}
+
+/// Apply one `StatusChange` to a pane's item list. Returns whether
+/// anything changed, so an idempotent repeat — a hook re-announcing the
+/// same state — costs no redraw.
+fn apply_status_op(items: &mut Vec<StatusItem>, op: StatusOp) -> bool {
+    match op {
+        StatusOp::Set {
+            key,
+            level,
+            progress,
+            text,
+        } => {
+            let item = StatusItem {
+                key,
+                level,
+                progress,
+                text,
+            };
+            if items.last() == Some(&item) {
+                return false;
+            }
+            items.retain(|i| i.key != item.key);
+            items.push(item);
+            true
+        }
+        StatusOp::Remove { key, prefix } => {
+            let before = items.len();
+            items.retain(|i| if prefix { !i.key.starts_with(&key) } else { i.key != key });
+            items.len() != before
+        }
+    }
+}
+
+/// The item that stands for a set of panes: the loudest level, and the
+/// most recently touched among equals — an agent asking for permission
+/// outranks the download ticking beside it.
+fn loudest<'a>(items: impl Iterator<Item = &'a StatusItem>) -> Option<&'a StatusItem> {
+    let rank = |l: StatusLevel| match l {
+        StatusLevel::Info => 0,
+        StatusLevel::Warn => 1,
+        StatusLevel::Error => 2,
+    };
+    // `max_by_key` keeps the last of equal maxima, and items arrive
+    // oldest first.
+    items.max_by_key(|i| rank(i.level))
 }
 
 impl Pane {
@@ -1089,6 +1162,10 @@ const MODAL_IDS: ModalIds<'static> = ModalIds {
 /// rather than resending the bar.
 const TABBAR_ELEMENT_ID: &str = "vmux-tabbar";
 const TABBAR_GROUND_ID: &str = "vmux-tabbar.ground";
+/// The bar-end status segment ([`StatusPlacement::BarEnd`]), present
+/// only while the active tab has a status. Beside the tabs rather than
+/// over them, so it shares their draw order.
+const TABBAR_STATUS_ID: &str = "vmux-tabbar.status";
 /// Draw orders under the tab bar group: the ground, then the tabs, with
 /// the active one above its neighbours — it may paint onto them (Aero's
 /// shadow).
@@ -1112,6 +1189,8 @@ const TABBAR_MIN_LABEL: usize = 2;
 /// Cells reserved for an overflow chevron (`‹` / `›`) on a clipped edge
 /// of the tab bar.
 const TABBAR_CHEVRON_W: f32 = 2.0;
+/// Narrowest bar-end status segment worth drawing, padding included.
+const TABBAR_STATUS_MIN_W: f32 = 6.0;
 /// The tab bar's size and spacing, as the style engine has it — read by
 /// pane bounds, mouse routing, the layout and its hit-test alike.
 fn tabbar_metrics() -> TabbarMetrics {
@@ -1301,6 +1380,13 @@ struct TabbarLayout {
     /// `(elided label, width)` of the session-name segment, or `None`
     /// for a plain `veter` host or a bar too narrow to spare the room.
     session_seg: Option<(String, f32)>,
+    /// Under [`StatusPlacement::BarEnd`], the active tab's status
+    /// segment: its text, elided to fit, and its left edge. It runs to
+    /// the bar's right end.
+    status_seg: Option<(String, f32)>,
+    /// Where the tabs' stretch of the bar ends: the host's width, less
+    /// the status segment.
+    bar_end: f32,
     has_left: bool,
     has_right: bool,
 }
@@ -1324,6 +1410,7 @@ fn compute_tabbar_layout(
     scroll: &mut usize,
     host_w: u32,
     session: Option<&str>,
+    statuses: &[Option<TabStatus<'_>>],
 ) -> TabbarLayout {
     let host_wf = host_w as f32;
     let n = labels.len();
@@ -1346,7 +1433,28 @@ fn compute_tabbar_layout(
         Some((label, w))
     });
     let session_w = session_seg.as_ref().map(|(_, w)| *w).unwrap_or(0.0);
-    let bar_w = (host_wf - session_w - 2.0 * m.margin).max(0.0);
+
+    // The active tab's status segment, pinned to the right as the
+    // session segment is to the left and capped the same way, so the
+    // two together leave the tabs at least a fifth of the bar. A
+    // segment too narrow to say anything is dropped rather than drawn
+    // as a sliver.
+    let status_seg: Option<(String, f32)> = match m.status {
+        StatusPlacement::InTab { .. } => None,
+        StatusPlacement::BarEnd => statuses.get(active).copied().flatten().and_then(|st| {
+            let label = st.label();
+            let w = (vge_ui::measure::text_cells(&label) + 2.0).min((host_wf * 0.4).floor());
+            if w < TABBAR_STATUS_MIN_W {
+                return None;
+            }
+            // What the label spends besides the text — the percentage.
+            let figure = vge_ui::measure::text_cells(&label) - vge_ui::measure::text_cells(st.text);
+            let room = (w - 2.0 - figure).max(1.0) as usize;
+            Some((vge_ui::measure::elide(st.text, room), host_wf - w))
+        }),
+    };
+    let bar_end = status_seg.as_ref().map_or(host_wf, |(_, x0)| *x0);
+    let bar_w = (bar_end - session_w - 2.0 * m.margin).max(0.0);
 
     // Per-tab sub-rect widths: " N " number rect + " label " name rect.
     // The " N " number rect depends only on the index.
@@ -1365,9 +1473,21 @@ fn compute_tabbar_layout(
     let cap = tabbar_label_cap(labels, &fixed, bar_w);
     let elided: Vec<String> =
         labels.iter().map(|l| elide_tab_label(l, cap)).collect();
+    // Under `InTab` a tab widens for its status line, up to the
+    // engine's cap; the elided label is the floor either way.
     let name_widths: Vec<f32> = elided
         .iter()
-        .map(|l| vge_ui::measure::text_cells(l) + m.name_pad)
+        .enumerate()
+        .map(|(i, l)| {
+            let w = vge_ui::measure::text_cells(l) + m.name_pad;
+            match (m.status, statuses.get(i).copied().flatten()) {
+                (StatusPlacement::InTab { scale, max_cells }, Some(st)) => w.max(
+                    (vge_ui::measure::text_cells(&st.label()) * scale + m.name_pad)
+                        .min(max_cells),
+                ),
+                _ => w,
+            }
+        })
         .collect();
     // Each tab carries the gap after it, so scrolling budgets it too.
     let tab_widths: Vec<f32> = (0..n)
@@ -1397,6 +1517,8 @@ fn compute_tabbar_layout(
     TabbarLayout {
         slots,
         session_seg,
+        status_seg,
+        bar_end,
         has_left,
         has_right,
     }
@@ -1416,7 +1538,7 @@ enum TabbarHit {
 /// Hit-test a row-0 click at host column `col` against a tab bar's
 /// geometry. The overflow chevrons own the bar's two edges; everything
 /// between resolves to whichever tab's extent contains `col`.
-fn tabbar_hit(layout: &TabbarLayout, host_w: u32, col: f32) -> Option<TabbarHit> {
+fn tabbar_hit(layout: &TabbarLayout, col: f32) -> Option<TabbarHit> {
     if layout.has_left {
         let x0 = layout.session_w();
         if col >= x0 && col < x0 + TABBAR_CHEVRON_W {
@@ -1424,8 +1546,8 @@ fn tabbar_hit(layout: &TabbarLayout, host_w: u32, col: f32) -> Option<TabbarHit>
         }
     }
     if layout.has_right {
-        let x0 = host_w as f32 - TABBAR_CHEVRON_W;
-        if col >= x0 && col < host_w as f32 {
+        let x0 = layout.bar_end - TABBAR_CHEVRON_W;
+        if col >= x0 && col < layout.bar_end {
             return Some(TabbarHit::NextTab);
         }
     }
@@ -1465,9 +1587,10 @@ fn build_tabbar(
     cell_ph: f32,
     session: Option<&str>,
     activity: &[bool],
+    statuses: &[Option<TabStatus<'_>>],
 ) -> TabbarParts {
     let host_wf = host_w as f32;
-    let layout = compute_tabbar_layout(labels, active, scroll, host_w, session);
+    let layout = compute_tabbar_layout(labels, active, scroll, host_w, session, statuses);
     let bar = TabBar {
         width: host_wf,
         session: layout.session_seg.as_ref().map(|(l, w)| (l.as_str(), *w)),
@@ -1482,12 +1605,20 @@ fn build_tabbar(
                 label: &s.label,
                 active: s.index == active,
                 activity: activity.get(s.index).copied().unwrap_or(false),
+                status: statuses.get(s.index).copied().flatten(),
             })
             .collect(),
         left_chevron: layout
             .has_left
             .then_some(layout.session_w() + tabbar_metrics().margin),
-        right_chevron: layout.has_right.then_some(host_wf - TABBAR_CHEVRON_W),
+        right_chevron: layout.has_right.then_some(layout.bar_end - TABBAR_CHEVRON_W),
+        status: layout.status_seg.as_ref().and_then(|(text, x0)| {
+            let st = statuses.get(active).copied().flatten()?;
+            Some(BarStatus {
+                status: TabStatus { text, ..st },
+                x0: *x0,
+            })
+        }),
     };
     let parts = style::engine().tab_bar(
         Px {
@@ -1504,14 +1635,17 @@ fn build_tabbar(
             .zip(parts.tabs)
             .map(|(t, cmds)| (t.index, t.active, cmds))
             .collect(),
+        status: parts.status,
     }
 }
 
-/// One render of the tab bar: the ground, and each visible tab as its
-/// index, whether it is the active one, and its commands.
+/// One render of the tab bar: the ground, each visible tab as its
+/// index, whether it is the active one, and its commands, and the
+/// bar-end status segment (empty without one).
 struct TabbarParts {
     ground: Vec<DrawCmd>,
     tabs: Vec<(usize, bool, Vec<DrawCmd>)>,
+    status: Vec<DrawCmd>,
 }
 
 /// What the host holds for the tab bar, so a render sends only what
@@ -1522,6 +1656,8 @@ struct TabbarParts {
 struct TabbarSent {
     ground: Vec<DrawCmd>,
     tabs: BTreeMap<usize, (i32, Vec<DrawCmd>)>,
+    /// The status segment's commands; empty while there is no element.
+    status: Vec<DrawCmd>,
 }
 
 impl TabbarSent {
@@ -1621,6 +1757,27 @@ impl TabbarSent {
             ));
         }
         sent.tabs = tabs;
+
+        // The status segment comes and goes with the active tab's
+        // status, so its element does too.
+        match (sent.status.is_empty(), parts.status.is_empty()) {
+            (true, false) => cmds.push((
+                child(TABBAR_STATUS_ID.into(), parts.status.clone(), TABBAR_TAB_ORDER),
+                0,
+            )),
+            (false, true) => cmds.push((
+                VgeCommand::DeleteElement {
+                    id: TABBAR_STATUS_ID.into(),
+                    by_prefix: false,
+                },
+                0,
+            )),
+            (false, false) if sent.status != parts.status => {
+                cmds.push((update(TABBAR_STATUS_ID.into(), parts.status.clone()), 0));
+            }
+            _ => {}
+        }
+        sent.status = parts.status;
         (cmds, sent)
     }
 }
@@ -2412,8 +2569,14 @@ impl State {
         else {
             return;
         };
+        let status = self
+            .panes
+            .get_mut(leaving)
+            .map(|p| std::mem::take(&mut p.status))
+            .unwrap_or_default();
         if let Some(p) = self.panes.get_mut(&heir) {
             p.io = PaneIo::Owned(pty);
+            p.status = status;
         }
         for id in group {
             if id == heir {
@@ -2569,6 +2732,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
+                status: Vec::new(),
                 io: PaneIo::Owned(pty),
                 last_rect: None,
                 // Pre-record the inner size so the first `relayout_and_render`
@@ -2667,6 +2831,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
+                status: Vec::new(),
                 io: PaneIo::Peer(owner),
                 last_rect: None,
                 // Left as None so the first relayout emits ForkPortal;
@@ -2723,6 +2888,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
+                status: Vec::new(),
                 io: PaneIo::Owned(pty),
                 last_rect: None,
                 last_inner: Some((cols, rows)),
@@ -3064,6 +3230,7 @@ impl State {
                 manual_title: None,
                 osc_title: None,
                 osc_icon: None,
+                status: Vec::new(),
                 io: PaneIo::Owned(pty),
                 last_rect: None,
                 last_inner: Some((cols, rows)),
@@ -4109,6 +4276,28 @@ impl State {
             .collect()
     }
 
+    /// The status item tab `tab_idx` stands for: the focused pane's
+    /// loudest, or failing that the loudest of its other panes — a tab
+    /// whose agent sits in a background split still shows it is waiting.
+    fn tab_status(&self, tab_idx: usize) -> Option<StatusItem> {
+        let tab = self.tabs.get(tab_idx)?;
+        let items_of = |id: &str| {
+            let pane = self.panes.get(id)?;
+            let owner = self.panes.get(pane.pty_owner()).unwrap_or(pane);
+            Some(owner.status.iter())
+        };
+        if let Some(item) = items_of(&tab.focus).and_then(loudest) {
+            return Some(item.clone());
+        }
+        let mut leaves = Vec::new();
+        tab.layout.collect_leaves(&mut leaves);
+        loudest(leaves.iter().filter_map(|id| items_of(id)).flatten()).cloned()
+    }
+
+    fn tab_statuses(&self) -> Vec<Option<StatusItem>> {
+        (0..self.tabs.len()).map(|i| self.tab_status(i)).collect()
+    }
+
     /// Per-tab activity flags for the tab bar — `true` when a tab
     /// other than the active one has a pane with unseen activity.
     fn tab_activity_flags(&self) -> Vec<bool> {
@@ -4170,6 +4359,8 @@ impl State {
     fn tabbar_commands(&mut self) -> Vec<(VgeCommand, u32)> {
         let labels = self.tabbar_labels();
         let activity = self.tab_activity_flags();
+        let statuses = self.tab_statuses();
+        let views: Vec<_> = statuses.iter().map(|s| s.as_ref().map(StatusItem::view)).collect();
         let parts = build_tabbar(
             &labels,
             self.active_tab,
@@ -4179,6 +4370,7 @@ impl State {
             self.cell_ph,
             self.session_name.as_deref(),
             &activity,
+            &views,
         );
         let (cmds, sent) = TabbarSent::diff(self.tabbar_sent.take(), parts);
         self.tabbar_sent = Some(sent);
@@ -5291,6 +5483,9 @@ fn handle_stdin_chunk(
     // Set when a background pane reported activity, so the tab bar is
     // re-rendered once after the frame loop.
     let mut activity_dirty = false;
+    // Set when a pane's status items changed; like activity, only the
+    // tab bar shows them.
+    let mut status_dirty = false;
     // Set by `EVT_HOST_THEME_CHANGED`: every colour we derived
     // ourselves is stale and the whole chrome has to be re-emitted.
     let mut theme_dirty = false;
@@ -5354,6 +5549,16 @@ fn handle_stdin_chunk(
                             titles_dirty.insert(id);
                         }
                     }
+                }
+            } else if ft == EVT_STATUS_CHANGE {
+                // §8.14: the pane's program changed a status item. It
+                // belongs to the shell, so it is kept on the pane that
+                // owns the PTY; only the tab bar shows it.
+                if let Ok((id, op)) = parse_status_change(body)
+                    && let Some(owner) = state.pty_owner(&id)
+                    && let Some(p) = state.panes.get_mut(&owner)
+                {
+                    status_dirty |= apply_status_op(&mut p.status, op);
                 }
             } else if ft == EVT_PORTAL_ACTIVITY {
                 // §8: string id. The host already suppresses the
@@ -5458,7 +5663,7 @@ fn handle_stdin_chunk(
     // tab bar (because the active pane's effective title can drive the
     // auto-tab-title). Cheap — small per-pane VGE elements. An activity
     // change needs only the tab bar re-rendered.
-    if !titles_dirty.is_empty() || activity_dirty {
+    if !titles_dirty.is_empty() || activity_dirty || status_dirty {
         let mut env = Vec::new();
         for id in &titles_dirty {
             env.extend(state.render_one_chrome(id));
@@ -5975,14 +6180,17 @@ fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
     // The last render already settled `tab_scroll`; hit-test against a
     // copy so this probe leaves the carried offset untouched.
     let mut scroll = state.tab_scroll;
+    let statuses = state.tab_statuses();
+    let views: Vec<_> = statuses.iter().map(|s| s.as_ref().map(StatusItem::view)).collect();
     let layout = compute_tabbar_layout(
         &labels,
         state.active_tab,
         &mut scroll,
         state.host_w,
         state.session_name.as_deref(),
+        &views,
     );
-    let env = match tabbar_hit(&layout, state.host_w, host_col as f32) {
+    let env = match tabbar_hit(&layout, host_col as f32) {
         Some(TabbarHit::Tab(idx)) => state.goto_tab(idx)?,
         Some(TabbarHit::PrevTab) => state.prev_tab()?,
         Some(TabbarHit::NextTab) => state.next_tab()?,
@@ -7437,7 +7645,7 @@ mod tests {
         // and the scroll offset advanced to reach the active tab.
         let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let parts = build_tabbar(&labels, 29, &mut scroll, 80, 8.0, 16.0, None, &[]);
+        let parts = build_tabbar(&labels, 29, &mut scroll, 80, 8.0, 16.0, None, &[], &[]);
         assert!(scroll > 0, "the bar must scroll to reveal the last tab");
         assert!(parts.tabs.iter().any(|(i, active, _)| *i == 29 && *active));
     }
@@ -7459,7 +7667,7 @@ mod tests {
     fn four_tabs(active: usize, activity: &[bool]) -> TabbarParts {
         let labels: Vec<String> = ["one", "two", "three", "four"].map(String::from).to_vec();
         let mut scroll = 0;
-        build_tabbar(&labels, active, &mut scroll, 120, 8.0, 16.0, None, activity)
+        build_tabbar(&labels, active, &mut scroll, 120, 8.0, 16.0, None, activity, &[])
     }
 
     /// The first render builds the group, the ground and every tab; a
@@ -7515,7 +7723,7 @@ mod tests {
         let (_, sent) = TabbarSent::diff(None, four_tabs(0, &[]));
         let labels: Vec<String> = ["one", "two", "three"].map(String::from).to_vec();
         let mut scroll = 0;
-        let three = build_tabbar(&labels, 0, &mut scroll, 120, 8.0, 16.0, None, &[]);
+        let three = build_tabbar(&labels, 0, &mut scroll, 120, 8.0, 16.0, None, &[], &[]);
         let (ops, sent) = TabbarSent::diff(Some(sent), three);
         assert!(tabbar_ops(&ops).contains(&"delete vmux-tabbar.tab3".to_string()));
         assert_eq!(sent.tabs.len(), 3);
@@ -7526,13 +7734,13 @@ mod tests {
         let labels: Vec<String> =
             vec!["one".into(), "two".into(), "three".into()];
         let mut scroll = 0;
-        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None);
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None, &[]);
         assert_eq!(layout.slots.len(), 3, "all three tabs fit a wide bar");
         // Every visible tab's midpoint must hit-test back to itself.
         for slot in &layout.slots {
             let mid = slot.x0 + (slot.num_w + slot.name_w) / 2.0;
             assert!(matches!(
-                tabbar_hit(&layout, 200, mid),
+                tabbar_hit(&layout, mid),
                 Some(TabbarHit::Tab(i)) if i == slot.index
             ));
         }
@@ -7542,10 +7750,10 @@ mod tests {
     fn tabbar_hit_misses_past_the_last_tab() {
         let labels: Vec<String> = vec!["solo".into()];
         let mut scroll = 0;
-        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None);
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None, &[]);
         let last = &layout.slots[0];
         let past = last.x0 + last.num_w + last.name_w + 1.0;
-        assert!(tabbar_hit(&layout, 200, past).is_none());
+        assert!(tabbar_hit(&layout, past).is_none());
     }
 
     #[test]
@@ -7554,14 +7762,14 @@ mod tests {
         // tab both chevrons show and own the bar's edges.
         let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let layout = compute_tabbar_layout(&labels, 15, &mut scroll, 80, None);
+        let layout = compute_tabbar_layout(&labels, 15, &mut scroll, 80, None, &[]);
         assert!(layout.has_left && layout.has_right);
         assert!(matches!(
-            tabbar_hit(&layout, 80, 0.5),
+            tabbar_hit(&layout, 0.5),
             Some(TabbarHit::PrevTab)
         ));
         assert!(matches!(
-            tabbar_hit(&layout, 80, 79.5),
+            tabbar_hit(&layout, 79.5),
             Some(TabbarHit::NextTab)
         ));
     }
@@ -7572,7 +7780,7 @@ mod tests {
         // between a drawn tab and its hit-test extent.
         let labels: Vec<String> = (0..6).map(|i| format!("tab{i}")).collect();
         let mut scroll = 0;
-        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 80, None);
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 80, None, &[]);
         for slot in &layout.slots {
             assert!(slot.x0 >= 0.0);
             assert!(slot.x0 + slot.num_w + slot.name_w <= 80.0);
@@ -7594,9 +7802,133 @@ mod tests {
             16.0,
             Some("session"),
             &[],
+            &[],
         );
         assert!(!parts.ground.is_empty());
         assert!(parts.tabs.iter().any(|(i, active, _)| *i == 11 && *active));
+    }
+
+    fn status_set(key: &str, level: StatusLevel, text: &str) -> StatusOp {
+        StatusOp::Set {
+            key: key.into(),
+            level,
+            progress: None,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn status_ops_set_replace_and_sweep_by_prefix() {
+        let mut items = Vec::new();
+        assert!(apply_status_op(&mut items, status_set("claude.state", StatusLevel::Info, "thinking")));
+        assert!(apply_status_op(&mut items, status_set("dl", StatusLevel::Info, "iso")));
+        // A repeat of the newest item changes nothing.
+        assert!(!apply_status_op(&mut items, status_set("dl", StatusLevel::Info, "iso")));
+        // Setting a key moves it to the end, as the most recent.
+        assert!(apply_status_op(&mut items, status_set("claude.state", StatusLevel::Info, "Bash")));
+        assert_eq!(
+            items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
+            ["dl", "claude.state"]
+        );
+        assert!(apply_status_op(
+            &mut items,
+            StatusOp::Remove { key: "claude.".into(), prefix: true }
+        ));
+        assert_eq!(items.len(), 1);
+        assert!(!apply_status_op(&mut items, StatusOp::Remove { key: "nope".into(), prefix: false }));
+        assert!(apply_status_op(&mut items, StatusOp::Remove { key: String::new(), prefix: true }));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn the_loudest_item_stands_for_a_tab_and_the_newest_breaks_ties() {
+        let mut items = Vec::new();
+        apply_status_op(&mut items, status_set("a", StatusLevel::Info, "old"));
+        apply_status_op(&mut items, status_set("b", StatusLevel::Warn, "waiting"));
+        apply_status_op(&mut items, status_set("c", StatusLevel::Info, "new"));
+        assert_eq!(loudest(items.iter()).unwrap().key, "b");
+        items.retain(|i| i.key != "b");
+        assert_eq!(loudest(items.iter()).unwrap().key, "c");
+    }
+
+    #[test]
+    fn bar_end_status_takes_the_right_of_the_bar_and_moves_the_chevron() {
+        let labels: Vec<String> = (0..30).map(|i| format!("tab{i}")).collect();
+        let status = TabStatus {
+            text: "Bash: cargo test -p vmux",
+            level: StatusLevel::Info,
+            progress: Some(StatusProgress::Percent(42)),
+        };
+        let mut statuses = vec![None; labels.len()];
+        statuses[0] = Some(status);
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 80, None, &statuses);
+        let (text, x0) = layout.status_seg.clone().expect("a status segment");
+        // " 42% Bash: cargo test -p vmux " fits under 40% of 80 cells.
+        assert_eq!(text, status.text);
+        assert_eq!(x0, 80.0 - (vge_ui::measure::text_cells(&status.label()) + 2.0));
+        assert_eq!(layout.bar_end, x0);
+        assert!(layout.has_right);
+        // Tabs stay clear of the segment, and the `›` sits just before it.
+        let last = layout.slots.last().unwrap();
+        assert!(last.x0 + last.num_w + last.name_w <= x0 - TABBAR_CHEVRON_W);
+        assert!(matches!(tabbar_hit(&layout, x0 - 1.0), Some(TabbarHit::NextTab)));
+        assert!(tabbar_hit(&layout, x0 + 1.0).is_none());
+    }
+
+    #[test]
+    fn a_long_bar_end_status_is_capped_and_elided() {
+        let labels = vec!["shell".to_string()];
+        let long = "x".repeat(200);
+        let statuses = [Some(TabStatus {
+            text: &long,
+            level: StatusLevel::Warn,
+            progress: None,
+        })];
+        let mut scroll = 0;
+        let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 100, None, &statuses);
+        let (text, x0) = layout.status_seg.unwrap();
+        assert_eq!(x0, 60.0);
+        assert_eq!(vge_ui::measure::text_cells(&text), 38.0);
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn the_status_element_comes_and_goes_with_the_status() {
+        let parts = |status: Vec<DrawCmd>| TabbarParts {
+            ground: Vec::new(),
+            tabs: Vec::new(),
+            status,
+        };
+        let ids = |cmds: &[(VgeCommand, u32)]| -> Vec<String> {
+            cmds.iter()
+                .map(|(c, _)| match c {
+                    VgeCommand::CreateElement(b) => format!("create {}", b.id),
+                    VgeCommand::UpdateCommands(b) => format!("update {}", b.id),
+                    VgeCommand::DeleteElement { id, .. } => format!("delete {id}"),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let text = |t: &str| {
+            vec![DrawCmd::DrawText {
+                origin: Point { x: 0.0, y: 0.0 },
+                align: vge_protocol::command::Align::Left,
+                fill: vge_protocol::command::Style::Ref("host.accent".into()),
+                font_style: vge_protocol::command::FontStyle(0),
+                font_scale: 1.0,
+                text: t.into(),
+            }]
+        };
+        let (_, sent) = TabbarSent::diff(None, parts(Vec::new()));
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(text("1%")));
+        assert_eq!(ids(&cmds), ["create vmux-tabbar.status"]);
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(text("2%")));
+        assert_eq!(ids(&cmds), ["update vmux-tabbar.status"]);
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(text("2%")));
+        assert!(cmds.is_empty());
+        let (cmds, _) = TabbarSent::diff(Some(sent), parts(Vec::new()));
+        assert_eq!(ids(&cmds), ["delete vmux-tabbar.status"]);
     }
 
     // ── layout resize ──────────────────────────────────────────────────
