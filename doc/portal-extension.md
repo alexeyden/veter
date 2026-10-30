@@ -1024,7 +1024,7 @@ move of a portal's view. The canonical case is a drag-select
 autoscroll whose anchor target is this portal: as the pointer crosses
 the portal's viewport edge, the host wants the view to follow, but
 scroll *mode* is owned by the client (the multiplexer's per-pane
-scroll state, its `[scroll: N]` indicator). Moving the view behind the
+scroll state, its offset indicator). Moving the view behind the
 client's back would leave that mode and its chrome out of step.
 
 The body is advisory: the client owns the policy and decides whether
@@ -1261,7 +1261,7 @@ none is a distance from live computed by the client: the view moves
 under the client whenever the pane prints, so any such number is stale
 by the time it arrives, and an absolute request would throw the view
 that far toward live. A client that tracks the offset for display
-(a `[scroll: N]` indicator) takes it from the response below and
+(an offset badge) takes it from the response below and
 treats its own figure as a prediction.
 
 New bytes still flow into the inner vt100 normally while a view is

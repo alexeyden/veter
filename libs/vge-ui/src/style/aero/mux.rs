@@ -560,9 +560,10 @@ fn hilite(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, y0: f32, x1: f32, y1: f32) {
 /// and its scroll thumb, an aqua capsule.
 pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {
     let (pw, ph, title, focused) = (pane.w, pane.h, pane.title, pane.focused);
+    let y0 = 0.25;
+    // Right edge of the next capsule's text, walking leftwards.
+    let mut text_x = pw - 1.0;
     if pane.show_title && !title.is_empty() {
-        let text_x = pw - 1.0;
-        let y0 = 0.25;
         let x0 = text_x - text_cells(title) - 0.5;
         pane_title(
             cmds,
@@ -575,6 +576,30 @@ pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>
             title,
             focused,
         );
+        text_x = x0 - 0.75 - 0.5;
+    }
+    // The badge is drawn even where the title is hidden: it says the
+    // pane is in a mode, not which pane it is.
+    if let Some(s) = pane.scroll {
+        let badge = s.badge();
+        let x0 = text_x - text_cells(&badge) - 0.5;
+        // The active tab's material: the badge is the pane's state in the
+        // same voice as the bar, not a warning.
+        let g = Gel::for_color(crate::theme::accent_color());
+        gel(cmds, px, x0, y0, text_x + 0.5, y0 + 1.0, &g);
+        let shade = hex(g.shade, 0.9);
+        text(
+            cmds,
+            px,
+            text_x,
+            y0,
+            Align::Right,
+            &badge,
+            white(1.0),
+            true,
+            Some(shade),
+        );
+        foot_pill(cmds, px, pw, ph, &s);
     }
     if let Some(s) = pane.scroll {
         let portal_rows = ph.max(1.0);
@@ -593,6 +618,52 @@ pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>
         let thumb_y = track_y0 + thumb_norm * available;
         scroll_thumb(cmds, px, pw - 1.30, thumb_y, 0.35, thumb_h);
     }
+}
+
+/// The pill centred along a scrolled pane's foot: smoked glass naming
+/// the way back to live, its key on a small aqua gel. Left out of a
+/// pane too small to hold it clear of the title and the thumb.
+fn foot_pill(cmds: &mut Vec<DrawCmd>, px: Px, pw: f32, ph: f32, s: &crate::style::PaneScroll) {
+    let Some((label, key)) = s.pill() else {
+        return;
+    };
+    let (label_w, key_w) = (text_cells(label), text_cells(key));
+    let gap = 1.0;
+    // The key's gel is `key_w + 1` wide, inset half a cell from the end.
+    let w = 1.0 + label_w + gap + key_w + 1.0 + 0.5;
+    if ph < 4.0 || w > pw - 4.0 {
+        return;
+    }
+    let x0 = ((pw - w) / 2.0).floor();
+    let (y0, y1) = (ph - 1.5, ph - 0.5);
+    smoke(cmds, px, x0, y0, x0 + w, y1);
+    let shade = Some(hex(0x06264d, 0.9));
+    text(
+        cmds,
+        px,
+        x0 + 1.0,
+        y0,
+        Align::Left,
+        label,
+        white(1.0),
+        false,
+        shade,
+    );
+    let kx0 = x0 + 1.0 + label_w + gap;
+    let (ky0, ky1) = (y0 + px.y(2.0), y1 - px.y(2.0));
+    gel(cmds, px, kx0, ky0, kx0 + key_w + 1.0, ky1, &GEL_AQUA);
+    let shade = Some(hex(GEL_AQUA.shade, 0.9));
+    text(
+        cmds,
+        px,
+        kx0 + 0.5,
+        y0,
+        Align::Left,
+        key,
+        white(1.0),
+        true,
+        shade,
+    );
 }
 
 /// The pane title: an aqua gel capsule on the focused pane, smoked

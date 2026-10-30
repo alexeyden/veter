@@ -1880,15 +1880,15 @@ impl TabbarSent {
     }
 }
 
-/// Where a pane is scrolled to, for the scroll thumb its chrome draws.
+/// Where a pane is scrolled to, for the scroll indicators its chrome draws.
 type ScrollIndicator = style::PaneScroll;
 
 /// Build chrome draw-commands for one pane. Element origin is the
 /// pane's top-left in host cells; commands are pane-relative.
 ///
 /// `show_title` is false for the only pane in a tab — there's nothing to
-/// disambiguate, so we hide the label. Scroll-indicator titles still
-/// show because they convey active state, not just identity.
+/// disambiguate, so we hide the label. The scroll badge still shows
+/// because it conveys active state, not just identity.
 fn build_chrome_commands(
     rect: PaneRect,
     title: &str,
@@ -3894,8 +3894,9 @@ impl State {
         let mut ordered: Vec<String> = rects.keys().cloned().collect();
         ordered.sort();
         // Hide the per-pane title when the active tab has only one pane
-        // (there's nothing to disambiguate). A scroll indicator still
-        // surfaces because `display_title != raw_title` in that case.
+        // (there's nothing to disambiguate). A zoom or resize mark still
+        // surfaces because `display_title != raw_title` in that case;
+        // the scroll badge is drawn regardless.
         let single_pane = ordered.len() <= 1;
         // Hoisted: the per-pane loop borrows `self.panes` mutably.
         let cell_px = self.cell_px();
@@ -4280,12 +4281,10 @@ impl State {
     }
 
     /// Title to display in `pane_id`'s chrome — usually the pane's own
-    /// label, but a `[scroll: N]` indicator while that pane is being
-    /// scrolled, or [`ZOOM_MARK`] while it is zoomed.
+    /// label, marked with [`ZOOM_MARK`] while it is zoomed. Scrolling
+    /// leaves it alone: the style engine draws its own badge beside it
+    /// (see [`Self::scroll_indicator_for`]).
     fn display_title_for(&self, pane_id: &str, raw_title: &str) -> String {
-        if let Some(s) = self.panes.get(pane_id).and_then(|p| p.scroll.as_ref()) {
-            return format!("[scroll: {}]", s.offset);
-        }
         if self.tabs[self.active_tab].zoomed.as_deref() == Some(pane_id) {
             return format!("{ZOOM_MARK} {}", raw_title);
         }
@@ -4297,13 +4296,15 @@ impl State {
         raw_title.to_string()
     }
 
-    /// Scroll-indicator state to draw a thumb in `pane_id`'s chrome,
-    /// or `None` if we're not currently scrolling that pane.
+    /// Scroll-indicator state for `pane_id`'s chrome — the engine draws
+    /// a thumb, an offset badge and a "back to live" pill from it — or
+    /// `None` if we're not currently scrolling that pane.
     fn scroll_indicator_for(&self, pane_id: &str) -> Option<ScrollIndicator> {
         let s = self.panes.get(pane_id)?.scroll.as_ref()?;
         Some(ScrollIndicator {
             offset: s.offset,
             history_depth: s.history_depth,
+            exit_key: "q",
         })
     }
 
@@ -4458,8 +4459,8 @@ impl State {
         let display_title = self.display_title_for(pane_id, &title_raw);
         let scroll_ind = self.scroll_indicator_for(pane_id);
         // Match the same single-pane suppression as the relayout path:
-        // a one-pane tab hides the title unless display_title is in
-        // scroll-indicator form (different from the raw label).
+        // a one-pane tab hides the title unless display_title carries a
+        // mode mark (different from the raw label).
         let mut leaves = Vec::new();
         self.tabs[self.active_tab]
             .layout
@@ -6549,7 +6550,7 @@ fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
 /// Target-carrying sibling of `wheel_scroll`. Routes
 /// `EVT_PORTAL_SCROLL_SET` (e.g. a host-driven scrollback search jump)
 /// through the same enter/`scroll_to`/exit ladder so the chrome thumb,
-/// `[scroll: N]` indicator, and host `SetPortalScrollback` envelope all
+/// scroll badge, and host `SetPortalScrollback` envelope all
 /// stay coherent. `Live` drops scroll mode entirely.
 fn apply_scroll_set(state: &mut State, pane_id: &str, to: ScrollTarget) -> Result<()> {
     let already_scrolling = state
@@ -6611,7 +6612,7 @@ fn wheel_scroll(state: &mut State, pane_id: &str, delta: i64) -> Result<()> {
     }
 
     // If we just landed back at live, drop scroll for this pane so the
-    // scrollbar / `[scroll: 0]` indicator clear.
+    // scrollbar / scroll badge clear.
     let at_live = state
         .panes
         .get(pane_id)

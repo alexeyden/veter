@@ -324,7 +324,8 @@ fn tab_status_mark(cmds: &mut Vec<DrawCmd>, x0: f32, x1: f32, s: &TabStatus<'_>)
 }
 
 /// A pane's title, on a translucent accent thumb when focused and the
-/// surface otherwise, and its scroll thumb.
+/// surface otherwise; while it is scrolled, an accent badge beside the
+/// title, a "back to live" pill along its foot, and its scroll thumb.
 pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>) {
     let (pw, ph, title, focused) = (pane.w, pane.h, pane.title, pane.focused);
 
@@ -335,48 +336,53 @@ pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>
     // separator on the pane boundary. Both thumb and text are nudged
     // down by 1/4 of a cell so the thumb doesn't visually fuse with the
     // top edge of the pane.
+    let top_pad = 0.25;
+    let pad_x = 0.5;
+    // Right edge of the next capsule's text, walking leftwards.
+    let mut text_x = pw - 1.0;
     if pane.show_title && !title.is_empty() {
-        let text_w = text_cells(title);
-        let top_pad = 0.25;
-        let text_origin_x = pw - 1.0;
-        let text_origin_y = top_pad;
-        let pad_x = 0.5;
-        let thumb_x0 = text_origin_x - text_w - pad_x;
-        let thumb_x1 = text_origin_x + pad_x;
-        let thumb_y0 = text_origin_y;
-        let thumb_y1 = text_origin_y + 1.0;
-        // Same slight rounding as the modal/tab chrome, with rx
-        // compensated for anisotropic cells.
-        let (rx, ry) = chrome_corner_radii(thumb_x1 - thumb_x0, thumb_y1 - thumb_y0, px.w, px.h);
         // Focused pane gets the translucent accent thumb; inactive panes
         // use the dim surface fill — the same color as an inactive tab's
         // number cell — so focus reads as an accent highlight.
-        cmds.push(DrawCmd::FillPath {
-            fill: if focused {
-                title_thumb_style()
-            } else {
-                surface_style()
-            },
-            segments: rounded_rect_path(thumb_x0, thumb_y0, thumb_x1, thumb_y1, rx, ry),
-        });
-        cmds.push(DrawCmd::DrawText {
-            origin: Point {
-                x: text_origin_x,
-                y: text_origin_y,
-            },
-            align: Align::Right,
-            fill: Style::Flat(title_text()),
-            font_style: FontStyle(if focused { 0x01 } else { 0x00 }),
-            font_scale: 1.0,
-            text: title.to_string(),
-        });
+        let fill = if focused {
+            title_thumb_style()
+        } else {
+            surface_style()
+        };
+        capsule(
+            cmds,
+            px,
+            text_x,
+            top_pad,
+            title,
+            fill,
+            title_text(),
+            focused,
+        );
+        text_x -= text_cells(title) + 2.0 * pad_x + 0.75;
+    }
+    // The badge is drawn even where the title is hidden: it says the
+    // pane is in a mode, not which pane it is.
+    if let Some(s) = pane.scroll {
+        let fill = Style::Flat(accent_color());
+        capsule(
+            cmds,
+            px,
+            text_x,
+            top_pad,
+            &s.badge(),
+            fill,
+            active_text(),
+            true,
+        );
+        foot_pill(cmds, px, pw, ph, &s);
     }
 
     // Scrollbar thumb at the right edge of the pane. Drawn in cell
     // units; sized by visible_rows / (visible_rows + history_depth)
     // and positioned by offset. Track starts below the title row so the
-    // thumb never collides with the scroll-indicator title that sits in
-    // the top-right cell while we're scrolling.
+    // thumb never collides with the title and badge in the top-right
+    // cells.
     if let Some(s) = pane.scroll {
         let portal_rows = ph.max(1.0);
         let total = portal_rows + s.history_depth as f32;
@@ -407,6 +413,78 @@ pub(super) fn pane_chrome(cmds: &mut Vec<DrawCmd>, px: Px, pane: &PaneChrome<'_>
             }],
         });
     }
+}
+
+/// One right-aligned label at `text_x` on a rounded `fill`.
+#[allow(clippy::too_many_arguments)]
+fn capsule(
+    cmds: &mut Vec<DrawCmd>,
+    px: Px,
+    text_x: f32,
+    y: f32,
+    label: &str,
+    fill: Style,
+    ink: Color,
+    bold: bool,
+) {
+    let pad_x = 0.5;
+    let (x0, x1) = (text_x - text_cells(label) - pad_x, text_x + pad_x);
+    // Same slight rounding as the modal/tab chrome, with rx
+    // compensated for anisotropic cells.
+    let (rx, ry) = chrome_corner_radii(x1 - x0, 1.0, px.w, px.h);
+    cmds.push(DrawCmd::FillPath {
+        fill,
+        segments: rounded_rect_path(x0, y, x1, y + 1.0, rx, ry),
+    });
+    cmds.push(DrawCmd::DrawText {
+        origin: Point { x: text_x, y },
+        align: Align::Right,
+        fill: Style::Flat(ink),
+        font_style: FontStyle(if bold { 0x01 } else { 0x00 }),
+        font_scale: 1.0,
+        text: label.to_string(),
+    });
+}
+
+/// The pill centred along a scrolled pane's foot: the way back to live
+/// on the surface, its key in the accent. Left out of a pane too small
+/// to hold it clear of the title and the thumb.
+fn foot_pill(cmds: &mut Vec<DrawCmd>, px: Px, pw: f32, ph: f32, s: &crate::style::PaneScroll) {
+    let Some((label, key)) = s.pill() else {
+        return;
+    };
+    let (label_w, key_w) = (text_cells(label), text_cells(key));
+    let gap = 1.5;
+    let w = label_w + gap + key_w + 2.0;
+    if ph < 4.0 || w > pw - 4.0 {
+        return;
+    }
+    let x0 = ((pw - w) / 2.0).floor();
+    let (y0, y1) = (ph - 1.5, ph - 0.5);
+    let (rx, ry) = chrome_corner_radii(w, 1.0, px.w, px.h);
+    cmds.push(DrawCmd::FillPath {
+        fill: surface_style(),
+        segments: rounded_rect_path(x0, y0, x0 + w, y1, rx, ry),
+    });
+    cmds.push(DrawCmd::DrawText {
+        origin: Point { x: x0 + 1.0, y: y0 },
+        align: Align::Left,
+        fill: Style::Flat(title_text()),
+        font_style: FontStyle(0x00),
+        font_scale: 1.0,
+        text: label.to_string(),
+    });
+    cmds.push(DrawCmd::DrawText {
+        origin: Point {
+            x: x0 + 1.0 + label_w + gap,
+            y: y0,
+        },
+        align: Align::Left,
+        fill: Style::Flat(accent_color()),
+        font_style: FontStyle(0x01),
+        font_scale: 1.0,
+        text: key.to_string(),
+    });
 }
 
 /// The dividers: plain accent lines.

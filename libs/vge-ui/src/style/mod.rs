@@ -503,10 +503,34 @@ pub struct PaneChrome<'a> {
 
 /// Where a pane is scrolled to: `offset` rows up a scrollback of
 /// `history_depth` (0 is the live screen).
+///
+/// An engine shows it three ways: the thumb at the pane's right edge, a
+/// badge beside the title saying how far back the view is
+/// ([`badge`](Self::badge)), and — once the view has left live — a pill
+/// along the pane's foot naming the way back ([`pill`](Self::pill)).
 #[derive(Clone, Copy, Debug)]
 pub struct PaneScroll {
     pub offset: u32,
     pub history_depth: u32,
+    /// The key that leaves scroll mode, shown in the pill.
+    pub exit_key: &'static str,
+}
+
+impl PaneScroll {
+    /// The badge's text: how many rows back the view is.
+    pub fn badge(&self) -> String {
+        if self.offset == 0 {
+            "\u{2195} scroll".to_string()
+        } else {
+            format!("\u{2191} {}", self.offset)
+        }
+    }
+
+    /// The pill's label and key, or `None` while the view is live —
+    /// there is nothing to go back to.
+    pub fn pill(&self) -> Option<(&'static str, &'static str)> {
+        (self.offset > 0).then_some(("\u{2193} back to live", self.exit_key))
+    }
 }
 
 /// Where a document's page sits on screen, in cells.
@@ -1064,6 +1088,66 @@ mod tests {
             };
             engine.scroll_thumb(&mut thumb, px, rect);
             assert!(!thumb.is_empty(), "{}", engine.name());
+        }
+    }
+
+    /// A scrolled pane keeps its title and gains the offset badge left
+    /// of it, and — away from live — the pill along its foot; both stay
+    /// inside the pane, and a one-pane tab still shows the badge.
+    #[test]
+    fn every_engine_draws_the_scroll_badge_and_pill() {
+        let px = Px { w: 8.0, h: 16.0 };
+        let scroll = |offset| PaneScroll {
+            offset,
+            history_depth: 500,
+            exit_key: "q",
+        };
+        for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+            let pane = |show_title, offset| PaneChrome {
+                w: 60.0,
+                h: 20.0,
+                title: "zsh",
+                focused: true,
+                show_title,
+                scroll: Some(scroll(offset)),
+            };
+            let mut cmds = Vec::new();
+            engine.pane_chrome(&mut cmds, px, &pane(true, 42));
+            let runs = texts(&cmds);
+            let find = |want: &str| {
+                runs.iter()
+                    .find(|(t, _)| *t == want)
+                    .map(|(_, at)| *at)
+                    .unwrap_or_else(|| panic!("{}: no {want:?}", engine.name()))
+            };
+            let (title, badge) = (find("zsh"), find("\u{2191} 42"));
+            assert!(
+                badge.x < title.x - 3.0,
+                "{}: badge over the title",
+                engine.name()
+            );
+            let (label, key) = (find("\u{2193} back to live"), find("q"));
+            for at in [title, badge, label, key] {
+                assert!((0.0..60.0).contains(&at.x) && (0.0..20.0).contains(&at.y));
+            }
+            assert!(label.y > 18.0 && key.x > label.x, "{}", engine.name());
+
+            // Live: no way back to show, but still the badge — with
+            // the title hidden too.
+            let mut cmds = Vec::new();
+            engine.pane_chrome(&mut cmds, px, &pane(false, 0));
+            let texts = texts(&cmds);
+            let names: Vec<_> = texts.iter().map(|(t, _)| *t).collect();
+            assert!(
+                names.contains(&"\u{2195} scroll"),
+                "{}: {names:?}",
+                engine.name()
+            );
+            assert!(
+                !names.contains(&"zsh") && !names.contains(&"q"),
+                "{}",
+                engine.name()
+            );
         }
     }
 
