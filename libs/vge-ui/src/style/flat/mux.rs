@@ -7,7 +7,7 @@ use vge_protocol::codec::{Point, Rect};
 use vge_protocol::command::{Align, Color, DrawCmd, FontStyle, Style};
 
 use crate::measure::text_cells;
-use crate::paint::Px;
+use crate::paint::{Px, hourglass};
 use crate::shape::{chrome_corner_radii, rounded_rect_path, rounded_rect_path_corners};
 use crate::style::{BarStatus, PaneChrome, TabBar, TabBarParts, TabStatus};
 use crate::theme::{
@@ -199,10 +199,7 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     if let Some(seg) = bar.status {
         status_segment(&mut status, px, bar.width, &seg);
     }
-    // The busy stripes stay still: a moving element would have to sit
-    // over the segment's label, or under its surface.
     TabBarParts {
-        marquees: vec![None; tabs.len()],
         ground,
         tabs,
         status,
@@ -211,20 +208,14 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
 
 /// How far a status item's tint shows: the share of a box a progress
 /// figure fills, or all of it for an item that only has a level.
-/// `None` when there is nothing to show beyond the text.
-fn status_fill(s: &TabStatus<'_>) -> Option<StatusFill> {
+/// `None` when there is nothing to show beyond the text — a busy item
+/// has no figure, and its hourglass is part of the label.
+fn status_fill(s: &TabStatus<'_>) -> Option<f32> {
     match s.progress {
-        Some(StatusProgress::Percent(p)) => Some(StatusFill::Share(f32::from(p) / 100.0)),
-        Some(StatusProgress::Indeterminate) => Some(StatusFill::Busy),
-        None if s.level != StatusLevel::Info => Some(StatusFill::Share(1.0)),
-        None => None,
+        Some(StatusProgress::Percent(p)) => Some(f32::from(p) / 100.0),
+        _ if s.level != StatusLevel::Info => Some(1.0),
+        _ => None,
     }
-}
-
-enum StatusFill {
-    Share(f32),
-    /// No figure to show, so stripes.
-    Busy,
 }
 
 /// The tint behind a status: the accent, translucent like a pane
@@ -253,28 +244,11 @@ fn status_segment(cmds: &mut Vec<DrawCmd>, px: Px, width: f32, seg: &BarStatus<'
         segments: shape(x1, true),
     });
     match status_fill(s) {
-        Some(StatusFill::Share(share)) if share > 0.0 => {
+        Some(share) if share > 0.0 => {
             let fx = x0 + (x1 - x0) * share;
             cmds.push(DrawCmd::FillPath {
                 fill: Style::Flat(status_tint(s.level, 0.55)),
                 segments: shape(fx, share >= 1.0),
-            });
-        }
-        Some(StatusFill::Busy) => {
-            // Inset past the rounded corners rather than clipped to them.
-            let rects = (0..)
-                .map(|i| x0 + 0.6 + i as f32)
-                .take_while(|x| x + 0.5 <= x1 - 0.6)
-                .map(|x| Rect {
-                    x,
-                    y: 0.0,
-                    w: 0.5,
-                    h: 1.0,
-                })
-                .collect();
-            cmds.push(DrawCmd::FillRectangles {
-                fill: Style::Flat(status_tint(s.level, 0.4)),
-                rects,
             });
         }
         _ => {}
@@ -287,6 +261,9 @@ fn status_segment(cmds: &mut Vec<DrawCmd>, px: Px, width: f32, seg: &BarStatus<'
         font_scale: 1.0,
         text: format!(" {} ", s.label()),
     });
+    if s.busy() {
+        hourglass(cmds, px, x0 + 1.0, 0.0, 1.0, title_text(), None);
+    }
 }
 
 /// A background tab's status, in the one row a flat tab has: a thin bar
@@ -296,8 +273,7 @@ fn status_segment(cmds: &mut Vec<DrawCmd>, px: Px, width: f32, seg: &BarStatus<'
 fn tab_status_mark(cmds: &mut Vec<DrawCmd>, x0: f32, x1: f32, s: &TabStatus<'_>) {
     const H: f32 = 0.14;
     let (share, alpha) = match status_fill(s) {
-        Some(StatusFill::Share(share)) => (share, 0.9),
-        Some(StatusFill::Busy) => (1.0, 0.45),
+        Some(share) => (share, 0.9),
         None => return,
     };
     if share <= 0.0 {

@@ -137,6 +137,103 @@ pub fn text(
     });
 }
 
+/// An hourglass in the character cell at `(x, y)` of text drawn at
+/// `scale`: what a status with no figure to show — busy, no telling how
+/// long — puts in front of its text. A glass outline over sand settled
+/// in the bottom bulb with a little left in the top, in `ink`, with
+/// `shadow` one pixel down and right like [`text`]'s.
+pub fn hourglass(
+    cmds: &mut Vec<DrawCmd>,
+    px: Px,
+    x: f32,
+    y: f32,
+    scale: f32,
+    ink: Color,
+    shadow: Option<Color>,
+) {
+    // In pixels from the cell's top-left: a glyph a little narrower
+    // than it is tall, as a font's would be, centred in the cell.
+    let (cw, ch) = (scale * px.w, scale * px.h);
+    let gh = (ch * 0.72).round().max(6.0);
+    let gw = (gh * 0.62).round().min(cw);
+    let (l, t) = (((cw - gw) / 2.0).round(), ((ch - gh) / 2.0).round());
+    let (r, b) = (l + gw, t + gh);
+    let mid = t + gh / 2.0;
+    let cap = (gh * 0.1).max(1.0);
+    let (inset, neck) = (gw * 0.12, gw * 0.08);
+    let glass_x = |yy: f32| {
+        // The left wall's x at height `yy`: the glass narrows linearly
+        // from the cap to the neck.
+        let half = if yy < mid {
+            (mid - yy) / (mid - t - cap)
+        } else {
+            (yy - mid) / (b - cap - mid)
+        };
+        l + inset + (gw / 2.0 - inset - neck) * (1.0 - half.clamp(0.0, 1.0))
+    };
+    let draw = |cmds: &mut Vec<DrawCmd>, dx: f32, dy: f32, ink: Color| {
+        let at = |px_x: f32, px_y: f32| Point {
+            x: x + px.x(px_x + dx),
+            y: y + px.y(px_y + dy),
+        };
+        let seg = |pts: &[(f32, f32)]| PathSegment {
+            start: at(pts[0].0, pts[0].1),
+            nodes: pts[1..]
+                .iter()
+                .map(|&(a, b)| PathNode::LineTo { dst: at(a, b) })
+                .chain([PathNode::ClosePath])
+                .collect(),
+        };
+        let sand_top = t + cap + (mid - t - cap) * 0.55;
+        let pile = mid + (b - cap - mid) * 0.35;
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(ink),
+            segments: vec![
+                seg(&[(l, t), (r, t), (r, t + cap), (l, t + cap)]),
+                seg(&[(l, b - cap), (r, b - cap), (r, b), (l, b)]),
+                // What is left in the top bulb, draining to the neck.
+                seg(&[
+                    (glass_x(sand_top), sand_top),
+                    (l + gw - (glass_x(sand_top) - l), sand_top),
+                    (l + gw / 2.0, mid),
+                ]),
+                // The pile in the bottom one.
+                seg(&[
+                    (l + gw / 2.0, pile),
+                    (r - inset, b - cap),
+                    (l + inset, b - cap),
+                ]),
+            ],
+        });
+        let wall = |yy: f32| (glass_x(yy), l + gw - (glass_x(yy) - l));
+        let (tl, tr) = wall(t + cap);
+        let (ml, mr) = wall(mid);
+        let (bl, br) = wall(b - cap);
+        cmds.push(DrawCmd::DrawLinePath {
+            stroke: Style::Flat(ink),
+            line_width: px.line(1.0),
+            segments: vec![PathSegment {
+                start: at(tl, t + cap),
+                nodes: [
+                    (ml, mid),
+                    (bl, b - cap),
+                    (br, b - cap),
+                    (mr, mid),
+                    (tr, t + cap),
+                ]
+                .into_iter()
+                .map(|(a, b)| PathNode::LineTo { dst: at(a, b) })
+                .chain([PathNode::ClosePath])
+                .collect(),
+            }],
+        });
+    };
+    if let Some(sh) = shadow {
+        draw(cmds, 1.0, 1.0, sh);
+    }
+    draw(cmds, 0.0, 0.0, ink);
+}
+
 /// A cheap stable hash, so scattered decoration keeps its place across
 /// redraws.
 pub fn hash(mut v: u32) -> u32 {

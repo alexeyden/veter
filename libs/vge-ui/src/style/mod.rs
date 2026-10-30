@@ -380,6 +380,11 @@ pub enum StatusPlacement {
     BarEnd,
 }
 
+/// What a busy status's label leads with: room for an hourglass, drawn
+/// as a path rather than taken from a font, which may have none or a
+/// colour emoji. Spaces, so the label measures and elides as text does.
+pub const BUSY_ICON: &str = "  ";
+
 /// A status item as the chrome shows it: the one a client picked to
 /// stand for a tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -391,16 +396,24 @@ pub struct TabStatus<'a> {
 
 impl TabStatus<'_> {
     /// What is written: the text, after the percentage when there is
-    /// one. Shared by the engines and by the client's layout so the room
-    /// it makes is the room the label takes.
+    /// one, or after [`BUSY_ICON`]'s room — two cells, the hourglass in
+    /// the first — when the progress is indeterminate. Shared by the
+    /// engines and by the client's layout so the room it makes is the
+    /// room the label takes.
     pub fn label(&self) -> String {
+        use prt_protocol::command::StatusProgress;
         match (self.progress, self.text.is_empty()) {
-            (Some(prt_protocol::command::StatusProgress::Percent(p)), true) => format!("{p}%"),
-            (Some(prt_protocol::command::StatusProgress::Percent(p)), false) => {
-                format!("{p}% {}", self.text)
-            }
-            _ => self.text.to_string(),
+            (Some(StatusProgress::Percent(p)), true) => format!("{p}%"),
+            (Some(StatusProgress::Percent(p)), false) => format!("{p}% {}", self.text),
+            (Some(StatusProgress::Indeterminate), _) => format!("{BUSY_ICON}{}", self.text),
+            (None, _) => self.text.to_string(),
         }
+    }
+
+    /// Whether the label starts with [`BUSY_ICON`]'s room, for the
+    /// engine to draw [`crate::paint::hourglass`] into its first cell.
+    pub fn busy(&self) -> bool {
+        self.progress == Some(prt_protocol::command::StatusProgress::Indeterminate)
     }
 }
 
@@ -445,35 +458,6 @@ pub struct TabBarParts {
     /// one. Its own part because it is what changes most often — a
     /// download ticks it once a percent.
     pub status: Vec<DrawCmd>,
-    /// Each tab's moving part, parallel to [`TabBar::tabs`]: what an
-    /// indeterminate status sweeps along, if the engine draws one.
-    pub marquees: Vec<Option<Marquee>>,
-}
-
-/// Something the client keeps moving, since a VGE frame cannot move by
-/// itself: `commands`, clipped to `clip`, slid right at `speed` cells a
-/// second and wrapped every `period` cells. The client makes it an
-/// element of its own at `clip`'s corner, `clip`'s size, and animates it
-/// with `UpdateTransform` alone, so a frame of motion is one tiny
-/// command rather than a resent tab. `commands` are relative to that
-/// corner and drawn at their phase-zero position.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Marquee {
-    pub clip: Rect,
-    pub commands: Vec<DrawCmd>,
-    pub period: f32,
-    pub speed: f32,
-}
-
-impl Marquee {
-    /// How far the commands are slid `secs` seconds into the sweep.
-    pub fn offset(&self, secs: f32) -> f32 {
-        if self.period > 0.0 {
-            (secs * self.speed).rem_euclid(self.period)
-        } else {
-            0.0
-        }
-    }
 }
 
 /// One tab: a number rect `[x0, x0 + num_w)` and a name rect after it.
@@ -1207,58 +1191,56 @@ mod tests {
         }
     }
 
-    /// Every engine hands back one marquee slot per tab, and Aero fills
-    /// a busy tab's with blocks that start out of its clip on the left
-    /// and wrap once they have left it on the right.
+    /// A busy item leads its label with the hourglass's room, and every
+    /// engine draws the hourglass, wherever its metrics put the status.
     #[test]
-    fn marquees_are_per_tab_and_sweep_through_their_clip() {
+    fn every_engine_marks_a_busy_status_with_an_hourglass() {
         use prt_protocol::command::{StatusLevel, StatusProgress};
         let px = Px { w: 8.0, h: 16.0 };
         let busy = TabStatus {
-            text: "sleep",
+            text: "Bash: cargo test",
             level: StatusLevel::Info,
             progress: Some(StatusProgress::Indeterminate),
         };
+        assert_eq!(busy.label(), format!("{BUSY_ICON}Bash: cargo test"));
+        let hourglasses = |cmds: &[DrawCmd]| {
+            cmds.iter()
+                .filter(|c| matches!(c, DrawCmd::DrawLinePath { .. }))
+                .count()
+        };
         for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
-            let bar = TabBar {
-                width: 120.0,
-                session: None,
-                tabs: vec![
-                    Tab {
+            let in_tab = matches!(
+                engine.metrics().tabbar.status,
+                StatusPlacement::InTab { .. }
+            );
+            // The hourglass's strokes, over the same item with no
+            // progress at all.
+            let lines = |status: TabStatus<'_>| {
+                let bar = TabBar {
+                    width: 120.0,
+                    session: None,
+                    tabs: vec![Tab {
                         index: 0,
                         x0: 0.5,
                         num_w: 3.0,
-                        name_w: 20.0,
-                        label: "busy",
+                        name_w: 30.0,
+                        label: "claude",
                         active: true,
                         activity: false,
-                        status: Some(busy),
-                    },
-                    Tab {
-                        index: 1,
-                        x0: 24.0,
-                        num_w: 3.0,
-                        name_w: 20.0,
-                        label: "idle",
-                        active: false,
-                        activity: false,
-                        status: None,
-                    },
-                ],
-                left_chevron: None,
-                right_chevron: None,
-                status: None,
+                        status: Some(status),
+                    }],
+                    left_chevron: None,
+                    right_chevron: None,
+                    status: (!in_tab).then_some(BarStatus { status, x0: 80.0 }),
+                };
+                let parts = engine.tab_bar(px, &bar);
+                hourglasses(&parts.tabs[0]) + hourglasses(&parts.status)
             };
-            let parts = engine.tab_bar(px, &bar);
-            assert_eq!(parts.marquees.len(), 2, "{}", engine.name());
-            assert!(parts.marquees[1].is_none(), "{}", engine.name());
-            if engine.name() == "aero" {
-                let m = parts.marquees[0]
-                    .as_ref()
-                    .expect("a busy aero tab has a marquee");
-                assert!(m.period > m.clip.w);
-                assert!(m.offset(0.0) == 0.0 && m.offset(m.period / m.speed * 1.5) < m.period);
-            }
+            let still = TabStatus {
+                progress: None,
+                ..busy
+            };
+            assert!(lines(busy) > lines(still), "{}", engine.name());
         }
     }
 

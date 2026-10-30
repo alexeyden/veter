@@ -63,7 +63,7 @@ use ses_protocol::{
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
-use vge_protocol::codec::{Point, Transform};
+use vge_protocol::codec::Point;
 use vge_protocol::command::{
     Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, UpdateCommandsBody,
 };
@@ -1196,21 +1196,10 @@ const TABBAR_STATUS_ID: &str = "vmux-tabbar.status";
 const TABBAR_GROUND_ORDER: i32 = 0;
 const TABBAR_TAB_ORDER: i32 = 1;
 const TABBAR_ACTIVE_ORDER: i32 = 2;
-/// A tab's marquee ([`style::Marquee`]) sits over every tab, its own
-/// included.
-const TABBAR_MARQUEE_ORDER: i32 = 3;
-/// How often a marquee moves. A busy bar needs to read as alive, not to
-/// be smooth, and each frame is bytes on the pty.
-const MARQUEE_TICK: Duration = Duration::from_millis(200);
 
 /// A tab's element id, by tab index.
 fn tab_element_id(index: usize) -> String {
     format!("vmux-tabbar.tab{index}")
-}
-
-/// A tab's marquee element id, by tab index.
-fn marquee_element_id(index: usize) -> String {
-    format!("vmux-tabbar.marquee{index}")
 }
 /// Cap on the window title we hand the host, in characters. A pane's
 /// OSC title is whatever the inner program said; the host clamps too,
@@ -1657,12 +1646,6 @@ fn build_tabbar(
     );
     TabbarParts {
         ground: parts.ground,
-        marquees: bar
-            .tabs
-            .iter()
-            .zip(parts.marquees)
-            .filter_map(|(t, m)| Some((t.index, m?)))
-            .collect(),
         tabs: bar
             .tabs
             .iter()
@@ -1675,13 +1658,11 @@ fn build_tabbar(
 
 /// One render of the tab bar: the ground, each visible tab as its
 /// index, whether it is the active one, and its commands, and the
-/// bar-end status segment (empty without one), and the marquees of the
-/// tabs that have one, by tab index.
+/// bar-end status segment (empty without one).
 struct TabbarParts {
     ground: Vec<DrawCmd>,
     tabs: Vec<(usize, bool, Vec<DrawCmd>)>,
     status: Vec<DrawCmd>,
-    marquees: BTreeMap<usize, style::Marquee>,
 }
 
 /// What the host holds for the tab bar, so a render sends only what
@@ -1694,9 +1675,6 @@ struct TabbarSent {
     tabs: BTreeMap<usize, (i32, Vec<DrawCmd>)>,
     /// The status segment's commands; empty while there is no element.
     status: Vec<DrawCmd>,
-    /// The marquee elements, by tab index. Their transforms are not
-    /// kept: they move on every tick ([`State::marquee_frame`]).
-    marquees: BTreeMap<usize, style::Marquee>,
 }
 
 impl TabbarSent {
@@ -1821,61 +1799,6 @@ impl TabbarSent {
             _ => {}
         }
         sent.status = parts.status;
-
-        // A marquee is created at its phase-zero position and the next
-        // tick puts it where the sweep has got to. One whose box moved
-        // is made again rather than moved and resized: it happens on a
-        // relayout, not on a tick.
-        for (index, m) in &parts.marquees {
-            let id = marquee_element_id(*index);
-            match sent.marquees.remove(index) {
-                Some(was) if was == *m => {}
-                Some(was) if was.clip == m.clip => {
-                    cmds.push((update(id, m.commands.clone()), 0));
-                }
-                was => {
-                    if was.is_some() {
-                        cmds.push((
-                            VgeCommand::DeleteElement {
-                                id: id.clone(),
-                                by_prefix: false,
-                            },
-                            0,
-                        ));
-                    }
-                    cmds.push((
-                        VgeCommand::CreateElement(CreateElementBody {
-                            id,
-                            commands: m.commands.clone(),
-                            origin: Point {
-                                x: m.clip.x,
-                                y: m.clip.y,
-                            },
-                            is_visible: true,
-                            draw_order: TABBAR_MARQUEE_ORDER,
-                            parent: Some(TABBAR_ELEMENT_ID.to_string()),
-                            size: Some(Point {
-                                x: m.clip.w,
-                                y: m.clip.h,
-                            }),
-                            transform: None,
-                            anchor: OriginAnchor::Viewport,
-                        }),
-                        0,
-                    ));
-                }
-            }
-        }
-        for index in std::mem::take(&mut sent.marquees).into_keys() {
-            cmds.push((
-                VgeCommand::DeleteElement {
-                    id: marquee_element_id(index),
-                    by_prefix: false,
-                },
-                0,
-            ));
-        }
-        sent.marquees = parts.marquees;
         (cmds, sent)
     }
 }
@@ -2912,9 +2835,6 @@ struct State {
     visible_panes: HashSet<String>,
     /// What the host holds for the tab bar; `None` until it is created.
     tabbar_sent: Option<TabbarSent>,
-    /// Where every marquee's sweep is timed from, so the phase a
-    /// marquee is at does not depend on when it was (re)created.
-    marquee_epoch: Instant,
     /// Index of the leftmost tab currently drawn in the tab bar. When
     /// the tabs don't all fit on row 0 the bar scrolls; this offset is
     /// nudged so the active tab stays visible (see `build_tabbar`).
@@ -2973,7 +2893,6 @@ impl State {
             last_focus_sent: None,
             visible_panes: HashSet::new(),
             tabbar_sent: None,
-            marquee_epoch: Instant::now(),
             tab_scroll: 0,
             separators_created: false,
             pending_scrolls: HashMap::new(),
@@ -4645,44 +4564,6 @@ impl State {
         out
     }
 
-    /// Whether anything in the tab bar is moving, which is what makes
-    /// the main loop wake on [`MARQUEE_TICK`].
-    fn has_marquees(&self) -> bool {
-        self.tabbar_sent
-            .as_ref()
-            .is_some_and(|s| !s.marquees.is_empty())
-    }
-
-    /// One frame of motion: each marquee slid to where its sweep is now.
-    fn marquee_frame(&self) -> Vec<u8> {
-        let Some(sent) = &self.tabbar_sent else {
-            return Vec::new();
-        };
-        let secs = self.marquee_epoch.elapsed().as_secs_f32();
-        let cmds: Vec<_> = sent
-            .marquees
-            .iter()
-            .map(|(index, m)| {
-                let transform = Transform {
-                    e: m.offset(secs),
-                    ..Transform::IDENTITY
-                };
-                (
-                    VgeCommand::UpdateTransform {
-                        id: marquee_element_id(*index),
-                        transform,
-                    },
-                    0,
-                )
-            })
-            .collect();
-        if cmds.is_empty() {
-            Vec::new()
-        } else {
-            build_vge_envelope(&cmds)
-        }
-    }
-
     /// The VGE commands that bring the host's tab bar up to date, and
     /// nothing for the parts it already shows ([`TabbarSent::diff`]).
     fn tabbar_commands(&mut self) -> Vec<(VgeCommand, u32)> {
@@ -5426,8 +5307,6 @@ fn main() -> Result<()> {
     // moment instead of for this window.
     let escape_time = escape_time();
     let mut esc_deadline: Option<Instant> = None;
-    // When the tab bar's marquees next move; `None` while none show.
-    let mut next_marquee: Option<Instant> = None;
 
     while !state.quit {
         if WINCH_FLAG.swap(false, Ordering::SeqCst) || state.needs_resize_check {
@@ -5528,24 +5407,15 @@ fn main() -> Result<()> {
 
         // Wake for the escape-time window while one is running, so a
         // held Esc is decided on time however busy the other fds are.
-        // And for the next marquee frame while one shows.
-        next_marquee = match next_marquee {
-            _ if !state.has_marquees() => None,
-            None => Some(Instant::now() + MARQUEE_TICK),
-            keep => keep,
+        let timeout = match esc_deadline {
+            Some(deadline) => u16::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u16::MAX),
+            None => IDLE_TICK_MS,
         };
-        let timeout = [esc_deadline, next_marquee]
-            .into_iter()
-            .flatten()
-            .min()
-            .map_or(IDLE_TICK_MS, |deadline| {
-                u16::try_from(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-                )
-                .unwrap_or(u16::MAX)
-            });
         match poll(&mut fds, PollTimeout::from(timeout)) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
@@ -5598,18 +5468,6 @@ fn main() -> Result<()> {
         } else {
             None
         };
-
-        // A frame of motion is skipped, not queued, while the host is
-        // behind: a late frame is only a jump the next one makes anyway.
-        if let Some(due) = next_marquee.filter(|due| Instant::now() >= *due) {
-            if out_pending() == 0 {
-                let env = state.marquee_frame();
-                if !env.is_empty() {
-                    write_all_stdout(&env)?;
-                }
-            }
-            next_marquee = Some(due.max(Instant::now() - MARQUEE_TICK) + MARQUEE_TICK);
-        }
 
         // The window elapsed with nothing arriving to complete the
         // sequence, so what is held was typed. Release it down the same
@@ -8270,7 +8128,6 @@ mod tests {
             ground: Vec::new(),
             tabs: Vec::new(),
             status,
-            marquees: BTreeMap::new(),
         };
         let ids = |cmds: &[(VgeCommand, u32)]| -> Vec<String> {
             cmds.iter()
@@ -8301,42 +8158,6 @@ mod tests {
         assert!(cmds.is_empty());
         let (cmds, _) = TabbarSent::diff(Some(sent), parts(Vec::new()));
         assert_eq!(ids(&cmds), ["delete vmux-tabbar.status"]);
-    }
-
-    /// A marquee's element comes and goes with its tab's busy item and
-    /// sits still across renders: the diff never resends it for moving,
-    /// since moving is the tick's `UpdateTransform`.
-    #[test]
-    fn a_marquee_element_follows_its_tab_status() {
-        let marquee = |w: f32| style::Marquee {
-            clip: vge_protocol::codec::Rect {
-                x: 1.0,
-                y: 1.5,
-                w,
-                h: 0.25,
-            },
-            commands: Vec::new(),
-            period: w + 3.0,
-            speed: 8.0,
-        };
-        let parts = |m: Option<style::Marquee>| TabbarParts {
-            ground: Vec::new(),
-            tabs: Vec::new(),
-            status: Vec::new(),
-            marquees: m.into_iter().map(|m| (2, m)).collect(),
-        };
-        let (_, sent) = TabbarSent::diff(None, parts(None));
-        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(20.0))));
-        assert_eq!(tabbar_ops(&cmds), ["create vmux-tabbar.marquee2"]);
-        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(20.0))));
-        assert!(cmds.is_empty());
-        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(24.0))));
-        assert_eq!(
-            tabbar_ops(&cmds),
-            ["delete vmux-tabbar.marquee2", "create vmux-tabbar.marquee2"]
-        );
-        let (cmds, _) = TabbarSent::diff(Some(sent), parts(None));
-        assert_eq!(tabbar_ops(&cmds), ["delete vmux-tabbar.marquee2"]);
     }
 
     // ── layout resize ──────────────────────────────────────────────────

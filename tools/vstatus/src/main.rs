@@ -76,7 +76,7 @@ enum Cmd {
         /// Text of the item. Defaults to the command line.
         #[arg(short, long)]
         text: Option<String>,
-        /// Show an indeterminate progress bar while it runs.
+        /// Mark the item busy (indeterminate progress) while it runs.
         #[arg(long)]
         spin: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -105,7 +105,7 @@ struct Look {
     /// Progress in percent, 0–100.
     #[arg(short, long, value_parser = clap::value_parser!(u8).range(0..=100))]
     progress: Option<u8>,
-    /// Indeterminate progress (a busy bar with no figure).
+    /// Indeterminate progress: busy, with no figure (shown as an hourglass).
     #[arg(long, conflicts_with = "progress")]
     spin: bool,
 }

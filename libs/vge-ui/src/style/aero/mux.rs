@@ -9,14 +9,12 @@ use prt_protocol::command::{StatusLevel, StatusProgress};
 
 use super::{
     BAR_BOTTOM, BAR_LIP, BAR_TOP, GEL_AMBER, GEL_AQUA, GEL_GREEN, GEL_RED, Gel, Tone, bubble, gel,
-    gel_rr, gloss, scroll_thumb, smoke, tone,
+    gloss, scroll_thumb, smoke, tone,
 };
 use crate::measure::text_cells;
-use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
+use crate::paint::{Px, hash, hex, hourglass, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
-use crate::style::{
-    Marquee, PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics,
-};
+use crate::style::{PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics};
 
 /// A two-row bar of tabs standing on its bottom edge, Windows XP
 /// fashion: the label sits on the bar's centre line, the active tab
@@ -62,10 +60,6 @@ const STATUS_Y: f32 = 1.18;
 const STATUS_SCALE: f32 = 0.6;
 /// …above a gel strip this many pixels deep, standing on the lip.
 const STATUS_STRIP_PX: f32 = 4.0;
-/// Width of one marquee block, in cells.
-const MARQUEE_BLOCK: f32 = 1.2;
-/// How fast the marquee sweeps, in cells a second.
-const MARQUEE_SPEED: f32 = 8.0;
 
 /// The tab bar: a two-row sky with the tabs standing on its bottom
 /// edge — the accent's gel for the active one, frosted glass for the
@@ -73,7 +67,6 @@ const MARQUEE_SPEED: f32 = 8.0;
 pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     let mut ground = Vec::new();
     let mut tabs = Vec::with_capacity(bar.tabs.len());
-    let mut marquees = Vec::with_capacity(bar.tabs.len());
     let cmds = &mut ground;
     let host_w = bar.width;
     let band = |y: f32, h: f32| Rect {
@@ -257,10 +250,9 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             is_active,
             Some(shadow),
         );
-        marquees.push(
-            slot.status
-                .and_then(|s| tab_status(cmds, px, x0, x1, &s, shadow)),
-        );
+        if let Some(s) = slot.status {
+            tab_status(cmds, px, x0, x1, &s, shadow);
+        }
         tabs.push(tab);
     }
 
@@ -282,7 +274,6 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
         ground,
         tabs,
         status: Vec::new(),
-        marquees,
     }
 }
 
@@ -290,16 +281,8 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
 /// own, and, for an item with a figure or a level worth seeing, a gel
 /// strip along the tab's foot as long as the progress made — green for
 /// progress, Windows XP's own, amber for a warning, red for an error.
-/// An indeterminate item's blocks are handed back as a [`Marquee`] for
-/// the client to sweep along the track.
-fn tab_status(
-    cmds: &mut Vec<DrawCmd>,
-    px: Px,
-    x0: f32,
-    x1: f32,
-    s: &TabStatus<'_>,
-    shadow: Color,
-) -> Option<Marquee> {
+/// A busy item with no figure leads its text with an hourglass instead.
+fn tab_status(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, x1: f32, s: &TabStatus<'_>, shadow: Color) {
     let max = ((x1 - x0 - 1.0) / STATUS_SCALE).max(1.0) as usize;
     let label = crate::measure::elide(&s.label(), max);
     let cx = (x0 + x1) * 0.5;
@@ -320,8 +303,20 @@ fn tab_status(
         fill: Style::Flat(white(1.0)),
         font_style: FontStyle(0x00),
         font_scale: STATUS_SCALE,
-        text: label,
+        text: label.clone(),
     });
+    if s.busy() {
+        let start = cx - text_cells(&label) * STATUS_SCALE * 0.5;
+        hourglass(
+            cmds,
+            px,
+            start,
+            STATUS_Y,
+            STATUS_SCALE,
+            white(1.0),
+            Some(shadow),
+        );
+    }
 
     let material = match s.level {
         StatusLevel::Info => &GEL_GREEN,
@@ -331,52 +326,26 @@ fn tab_status(
     let (sx0, sx1) = (x0 + 0.5, x1 - 0.5);
     let y1 = BAR_H - px.y(1.0);
     let y0 = y1 - px.y(STATUS_STRIP_PX);
-    // The empty part of the track, under either kind of progress, so a
-    // low figure still reads as a bar with a long way to go and the
-    // marquee as something moving along one.
-    let track = |cmds: &mut Vec<DrawCmd>| {
-        cmds.push(DrawCmd::FillPath {
-            fill: Style::Flat(hex(0x06264d, 0.35)),
-            segments: pill(px, sx0, y0, sx1, y1),
-        });
-    };
     match s.progress {
         Some(StatusProgress::Percent(p)) => {
-            track(cmds);
+            // The empty part of the track, so a low figure still reads
+            // as a bar with a long way to go.
+            cmds.push(DrawCmd::FillPath {
+                fill: Style::Flat(hex(0x06264d, 0.35)),
+                segments: pill(px, sx0, y0, sx1, y1),
+            });
             let fx = sx0 + (sx1 - sx0) * f32::from(p) / 100.0;
             if fx - sx0 >= px.x(STATUS_STRIP_PX) {
                 gel(cmds, px, sx0, y0, fx, y1, material);
             }
         }
-        // XP's marquee: a short run of blocks sweeping along the track,
-        // entering at its left end and leaving at its right.
-        Some(StatusProgress::Indeterminate) => {
-            track(cmds);
-            let gap = px.x(2.0);
-            let block = ((sx1 - sx0 - 2.0 * gap) / 3.0).min(MARQUEE_BLOCK);
-            let run = 3.0 * block + 2.0 * gap;
-            let mut blocks = Vec::new();
-            let mut bx = -run;
-            for _ in 0..3 {
-                gel_rr(&mut blocks, px, bx, 0.0, bx + block, y1 - y0, 1.0, material);
-                bx += block + gap;
-            }
-            return Some(Marquee {
-                clip: Rect {
-                    x: sx0,
-                    y: y0,
-                    w: sx1 - sx0,
-                    h: y1 - y0,
-                },
-                commands: blocks,
-                period: sx1 - sx0 + run,
-                speed: MARQUEE_SPEED,
-            });
+        // No figure: the hourglass says busy, and the strip only the
+        // level, as for an item with no progress at all.
+        Some(StatusProgress::Indeterminate) | None if s.level != StatusLevel::Info => {
+            gel(cmds, px, sx0, y0, sx1, y1, material)
         }
-        None if s.level != StatusLevel::Info => gel(cmds, px, sx0, y0, sx1, y1, material),
-        None => {}
+        _ => {}
     }
-    None
 }
 
 /// The deep tone of a frosted tab, which its number's socket is
