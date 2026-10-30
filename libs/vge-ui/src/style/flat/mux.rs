@@ -199,7 +199,10 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     if let Some(seg) = bar.status {
         status_segment(&mut status, px, bar.width, &seg);
     }
+    // The busy stripes stay still: a moving element would have to sit
+    // over the segment's label, or under its surface.
     TabBarParts {
+        marquees: vec![None; tabs.len()],
         ground,
         tabs,
         status,
@@ -220,7 +223,7 @@ fn status_fill(s: &TabStatus<'_>) -> Option<StatusFill> {
 
 enum StatusFill {
     Share(f32),
-    /// No figure to show, so stripes: a static VGE frame cannot spin.
+    /// No figure to show, so stripes.
     Busy,
 }
 

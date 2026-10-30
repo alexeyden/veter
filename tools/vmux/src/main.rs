@@ -34,18 +34,18 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use nix::errno::Errno;
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use nix::pty::{forkpty, ForkptyResult, Winsize};
-use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::unistd::{chdir, execvp, tcgetpgrp, Pid};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::pty::{ForkptyResult, Winsize, forkpty};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
+use nix::unistd::{Pid, chdir, execvp, tcgetpgrp};
 
 use prt_protocol::apc::ApcStream as PrtApcStream;
 use prt_protocol::codec::Reader as PrtReader;
 use prt_protocol::command::{
-    AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, ForkPortalBody,
-    ScrollTarget, StatusLevel, StatusOp, StatusProgress, UpdateOriginBody, WritePortalBody,
+    AnchorMode, Command as PrtCommand, CreatePortalBody, FocusTarget, ForkPortalBody, ScrollTarget,
+    StatusLevel, StatusOp, StatusProgress, UpdateOriginBody, WritePortalBody,
 };
 use prt_protocol::encode::build_envelope as build_prt_envelope;
 use prt_protocol::envelope::parse_status_change;
@@ -63,7 +63,7 @@ use ses_protocol::{
 };
 
 use vge_protocol::apc::ApcStream as VgeApcStream;
-use vge_protocol::codec::Point;
+use vge_protocol::codec::{Point, Transform};
 use vge_protocol::command::{
     Command as VgeCommand, CreateElementBody, DrawCmd, OriginAnchor, UpdateCommandsBody,
 };
@@ -73,8 +73,10 @@ use vge_protocol::frame::{MARKER_T2C as VGE_MARKER_T2C, RSP_PROBE as VGE_RSP_PRO
 use vge_ui::edit::{EditOutcome, LineEditor};
 use vge_ui::modal::{ModalIds, ScrollModal};
 use vge_ui::paint::Px;
-use vge_ui::style::{self, BarStatus, PaneChrome, StatusPlacement, TabBar, TabStatus, TabbarMetrics};
 use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
+use vge_ui::style::{
+    self, BarStatus, PaneChrome, StatusPlacement, TabBar, TabStatus, TabbarMetrics,
+};
 use vge_ui::theme;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -138,11 +140,7 @@ fn escape_time() -> Duration {
 
 /// Whether any of the three parsers is sitting on bytes that belong to
 /// the focused pane if no follow-up byte arrives.
-fn apc_holding(
-    prt: &PrtApcStream,
-    vge: &VgeApcStream,
-    ses: &SesApcStream,
-) -> bool {
+fn apc_holding(prt: &PrtApcStream, vge: &VgeApcStream, ses: &SesApcStream) -> bool {
     prt.has_deferred_bytes() || vge.has_deferred_bytes() || ses.has_deferred_bytes()
 }
 
@@ -155,11 +153,7 @@ static DEBUG_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 fn init_debug_log() {
     if let Ok(path) = std::env::var("VMUX_LOG") {
-        if let Ok(f) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        if let Ok(f) = OpenOptions::new().create(true).append(true).open(&path) {
             *DEBUG_LOG.lock().unwrap() = Some(f);
         }
     }
@@ -301,9 +295,7 @@ impl Layout {
     fn contains_leaf(&self, target: &str) -> bool {
         match self {
             Layout::Leaf(id) => id == target,
-            Layout::Split { a, b, .. } => {
-                a.contains_leaf(target) || b.contains_leaf(target)
-            }
+            Layout::Split { a, b, .. } => a.contains_leaf(target) || b.contains_leaf(target),
         }
     }
 
@@ -490,7 +482,11 @@ fn build_separators_body(layout: &Layout, full: PaneRect) -> CreateElementBody {
             .into_iter()
             .map(|s| match s {
                 Separator::Vertical { x, y0, y1 } => {
-                    let y1 = if y1 >= full_bottom { y1 + OVERSHOOT } else { y1 };
+                    let y1 = if y1 >= full_bottom {
+                        y1 + OVERSHOOT
+                    } else {
+                        y1
+                    };
                     (Point { x, y: y0 }, Point { x, y: y1 })
                 }
                 Separator::Horizontal { y, x0, x1 } => {
@@ -534,8 +530,18 @@ fn split_child_rects(dir: SplitDir, ratio: f32, bounds: PaneRect) -> (PaneRect, 
                 .min(bounds.w.saturating_sub(1));
             let w_b = bounds.w - w_a;
             (
-                PaneRect { x: bounds.x, y: bounds.y, w: w_a, h: bounds.h },
-                PaneRect { x: bounds.x + w_a as i32, y: bounds.y, w: w_b, h: bounds.h },
+                PaneRect {
+                    x: bounds.x,
+                    y: bounds.y,
+                    w: w_a,
+                    h: bounds.h,
+                },
+                PaneRect {
+                    x: bounds.x + w_a as i32,
+                    y: bounds.y,
+                    w: w_b,
+                    h: bounds.h,
+                },
             )
         }
         SplitDir::Horizontal => {
@@ -544,8 +550,18 @@ fn split_child_rects(dir: SplitDir, ratio: f32, bounds: PaneRect) -> (PaneRect, 
                 .min(bounds.h.saturating_sub(1));
             let h_b = bounds.h - h_a;
             (
-                PaneRect { x: bounds.x, y: bounds.y, w: bounds.w, h: h_a },
-                PaneRect { x: bounds.x, y: bounds.y + h_a as i32, w: bounds.w, h: h_b },
+                PaneRect {
+                    x: bounds.x,
+                    y: bounds.y,
+                    w: bounds.w,
+                    h: h_a,
+                },
+                PaneRect {
+                    x: bounds.x,
+                    y: bounds.y + h_a as i32,
+                    w: bounds.w,
+                    h: h_b,
+                },
             )
         }
     }
@@ -657,7 +673,11 @@ fn resize_split(
         return false;
     }
     let (rect_a, rect_b) = split_child_rects(*dir, *ratio, bounds);
-    let (child, child_bounds) = if in_a { (a.as_mut(), rect_a) } else { (b.as_mut(), rect_b) };
+    let (child, child_bounds) = if in_a {
+        (a.as_mut(), rect_a)
+    } else {
+        (b.as_mut(), rect_b)
+    };
     // Innermost matching split wins — try deeper before adjusting here.
     if resize_split(child, target, want, cells, child_bounds) {
         return true;
@@ -714,15 +734,11 @@ fn separator_hit(
     let on = match dir {
         SplitDir::Vertical => {
             let dx = rect_b.x;
-            row >= bounds.y
-                && row < bounds.y + bounds.h as i32
-                && (col == dx || col == dx - 1)
+            row >= bounds.y && row < bounds.y + bounds.h as i32 && (col == dx || col == dx - 1)
         }
         SplitDir::Horizontal => {
             let dy = rect_b.y;
-            col >= bounds.x
-                && col < bounds.x + bounds.w as i32
-                && (row == dy || row == dy - 1)
+            col >= bounds.x && col < bounds.x + bounds.w as i32 && (row == dy || row == dy - 1)
         }
     };
     if on {
@@ -806,8 +822,7 @@ impl PanePty {
             ws_xpixel: xpixel,
             ws_ypixel: ypixel,
         };
-        let result =
-            unsafe { forkpty(Some(&winsize), None) }.context("forkpty")?;
+        let result = unsafe { forkpty(Some(&winsize), None) }.context("forkpty")?;
         match result {
             ForkptyResult::Child => {
                 // Start where the pane we were split off from was (see
@@ -926,7 +941,11 @@ impl PaneScroll {
     /// reported, or the ring's capacity before the first ack. Only ever
     /// a guess for the indicator — the host clamps the real thing.
     fn depth_bound(&self) -> u32 {
-        if self.history_depth > 0 { self.history_depth } else { PORTAL_SCROLLBACK_LINES }
+        if self.history_depth > 0 {
+            self.history_depth
+        } else {
+            PORTAL_SCROLLBACK_LINES
+        }
     }
 }
 
@@ -1057,7 +1076,13 @@ fn apply_status_op(items: &mut Vec<StatusItem>, op: StatusOp) -> bool {
         }
         StatusOp::Remove { key, prefix } => {
             let before = items.len();
-            items.retain(|i| if prefix { !i.key.starts_with(&key) } else { i.key != key });
+            items.retain(|i| {
+                if prefix {
+                    !i.key.starts_with(&key)
+                } else {
+                    i.key != key
+                }
+            });
             items.len() != before
         }
     }
@@ -1102,7 +1127,6 @@ impl Pane {
             PaneIo::Peer(_) => None,
         }
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1172,10 +1196,21 @@ const TABBAR_STATUS_ID: &str = "vmux-tabbar.status";
 const TABBAR_GROUND_ORDER: i32 = 0;
 const TABBAR_TAB_ORDER: i32 = 1;
 const TABBAR_ACTIVE_ORDER: i32 = 2;
+/// A tab's marquee ([`style::Marquee`]) sits over every tab, its own
+/// included.
+const TABBAR_MARQUEE_ORDER: i32 = 3;
+/// How often a marquee moves. A busy bar needs to read as alive, not to
+/// be smooth, and each frame is bytes on the pty.
+const MARQUEE_TICK: Duration = Duration::from_millis(200);
 
 /// A tab's element id, by tab index.
 fn tab_element_id(index: usize) -> String {
     format!("vmux-tabbar.tab{index}")
+}
+
+/// A tab's marquee element id, by tab index.
+fn marquee_element_id(index: usize) -> String {
+    format!("vmux-tabbar.marquee{index}")
 }
 /// Cap on the window title we hand the host, in characters. A pane's
 /// OSC title is whatever the inner program said; the host clamps too,
@@ -1258,9 +1293,7 @@ fn tabbar_label_cap(labels: &[String], num_widths: &[f32], host_w: f32) -> usize
     let budget = host_w - base;
     // Total glyph width at a given cap: Σ min(len_i, cap). Monotonic
     // non-decreasing in `cap`.
-    let glyph_width = |cap: usize| -> f32 {
-        lens.iter().map(|&l| l.min(cap) as f32).sum()
-    };
+    let glyph_width = |cap: usize| -> f32 { lens.iter().map(|&l| l.min(cap) as f32).sum() };
     let max_len = lens.iter().copied().max().unwrap_or(0);
     if glyph_width(TABBAR_MIN_LABEL) > budget {
         return TABBAR_MIN_LABEL;
@@ -1332,12 +1365,7 @@ fn tabbar_last_visible(widths: &[f32], host_w: f32, first: usize) -> usize {
 /// advances right until the active tab fits, then is pulled back left to
 /// reclaim empty space — so closing tabs collapses the bar instead of
 /// leaving it stuck mid-scroll.
-fn tabbar_window(
-    widths: &[f32],
-    active: usize,
-    host_w: f32,
-    scroll: &mut usize,
-) -> (usize, usize) {
+fn tabbar_window(widths: &[f32], active: usize, host_w: f32, scroll: &mut usize) -> (usize, usize) {
     let n = widths.len();
     if n == 0 {
         *scroll = 0;
@@ -1471,8 +1499,7 @@ fn compute_tabbar_layout(
         .map(|w| w + m.name_pad - 2.0 + m.gap)
         .collect();
     let cap = tabbar_label_cap(labels, &fixed, bar_w);
-    let elided: Vec<String> =
-        labels.iter().map(|l| elide_tab_label(l, cap)).collect();
+    let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l, cap)).collect();
     // Under `InTab` a tab widens for its status line, up to the
     // engine's cap; the elided label is the floor either way.
     let name_widths: Vec<f32> = elided
@@ -1482,8 +1509,7 @@ fn compute_tabbar_layout(
             let w = vge_ui::measure::text_cells(l) + m.name_pad;
             match (m.status, statuses.get(i).copied().flatten()) {
                 (StatusPlacement::InTab { scale, max_cells }, Some(st)) => w.max(
-                    (vge_ui::measure::text_cells(&st.label()) * scale + m.name_pad)
-                        .min(max_cells),
+                    (vge_ui::measure::text_cells(&st.label()) * scale + m.name_pad).min(max_cells),
                 ),
                 _ => w,
             }
@@ -1611,7 +1637,9 @@ fn build_tabbar(
         left_chevron: layout
             .has_left
             .then_some(layout.session_w() + tabbar_metrics().margin),
-        right_chevron: layout.has_right.then_some(layout.bar_end - TABBAR_CHEVRON_W),
+        right_chevron: layout
+            .has_right
+            .then_some(layout.bar_end - TABBAR_CHEVRON_W),
         status: layout.status_seg.as_ref().and_then(|(text, x0)| {
             let st = statuses.get(active).copied().flatten()?;
             Some(BarStatus {
@@ -1629,6 +1657,12 @@ fn build_tabbar(
     );
     TabbarParts {
         ground: parts.ground,
+        marquees: bar
+            .tabs
+            .iter()
+            .zip(parts.marquees)
+            .filter_map(|(t, m)| Some((t.index, m?)))
+            .collect(),
         tabs: bar
             .tabs
             .iter()
@@ -1641,11 +1675,13 @@ fn build_tabbar(
 
 /// One render of the tab bar: the ground, each visible tab as its
 /// index, whether it is the active one, and its commands, and the
-/// bar-end status segment (empty without one).
+/// bar-end status segment (empty without one), and the marquees of the
+/// tabs that have one, by tab index.
 struct TabbarParts {
     ground: Vec<DrawCmd>,
     tabs: Vec<(usize, bool, Vec<DrawCmd>)>,
     status: Vec<DrawCmd>,
+    marquees: BTreeMap<usize, style::Marquee>,
 }
 
 /// What the host holds for the tab bar, so a render sends only what
@@ -1658,6 +1694,9 @@ struct TabbarSent {
     tabs: BTreeMap<usize, (i32, Vec<DrawCmd>)>,
     /// The status segment's commands; empty while there is no element.
     status: Vec<DrawCmd>,
+    /// The marquee elements, by tab index. Their transforms are not
+    /// kept: they move on every tick ([`State::marquee_frame`]).
+    marquees: BTreeMap<usize, style::Marquee>,
 }
 
 impl TabbarSent {
@@ -1762,7 +1801,11 @@ impl TabbarSent {
         // status, so its element does too.
         match (sent.status.is_empty(), parts.status.is_empty()) {
             (true, false) => cmds.push((
-                child(TABBAR_STATUS_ID.into(), parts.status.clone(), TABBAR_TAB_ORDER),
+                child(
+                    TABBAR_STATUS_ID.into(),
+                    parts.status.clone(),
+                    TABBAR_TAB_ORDER,
+                ),
                 0,
             )),
             (false, true) => cmds.push((
@@ -1778,6 +1821,61 @@ impl TabbarSent {
             _ => {}
         }
         sent.status = parts.status;
+
+        // A marquee is created at its phase-zero position and the next
+        // tick puts it where the sweep has got to. One whose box moved
+        // is made again rather than moved and resized: it happens on a
+        // relayout, not on a tick.
+        for (index, m) in &parts.marquees {
+            let id = marquee_element_id(*index);
+            match sent.marquees.remove(index) {
+                Some(was) if was == *m => {}
+                Some(was) if was.clip == m.clip => {
+                    cmds.push((update(id, m.commands.clone()), 0));
+                }
+                was => {
+                    if was.is_some() {
+                        cmds.push((
+                            VgeCommand::DeleteElement {
+                                id: id.clone(),
+                                by_prefix: false,
+                            },
+                            0,
+                        ));
+                    }
+                    cmds.push((
+                        VgeCommand::CreateElement(CreateElementBody {
+                            id,
+                            commands: m.commands.clone(),
+                            origin: Point {
+                                x: m.clip.x,
+                                y: m.clip.y,
+                            },
+                            is_visible: true,
+                            draw_order: TABBAR_MARQUEE_ORDER,
+                            parent: Some(TABBAR_ELEMENT_ID.to_string()),
+                            size: Some(Point {
+                                x: m.clip.w,
+                                y: m.clip.h,
+                            }),
+                            transform: None,
+                            anchor: OriginAnchor::Viewport,
+                        }),
+                        0,
+                    ));
+                }
+            }
+        }
+        for index in std::mem::take(&mut sent.marquees).into_keys() {
+            cmds.push((
+                VgeCommand::DeleteElement {
+                    id: marquee_element_id(index),
+                    by_prefix: false,
+                },
+                0,
+            ));
+        }
+        sent.marquees = parts.marquees;
         (cmds, sent)
     }
 }
@@ -1809,7 +1907,14 @@ fn build_chrome_commands(
         show_title,
         scroll,
     };
-    style::engine().pane_chrome(&mut cmds, Px { w: cell_pw, h: cell_ph }, &pane);
+    style::engine().pane_chrome(
+        &mut cmds,
+        Px {
+            w: cell_pw,
+            h: cell_ph,
+        },
+        &pane,
+    );
     cmds
 }
 
@@ -1848,7 +1953,8 @@ fn help_modal() -> &'static ScrollModal {
             "  :        open the command palette".into(),
             "  t        pick a tab from a list".into(),
             "  w        pick a pane from all tabs".into(),
-            "  (type to filter · ↑/↓ or Ctrl+P/N move · Tab completes · Enter runs · Esc cancels)".into(),
+            "  (type to filter · ↑/↓ or Ctrl+P/N move · Tab completes · Enter runs · Esc cancels)"
+                .into(),
             "".into(),
             "Scroll  (prefix-[ enters; q/Esc/G exits)".into(),
             "  k / Up        scroll up one line".into(),
@@ -1886,9 +1992,6 @@ fn help_modal() -> &'static ScrollModal {
 /// Number of body lines a half-page jump moves through.
 const HELP_HALF_PAGE: i64 = 6;
 
-
-
-
 // ─────────────────────────────────────────────────────────────────────────
 // Input mode state machine
 // ─────────────────────────────────────────────────────────────────────────
@@ -1898,7 +2001,6 @@ enum RenameTarget {
     Pane(String),
     Tab(usize),
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────
 // Reusable list picker
@@ -1978,7 +2080,6 @@ impl std::ops::DerefMut for Picker {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────
 // Command table
 // ─────────────────────────────────────────────────────────────────────────
@@ -1994,34 +2095,174 @@ struct CommandSpec {
 
 /// Every command reachable from the palette. Order is the display order.
 const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "resize", aliases: &[], args: "[PANE#] [SIZE]", summary: "resize pane or enter resize mode" },
-    CommandSpec { name: "rename-pane", aliases: &["rename"], args: "[PANE#] [NAME]", summary: "rename a pane" },
-    CommandSpec { name: "rename-tab", aliases: &[], args: "[TAB#] [NAME]", summary: "rename a tab" },
-    CommandSpec { name: "new-pane", aliases: &["split"], args: "[NAME]", summary: "split the focused pane" },
-    CommandSpec { name: "new-tab", aliases: &[], args: "[NAME]", summary: "open a new tab" },
-    CommandSpec { name: "delete-pane", aliases: &["close-pane", "kill-pane"], args: "[PANE#]", summary: "close a pane" },
-    CommandSpec { name: "delete-tab", aliases: &["close-tab", "kill-tab"], args: "[TAB#]", summary: "close a tab and its panes" },
-    CommandSpec { name: "move-pane", aliases: &[], args: "[TAB#] [PANE#]", summary: "move a pane to another tab" },
-    CommandSpec { name: "split-v", aliases: &[], args: "", summary: "split focused pane vertically" },
-    CommandSpec { name: "split-h", aliases: &[], args: "", summary: "split focused pane horizontally" },
-    CommandSpec { name: "mirror-v", aliases: &["mirror"], args: "", summary: "second view of this pane, side by side" },
-    CommandSpec { name: "mirror-h", aliases: &[], args: "", summary: "second view of this pane, stacked" },
-    CommandSpec { name: "zoom", aliases: &[], args: "", summary: "toggle zoom on the focused pane" },
-    CommandSpec { name: "swap-prev", aliases: &["swap-pane-prev"], args: "", summary: "swap focused pane with the previous one" },
-    CommandSpec { name: "swap-next", aliases: &["swap-pane-next"], args: "", summary: "swap focused pane with the next one" },
-    CommandSpec { name: "rotate", aliases: &["rotate-window"], args: "", summary: "cycle all panes through the cells" },
-    CommandSpec { name: "toggle-split", aliases: &["rotate-split"], args: "", summary: "rotate the focused pane's divider 90°" },
-    CommandSpec { name: "focus-pane", aliases: &["select-pane"], args: "[PANE#]", summary: "focus a pane (or cycle)" },
-    CommandSpec { name: "focus-tab", aliases: &["select-tab", "goto-tab"], args: "[TAB#]", summary: "switch to a tab" },
-    CommandSpec { name: "tabs", aliases: &["tab-list"], args: "", summary: "pick a tab from a list" },
-    CommandSpec { name: "panes", aliases: &["pane-list", "windows"], args: "", summary: "pick a pane from all tabs" },
-    CommandSpec { name: "next-tab", aliases: &[], args: "", summary: "switch to the next tab" },
-    CommandSpec { name: "prev-tab", aliases: &["previous-tab"], args: "", summary: "switch to the previous tab" },
-    CommandSpec { name: "move-tab-left", aliases: &[], args: "", summary: "move the current tab left" },
-    CommandSpec { name: "move-tab-right", aliases: &[], args: "", summary: "move the current tab right" },
-    CommandSpec { name: "detach", aliases: &[], args: "", summary: "detach the vsd session" },
-    CommandSpec { name: "help", aliases: &["keys"], args: "", summary: "show the keybinding help" },
-    CommandSpec { name: "quit", aliases: &["exit"], args: "", summary: "quit vmux (confirms first)" },
+    CommandSpec {
+        name: "resize",
+        aliases: &[],
+        args: "[PANE#] [SIZE]",
+        summary: "resize pane or enter resize mode",
+    },
+    CommandSpec {
+        name: "rename-pane",
+        aliases: &["rename"],
+        args: "[PANE#] [NAME]",
+        summary: "rename a pane",
+    },
+    CommandSpec {
+        name: "rename-tab",
+        aliases: &[],
+        args: "[TAB#] [NAME]",
+        summary: "rename a tab",
+    },
+    CommandSpec {
+        name: "new-pane",
+        aliases: &["split"],
+        args: "[NAME]",
+        summary: "split the focused pane",
+    },
+    CommandSpec {
+        name: "new-tab",
+        aliases: &[],
+        args: "[NAME]",
+        summary: "open a new tab",
+    },
+    CommandSpec {
+        name: "delete-pane",
+        aliases: &["close-pane", "kill-pane"],
+        args: "[PANE#]",
+        summary: "close a pane",
+    },
+    CommandSpec {
+        name: "delete-tab",
+        aliases: &["close-tab", "kill-tab"],
+        args: "[TAB#]",
+        summary: "close a tab and its panes",
+    },
+    CommandSpec {
+        name: "move-pane",
+        aliases: &[],
+        args: "[TAB#] [PANE#]",
+        summary: "move a pane to another tab",
+    },
+    CommandSpec {
+        name: "split-v",
+        aliases: &[],
+        args: "",
+        summary: "split focused pane vertically",
+    },
+    CommandSpec {
+        name: "split-h",
+        aliases: &[],
+        args: "",
+        summary: "split focused pane horizontally",
+    },
+    CommandSpec {
+        name: "mirror-v",
+        aliases: &["mirror"],
+        args: "",
+        summary: "second view of this pane, side by side",
+    },
+    CommandSpec {
+        name: "mirror-h",
+        aliases: &[],
+        args: "",
+        summary: "second view of this pane, stacked",
+    },
+    CommandSpec {
+        name: "zoom",
+        aliases: &[],
+        args: "",
+        summary: "toggle zoom on the focused pane",
+    },
+    CommandSpec {
+        name: "swap-prev",
+        aliases: &["swap-pane-prev"],
+        args: "",
+        summary: "swap focused pane with the previous one",
+    },
+    CommandSpec {
+        name: "swap-next",
+        aliases: &["swap-pane-next"],
+        args: "",
+        summary: "swap focused pane with the next one",
+    },
+    CommandSpec {
+        name: "rotate",
+        aliases: &["rotate-window"],
+        args: "",
+        summary: "cycle all panes through the cells",
+    },
+    CommandSpec {
+        name: "toggle-split",
+        aliases: &["rotate-split"],
+        args: "",
+        summary: "rotate the focused pane's divider 90°",
+    },
+    CommandSpec {
+        name: "focus-pane",
+        aliases: &["select-pane"],
+        args: "[PANE#]",
+        summary: "focus a pane (or cycle)",
+    },
+    CommandSpec {
+        name: "focus-tab",
+        aliases: &["select-tab", "goto-tab"],
+        args: "[TAB#]",
+        summary: "switch to a tab",
+    },
+    CommandSpec {
+        name: "tabs",
+        aliases: &["tab-list"],
+        args: "",
+        summary: "pick a tab from a list",
+    },
+    CommandSpec {
+        name: "panes",
+        aliases: &["pane-list", "windows"],
+        args: "",
+        summary: "pick a pane from all tabs",
+    },
+    CommandSpec {
+        name: "next-tab",
+        aliases: &[],
+        args: "",
+        summary: "switch to the next tab",
+    },
+    CommandSpec {
+        name: "prev-tab",
+        aliases: &["previous-tab"],
+        args: "",
+        summary: "switch to the previous tab",
+    },
+    CommandSpec {
+        name: "move-tab-left",
+        aliases: &[],
+        args: "",
+        summary: "move the current tab left",
+    },
+    CommandSpec {
+        name: "move-tab-right",
+        aliases: &[],
+        args: "",
+        summary: "move the current tab right",
+    },
+    CommandSpec {
+        name: "detach",
+        aliases: &[],
+        args: "",
+        summary: "detach the vsd session",
+    },
+    CommandSpec {
+        name: "help",
+        aliases: &["keys"],
+        args: "",
+        summary: "show the keybinding help",
+    },
+    CommandSpec {
+        name: "quit",
+        aliases: &["exit"],
+        args: "",
+        summary: "quit vmux (confirms first)",
+    },
 ];
 
 /// Build the command-palette item list from [`COMMANDS`].
@@ -2090,7 +2331,10 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
     // PANE# resolver: an explicit 1-based number, else the focused pane.
     let pane_or_focus = |state: &State, tok: Option<&String>| -> Option<String> {
         match tok {
-            Some(s) => s.parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n)),
+            Some(s) => s
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| pane_id_for_n(state, n)),
             None => Some(state.focus().to_string()),
         }
     };
@@ -2106,7 +2350,10 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
                 state.resize_pane(&target, size)
             }
             _ => {
-                let Some(target) = args[0].parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n))
+                let Some(target) = args[0]
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| pane_id_for_n(state, n))
                 else {
                     return Ok(Vec::new());
                 };
@@ -2159,7 +2406,11 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
         },
         "delete-tab" => {
             let idx = match args.first() {
-                Some(s) => match s.parse::<usize>().ok().and_then(|n| tab_index_for_n(state, n)) {
+                Some(s) => match s
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| tab_index_for_n(state, n))
+                {
                     Some(i) => i,
                     None => return Ok(Vec::new()),
                 },
@@ -2191,7 +2442,10 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
                 let pane = state.focus().to_string();
                 return Ok(state.open_move_pane_picker(pane));
             }
-            let Some(dest) = args[0].parse::<usize>().ok().and_then(|n| tab_index_for_n(state, n))
+            let Some(dest) = args[0]
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| tab_index_for_n(state, n))
             else {
                 return Ok(Vec::new());
             };
@@ -2206,13 +2460,21 @@ fn run_command(state: &mut State, name: &str, args: &[String]) -> Result<Vec<u8>
         "rotate" => state.rotate_panes(1),
         "toggle-split" => state.toggle_split_dir(),
         "focus-pane" => match args.first() {
-            Some(s) => match s.parse::<usize>().ok().and_then(|n| pane_id_for_n(state, n)) {
+            Some(s) => match s
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| pane_id_for_n(state, n))
+            {
                 Some(p) => state.focus_pane(&p),
                 None => Ok(Vec::new()),
             },
             None => state.cycle_focus(),
         },
-        "focus-tab" => match args.first().and_then(|s| s.parse::<usize>().ok()).and_then(|n| tab_index_for_n(state, n)) {
+        "focus-tab" => match args
+            .first()
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|n| tab_index_for_n(state, n))
+        {
             Some(idx) => state.goto_tab(idx),
             None => Ok(Vec::new()),
         },
@@ -2314,7 +2576,7 @@ fn prefix_csi_u() -> Option<(u32, u32)> {
     /// 1 + ctrl's bit (0b100).
     const CTRL: u32 = 5;
     let cp = match prefix_byte() {
-        0x00 => 32, // Ctrl+Space
+        0x00 => 32,                           // Ctrl+Space
         b @ 0x01..=0x1a => u32::from(b) + 96, // Ctrl+a … Ctrl+z
         // Under the protocol these stop colliding with Esc, Tab and
         // friends — that collision is what it exists to remove.
@@ -2341,10 +2603,7 @@ fn parse_csi_u(bytes: &[u8]) -> Option<(u32, u32, usize)> {
     const MAX_BODY: usize = 12;
     let rest = bytes.strip_prefix(b"\x1b[")?;
     let mut end = 0;
-    while end < rest.len()
-        && end < MAX_BODY
-        && (rest[end].is_ascii_digit() || rest[end] == b';')
-    {
+    while end < rest.len() && end < MAX_BODY && (rest[end].is_ascii_digit() || rest[end] == b';') {
         end += 1;
     }
     if rest.get(end) != Some(&b'u') {
@@ -2559,14 +2818,12 @@ impl State {
         let Some(heir) = group.iter().find(|id| *id != leaving).cloned() else {
             return;
         };
-        let Some(pty) = self
-            .panes
-            .get_mut(leaving)
-            .and_then(|p| match std::mem::replace(&mut p.io, PaneIo::Peer(heir.clone())) {
+        let Some(pty) = self.panes.get_mut(leaving).and_then(|p| {
+            match std::mem::replace(&mut p.io, PaneIo::Peer(heir.clone())) {
                 PaneIo::Owned(pty) => Some(pty),
                 PaneIo::Peer(_) => None,
-            })
-        else {
+            }
+        }) else {
             return;
         };
         let status = self
@@ -2655,6 +2912,9 @@ struct State {
     visible_panes: HashSet<String>,
     /// What the host holds for the tab bar; `None` until it is created.
     tabbar_sent: Option<TabbarSent>,
+    /// Where every marquee's sweep is timed from, so the phase a
+    /// marquee is at does not depend on when it was (re)created.
+    marquee_epoch: Instant,
     /// Index of the leftmost tab currently drawn in the tab bar. When
     /// the tabs don't all fit on row 0 the bar scrolls; this offset is
     /// nudged so the active tab stays visible (see `build_tabbar`).
@@ -2713,6 +2973,7 @@ impl State {
             last_focus_sent: None,
             visible_panes: HashSet::new(),
             tabbar_sent: None,
+            marquee_epoch: Instant::now(),
             tab_scroll: 0,
             separators_created: false,
             pending_scrolls: HashMap::new(),
@@ -2789,7 +3050,9 @@ impl State {
     /// active tab's layout).
     fn active_pane_ids(&self) -> HashSet<String> {
         let mut leaves = Vec::new();
-        self.tabs[self.active_tab].layout.collect_leaves(&mut leaves);
+        self.tabs[self.active_tab]
+            .layout
+            .collect_leaves(&mut leaves);
         leaves.into_iter().collect()
     }
 
@@ -2984,7 +3247,9 @@ impl State {
                 self.panes.remove(target);
                 self.visible_panes.remove(target);
                 out.extend(build_prt_envelope(&[(
-                    PrtCommand::DeletePortal { id: target.to_string() },
+                    PrtCommand::DeletePortal {
+                        id: target.to_string(),
+                    },
                     0,
                 )]));
                 out.extend(build_vge_envelope(&[(
@@ -3022,7 +3287,9 @@ impl State {
                     self.tabs[tab_idx].zoomed = None;
                 }
                 out.extend(build_prt_envelope(&[(
-                    PrtCommand::DeletePortal { id: target.to_string() },
+                    PrtCommand::DeletePortal {
+                        id: target.to_string(),
+                    },
                     0,
                 )]));
                 out.extend(build_vge_envelope(&[(
@@ -3041,7 +3308,9 @@ impl State {
 
     fn cycle_focus(&mut self) -> Result<Vec<u8>> {
         let mut leaves = Vec::new();
-        self.tabs[self.active_tab].layout.collect_leaves(&mut leaves);
+        self.tabs[self.active_tab]
+            .layout
+            .collect_leaves(&mut leaves);
         if leaves.len() < 2 {
             return Ok(Vec::new());
         }
@@ -3177,15 +3446,13 @@ impl State {
                 if drag.bounds.w < 2 {
                     return Ok(Vec::new());
                 }
-                ((col - drag.bounds.x) as f32 / drag.bounds.w as f32)
-                    .clamp(MIN_RATIO, MAX_RATIO)
+                ((col - drag.bounds.x) as f32 / drag.bounds.w as f32).clamp(MIN_RATIO, MAX_RATIO)
             }
             SplitDir::Horizontal => {
                 if drag.bounds.h < 2 {
                     return Ok(Vec::new());
                 }
-                ((row - drag.bounds.y) as f32 / drag.bounds.h as f32)
-                    .clamp(MIN_RATIO, MAX_RATIO)
+                ((row - drag.bounds.y) as f32 / drag.bounds.h as f32).clamp(MIN_RATIO, MAX_RATIO)
             }
         };
         match self.layout_mut().ratio_at_path_mut(&drag.path) {
@@ -3442,14 +3709,26 @@ impl State {
             SizeArg::Rel(d) => d,
             SizeArg::Abs(n) => n as i32 - rect.w as i32,
         };
-        if resize_split(self.layout_mut(), target, SplitDir::Vertical, cells_w, bounds) {
+        if resize_split(
+            self.layout_mut(),
+            target,
+            SplitDir::Vertical,
+            cells_w,
+            bounds,
+        ) {
             return self.relayout_and_render();
         }
         let cells_h = match size {
             SizeArg::Rel(d) => d,
             SizeArg::Abs(n) => n as i32 - rect.h as i32,
         };
-        if resize_split(self.layout_mut(), target, SplitDir::Horizontal, cells_h, bounds) {
+        if resize_split(
+            self.layout_mut(),
+            target,
+            SplitDir::Horizontal,
+            cells_h,
+            bounds,
+        ) {
             self.relayout_and_render()
         } else {
             Ok(Vec::new())
@@ -3505,7 +3784,11 @@ impl State {
         if dest >= self.tabs.len() {
             return Ok(Vec::new());
         }
-        let Some(src) = self.tabs.iter().position(|t| t.layout.contains_leaf(pane_id)) else {
+        let Some(src) = self
+            .tabs
+            .iter()
+            .position(|t| t.layout.contains_leaf(pane_id))
+        else {
             return Ok(Vec::new());
         };
         if src == dest {
@@ -3543,16 +3826,25 @@ impl State {
     fn splice_into_tab(&mut self, dest: usize, pane_id: &str) {
         self.tabs[dest].zoomed = None;
         let focus = self.tabs[dest].focus.clone();
-        if !self.tabs[dest].layout.split_leaf(&focus, SplitDir::Vertical, pane_id) {
+        if !self.tabs[dest]
+            .layout
+            .split_leaf(&focus, SplitDir::Vertical, pane_id)
+        {
             let first = self.tabs[dest].layout.first_leaf().to_string();
-            self.tabs[dest].layout.split_leaf(&first, SplitDir::Vertical, pane_id);
+            self.tabs[dest]
+                .layout
+                .split_leaf(&first, SplitDir::Vertical, pane_id);
         }
     }
 
     /// Focus `pane_id` wherever it lives — switching to its tab first if it
     /// is not in the active one. Used by the global pane picker.
     fn focus_pane_global(&mut self, pane_id: &str) -> Result<Vec<u8>> {
-        let Some(tab) = self.tabs.iter().position(|t| t.layout.contains_leaf(pane_id)) else {
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .position(|t| t.layout.contains_leaf(pane_id))
+        else {
             return Ok(Vec::new());
         };
         if tab != self.active_tab {
@@ -3797,9 +4089,7 @@ impl State {
 
         // Focus update — always emit so an unrelated focus change still
         // shows up. Only valid when the focused pane is currently visible.
-        if self.visible_panes.contains(&focus)
-            && self.last_focus_sent.as_deref() != Some(&focus)
-        {
+        if self.visible_panes.contains(&focus) && self.last_focus_sent.as_deref() != Some(&focus) {
             prt_cmds.push((
                 PrtCommand::SetFocus {
                     target: FocusTarget::Portal(focus.clone()),
@@ -4171,7 +4461,9 @@ impl State {
         // a one-pane tab hides the title unless display_title is in
         // scroll-indicator form (different from the raw label).
         let mut leaves = Vec::new();
-        self.tabs[self.active_tab].layout.collect_leaves(&mut leaves);
+        self.tabs[self.active_tab]
+            .layout
+            .collect_leaves(&mut leaves);
         let single_pane = leaves.len() <= 1;
         let show_title = !single_pane || display_title != title_raw;
         let cmds = build_chrome_commands(
@@ -4229,9 +4521,7 @@ impl State {
             // Read through the peer link, so focusing the mirror half
             // of a pair bubbles the same name up as focusing the other.
             let named = self.panes.get(pane.pty_owner()).unwrap_or(pane);
-            if named.manual_title.is_some()
-                || named.osc_title.is_some()
-                || named.osc_icon.is_some()
+            if named.manual_title.is_some() || named.osc_title.is_some() || named.osc_icon.is_some()
             {
                 return self.effective_title_for(&tab.focus);
             }
@@ -4354,13 +4644,54 @@ impl State {
         out
     }
 
+    /// Whether anything in the tab bar is moving, which is what makes
+    /// the main loop wake on [`MARQUEE_TICK`].
+    fn has_marquees(&self) -> bool {
+        self.tabbar_sent
+            .as_ref()
+            .is_some_and(|s| !s.marquees.is_empty())
+    }
+
+    /// One frame of motion: each marquee slid to where its sweep is now.
+    fn marquee_frame(&self) -> Vec<u8> {
+        let Some(sent) = &self.tabbar_sent else {
+            return Vec::new();
+        };
+        let secs = self.marquee_epoch.elapsed().as_secs_f32();
+        let cmds: Vec<_> = sent
+            .marquees
+            .iter()
+            .map(|(index, m)| {
+                let transform = Transform {
+                    e: m.offset(secs),
+                    ..Transform::IDENTITY
+                };
+                (
+                    VgeCommand::UpdateTransform {
+                        id: marquee_element_id(*index),
+                        transform,
+                    },
+                    0,
+                )
+            })
+            .collect();
+        if cmds.is_empty() {
+            Vec::new()
+        } else {
+            build_vge_envelope(&cmds)
+        }
+    }
+
     /// The VGE commands that bring the host's tab bar up to date, and
     /// nothing for the parts it already shows ([`TabbarSent::diff`]).
     fn tabbar_commands(&mut self) -> Vec<(VgeCommand, u32)> {
         let labels = self.tabbar_labels();
         let activity = self.tab_activity_flags();
         let statuses = self.tab_statuses();
-        let views: Vec<_> = statuses.iter().map(|s| s.as_ref().map(StatusItem::view)).collect();
+        let views: Vec<_> = statuses
+            .iter()
+            .map(|s| s.as_ref().map(StatusItem::view))
+            .collect();
         let parts = build_tabbar(
             &labels,
             self.active_tab,
@@ -4408,7 +4739,7 @@ struct TtyGuard {
 impl TtyGuard {
     fn enable() -> Result<Self> {
         use nix::sys::termios::{
-            tcgetattr, tcsetattr, InputFlags, LocalFlags, OutputFlags, SetArg,
+            InputFlags, LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr,
         };
         let stdin = std::io::stdin();
         let fd = stdin.as_raw_fd();
@@ -4439,9 +4770,7 @@ impl TtyGuard {
         // bounds in `handle_mouse_event` and either drive a resize drag,
         // drive scrollback, or re-encode and forward to the inner
         // program's PTY.
-        write_all_stdout(
-            b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h",
-        )?;
+        write_all_stdout(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h")?;
         self.in_alt = true;
         Ok(())
     }
@@ -4453,12 +4782,10 @@ impl Drop for TtyGuard {
             // Disable mouse reporting first so leftover wheel events
             // don't leak into the outer shell, then leave alt screen
             // and re-show the cursor.
-            let _ = write_all_stdout(
-                b"\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b[?25h",
-            );
+            let _ = write_all_stdout(b"\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1049l\x1b[?25h");
         }
         if let Some(saved) = self.saved.take() {
-            use nix::sys::termios::{tcsetattr, SetArg};
+            use nix::sys::termios::{SetArg, tcsetattr};
             let _ = unsafe {
                 let borrowed = BorrowedFd::borrow_raw(self.fd);
                 tcsetattr(borrowed, SetArg::TCSANOW, &saved)
@@ -4953,7 +5280,10 @@ struct CliOptions {
 /// each take a value (also accepted as `--flag=value`); `--help`/`-h` prints
 /// usage and exits. Unknown flags are errors so typos surface loudly.
 fn parse_cli_args() -> Result<CliOptions> {
-    let mut opts = CliOptions { accent: None, prefix: None };
+    let mut opts = CliOptions {
+        accent: None,
+        prefix: None,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let take = |args: &mut std::iter::Skip<std::env::Args>| {
@@ -5043,9 +5373,7 @@ fn main() -> Result<()> {
 
     let probe = probe_all(PROBE_TIMEOUT)?;
     if !probe.prt_ok {
-        bail!(
-            "PRT probe timed out — host terminal does not advertise the Portal Extension"
-        );
+        bail!("PRT probe timed out — host terminal does not advertise the Portal Extension");
     }
     let host_ws = get_host_winsize()?;
     // `TIOCGWINSZ` first: a veter host reports real pixel dimensions
@@ -5065,8 +5393,7 @@ fn main() -> Result<()> {
 
     tty.enter_alt_screen()?;
 
-    let mut state =
-        State::new(host_ws.cols as u32, host_ws.rows as u32, cell_pw, cell_ph)?;
+    let mut state = State::new(host_ws.cols as u32, host_ws.rows as u32, cell_pw, cell_ph)?;
     // A `vsd` session host answers the SES probe with its name; a
     // plain local `veter` host does not, leaving this `None`.
     state.session_name = probe.session_name;
@@ -5098,6 +5425,8 @@ fn main() -> Result<()> {
     // moment instead of for this window.
     let escape_time = escape_time();
     let mut esc_deadline: Option<Instant> = None;
+    // When the tab bar's marquees next move; `None` while none show.
+    let mut next_marquee: Option<Instant> = None;
 
     while !state.quit {
         if WINCH_FLAG.swap(false, Ordering::SeqCst) || state.needs_resize_check {
@@ -5127,8 +5456,7 @@ fn main() -> Result<()> {
         // stdout for POLLOUT, then every pane's PTY master.
         let stdin_fd = std::io::stdin().as_raw_fd();
         let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-        let mut fds: Vec<PollFd<'_>> =
-            vec![PollFd::new(stdin_borrowed, PollFlags::POLLIN)];
+        let mut fds: Vec<PollFd<'_>> = vec![PollFd::new(stdin_borrowed, PollFlags::POLLIN)];
 
         // Watch stdout for writability only while bytes are queued, otherwise
         // POLLOUT would fire continuously and spin the loop.
@@ -5191,10 +5519,7 @@ fn main() -> Result<()> {
             if read_pane[i] {
                 ev |= PollFlags::POLLIN;
             }
-            if state.panes[id]
-                .own_pty()
-                .is_some_and(PanePty::wants_write)
-            {
+            if state.panes[id].own_pty().is_some_and(PanePty::wants_write) {
                 ev |= PollFlags::POLLOUT;
             }
             fds.push(PollFd::new(pane_borroweds[i], ev));
@@ -5202,13 +5527,24 @@ fn main() -> Result<()> {
 
         // Wake for the escape-time window while one is running, so a
         // held Esc is decided on time however busy the other fds are.
-        let timeout = match esc_deadline {
-            Some(deadline) => u16::try_from(
-                deadline.saturating_duration_since(Instant::now()).as_millis(),
-            )
-            .unwrap_or(u16::MAX),
-            None => IDLE_TICK_MS,
+        // And for the next marquee frame while one shows.
+        next_marquee = match next_marquee {
+            _ if !state.has_marquees() => None,
+            None => Some(Instant::now() + MARQUEE_TICK),
+            keep => keep,
         };
+        let timeout = [esc_deadline, next_marquee]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(IDLE_TICK_MS, |deadline| {
+                u16::try_from(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
+                )
+                .unwrap_or(u16::MAX)
+            });
         match poll(&mut fds, PollTimeout::from(timeout)) {
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
@@ -5262,6 +5598,18 @@ fn main() -> Result<()> {
             None
         };
 
+        // A frame of motion is skipped, not queued, while the host is
+        // behind: a late frame is only a jump the next one makes anyway.
+        if let Some(due) = next_marquee.filter(|due| Instant::now() >= *due) {
+            if out_pending() == 0 {
+                let env = state.marquee_frame();
+                if !env.is_empty() {
+                    write_all_stdout(&env)?;
+                }
+            }
+            next_marquee = Some(due.max(Instant::now() - MARQUEE_TICK) + MARQUEE_TICK);
+        }
+
         // The window elapsed with nothing arriving to complete the
         // sequence, so what is held was typed. Release it down the same
         // parser chain a real read goes through — an envelope whose
@@ -5274,8 +5622,8 @@ fn main() -> Result<()> {
             to_pane.extend(ses_apc.flush_pending_esc());
             // A flush out of `ApcPrefix` releases the ESC and keeps the
             // `_`, so the window runs again for whatever is still held.
-            esc_deadline = apc_holding(&prt_apc, &vge_apc, &ses_apc)
-                .then(|| Instant::now() + escape_time);
+            esc_deadline =
+                apc_holding(&prt_apc, &vge_apc, &ses_apc).then(|| Instant::now() + escape_time);
             if !to_pane.is_empty() {
                 process_user_input(&mut state, &to_pane)?;
                 // Input handling can close a pane, and the fd table the
@@ -5287,8 +5635,7 @@ fn main() -> Result<()> {
         // Pane PTYs: drain queued input toward the pane (POLLOUT) and
         // relay shell output → WritePortal (POLLIN, unless backpressured).
         for (i, pid) in pane_ids.iter().enumerate() {
-            let revents =
-                fds[pane_base + i].revents().unwrap_or(PollFlags::empty());
+            let revents = fds[pane_base + i].revents().unwrap_or(PollFlags::empty());
 
             // Flush whatever we have queued toward this pane, first and
             // unconditionally on writability. This is the non-blocking
@@ -5638,9 +5985,7 @@ fn handle_stdin_chunk(
                     style_changed |= theme::adopt_host_theme(&host);
                     theme_dirty = true;
                 }
-            } else if ft == prt_protocol::frame::RSP_OK
-                && body.len() >= 4
-            {
+            } else if ft == prt_protocol::frame::RSP_OK && body.len() >= 4 {
                 // §9.3 `SetPortalScrollback` ack: u32 applied_lines,
                 // u32 history_depth (history_depth is optional per the
                 // spec — older hosts may omit it). The frame doesn't
@@ -5761,10 +6106,7 @@ fn handle_stdin_chunk(
 fn sync_pixel_mouse_reporting(state: &mut State) -> Result<()> {
     let want = state.cell_pw >= 1.0
         && state.cell_ph >= 1.0
-        && state
-            .panes
-            .values()
-            .any(|p| p.inner_mouse_encoding == 4); // §8.9: SGR-Pixels
+        && state.panes.values().any(|p| p.inner_mouse_encoding == 4); // §8.9: SGR-Pixels
     if want == state.pixel_mouse {
         return Ok(());
     }
@@ -5831,19 +6173,13 @@ fn extract_mouse_events(
     while i < bytes.len() {
         // Try to recognise `\e[<…M/m` as a mouse event. Anything else
         // (including non-mouse CSI sequences) goes through verbatim.
-        if bytes[i] == 0x1B
-            && i + 2 < bytes.len()
-            && bytes[i + 1] == b'['
-            && bytes[i + 2] == b'<'
-        {
+        if bytes[i] == 0x1B && i + 2 < bytes.len() && bytes[i + 1] == b'[' && bytes[i + 2] == b'<' {
             // Scan ahead for the terminating M/m, capping the lookahead
             // so a malformed sequence doesn't swallow the rest of the
             // chunk.
             let start = i + 3;
             let cap = (start + 32).min(bytes.len());
-            if let Some(end) = (start..cap)
-                .find(|&j| bytes[j] == b'M' || bytes[j] == b'm')
-            {
+            if let Some(end) = (start..cap).find(|&j| bytes[j] == b'M' || bytes[j] == b'm') {
                 let press = bytes[end] == b'M';
                 let body = &bytes[start..end];
                 if let Some(ev) = parse_sgr_body(body, press, pixels, cell) {
@@ -5859,12 +6195,7 @@ fn extract_mouse_events(
     (out_bytes, events)
 }
 
-fn parse_sgr_body(
-    body: &[u8],
-    press: bool,
-    pixels: bool,
-    cell: (u16, u16),
-) -> Option<MouseEvent> {
+fn parse_sgr_body(body: &[u8], press: bool, pixels: bool, cell: (u16, u16)) -> Option<MouseEvent> {
     let s = std::str::from_utf8(body).ok()?;
     let mut parts = s.splitn(3, ';');
     let button: u32 = parts.next()?.parse().ok()?;
@@ -5882,7 +6213,12 @@ fn parse_sgr_body(
             y,
         )
     } else {
-        (x, y, x.saturating_sub(1) * cw + 1, y.saturating_sub(1) * ch + 1)
+        (
+            x,
+            y,
+            x.saturating_sub(1) * cw + 1,
+            y.saturating_sub(1) * ch + 1,
+        )
     };
     Some(MouseEvent {
         button,
@@ -5950,7 +6286,11 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
         if let Some((path, dir, sbounds)) =
             separator_hit(state.active_layout(), bounds, host_col, host_row, &mut path)
         {
-            state.resize_drag = Some(ResizeDrag { path, dir, bounds: sbounds });
+            state.resize_drag = Some(ResizeDrag {
+                path,
+                dir,
+                bounds: sbounds,
+            });
             return Ok(());
         }
     }
@@ -6049,11 +6389,7 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
     let (origin_x, origin_y) = inner_origin_for(rect);
     let portal_col = host_col - origin_x;
     let portal_row = host_row - origin_y;
-    if portal_col < 0
-        || portal_col >= cols as i32
-        || portal_row < 0
-        || portal_row >= rows as i32
-    {
+    if portal_col < 0 || portal_col >= cols as i32 || portal_row < 0 || portal_row >= rows as i32 {
         return Ok(());
     }
     let (proto, encoding) = state
@@ -6090,8 +6426,7 @@ fn handle_mouse_event(state: &mut State, ev: MouseEvent) -> Result<()> {
             None => return Ok(()),
         }
     }
-    let Some(payload) =
-        encode_mouse_report(encoding, proto, ev.button, sent_x, sent_y, ev.press)
+    let Some(payload) = encode_mouse_report(encoding, proto, ev.button, sent_x, sent_y, ev.press)
     else {
         return Ok(());
     };
@@ -6181,7 +6516,10 @@ fn handle_tabbar_click(state: &mut State, host_col: i32) -> Result<()> {
     // copy so this probe leaves the carried offset untouched.
     let mut scroll = state.tab_scroll;
     let statuses = state.tab_statuses();
-    let views: Vec<_> = statuses.iter().map(|s| s.as_ref().map(StatusItem::view)).collect();
+    let views: Vec<_> = statuses
+        .iter()
+        .map(|s| s.as_ref().map(StatusItem::view))
+        .collect();
     let layout = compute_tabbar_layout(
         &labels,
         state.active_tab,
@@ -6308,9 +6646,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
         // `Mode::Normal` is excluded because there the sequence belongs
         // to the pane and passes through untouched, and `Mode::Prefix`
         // does its own, wider, escape-sequence handling.
-        let esc_len = if b == 0x1b
-            && !matches!(state.mode, Mode::Normal | Mode::Prefix)
-        {
+        let esc_len = if b == 0x1b && !matches!(state.mode, Mode::Normal | Mode::Prefix) {
             // Whatever modifiers came with it — a modified Esc is still
             // the key the modals act on, the way `scroll_key` reads it.
             match parse_csi_u(&bytes[idx..]) {
@@ -6372,8 +6708,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                 let stop = (idx..bytes.len())
                     .find(|&i| {
                         bytes[i] == prefix_byte()
-                            || (bytes[i] == 0x1b
-                                && prefix_chord_at(&bytes[i..]).is_some())
+                            || (bytes[i] == 0x1b && prefix_chord_at(&bytes[i..]).is_some())
                     })
                     .unwrap_or(bytes.len());
                 // Typing in a mirror view reaches the shared shell:
@@ -6408,9 +6743,7 @@ fn process_user_input(state: &mut State, bytes: &[u8]) -> Result<()> {
                         if let Some(pty) = state.pty_mut(&focus_id) {
                             pty.enqueue(seq);
                         }
-                    } else if len == 3
-                        && matches!(seq[2], b'A'..=b'D')
-                    {
+                    } else if len == 3 && matches!(seq[2], b'A'..=b'D') {
                         // `prefix + <arrow>`, in either the CSI or the
                         // DECCKM SS3 spelling.
                         let env = handle_prefix_arrow(state, seq[2])?;
@@ -6672,25 +7005,26 @@ fn handle_picker_input(state: &mut State, rest: &[u8]) -> Result<(usize, Vec<u8>
                 let Mode::Picker(p) = &state.mode else {
                     return Ok((consumed, Vec::new()));
                 };
-                p.current().map(|item_idx| match &p.items[item_idx].payload {
-                    PickerPayload::Command(ci) => {
-                        let args = p
-                            .editor
-                            .buffer
-                            .split_whitespace()
-                            .skip(1)
-                            .map(|s| s.to_string())
-                            .collect();
-                        PickerCommit::Command(*ci, args)
-                    }
-                    PickerPayload::Tab(idx) => match &p.kind {
-                        PickerKind::MovePaneTarget { pane } => {
-                            PickerCommit::MovePane(pane.clone(), *idx)
+                p.current()
+                    .map(|item_idx| match &p.items[item_idx].payload {
+                        PickerPayload::Command(ci) => {
+                            let args = p
+                                .editor
+                                .buffer
+                                .split_whitespace()
+                                .skip(1)
+                                .map(|s| s.to_string())
+                                .collect();
+                            PickerCommit::Command(*ci, args)
                         }
-                        _ => PickerCommit::FocusTab(*idx),
-                    },
-                    PickerPayload::Pane(id) => PickerCommit::FocusPane(id.clone()),
-                })
+                        PickerPayload::Tab(idx) => match &p.kind {
+                            PickerKind::MovePaneTarget { pane } => {
+                                PickerCommit::MovePane(pane.clone(), *idx)
+                            }
+                            _ => PickerCommit::FocusTab(*idx),
+                        },
+                        PickerPayload::Pane(id) => PickerCommit::FocusPane(id.clone()),
+                    })
             };
             // Tear the picker down first; the action may open another modal.
             state.mode = Mode::Normal;
@@ -6873,9 +7207,7 @@ fn handle_help_byte(state: &mut State, b: u8) -> Result<Vec<u8>> {
         other => {
             if let Mode::Help { offset, .. } = &mut state.mode {
                 let new_off = match other {
-                    Action::Delta(d) => (*offset as i64 + d)
-                        .max(0)
-                        .min(max_offset as i64) as u32,
+                    Action::Delta(d) => (*offset as i64 + d).max(0).min(max_offset as i64) as u32,
                     Action::Top => 0,
                     Action::Bottom => max_offset,
                     _ => *offset,
@@ -6997,12 +7329,12 @@ fn scroll_key(csi_buf: &mut Vec<u8>, b: u8, last: bool, half: i64) -> ScrollKey 
             }
             let seq = std::mem::take(csi_buf);
             match seq.as_slice() {
-                [0x1B, b'[', b'A'] => ScrollKey::Delta(1),              // Up
-                [0x1B, b'[', b'B'] => ScrollKey::Delta(-1),             // Down
+                [0x1B, b'[', b'A'] => ScrollKey::Delta(1),  // Up
+                [0x1B, b'[', b'B'] => ScrollKey::Delta(-1), // Down
                 [0x1B, b'[', b'5', b'~'] => ScrollKey::Delta(half * 2), // PgUp
                 [0x1B, b'[', b'6', b'~'] => ScrollKey::Delta(-half * 2), // PgDn
-                [0x1B, b'[', b'H'] => ScrollKey::SetTop,                // Home
-                [0x1B, b'[', b'F'] => ScrollKey::SetLive,               // End
+                [0x1B, b'[', b'H'] => ScrollKey::SetTop,    // Home
+                [0x1B, b'[', b'F'] => ScrollKey::SetLive,   // End
                 // A paste isn't navigation. Leave, and deliver it where
                 // it was aimed, the way a paste into a scrolled-back
                 // shell with no multiplexer snaps to live.
@@ -7043,7 +7375,10 @@ fn handle_scroll_byte(
                 .get(pane_id)
                 .and_then(|p| p.scroll.as_ref())
                 .map(PaneScroll::depth_bound);
-            (state.scroll_to(pane_id, ScrollTarget::Line(i64::MIN), top)?, true)
+            (
+                state.scroll_to(pane_id, ScrollTarget::Line(i64::MIN), top)?,
+                true,
+            )
         }
         ScrollKey::SetLive => (state.scroll_to(pane_id, ScrollTarget::Live, Some(0))?, true),
         ScrollKey::Exit => (state.exit_scroll(pane_id)?, true),
@@ -7074,20 +7409,14 @@ fn trace_vmux_stdin(bytes: &[u8]) {
 /// master. Same env var, separate log file
 /// (`/tmp/vmux-output.log`).
 fn trace_vmux_to_pane(pane_id: &str, bytes: &[u8]) {
-    trace_bytes(
-        "/tmp/vmux-output.log",
-        &format!("pane:{pane_id}"),
-        bytes,
-    );
+    trace_bytes("/tmp/vmux-output.log", &format!("pane:{pane_id}"), bytes);
 }
 
 fn trace_bytes(path: &str, label: &str, bytes: &[u8]) {
     use std::io::Write;
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
-        std::env::var_os("VMUX_DEBUG_INPUT")
-            .map(|v| v != "0" && !v.is_empty())
-            == Some(true)
+        std::env::var_os("VMUX_DEBUG_INPUT").map(|v| v != "0" && !v.is_empty()) == Some(true)
     });
     if !enabled {
         return;
@@ -7254,14 +7583,14 @@ mod tests {
     #[test]
     fn csi_u_refuses_everything_that_is_not_a_key() {
         for input in [
-            b"\x1b[u".as_ref(),      // SCORC — no parameters
-            b"\x1b[>1u".as_ref(),    // push flags
-            b"\x1b[<u".as_ref(),     // pop flags
-            b"\x1b[=1;2u".as_ref(),  // set flags
+            b"\x1b[u".as_ref(),       // SCORC — no parameters
+            b"\x1b[>1u".as_ref(),     // push flags
+            b"\x1b[<u".as_ref(),      // pop flags
+            b"\x1b[=1;2u".as_ref(),   // set flags
             b"\x1b[27;1;2u".as_ref(), // a third parameter
-            b"\x1b[27".as_ref(),     // truncated
-            b"\x1b[27;5".as_ref(),   // truncated before the final
-            b"\x1b[A".as_ref(),      // an ordinary arrow
+            b"\x1b[27".as_ref(),      // truncated
+            b"\x1b[27;5".as_ref(),    // truncated before the final
+            b"\x1b[A".as_ref(),       // an ordinary arrow
         ] {
             assert!(parse_csi_u(input).is_none(), "parsed {input:?}");
         }
@@ -7412,7 +7741,10 @@ mod tests {
     fn pane_pixels_saturate_instead_of_wrapping() {
         // Nothing renderable gets this big; clamping beats wrapping to
         // a small value, which would look like a legitimate size.
-        assert_eq!(pane_pixel_size(u16::MAX, u16::MAX, (12, 28)), (u16::MAX, u16::MAX));
+        assert_eq!(
+            pane_pixel_size(u16::MAX, u16::MAX, (12, 28)),
+            (u16::MAX, u16::MAX)
+        );
         assert_eq!(pane_pixel_size(10, 10, (0, 0)), (0, 0));
     }
 
@@ -7557,8 +7889,7 @@ mod tests {
     fn label_cap_shrinks_to_reclaim_space() {
         // Eight 14-char tabs on an 80-cell bar: the cap drops below the
         // natural length but stays at or above the minimum.
-        let labels: Vec<String> =
-            (0..8).map(|_| "long-tab-title".to_string()).collect();
+        let labels: Vec<String> = (0..8).map(|_| "long-tab-title".to_string()).collect();
         let num_widths = vec![3.0; 8];
         let cap = tabbar_label_cap(&labels, &num_widths, 80.0);
         assert!(cap >= TABBAR_MIN_LABEL);
@@ -7667,7 +7998,17 @@ mod tests {
     fn four_tabs(active: usize, activity: &[bool]) -> TabbarParts {
         let labels: Vec<String> = ["one", "two", "three", "four"].map(String::from).to_vec();
         let mut scroll = 0;
-        build_tabbar(&labels, active, &mut scroll, 120, 8.0, 16.0, None, activity, &[])
+        build_tabbar(
+            &labels,
+            active,
+            &mut scroll,
+            120,
+            8.0,
+            16.0,
+            None,
+            activity,
+            &[],
+        )
     }
 
     /// The first render builds the group, the ground and every tab; a
@@ -7731,8 +8072,7 @@ mod tests {
 
     #[test]
     fn tabbar_hit_resolves_a_click_to_the_tab_under_it() {
-        let labels: Vec<String> =
-            vec!["one".into(), "two".into(), "three".into()];
+        let labels: Vec<String> = vec!["one".into(), "two".into(), "three".into()];
         let mut scroll = 0;
         let layout = compute_tabbar_layout(&labels, 0, &mut scroll, 200, None, &[]);
         assert_eq!(layout.slots.len(), 3, "all three tabs fit a wide bar");
@@ -7764,10 +8104,7 @@ mod tests {
         let mut scroll = 0;
         let layout = compute_tabbar_layout(&labels, 15, &mut scroll, 80, None, &[]);
         assert!(layout.has_left && layout.has_right);
-        assert!(matches!(
-            tabbar_hit(&layout, 0.5),
-            Some(TabbarHit::PrevTab)
-        ));
+        assert!(matches!(tabbar_hit(&layout, 0.5), Some(TabbarHit::PrevTab)));
         assert!(matches!(
             tabbar_hit(&layout, 79.5),
             Some(TabbarHit::NextTab)
@@ -7820,23 +8157,50 @@ mod tests {
     #[test]
     fn status_ops_set_replace_and_sweep_by_prefix() {
         let mut items = Vec::new();
-        assert!(apply_status_op(&mut items, status_set("claude.state", StatusLevel::Info, "thinking")));
-        assert!(apply_status_op(&mut items, status_set("dl", StatusLevel::Info, "iso")));
+        assert!(apply_status_op(
+            &mut items,
+            status_set("claude.state", StatusLevel::Info, "thinking")
+        ));
+        assert!(apply_status_op(
+            &mut items,
+            status_set("dl", StatusLevel::Info, "iso")
+        ));
         // A repeat of the newest item changes nothing.
-        assert!(!apply_status_op(&mut items, status_set("dl", StatusLevel::Info, "iso")));
+        assert!(!apply_status_op(
+            &mut items,
+            status_set("dl", StatusLevel::Info, "iso")
+        ));
         // Setting a key moves it to the end, as the most recent.
-        assert!(apply_status_op(&mut items, status_set("claude.state", StatusLevel::Info, "Bash")));
+        assert!(apply_status_op(
+            &mut items,
+            status_set("claude.state", StatusLevel::Info, "Bash")
+        ));
         assert_eq!(
             items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
             ["dl", "claude.state"]
         );
         assert!(apply_status_op(
             &mut items,
-            StatusOp::Remove { key: "claude.".into(), prefix: true }
+            StatusOp::Remove {
+                key: "claude.".into(),
+                prefix: true
+            }
         ));
         assert_eq!(items.len(), 1);
-        assert!(!apply_status_op(&mut items, StatusOp::Remove { key: "nope".into(), prefix: false }));
-        assert!(apply_status_op(&mut items, StatusOp::Remove { key: String::new(), prefix: true }));
+        assert!(!apply_status_op(
+            &mut items,
+            StatusOp::Remove {
+                key: "nope".into(),
+                prefix: false
+            }
+        ));
+        assert!(apply_status_op(
+            &mut items,
+            StatusOp::Remove {
+                key: String::new(),
+                prefix: true
+            }
+        ));
         assert!(items.is_empty());
     }
 
@@ -7866,13 +8230,19 @@ mod tests {
         let (text, x0) = layout.status_seg.clone().expect("a status segment");
         // " 42% Bash: cargo test -p vmux " fits under 40% of 80 cells.
         assert_eq!(text, status.text);
-        assert_eq!(x0, 80.0 - (vge_ui::measure::text_cells(&status.label()) + 2.0));
+        assert_eq!(
+            x0,
+            80.0 - (vge_ui::measure::text_cells(&status.label()) + 2.0)
+        );
         assert_eq!(layout.bar_end, x0);
         assert!(layout.has_right);
         // Tabs stay clear of the segment, and the `›` sits just before it.
         let last = layout.slots.last().unwrap();
         assert!(last.x0 + last.num_w + last.name_w <= x0 - TABBAR_CHEVRON_W);
-        assert!(matches!(tabbar_hit(&layout, x0 - 1.0), Some(TabbarHit::NextTab)));
+        assert!(matches!(
+            tabbar_hit(&layout, x0 - 1.0),
+            Some(TabbarHit::NextTab)
+        ));
         assert!(tabbar_hit(&layout, x0 + 1.0).is_none());
     }
 
@@ -7899,6 +8269,7 @@ mod tests {
             ground: Vec::new(),
             tabs: Vec::new(),
             status,
+            marquees: BTreeMap::new(),
         };
         let ids = |cmds: &[(VgeCommand, u32)]| -> Vec<String> {
             cmds.iter()
@@ -7931,6 +8302,42 @@ mod tests {
         assert_eq!(ids(&cmds), ["delete vmux-tabbar.status"]);
     }
 
+    /// A marquee's element comes and goes with its tab's busy item and
+    /// sits still across renders: the diff never resends it for moving,
+    /// since moving is the tick's `UpdateTransform`.
+    #[test]
+    fn a_marquee_element_follows_its_tab_status() {
+        let marquee = |w: f32| style::Marquee {
+            clip: vge_protocol::codec::Rect {
+                x: 1.0,
+                y: 1.5,
+                w,
+                h: 0.25,
+            },
+            commands: Vec::new(),
+            period: w + 3.0,
+            speed: 8.0,
+        };
+        let parts = |m: Option<style::Marquee>| TabbarParts {
+            ground: Vec::new(),
+            tabs: Vec::new(),
+            status: Vec::new(),
+            marquees: m.into_iter().map(|m| (2, m)).collect(),
+        };
+        let (_, sent) = TabbarSent::diff(None, parts(None));
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(20.0))));
+        assert_eq!(tabbar_ops(&cmds), ["create vmux-tabbar.marquee2"]);
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(20.0))));
+        assert!(cmds.is_empty());
+        let (cmds, sent) = TabbarSent::diff(Some(sent), parts(Some(marquee(24.0))));
+        assert_eq!(
+            tabbar_ops(&cmds),
+            ["delete vmux-tabbar.marquee2", "create vmux-tabbar.marquee2"]
+        );
+        let (cmds, _) = TabbarSent::diff(Some(sent), parts(None));
+        assert_eq!(tabbar_ops(&cmds), ["delete vmux-tabbar.marquee2"]);
+    }
+
     // ── layout resize ──────────────────────────────────────────────────
 
     /// `a | b` vertical split (a left, b right) at ratio 0.5 over a
@@ -7942,7 +8349,15 @@ mod tests {
             a: Box::new(Layout::Leaf("a".into())),
             b: Box::new(Layout::Leaf("b".into())),
         };
-        (layout, PaneRect { x: 0, y: 0, w: 100, h: 40 })
+        (
+            layout,
+            PaneRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40,
+            },
+        )
     }
 
     #[test]
@@ -7952,30 +8367,71 @@ mod tests {
         // mirror — so a bottom/right pane shrinks on Down/Right and grows
         // on Up/Left, which is the intuitive "push the shared border".
         let (mut layout, bounds) = vsplit_5050();
-        assert!(resize_split(&mut layout, "a", SplitDir::Vertical, 10, bounds));
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
-        assert!((*ratio - 0.6).abs() < 1e-6, "focus a, +cells: ratio {ratio} should be 0.6");
+        assert!(resize_split(
+            &mut layout,
+            "a",
+            SplitDir::Vertical,
+            10,
+            bounds
+        ));
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
+        assert!(
+            (*ratio - 0.6).abs() < 1e-6,
+            "focus a, +cells: ratio {ratio} should be 0.6"
+        );
 
         // Same +cells with the *other* pane focused moves the divider the
         // same way (ratio still rises) — sign is direction, not side.
         let (mut layout, bounds) = vsplit_5050();
-        assert!(resize_split(&mut layout, "b", SplitDir::Vertical, 10, bounds));
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
-        assert!((*ratio - 0.6).abs() < 1e-6, "focus b, +cells: ratio {ratio} should be 0.6");
+        assert!(resize_split(
+            &mut layout,
+            "b",
+            SplitDir::Vertical,
+            10,
+            bounds
+        ));
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
+        assert!(
+            (*ratio - 0.6).abs() < 1e-6,
+            "focus b, +cells: ratio {ratio} should be 0.6"
+        );
 
         // −cells (Up/Left) grows the bottom/right focused pane.
         let (mut layout, bounds) = vsplit_5050();
-        assert!(resize_split(&mut layout, "b", SplitDir::Vertical, -10, bounds));
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
-        assert!((*ratio - 0.4).abs() < 1e-6, "focus b, −cells: ratio {ratio} should be 0.4");
+        assert!(resize_split(
+            &mut layout,
+            "b",
+            SplitDir::Vertical,
+            -10,
+            bounds
+        ));
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
+        assert!(
+            (*ratio - 0.4).abs() < 1e-6,
+            "focus b, −cells: ratio {ratio} should be 0.4"
+        );
     }
 
     #[test]
     fn resize_clamps_to_the_ratio_bounds() {
         let (mut layout, bounds) = vsplit_5050();
         // A huge shrink on the left pane pins ratio at the minimum.
-        assert!(resize_split(&mut layout, "a", SplitDir::Vertical, -1000, bounds));
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!(resize_split(
+            &mut layout,
+            "a",
+            SplitDir::Vertical,
+            -1000,
+            bounds
+        ));
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
         assert!((*ratio - MIN_RATIO).abs() < 1e-6);
     }
 
@@ -7983,8 +8439,16 @@ mod tests {
     fn resize_ignores_the_wrong_orientation() {
         let (mut layout, bounds) = vsplit_5050();
         // A vertical-only split can't satisfy a height (Horizontal) resize.
-        assert!(!resize_split(&mut layout, "a", SplitDir::Horizontal, 10, bounds));
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        assert!(!resize_split(
+            &mut layout,
+            "a",
+            SplitDir::Horizontal,
+            10,
+            bounds
+        ));
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
         assert!((*ratio - 0.5).abs() < 1e-6, "ratio must be untouched");
     }
 
@@ -8003,13 +8467,34 @@ mod tests {
                 b: Box::new(Layout::Leaf("d".into())),
             }),
         };
-        let bounds = PaneRect { x: 0, y: 0, w: 100, h: 40 };
-        assert!(resize_split(&mut layout, "c", SplitDir::Vertical, 5, bounds));
-        let Layout::Split { ratio: outer, b, .. } = &layout else { unreachable!() };
+        let bounds = PaneRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+        assert!(resize_split(
+            &mut layout,
+            "c",
+            SplitDir::Vertical,
+            5,
+            bounds
+        ));
+        let Layout::Split {
+            ratio: outer, b, ..
+        } = &layout
+        else {
+            unreachable!()
+        };
         assert!((*outer - 0.5).abs() < 1e-6, "outer divider must not move");
-        let Layout::Split { ratio: inner, .. } = b.as_ref() else { unreachable!() };
+        let Layout::Split { ratio: inner, .. } = b.as_ref() else {
+            unreachable!()
+        };
         // Inner region is the right half (width 50); +5 cells → +0.1.
-        assert!((*inner - 0.6).abs() < 1e-6, "inner ratio {inner} should be 0.6");
+        assert!(
+            (*inner - 0.6).abs() < 1e-6,
+            "inner ratio {inner} should be 0.6"
+        );
     }
 
     // ── directional focus ─────────────────────────────────────────────
@@ -8022,8 +8507,14 @@ mod tests {
         layout_rects(&layout, bounds, &mut rects);
         let a = rects["a"];
         let b = rects["b"];
-        assert_eq!(pick_directional(&rects, "a", a, Dir::Right).as_deref(), Some("b"));
-        assert_eq!(pick_directional(&rects, "b", b, Dir::Left).as_deref(), Some("a"));
+        assert_eq!(
+            pick_directional(&rects, "a", a, Dir::Right).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            pick_directional(&rects, "b", b, Dir::Left).as_deref(),
+            Some("a")
+        );
         // No pane lies further left of `a` or above either pane.
         assert_eq!(pick_directional(&rects, "a", a, Dir::Left), None);
         assert_eq!(pick_directional(&rects, "a", a, Dir::Up), None);
@@ -8047,7 +8538,12 @@ mod tests {
                 b: Box::new(Layout::Leaf("d".into())),
             }),
         };
-        let bounds = PaneRect { x: 0, y: 0, w: 100, h: 40 };
+        let bounds = PaneRect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
         let mut rects = HashMap::new();
         layout_rects(&layout, bounds, &mut rects);
         let a = rects["a"];
@@ -8057,8 +8553,14 @@ mod tests {
         assert!(matches!(right.as_deref(), Some("c") | Some("d")));
         // From the upper-right pane `c`, Down reaches `d` and Left reaches `a`.
         let c = rects["c"];
-        assert_eq!(pick_directional(&rects, "c", c, Dir::Down).as_deref(), Some("d"));
-        assert_eq!(pick_directional(&rects, "c", c, Dir::Left).as_deref(), Some("a"));
+        assert_eq!(
+            pick_directional(&rects, "c", c, Dir::Down).as_deref(),
+            Some("d")
+        );
+        assert_eq!(
+            pick_directional(&rects, "c", c, Dir::Left).as_deref(),
+            Some("a")
+        );
         assert_eq!(pick_directional(&rects, "c", c, Dir::Up), None);
     }
 
@@ -8084,7 +8586,9 @@ mod tests {
         let mut p = Vec::new();
         let (path, _, _) = separator_hit(&layout, bounds, 50, 20, &mut p).unwrap();
         *layout.ratio_at_path_mut(&path).unwrap() = 0.25;
-        let Layout::Split { ratio, .. } = &layout else { unreachable!() };
+        let Layout::Split { ratio, .. } = &layout else {
+            unreachable!()
+        };
         assert!((*ratio - 0.25).abs() < 1e-6);
     }
 
@@ -8166,10 +8670,19 @@ mod tests {
     #[test]
     fn picker_move_pane_digit_jumps_and_commits() {
         let items: Vec<PickerItem> = (0..3)
-            .map(|i| PickerItem::new(format!("t{i}"), format!("tab {}", i + 1), PickerPayload::Tab(i)))
+            .map(|i| {
+                PickerItem::new(
+                    format!("t{i}"),
+                    format!("tab {}", i + 1),
+                    PickerPayload::Tab(i),
+                )
+            })
             .collect();
-        let mut p =
-            Picker::new(PickerKind::MovePaneTarget { pane: "p1".into() }, "Move".into(), items);
+        let mut p = Picker::new(
+            PickerKind::MovePaneTarget { pane: "p1".into() },
+            "Move".into(),
+            items,
+        );
         // Pressing '2' selects the second tab and commits immediately.
         assert_eq!(feed_picker(&mut p, b"2"), "commit");
         assert_eq!(p.current(), Some(1));
@@ -8206,7 +8719,14 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(
             evs,
-            vec![MouseEvent { button: 0, col: 3, row: 3, px: 25, py: 45, press: true }]
+            vec![MouseEvent {
+                button: 0,
+                col: 3,
+                row: 3,
+                px: 25,
+                py: 45,
+                press: true
+            }]
         );
         // The cell's last pixel still resolves to that cell, and the
         // next one moves on — the boundary the host is careful to keep
@@ -8222,7 +8742,14 @@ mod tests {
         let (_, evs) = extract_mouse_events(b"\x1b[<0;3;3M", false, (10, 20));
         assert_eq!(
             evs,
-            vec![MouseEvent { button: 0, col: 3, row: 3, px: 21, py: 41, press: true }]
+            vec![MouseEvent {
+                button: 0,
+                col: 3,
+                row: 3,
+                px: 21,
+                py: 41,
+                press: true
+            }]
         );
         // Non-mouse bytes are still passed through untouched.
         let (rest, evs) = extract_mouse_events(b"ab\x1b[<0;25;45Mcd", true, (10, 20));
@@ -8274,7 +8801,12 @@ mod tests {
         assert_eq!(&utf8[..3], b"\x1b[M");
         assert_eq!(
             String::from_utf8(utf8[3..].to_vec()).unwrap(),
-            format!("{}{}{}", ' ', char::from_u32(224 + 32).unwrap(), char::from_u32(10 + 32).unwrap())
+            format!(
+                "{}{}{}",
+                ' ',
+                char::from_u32(224 + 32).unwrap(),
+                char::from_u32(10 + 32).unwrap()
+            )
         );
 
         // urxvt (1015): decimal parameters, always `M`.

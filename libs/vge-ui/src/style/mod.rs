@@ -445,6 +445,35 @@ pub struct TabBarParts {
     /// one. Its own part because it is what changes most often — a
     /// download ticks it once a percent.
     pub status: Vec<DrawCmd>,
+    /// Each tab's moving part, parallel to [`TabBar::tabs`]: what an
+    /// indeterminate status sweeps along, if the engine draws one.
+    pub marquees: Vec<Option<Marquee>>,
+}
+
+/// Something the client keeps moving, since a VGE frame cannot move by
+/// itself: `commands`, clipped to `clip`, slid right at `speed` cells a
+/// second and wrapped every `period` cells. The client makes it an
+/// element of its own at `clip`'s corner, `clip`'s size, and animates it
+/// with `UpdateTransform` alone, so a frame of motion is one tiny
+/// command rather than a resent tab. `commands` are relative to that
+/// corner and drawn at their phase-zero position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Marquee {
+    pub clip: Rect,
+    pub commands: Vec<DrawCmd>,
+    pub period: f32,
+    pub speed: f32,
+}
+
+impl Marquee {
+    /// How far the commands are slid `secs` seconds into the sweep.
+    pub fn offset(&self, secs: f32) -> f32 {
+        if self.period > 0.0 {
+            (secs * self.speed).rem_euclid(self.period)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// One tab: a number rect `[x0, x0 + num_w)` and a name rect after it.
@@ -1090,6 +1119,61 @@ mod tests {
                 assert!(!parts.tabs.iter().any(|t| says(t)), "{}", engine.name());
                 // The background tab still marks its progress somehow.
                 assert!(parts.tabs[1].len() > tab_bar_without_status(engine, px)[1].len());
+            }
+        }
+    }
+
+    /// Every engine hands back one marquee slot per tab, and Aero fills
+    /// a busy tab's with blocks that start out of its clip on the left
+    /// and wrap once they have left it on the right.
+    #[test]
+    fn marquees_are_per_tab_and_sweep_through_their_clip() {
+        use prt_protocol::command::{StatusLevel, StatusProgress};
+        let px = Px { w: 8.0, h: 16.0 };
+        let busy = TabStatus {
+            text: "sleep",
+            level: StatusLevel::Info,
+            progress: Some(StatusProgress::Indeterminate),
+        };
+        for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
+            let bar = TabBar {
+                width: 120.0,
+                session: None,
+                tabs: vec![
+                    Tab {
+                        index: 0,
+                        x0: 0.5,
+                        num_w: 3.0,
+                        name_w: 20.0,
+                        label: "busy",
+                        active: true,
+                        activity: false,
+                        status: Some(busy),
+                    },
+                    Tab {
+                        index: 1,
+                        x0: 24.0,
+                        num_w: 3.0,
+                        name_w: 20.0,
+                        label: "idle",
+                        active: false,
+                        activity: false,
+                        status: None,
+                    },
+                ],
+                left_chevron: None,
+                right_chevron: None,
+                status: None,
+            };
+            let parts = engine.tab_bar(px, &bar);
+            assert_eq!(parts.marquees.len(), 2, "{}", engine.name());
+            assert!(parts.marquees[1].is_none(), "{}", engine.name());
+            if engine.name() == "aero" {
+                let m = parts.marquees[0]
+                    .as_ref()
+                    .expect("a busy aero tab has a marquee");
+                assert!(m.period > m.clip.w);
+                assert!(m.offset(0.0) == 0.0 && m.offset(m.period / m.speed * 1.5) < m.period);
             }
         }
     }

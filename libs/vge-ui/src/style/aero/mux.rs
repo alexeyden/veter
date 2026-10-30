@@ -14,7 +14,9 @@ use super::{
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
-use crate::style::{PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics};
+use crate::style::{
+    Marquee, PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics,
+};
 
 /// A two-row bar of tabs standing on its bottom edge, Windows XP
 /// fashion: the label sits on the bar's centre line, the active tab
@@ -62,6 +64,8 @@ const STATUS_SCALE: f32 = 0.6;
 const STATUS_STRIP_PX: f32 = 4.0;
 /// Width of one marquee block, in cells.
 const MARQUEE_BLOCK: f32 = 1.2;
+/// How fast the marquee sweeps, in cells a second.
+const MARQUEE_SPEED: f32 = 8.0;
 
 /// The tab bar: a two-row sky with the tabs standing on its bottom
 /// edge — the accent's gel for the active one, frosted glass for the
@@ -69,6 +73,7 @@ const MARQUEE_BLOCK: f32 = 1.2;
 pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
     let mut ground = Vec::new();
     let mut tabs = Vec::with_capacity(bar.tabs.len());
+    let mut marquees = Vec::with_capacity(bar.tabs.len());
     let cmds = &mut ground;
     let host_w = bar.width;
     let band = |y: f32, h: f32| Rect {
@@ -252,9 +257,10 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
             is_active,
             Some(shadow),
         );
-        if let Some(s) = slot.status {
-            tab_status(cmds, px, x0, x1, &s, shadow);
-        }
+        marquees.push(
+            slot.status
+                .and_then(|s| tab_status(cmds, px, x0, x1, &s, shadow)),
+        );
         tabs.push(tab);
     }
 
@@ -276,6 +282,7 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
         ground,
         tabs,
         status: Vec::new(),
+        marquees,
     }
 }
 
@@ -283,7 +290,16 @@ pub(super) fn tab_bar(px: Px, bar: &TabBar<'_>) -> TabBarParts {
 /// own, and, for an item with a figure or a level worth seeing, a gel
 /// strip along the tab's foot as long as the progress made — green for
 /// progress, Windows XP's own, amber for a warning, red for an error.
-fn tab_status(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, x1: f32, s: &TabStatus<'_>, shadow: Color) {
+/// An indeterminate item's blocks are handed back as a [`Marquee`] for
+/// the client to sweep along the track.
+fn tab_status(
+    cmds: &mut Vec<DrawCmd>,
+    px: Px,
+    x0: f32,
+    x1: f32,
+    s: &TabStatus<'_>,
+    shadow: Color,
+) -> Option<Marquee> {
     let max = ((x1 - x0 - 1.0) / STATUS_SCALE).max(1.0) as usize;
     let label = crate::measure::elide(&s.label(), max);
     let cx = (x0 + x1) * 0.5;
@@ -332,22 +348,35 @@ fn tab_status(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, x1: f32, s: &TabStatus<'
                 gel(cmds, px, sx0, y0, fx, y1, material);
             }
         }
-        // XP's marquee: a short run of blocks partway along the track,
-        // caught mid-sweep, since one frame can't move it.
+        // XP's marquee: a short run of blocks sweeping along the track,
+        // entering at its left end and leaving at its right.
         Some(StatusProgress::Indeterminate) => {
             track(cmds);
             let gap = px.x(2.0);
             let block = ((sx1 - sx0 - 2.0 * gap) / 3.0).min(MARQUEE_BLOCK);
             let run = 3.0 * block + 2.0 * gap;
-            let mut bx = sx0 + (sx1 - sx0 - run) * 0.5;
+            let mut blocks = Vec::new();
+            let mut bx = -run;
             for _ in 0..3 {
-                gel_rr(cmds, px, bx, y0, bx + block, y1, 1.0, material);
+                gel_rr(&mut blocks, px, bx, 0.0, bx + block, y1 - y0, 1.0, material);
                 bx += block + gap;
             }
+            return Some(Marquee {
+                clip: Rect {
+                    x: sx0,
+                    y: y0,
+                    w: sx1 - sx0,
+                    h: y1 - y0,
+                },
+                commands: blocks,
+                period: sx1 - sx0 + run,
+                speed: MARQUEE_SPEED,
+            });
         }
         None if s.level != StatusLevel::Info => gel(cmds, px, sx0, y0, sx1, y1, material),
         None => {}
     }
+    None
 }
 
 /// The deep tone of a frosted tab, which its number's socket is
