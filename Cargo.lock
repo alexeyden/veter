@@ -3395,6 +3395,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vstatus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "prt-protocol",
+ "veter-host",
+ "veter-version",
+ "vge-render",
+]
+
+[[package]]
 name = "vt100"
 version = "0.16.2"
 dependencies = [

@@ -8,6 +8,21 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+/// The tty an out-of-band client writes to: `explicit` (a `--tty`
+/// flag), else `$VMUX_PANE_TTY` (set by vmux inside each pane, so a
+/// hook or script reaches the pane it was started in without walking
+/// `ps` ancestry), else the controlling terminal. Shared by `vproto`
+/// and `vstatus`, which must agree on which pane they are talking to.
+pub fn pane_tty(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(p) = std::env::var_os("VMUX_PANE_TTY").filter(|v| !v.is_empty()) {
+        return Ok(p.into());
+    }
+    Ok("/dev/tty".into())
+}
+
 /// Block until stdin has data ready or `deadline` elapses. Returns
 /// `true` if stdin is readable, `false` on timeout.
 ///

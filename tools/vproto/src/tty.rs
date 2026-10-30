@@ -10,24 +10,13 @@
 //! `TIOCGWINSZ` and the environment rather than a protocol round-trip.
 
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::proto::{Frame, Proto, parse_payload};
 
-/// Where to write. `--tty`, else `$VMUX_PANE_TTY` (set by vmux inside a
-/// pane), else the controlling terminal.
-pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
-    }
-    if let Some(p) = std::env::var_os("VMUX_PANE_TTY").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(p));
-    }
-    Ok(PathBuf::from("/dev/tty"))
-}
+pub use vge_render::tty::pane_tty as resolve;
 
 /// Cell metrics and the static limits, obtained without a round-trip.
 ///

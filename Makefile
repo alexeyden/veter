@@ -11,7 +11,7 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONROOT ?= $(PREFIX)/share/icons/hicolor
 
-PACKAGES := veter vcat vplay vdraw vfm vmd vmux vproto vsend vrecv vsd vssh
+PACKAGES := veter vcat vplay vdraw vfm vmd vmux vproto vsend vrecv vsd vssh vstatus
 DESKTOP_FILE := $(APPDIR)/veter.desktop
 # Second launcher: a plain shell, no vmux (`veter --shell`).
 SHELL_DESKTOP_FILE := $(APPDIR)/veter-shell.desktop
@@ -313,7 +313,7 @@ clean:
 # into either a .tar.xz or a .deb. Per-arch targets are emitted by the
 # DIST_ARCH_RULES macro below.
 
-DIST_TOOLS := vmux vcat vplay vdraw vfm vmd vproto vsend vrecv vsd
+DIST_TOOLS := vmux vcat vplay vdraw vfm vmd vproto vsend vrecv vsd vstatus
 DIST_VERSION ?= 0.1.7
 
 # vfm builds separately, with `--no-default-features`. Its
@@ -409,6 +409,7 @@ dist-$(3)-tarxz: dist-$(3)-build
 	    '  vproto  speak VGE/PRT/SES from a script (JSON in, JSON out)' \
 	    '  vsend   upload local files (VFT)' \
 	    '  vrecv   download remote files (VFT)' \
+	    '  vstatus set the status line of the pane it runs in (PRT)' \
 	    '  vsd  persistent session daemon (doc/session-manager.md)' \
 	    > $$(DIST_TARXZ_STAGING_$(1))/veter-tools-$$(DIST_VERSION)/README
 	@tar -cJf $$(DIST_TARXZ_FILE_$(1)) \

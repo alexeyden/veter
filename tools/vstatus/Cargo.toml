@@ -1,0 +1,19 @@
+[package]
+name = "vstatus"
+version = "0.1.0"
+edition = "2024"
+description = "Set the status line of the veter pane you are running in."
+
+[dependencies]
+veter-version = { path = "../../libs/veter-version" }
+prt-protocol = { path = "../../protocol/prt" }
+vge-render = { path = "../../libs/vge-render" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+
+[dev-dependencies]
+# The end-to-end test runs the binary and replays what it wrote inside a
+# portal through the real host engine, so both sides of §9.4 are the
+# shipping code.
+veter-host = { path = "../../libs/veter-host" }
