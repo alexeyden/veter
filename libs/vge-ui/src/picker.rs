@@ -543,7 +543,10 @@ mod tests {
         }
         assert_eq!(evs.editor.buffer, bytes.editor.buffer);
 
-        assert_eq!(evs.feed_event(Event::Arrow(Dir::Down)), PickerOutcome::Redraw);
+        assert_eq!(
+            evs.feed_event(Event::Arrow(Dir::Down)),
+            PickerOutcome::Redraw
+        );
         assert_eq!(evs.feed_event(Event::Enter), PickerOutcome::Commit);
         assert_eq!(evs.feed_event(Event::Escape), PickerOutcome::Cancel);
     }
@@ -551,7 +554,8 @@ mod tests {
     #[test]
     fn filter_key_widens_the_haystack_beyond_the_label() {
         let items = vec![
-            PickerItem::new("delete-pane", "", 0usize).with_filter_key("delete-pane kill-pane close"),
+            PickerItem::new("delete-pane", "", 0usize)
+                .with_filter_key("delete-pane kill-pane close"),
         ];
         let mut p = Picker::new("Command", FilterMode::CommandLine, items);
         feed(&mut p, b"kill");

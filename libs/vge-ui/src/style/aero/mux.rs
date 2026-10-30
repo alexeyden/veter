@@ -9,7 +9,7 @@ use prt_protocol::command::{StatusLevel, StatusProgress};
 
 use super::{
     BAR_BOTTOM, BAR_LIP, BAR_TOP, GEL_AMBER, GEL_AQUA, GEL_GREEN, GEL_RED, Gel, Tone, bubble, gel,
-    gloss, scroll_thumb, smoke, tone,
+    gel_rr, gloss, scroll_thumb, smoke, tone,
 };
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, pill, radial, text, unit, vgrad, white};
@@ -60,6 +60,8 @@ const STATUS_Y: f32 = 1.18;
 const STATUS_SCALE: f32 = 0.6;
 /// …above a gel strip this many pixels deep, standing on the lip.
 const STATUS_STRIP_PX: f32 = 4.0;
+/// Width of one marquee block, in cells.
+const MARQUEE_BLOCK: f32 = 1.2;
 
 /// The tab bar: a two-row sky with the tabs standing on its bottom
 /// edge — the accent's gel for the active one, frosted glass for the
@@ -313,26 +315,34 @@ fn tab_status(cmds: &mut Vec<DrawCmd>, px: Px, x0: f32, x1: f32, s: &TabStatus<'
     let (sx0, sx1) = (x0 + 0.5, x1 - 0.5);
     let y1 = BAR_H - px.y(1.0);
     let y0 = y1 - px.y(STATUS_STRIP_PX);
+    // The empty part of the track, under either kind of progress, so a
+    // low figure still reads as a bar with a long way to go and the
+    // marquee as something moving along one.
+    let track = |cmds: &mut Vec<DrawCmd>| {
+        cmds.push(DrawCmd::FillPath {
+            fill: Style::Flat(hex(0x06264d, 0.35)),
+            segments: pill(px, sx0, y0, sx1, y1),
+        });
+    };
     match s.progress {
         Some(StatusProgress::Percent(p)) => {
-            // The empty part of the track, so a low figure still reads
-            // as a bar with a long way to go.
-            cmds.push(DrawCmd::FillPath {
-                fill: Style::Flat(hex(0x06264d, 0.35)),
-                segments: pill(px, sx0, y0, sx1, y1),
-            });
+            track(cmds);
             let fx = sx0 + (sx1 - sx0) * f32::from(p) / 100.0;
             if fx - sx0 >= px.x(STATUS_STRIP_PX) {
                 gel(cmds, px, sx0, y0, fx, y1, material);
             }
         }
-        // XP's marquee: blocks with no figure behind them.
+        // XP's marquee: a short run of blocks partway along the track,
+        // caught mid-sweep, since one frame can't move it.
         Some(StatusProgress::Indeterminate) => {
-            let block = 0.6;
-            let mut bx = sx0;
-            while bx + block <= sx1 {
-                gel(cmds, px, bx, y0, bx + block, y1, material);
-                bx += block * 2.0;
+            track(cmds);
+            let gap = px.x(2.0);
+            let block = ((sx1 - sx0 - 2.0 * gap) / 3.0).min(MARQUEE_BLOCK);
+            let run = 3.0 * block + 2.0 * gap;
+            let mut bx = sx0 + (sx1 - sx0 - run) * 0.5;
+            for _ in 0..3 {
+                gel_rr(cmds, px, bx, y0, bx + block, y1, 1.0, material);
+                bx += block + gap;
             }
         }
         None if s.level != StatusLevel::Info => gel(cmds, px, sx0, y0, sx1, y1, material),

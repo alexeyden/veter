@@ -1052,7 +1052,10 @@ mod tests {
             progress: Some(StatusProgress::Percent(42)),
         };
         for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
-            let in_tab = matches!(engine.metrics().tabbar.status, StatusPlacement::InTab { .. });
+            let in_tab = matches!(
+                engine.metrics().tabbar.status,
+                StatusPlacement::InTab { .. }
+            );
             let tab = |index: usize, x0: f32, active: bool| Tab {
                 index,
                 x0,
@@ -1072,7 +1075,11 @@ mod tests {
                 status: (!in_tab).then_some(BarStatus { status, x0: 90.0 }),
             };
             let parts = engine.tab_bar(px, &bar);
-            let says = |cmds: &[DrawCmd]| texts(cmds).iter().any(|(t, _)| t.contains("42% cargo test"));
+            let says = |cmds: &[DrawCmd]| {
+                texts(cmds)
+                    .iter()
+                    .any(|(t, _)| t.contains("42% cargo test"))
+            };
             if in_tab {
                 assert!(parts.tabs.iter().all(|t| says(t)), "{}", engine.name());
                 assert!(parts.status.is_empty(), "{}", engine.name());

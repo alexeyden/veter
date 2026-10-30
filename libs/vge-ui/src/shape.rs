@@ -47,14 +47,7 @@ fn corner_radii(width: f32, height: f32, cell_pw: f32, cell_ph: f32, rounding: f
 /// — `false` produces a square corner. Traversal is CCW in y-down coords
 /// (matches femtovg's tessellator preference — see `brick_drawcmd` in
 /// tools/breakout).
-pub fn rounded_rect_path(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    rx: f32,
-    ry: f32,
-) -> Vec<PathSegment> {
+pub fn rounded_rect_path(x0: f32, y0: f32, x1: f32, y1: f32, rx: f32, ry: f32) -> Vec<PathSegment> {
     rounded_rect_path_corners(x0, y0, x1, y1, rx, ry, true, true, true, true)
 }
 
@@ -169,9 +162,8 @@ mod tests {
 
     #[test]
     fn square_corners_emit_no_arcs() {
-        let segs = rounded_rect_path_corners(
-            0.0, 0.0, 4.0, 2.0, 0.2, 0.2, false, false, false, false,
-        );
+        let segs =
+            rounded_rect_path_corners(0.0, 0.0, 4.0, 2.0, 0.2, 0.2, false, false, false, false);
         let arcs = segs[0]
             .nodes
             .iter()

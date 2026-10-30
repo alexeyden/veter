@@ -181,7 +181,12 @@ pub fn picker_element(
     // Rows available for the list (everything but the title + input rows
     // and a little vertical margin), capped so a huge list stays compact.
     let avail = (host_h.saturating_sub(4)).max(1) as usize;
-    let visible_rows = picker.matches().len().max(1).min(avail).min(PICKER_MAX_ROWS);
+    let visible_rows = picker
+        .matches()
+        .len()
+        .max(1)
+        .min(avail)
+        .min(PICKER_MAX_ROWS);
 
     // Window the matches so the selection stays on screen.
     let total = picker.matches().len();
@@ -261,10 +266,7 @@ pub fn picker_element(
         });
         if !hint.is_empty() {
             cmds.push(DrawCmd::DrawText {
-                origin: Point {
-                    x: box_w - 1.5,
-                    y,
-                },
+                origin: Point { x: box_w - 1.5, y },
                 align: Align::Right,
                 fill: Style::Flat(dim_text()),
                 font_style: FontStyle(0x00),
@@ -472,10 +474,7 @@ impl ScrollModal {
             is_visible: true,
             draw_order,
             parent: None,
-            size: Some(Point {
-                x: box_w,
-                y: box_h,
-            }),
+            size: Some(Point { x: box_w, y: box_h }),
             transform: None,
             anchor: OriginAnchor::Viewport,
         });
@@ -665,9 +664,15 @@ mod tests {
                 .unwrap()
         };
         let prompt = prompt_element("p", 80, 24, "Rename", "abc", 10.0, 20.0, None, 0);
-        assert_eq!(title_fill(&prompt.commands, "Rename"), Style::Flat(active_text()));
+        assert_eq!(
+            title_fill(&prompt.commands, "Rename"),
+            Style::Flat(active_text())
+        );
         let scroll = ScrollModal::new(lines(3)).elements(IDS, 80, 24, 0, 10.0, 20.0, 0);
-        assert_eq!(title_fill(&scroll[0].commands, "Title"), Style::Flat(active_text()));
+        assert_eq!(
+            title_fill(&scroll[0].commands, "Title"),
+            Style::Flat(active_text())
+        );
     }
 
     #[test]
@@ -716,7 +721,10 @@ mod tests {
         let m = ScrollModal::new(lines(60));
         let (_, box_h) = m.box_size(80, 24);
         let max = m.body_window(box_h).1;
-        assert_eq!(m.thumb_origin_y(box_h, max), m.thumb_origin_y(box_h, max + 99));
+        assert_eq!(
+            m.thumb_origin_y(box_h, max),
+            m.thumb_origin_y(box_h, max + 99)
+        );
     }
 
     /// Box width back out of the centered origin: `origin_x` is

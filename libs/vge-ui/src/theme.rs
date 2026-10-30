@@ -429,14 +429,28 @@ fn text_on(accent: Color, darkest: Color, lightest: Color) -> Color {
     if luminance(accent) > 0.55 {
         grey(darken(darkest, 0.35))
     } else {
-        grey(mix(lightest, Color { r: 1.0, g: 1.0, b: 1.0, a: lightest.a }, 0.5))
+        grey(mix(
+            lightest,
+            Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: lightest.a,
+            },
+            0.5,
+        ))
     }
 }
 
 /// The grey of the same [`luminance`] — veter's `Rgba::grey`.
 fn grey(c: Color) -> Color {
     let v = luminance(c);
-    Color { r: v, g: v, b: v, a: c.a }
+    Color {
+        r: v,
+        g: v,
+        b: v,
+        a: c.a,
+    }
 }
 
 /// sRGB-weighted relative luminance, `0.0..=1.0` — veter's
@@ -623,7 +637,8 @@ pub fn parse_accent(s: &str) -> Result<AccentSpec, String> {
 /// A theme swatch name as veter accepts one (`host.swatch.<name>`).
 fn is_swatch_token(t: &str) -> bool {
     (1..=32).contains(&t.len())
-        && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The swatch an alias stands for: veter publishes one name per hue.
@@ -726,14 +741,27 @@ mod tests {
     /// a dark one, pushed past the theme's own extremes either way.
     #[test]
     fn text_on_an_accent_follows_its_luminance() {
-        let ink = Color { r: 0.2, g: 0.3, b: 0.6, a: 1.0 };
-        let ground = Color { r: 0.9, g: 0.9, b: 0.92, a: 1.0 };
+        let ink = Color {
+            r: 0.2,
+            g: 0.3,
+            b: 0.6,
+            a: 1.0,
+        };
+        let ground = Color {
+            r: 0.9,
+            g: 0.9,
+            b: 0.92,
+            a: 1.0,
+        };
         let yellow = unpack(parse_accent_color("#ffd700").unwrap());
         let orange = unpack(parse_accent_color("#c06020").unwrap());
         assert!(luminance(text_on(yellow, ink, ground)) < luminance(ink));
         assert!(luminance(text_on(orange, ink, ground)) > luminance(ground));
         let dark = text_on(yellow, ink, ground);
-        assert!(dark.r == dark.g && dark.g == dark.b, "the ink's blue leaks into the text");
+        assert!(
+            dark.r == dark.g && dark.g == dark.b,
+            "the ink's blue leaks into the text"
+        );
     }
 
     /// Colour words and their aliases are names; hex stays hex with or
@@ -745,8 +773,14 @@ mod tests {
         assert_eq!(parse_accent("Orange"), Ok(named("orange")));
         assert_eq!(parse_accent("pink"), Ok(named("magenta")));
         assert_eq!(parse_accent("grey"), Ok(named("grey")));
-        assert_eq!(parse_accent("#ff8800"), Ok(AccentSpec::Literal(0xff_88_00_ff)));
-        assert_eq!(parse_accent("ff8800"), Ok(AccentSpec::Literal(0xff_88_00_ff)));
+        assert_eq!(
+            parse_accent("#ff8800"),
+            Ok(AccentSpec::Literal(0xff_88_00_ff))
+        );
+        assert_eq!(
+            parse_accent("ff8800"),
+            Ok(AccentSpec::Literal(0xff_88_00_ff))
+        );
         assert_eq!(parse_accent("seafoam"), Ok(named("seafoam")));
         assert!(parse_accent("#seafoam").is_err());
         assert!(parse_accent("two words").is_err());

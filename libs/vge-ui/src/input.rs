@@ -551,7 +551,12 @@ mod tests {
             max_nesting_depth: 8,
         };
         let mut frames = Vec::new();
-        append_frame(&mut frames, vge_protocol::frame::RSP_PROBE, 1, &body.encode());
+        append_frame(
+            &mut frames,
+            vge_protocol::frame::RSP_PROBE,
+            1,
+            &body.encode(),
+        );
         let env = wrap_t2c_envelope(&frames);
 
         let mut p = InputParser::disambiguated();
@@ -624,7 +629,10 @@ mod tests {
                 row: 0
             }]
         );
-        assert_eq!(events(b"\x1b[<64;3;3M"), vec![Event::WheelUp { col: 2, row: 2 }]);
+        assert_eq!(
+            events(b"\x1b[<64;3;3M"),
+            vec![Event::WheelUp { col: 2, row: 2 }]
+        );
         assert_eq!(
             events(b"\x1b[<65;3;3M"),
             vec![Event::WheelDown { col: 2, row: 2 }]
