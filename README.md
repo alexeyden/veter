@@ -27,6 +27,7 @@ Every protocol is framed as APC envelopes (`ESC _ … ESC \`) so they pass clean
 | `vsd` | Persistent session daemon — holds session state across renderer disconnects. |
 | `vssh` | SSH wrapper that keeps the veter tools fresh on remote hosts. |
 | `vproto` | Speak VGE/PRT/SES from a script: JSON commands in, JSON responses out. `vproto schema` prints the command shapes. |
+| `vstatus` | Set the status shown for the pane it runs in — text, a level, progress — from a script or hook; `vstatus claude-hook` shows what a Claude Code session is doing. |
 | `vplace` | Place an image into a pane from outside its foreground program, anchored to a marker line that doubles as the caption. |
 | `vge-protocol`, `prt-protocol`, `vft-protocol`, `ses-protocol`, `vss-protocol` | Pure wire-format crates — APC parser, codec, encoders. No state, no rendering. |
 | `vge-render` | Shared client-side image-rendering + raw-TTY / probe helpers (used by `vcat`, `vplay`, `vdraw`, `vfm`, `vmd`). |
@@ -46,7 +47,7 @@ cargo run -p veter
 ## Install
 
 ```sh
-make install      # veter + vcat, vplay, vdraw, vfm, vmd, vmux, vsend, vrecv, vsd, vssh to $PREFIX/bin (default ~/.local) plus a desktop entry
+make install      # veter + vcat, vplay, vdraw, vfm, vmd, vmux, vproto, vsend, vrecv, vsd, vssh, vstatus to $PREFIX/bin (default ~/.local) plus a desktop entry
 make uninstall
 ```
 

@@ -5,7 +5,9 @@
 
 use prt_protocol::apc::ApcStream;
 use prt_protocol::codec::Reader;
-use prt_protocol::command::{AnchorMode, Command, CreatePortalBody, StatusLevel, StatusOp, StatusProgress, WritePortalBody};
+use prt_protocol::command::{
+    AnchorMode, Command, CreatePortalBody, StatusLevel, StatusOp, StatusProgress, WritePortalBody,
+};
 use prt_protocol::encode::build_envelope;
 use prt_protocol::envelope::parse_status_change;
 use prt_protocol::frame::{EVT_STATUS_CHANGE, MARKER_T2C};
@@ -42,7 +44,10 @@ fn status_events(output: &[u8]) -> Vec<(String, StatusOp)> {
         flags: 0,
         scrollback_lines: 0,
     });
-    let write = Command::WritePortal(WritePortalBody { id: "pane".into(), data: output.to_vec() });
+    let write = Command::WritePortal(WritePortalBody {
+        id: "pane".into(),
+        data: output.to_vec(),
+    });
     engine.process_pty_chunk(&build_envelope(&[(create, 1), (write, 2)]));
 
     let mut apc = ApcStream::with_marker(*MARKER_T2C);
@@ -93,8 +98,14 @@ fn set_and_clear_reach_the_pane_s_client() {
                 progress: Some(StatusProgress::Percent(42)),
                 text: "ubuntu iso".into(),
             },
-            StatusOp::Remove { key: "d".into(), prefix: true },
-            StatusOp::Remove { key: String::new(), prefix: true },
+            StatusOp::Remove {
+                key: "d".into(),
+                prefix: true
+            },
+            StatusOp::Remove {
+                key: String::new(),
+                prefix: true
+            },
         ]
     );
 }
@@ -112,8 +123,15 @@ fn run_clears_on_success_and_leaves_an_error_on_failure() {
     assert_eq!(
         ops(&ok),
         vec![
-            run("true", StatusLevel::Info, Some(StatusProgress::Indeterminate)),
-            StatusOp::Remove { key: "run".into(), prefix: false },
+            run(
+                "true",
+                StatusLevel::Info,
+                Some(StatusProgress::Indeterminate)
+            ),
+            StatusOp::Remove {
+                key: "run".into(),
+                prefix: false
+            },
         ]
     );
 
@@ -140,4 +158,81 @@ fn without_a_veter_pane_in_sight_nothing_is_written() {
         .unwrap();
     assert!(out.status.success());
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
+}
+
+/// Run `vstatus claude-hook` with `event` on stdin, as Claude Code does;
+/// return what it wrote to the tty, its exit code and its stdout+stderr.
+fn claude_hook(name: &str, event: &str) -> (Vec<u8>, i32, Vec<u8>) {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("vstatus-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tty = dir.join(format!("hook-{name}"));
+    std::fs::write(&tty, b"").unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vstatus"))
+        .arg("--tty")
+        .arg(&tty)
+        .arg("claude-hook")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let mut said = out.stdout;
+    said.extend(out.stderr);
+    (
+        std::fs::read(&tty).unwrap(),
+        out.status.code().unwrap(),
+        said,
+    )
+}
+
+#[test]
+fn claude_hook_shows_the_tool_and_clears_on_stop() {
+    let (pre, code, said) = claude_hook(
+        "pre",
+        r#"{"hook_event_name":"PreToolUse","cwd":"/w","tool_name":"Edit",
+            "tool_input":{"file_path":"/w/src/lib.rs"}}"#,
+    );
+    assert_eq!(code, 0);
+    assert!(said.is_empty());
+    let (stop, _, _) = claude_hook("stop", r#"{"hook_event_name":"Stop"}"#);
+    let mut output = pre;
+    output.extend(&stop);
+    assert_eq!(
+        ops(&output),
+        vec![
+            StatusOp::Set {
+                key: "claude.state".into(),
+                level: StatusLevel::Info,
+                progress: Some(StatusProgress::Indeterminate),
+                text: "Edit: src/lib.rs".into(),
+            },
+            StatusOp::Remove {
+                key: "claude.state".into(),
+                prefix: false
+            },
+        ]
+    );
+}
+
+/// A `PreToolUse` hook that exits 2 blocks the tool, so nothing the hook
+/// is fed may make it fail or speak.
+#[test]
+fn claude_hook_never_fails_and_never_speaks() {
+    for (name, event) in [
+        ("garbage", "not json"),
+        ("empty", ""),
+        ("unknown", r#"{"hook_event_name":"X"}"#),
+    ] {
+        let (wrote, code, said) = claude_hook(name, event);
+        assert_eq!(code, 0, "{name}");
+        assert!(wrote.is_empty() && said.is_empty(), "{name}");
+    }
 }

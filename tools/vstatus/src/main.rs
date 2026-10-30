@@ -1,9 +1,8 @@
 //! `vstatus` — set the status line of the pane you are running in.
 //!
 //! A status item is a keyed line of text, optionally with a progress
-//! figure, that the pane's multiplexer paints with the pane (vmux: at
-//! the right of its title strip, and as a badge on its tab when the pane
-//! is out of sight). It travels as PRT `SetStatus`
+//! figure, that the pane's multiplexer paints with the pane (vmux: in
+//! its tab bar, where depends on the style). It travels as PRT `SetStatus`
 //! (`doc/portal-extension.md` §9.4).
 //!
 //! The intended caller is not the pane's foreground program but
@@ -83,6 +82,13 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Claude Code hook: show what the session is doing.
+    ///
+    /// Reads a hook event from stdin. Register it for `SessionStart`,
+    /// `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`,
+    /// `PreCompact`, `Stop` and `SessionEnd`. Never fails and prints
+    /// nothing, since a hook's exit status and output steer Claude Code.
+    ClaudeHook,
 }
 
 #[derive(Args, Debug)]
@@ -121,8 +127,14 @@ impl From<Level> for StatusLevel {
     }
 }
 
+mod claude;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Cmd::ClaudeHook = cli.cmd {
+        claude_hook(cli.tty);
+        return ExitCode::SUCCESS;
+    }
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -141,14 +153,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Clear { key, prefix, all } => {
             let op = if all {
-                StatusOp::Remove { key: String::new(), prefix: true }
+                StatusOp::Remove {
+                    key: String::new(),
+                    prefix: true,
+                }
             } else {
-                StatusOp::Remove { key: checked_key(&key.key)?, prefix }
+                StatusOp::Remove {
+                    key: checked_key(&key.key)?,
+                    prefix,
+                }
             };
             out.send(op)?;
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Run { key, text, spin, command } => run_command(&out, &key, text, spin, &command),
+        Cmd::Run {
+            key,
+            text,
+            spin,
+            command,
+        } => run_command(&out, &key, text, spin, &command),
+        Cmd::ClaudeHook => unreachable!("handled before the tty is opened"),
+    }
+}
+
+/// [`claude`]'s hook, with every failure swallowed: an unreadable event,
+/// a tty that won't open, a write that fails.
+fn claude_hook(tty: Option<PathBuf>) {
+    let mut input = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
+        return;
+    }
+    let Ok(event) = serde_json::from_str(&input) else {
+        return;
+    };
+    let Some(op) = claude::op_for(&event) else {
+        return;
+    };
+    if let Ok(out) = Out::open(tty) {
+        let _ = out.send(op);
     }
 }
 
@@ -174,7 +216,10 @@ fn checked_key(key: &str) -> Result<String> {
         key.len() <= MAX_STATUS_KEY_BYTES,
         "key is longer than {MAX_STATUS_KEY_BYTES} bytes"
     );
-    anyhow::ensure!(!key.chars().any(char::is_control), "key contains control characters");
+    anyhow::ensure!(
+        !key.chars().any(char::is_control),
+        "key contains control characters"
+    );
     Ok(key.to_owned())
 }
 
@@ -185,7 +230,10 @@ fn checked_key(key: &str) -> Result<String> {
 /// to the §9.4 limit, with an ellipsis to show it was.
 fn one_line(text: &str) -> String {
     let mut s = String::with_capacity(text.len().min(MAX_STATUS_TEXT_BYTES));
-    for word in text.split(|c: char| c.is_whitespace()).filter(|w| !w.is_empty()) {
+    for word in text
+        .split(|c: char| c.is_whitespace())
+        .filter(|w| !w.is_empty())
+    {
         if !s.is_empty() {
             s.push(' ');
         }
@@ -239,9 +287,13 @@ impl Out {
     /// to the same tty, and a single write is not interleaved with
     /// another writer's.
     fn send(&self, op: StatusOp) -> Result<()> {
-        let Some((path, tty)) = &self.0 else { return Ok(()) };
+        let Some((path, tty)) = &self.0 else {
+            return Ok(());
+        };
         let envelope = build_envelope(&[(Command::SetStatus(op), REQ_ID_NO_RESPONSE)]);
-        (&*tty).write_all(&envelope).with_context(|| format!("write {}", path.display()))?;
+        (&*tty)
+            .write_all(&envelope)
+            .with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
 }
@@ -255,10 +307,17 @@ fn run_command(
 ) -> Result<ExitCode> {
     let key = checked_key(key)?;
     let label = one_line(&text.unwrap_or_else(|| command.join(" ")));
-    let look = Look { level: Level::Info, progress: None, spin };
+    let look = Look {
+        level: Level::Info,
+        progress: None,
+        spin,
+    };
     out.send(set_op(&key, &look, &label)?)?;
 
-    let mut child = match std::process::Command::new(&command[0]).args(&command[1..]).spawn() {
+    let mut child = match std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
             out.send(StatusOp::Remove { key, prefix: false })?;
@@ -276,7 +335,10 @@ fn run_command(
     }
     let status = child.wait().context("wait for the command")?;
 
-    let code = match (status.code(), std::os::unix::process::ExitStatusExt::signal(&status)) {
+    let code = match (
+        status.code(),
+        std::os::unix::process::ExitStatusExt::signal(&status),
+    ) {
         (Some(c), _) => c,
         (None, Some(sig)) => 128 + sig,
         (None, None) => 1,
@@ -300,7 +362,10 @@ mod tests {
 
     #[test]
     fn one_line_collapses_whitespace_and_drops_controls() {
-        assert_eq!(one_line("cargo test \\\n  -p vmux\t--lib"), "cargo test \\ -p vmux --lib");
+        assert_eq!(
+            one_line("cargo test \\\n  -p vmux\t--lib"),
+            "cargo test \\ -p vmux --lib"
+        );
         assert_eq!(one_line("a\x1b[2Jb\x07"), "a[2Jb");
         assert_eq!(one_line("  \n "), "");
     }
@@ -315,7 +380,11 @@ mod tests {
 
     #[test]
     fn what_vstatus_builds_is_what_the_host_accepts() {
-        let look = Look { level: Level::Warn, progress: Some(42), spin: false };
+        let look = Look {
+            level: Level::Warn,
+            progress: Some(42),
+            spin: false,
+        };
         let op = set_op("dl", &look, &"x\n".repeat(400)).unwrap();
         let body = prt_protocol::encode::set_status_body(&op);
         let parsed = prt_protocol::command::parse(prt_protocol::frame::CMD_SET_STATUS, &body);
