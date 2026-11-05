@@ -14,7 +14,9 @@ use super::{
 use crate::measure::text_cells;
 use crate::paint::{Px, hash, hex, hourglass, pill, radial, text, unit, vgrad, white};
 use crate::shape::rounded_rect_path_corners;
-use crate::style::{PaneChrome, StatusPlacement, TabBar, TabBarParts, TabStatus, TabbarMetrics};
+use crate::style::{
+    PaneChrome, StatusPlacement, TabBar, TabBarParts, TabSizing, TabStatus, TabbarMetrics,
+};
 
 /// A two-row bar of tabs standing on its bottom edge, Windows XP
 /// fashion: the label sits on the bar's centre line, the active tab
@@ -26,6 +28,12 @@ pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
     gap: 0.3,
     name_pad: 4.0,
     status: StatusPlacement::InTab,
+    // Gel tabs look right at one size, and each carries a status line
+    // that wants the room.
+    sizing: TabSizing::Equal {
+        min: 14.0,
+        max: 32.0,
+    },
 };
 /// The bar's height in cells.
 const BAR_H: f32 = TABBAR_METRICS.rows as f32;

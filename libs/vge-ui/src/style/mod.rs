@@ -363,6 +363,22 @@ pub struct TabbarMetrics {
     pub name_pad: f32,
     /// Where a pane's status (`doc/portal-extension.md` §9.4) goes.
     pub status: StatusPlacement,
+    /// How wide each tab is.
+    pub sizing: TabSizing,
+}
+
+/// How a tab bar shares its width between tabs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TabSizing {
+    /// Each tab is as wide as its label, labels shortened uniformly only
+    /// when they don't all fit.
+    Fit,
+    /// Every tab is the same width, the bar's share per tab clamped to
+    /// `min..=max` cells (gap included), labels elided to it. A tab's
+    /// width then depends on how many tabs there are and nothing else,
+    /// so a retitle or a status never moves its neighbours. Past `min`
+    /// the bar scrolls, its visible tabs stretched to fill it.
+    Equal { min: f32, max: f32 },
 }
 
 /// Where the tab bar shows status, which decides the room the client

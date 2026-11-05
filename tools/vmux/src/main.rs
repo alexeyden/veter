@@ -75,7 +75,7 @@ use vge_ui::modal::{ModalIds, ScrollModal};
 use vge_ui::paint::Px;
 use vge_ui::picker::{FilterMode, Picker as UiPicker, PickerItem as UiPickerItem, PickerOutcome};
 use vge_ui::style::{
-    self, BarStatus, PaneChrome, StatusPlacement, TabBar, TabStatus, TabbarMetrics,
+    self, BarStatus, PaneChrome, StatusPlacement, TabBar, TabSizing, TabStatus, TabbarMetrics,
 };
 use vge_ui::theme;
 
@@ -1346,6 +1346,26 @@ fn tabbar_last_visible(widths: &[f32], host_w: f32, first: usize) -> usize {
     last
 }
 
+/// Every tab's width under [`TabSizing::Equal`]: the bar's share per tab,
+/// clamped to `min..=max`. Once `min` no longer fits them all the bar
+/// scrolls, and the width is stretched so the tabs it shows fill it: as
+/// many as fit at `min` between both chevrons, sharing that room
+/// exactly. Rounded down to a binary fraction of a cell, so that
+/// [`tabbar_last_visible`]'s running sum of them is exact and the last
+/// tab is not dropped for a rounding error.
+fn equal_tab_width(n: usize, bar_w: f32, min: f32, max: f32) -> f32 {
+    let snap = |w: f32| (w * 64.0).floor() / 64.0;
+    if n == 0 {
+        return min;
+    }
+    if n as f32 * min <= bar_w {
+        return snap((bar_w / n as f32).min(max));
+    }
+    let room = bar_w - 2.0 * TABBAR_CHEVRON_W;
+    let shown = ((room / min).floor() as usize).max(1);
+    snap((room / shown as f32).max(min.min(room)))
+}
+
 /// Nudge `scroll` (the leftmost visible tab, carried across renders) the
 /// minimum amount needed to keep the `active` tab on screen, then return
 /// the inclusive `[first, last]` window of tabs to draw.
@@ -1478,28 +1498,56 @@ fn compute_tabbar_layout(
     let num_widths: Vec<f32> = (0..n)
         .map(|i| format!(" {} ", i + 1).chars().count() as f32)
         .collect();
-    // Pick the widest label cap the bar can afford, then elide to it —
-    // so labels are only shortened to reclaim space, never pre-emptively,
-    // and the widths used for scrolling match what gets drawn.
-    // The cap budgets two padding cells per label; whatever padding
-    // and gap the metrics add beyond that is a fixed per-tab cost too.
-    let fixed: Vec<f32> = num_widths
-        .iter()
-        .map(|w| w + m.name_pad - 2.0 + m.gap)
-        .collect();
-    let cap = tabbar_label_cap(labels, &fixed, bar_w);
-    let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l, cap)).collect();
-    // The label alone sizes a tab. Under `InTab` its status elides to
-    // that width instead of widening it, since a status changes far
-    // more often than a title and a width change moves every tab after.
-    let name_widths: Vec<f32> = elided
-        .iter()
-        .map(|l| vge_ui::measure::text_cells(l) + m.name_pad)
-        .collect();
-    // Each tab carries the gap after it, so scrolling budgets it too.
-    let tab_widths: Vec<f32> = (0..n)
-        .map(|i| num_widths[i] + name_widths[i] + m.gap)
-        .collect();
+    let (elided, name_widths, tab_widths) = match m.sizing {
+        TabSizing::Fit => {
+            // Pick the widest label cap the bar can afford, then elide
+            // to it — so labels are only shortened to reclaim space,
+            // never pre-emptively, and the widths used for scrolling
+            // match what gets drawn. The cap budgets two padding cells
+            // per label; whatever padding and gap the metrics add beyond
+            // that is a fixed per-tab cost too.
+            let fixed: Vec<f32> = num_widths
+                .iter()
+                .map(|w| w + m.name_pad - 2.0 + m.gap)
+                .collect();
+            let cap = tabbar_label_cap(labels, &fixed, bar_w);
+            let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l, cap)).collect();
+            // The label alone sizes a tab: a status changes far more
+            // often than a title, and a width change moves every tab
+            // after it.
+            let name_widths: Vec<f32> = elided
+                .iter()
+                .map(|l| vge_ui::measure::text_cells(l) + m.name_pad)
+                .collect();
+            // Each tab carries the gap after it, so scrolling budgets it
+            // too.
+            let tab_widths: Vec<f32> = (0..n)
+                .map(|i| num_widths[i] + name_widths[i] + m.gap)
+                .collect();
+            (elided, name_widths, tab_widths)
+        }
+        TabSizing::Equal { min, max } => {
+            let w = equal_tab_width(n, bar_w, min, max);
+            // The number rect still fits its digits; the name rect takes
+            // the rest, so a tab's whole extent is the same either way.
+            let name_widths: Vec<f32> = num_widths
+                .iter()
+                .map(|nw| (w - nw - m.gap).max(m.name_pad + TABBAR_MIN_LABEL as f32))
+                .collect();
+            let elided: Vec<String> = labels
+                .iter()
+                .zip(&name_widths)
+                .map(|(l, nw)| {
+                    let room = ((nw - m.name_pad).floor() as usize).max(TABBAR_MIN_LABEL);
+                    elide_tab_label(l, room)
+                })
+                .collect();
+            let tab_widths: Vec<f32> = (0..n)
+                .map(|i| num_widths[i] + name_widths[i] + m.gap)
+                .collect();
+            (elided, name_widths, tab_widths)
+        }
+    };
 
     let (first, last) = tabbar_window(&tab_widths, active, bar_w, scroll);
     let has_left = first > 0;
@@ -8150,6 +8198,34 @@ mod tests {
         assert!(cmds.is_empty());
         let (cmds, _) = TabbarSent::diff(Some(sent), parts(Vec::new()));
         assert_eq!(ids(&cmds), ["delete vmux-tabbar.status"]);
+    }
+
+    /// Equal tabs share the bar up to their cap, and once they stop
+    /// fitting at their floor the ones in view fill the bar between the
+    /// chevrons — at every scroll position, with none dropped for a
+    /// rounding error.
+    #[test]
+    fn equal_tabs_share_the_bar_then_scroll_filling_it() {
+        let (min, max) = (14.0, 32.0);
+        assert_eq!(equal_tab_width(2, 200.0, min, max), 32.0);
+        assert_eq!(equal_tab_width(5, 100.0, min, max), 20.0);
+        let bar = 100.0;
+        let n = 12;
+        let w = equal_tab_width(n, bar, min, max);
+        assert!(w >= min);
+        let shown = ((bar - 2.0 * TABBAR_CHEVRON_W) / w).round() as usize;
+        assert!((shown as f32 * w - (bar - 2.0 * TABBAR_CHEVRON_W)).abs() < 0.1);
+        let widths = vec![w; n];
+        for active in 0..n {
+            let mut scroll = 0;
+            let (first, last) = tabbar_window(&widths, active, bar, &mut scroll);
+            assert!((first..=last).contains(&active));
+            // Between both chevrons, or against one end of the bar.
+            assert!(
+                last - first + 1 >= shown,
+                "active {active}: {first}..={last}"
+            );
+        }
     }
 
     // ── layout resize ──────────────────────────────────────────────────
