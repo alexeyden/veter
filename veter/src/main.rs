@@ -1235,13 +1235,21 @@ const JUMP_LABEL_ALPHABET: &[char] =
 /// Label alphabet for hint mode. Hint mode has no query, so no key can
 /// be mistaken for query input: the reservations that shrink
 /// [`JUMP_LABEL_ALPHABET`] don't apply and the whole keyboard is
-/// available. Home row first (same muscle memory), then the rest of the
-/// letters, then digits — a screen of `ls -la` output can easily carry
-/// thirty hints, and running out means the tail of the screen silently
-/// has no labels.
+/// available — the base64 set, 64 keys. Unshifted first: home row
+/// (same muscle memory), then the rest of the letters, then digits; then
+/// the capitals in the same order, and `+` `/` last. A screen of
+/// `ls -la` or build output can easily carry forty hints, and running
+/// out means the tail of the screen silently has no labels.
+///
+/// Shift has no other meaning in hint mode, so a capital is just another
+/// key — but it is only *its own* label once more than 36 hints are on
+/// screen; below that a capital still folds onto its lowercase label
+/// (see `handle_search_key_input`), so Caps Lock keeps working.
 const HINT_LABEL_ALPHABET: &[char] = &[
     'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
     'z', 'x', 'c', 'v', 'b', 'n', 'm', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+    'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P',
+    'Z', 'X', 'C', 'V', 'B', 'N', 'M', '+', '/',
 ];
 
 /// The label key `ch` is the shifted form of, if it is one. Labels are
@@ -4656,13 +4664,16 @@ impl App {
                 .next()
                 .filter(|_| s.chars().count() == 1)
                 .and_then(|ch| {
-                    // Shift isn't used for anything here, so a capital
-                    // (stray Shift, Caps Lock) still finds its label.
+                    // A capital is its own label when one is assigned;
+                    // otherwise (stray Shift, Caps Lock, a screen with
+                    // too few hints to reach the capitals) it falls back
+                    // to the lowercase one.
                     let lower = ch.to_ascii_lowercase();
-                    search
-                        .labels
+                    let labels = &search.labels;
+                    labels
                         .iter()
-                        .find(|l| l.ch == ch || l.ch == lower)
+                        .find(|l| l.ch == ch)
+                        .or_else(|| labels.iter().find(|l| l.ch == lower))
                         .copied()
                 });
             match hit {
@@ -6929,6 +6940,29 @@ mod jump_label_tests {
             &HINT_LABEL_ALPHABET[..JUMP_LABEL_ALPHABET.len()],
             JUMP_LABEL_ALPHABET
         );
+    }
+
+    /// Hint mode's alphabet is the base64 set: 64 distinct keys, the
+    /// unshifted ones handed out before any capital.
+    #[test]
+    fn hint_alphabet_is_base64() {
+        let set: HashSet<char> = HINT_LABEL_ALPHABET.iter().copied().collect();
+        let base64: HashSet<char> = ('A'..='Z')
+            .chain('a'..='z')
+            .chain('0'..='9')
+            .chain(['+', '/'])
+            .collect();
+        assert_eq!(set, base64);
+        let first_shifted = HINT_LABEL_ALPHABET
+            .iter()
+            .position(|c| c.is_ascii_uppercase())
+            .unwrap();
+        assert!(
+            HINT_LABEL_ALPHABET[..first_shifted]
+                .iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+        assert_eq!(first_shifted, 36);
     }
 
     /// Hint mode has no query, so nothing is ever excluded: with no

@@ -123,12 +123,14 @@ impl HintConfig {
 /// Scan `index` for every enabled kind and return the surviving hints in
 /// reading order (oldest row first; left to right within a row).
 ///
-/// `cfg.kinds` is both the enable list and the priority order — earlier
-/// wins an overlap. Overlap resolution is global per logical line:
-/// candidates are considered in (priority, position, length) order and
-/// each is kept only if it doesn't touch one already kept. That gives
-/// priority absolute precedence, which is what makes
-/// `https://host/a1b2c3d` one URL rather than a URL plus a hash.
+/// `cfg.kinds` is both the enable list and the priority order. Overlap
+/// resolution is global per logical line, in two steps. First a
+/// candidate contained in a longer one is dropped as a fragment of it,
+/// regardless of kind — which is what makes `https://host/a1b2c3d` one
+/// URL rather than a URL plus a hash, and keeps a path through a
+/// UUID-named directory whole even though `uuid` outranks `path`. Then
+/// the rest are considered in (priority, position, length) order and
+/// each is kept only if it doesn't touch one already kept.
 pub fn find_hints(index: &TextIndex, cfg: &HintConfig) -> Vec<Hint> {
     let kinds = &cfg.kinds;
     let mut out = Vec::new();
@@ -147,6 +149,25 @@ pub fn find_hints(index: &TextIndex, cfg: &HintConfig) -> Vec<Hint> {
         if cands.is_empty() {
             continue;
         }
+        // A candidate lying wholly inside a longer one is a fragment of
+        // it — the UUID directory in a scratchpad path, the hash in a
+        // URL — and the enclosing span is what the user means to act on,
+        // whatever order the kinds are in. Priority only decides real
+        // collisions: spans that overlap without one containing the other,
+        // or the same span claimed by two kinds.
+        let fragment = |c: &Cand| {
+            cands.iter().any(|d| {
+                d.start <= c.start && c.end <= d.end && d.end - d.start > c.end - c.start
+            })
+        };
+        let mut cands: Vec<Cand> = {
+            let keep: Vec<bool> = cands.iter().map(|c| !fragment(c)).collect();
+            cands
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(c, k)| k.then_some(c))
+                .collect()
+        };
         // Priority first, then leftmost, then longest — so a tie between
         // two same-kind candidates (the `://` and `www.` halves of one
         // URL) resolves to the one that starts earlier and covers more.
@@ -1246,6 +1267,24 @@ mod tests {
         assert_eq!(only(HintKind::Hash, &h), Vec::<String>::new());
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].0, HintKind::Url);
+    }
+
+    /// `uuid` outranks `path`, but a UUID that is one directory of a
+    /// path is part of it — the path is what gets the label.
+    #[test]
+    fn a_uuid_inside_a_path_loses_to_the_path() {
+        let p = "/tmp/claude-1000/-mnt-dev/4ae016a0-b2ad-4447-98cd-5f14525f438f/scratchpad/ptz_task.md";
+        let h = hints_of(p, 120);
+        assert_eq!(h, vec![(HintKind::Path, p.to_string())]);
+    }
+
+    /// Containment beats priority in either direction: a path whose
+    /// tail is an IP-looking segment stays a path too.
+    #[test]
+    fn an_ip_inside_a_path_loses_to_the_path() {
+        let h = hints_of("cat /srv/hosts/10.0.0.4/notes", 80);
+        assert_eq!(only(HintKind::Path, &h), vec!["/srv/hosts/10.0.0.4/notes"]);
+        assert_eq!(h.len(), 1);
     }
 
     #[test]
