@@ -25,10 +25,7 @@ pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
     margin: 0.5,
     gap: 0.3,
     name_pad: 4.0,
-    status: StatusPlacement::InTab {
-        scale: STATUS_SCALE,
-        max_cells: 24.0,
-    },
+    status: StatusPlacement::InTab,
 };
 /// The bar's height in cells.
 const BAR_H: f32 = TABBAR_METRICS.rows as f32;

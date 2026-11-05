@@ -370,9 +370,9 @@ pub struct TabbarMetrics {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StatusPlacement {
     /// Every tab carries its own status on a second line under its
-    /// label, at `scale` of the text size. A tab widens to fit it, up to
-    /// `max_cells` wide; past that the status is elided.
-    InTab { scale: f32, max_cells: f32 },
+    /// label, elided to the width the label gave the tab: a status that
+    /// changes every second must not move the tabs beside it.
+    InTab,
     /// The active tab's status is a segment pinned at the bar's right
     /// end ([`TabBar::status`]), opposite the session name; the other
     /// tabs carry theirs as [`Tab::status`] for whatever mark fits a
@@ -1149,10 +1149,7 @@ mod tests {
             progress: Some(StatusProgress::Percent(42)),
         };
         for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
-            let in_tab = matches!(
-                engine.metrics().tabbar.status,
-                StatusPlacement::InTab { .. }
-            );
+            let in_tab = matches!(engine.metrics().tabbar.status, StatusPlacement::InTab);
             let tab = |index: usize, x0: f32, active: bool| Tab {
                 index,
                 x0,
@@ -1209,10 +1206,7 @@ mod tests {
                 .count()
         };
         for engine in [&flat::Flat as &dyn Engine, &aero::Aero] {
-            let in_tab = matches!(
-                engine.metrics().tabbar.status,
-                StatusPlacement::InTab { .. }
-            );
+            let in_tab = matches!(engine.metrics().tabbar.status, StatusPlacement::InTab);
             // The hourglass's strokes, over the same item with no
             // progress at all.
             let lines = |status: TabStatus<'_>| {

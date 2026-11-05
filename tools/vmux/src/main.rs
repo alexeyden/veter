@@ -1457,7 +1457,7 @@ fn compute_tabbar_layout(
     // segment too narrow to say anything is dropped rather than drawn
     // as a sliver.
     let status_seg: Option<(String, f32)> = match m.status {
-        StatusPlacement::InTab { .. } => None,
+        StatusPlacement::InTab => None,
         StatusPlacement::BarEnd => statuses.get(active).copied().flatten().and_then(|st| {
             let label = st.label();
             let w = (vge_ui::measure::text_cells(&label) + 2.0).min((host_wf * 0.4).floor());
@@ -1489,20 +1489,12 @@ fn compute_tabbar_layout(
         .collect();
     let cap = tabbar_label_cap(labels, &fixed, bar_w);
     let elided: Vec<String> = labels.iter().map(|l| elide_tab_label(l, cap)).collect();
-    // Under `InTab` a tab widens for its status line, up to the
-    // engine's cap; the elided label is the floor either way.
+    // The label alone sizes a tab. Under `InTab` its status elides to
+    // that width instead of widening it, since a status changes far
+    // more often than a title and a width change moves every tab after.
     let name_widths: Vec<f32> = elided
         .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let w = vge_ui::measure::text_cells(l) + m.name_pad;
-            match (m.status, statuses.get(i).copied().flatten()) {
-                (StatusPlacement::InTab { scale, max_cells }, Some(st)) => w.max(
-                    (vge_ui::measure::text_cells(&st.label()) * scale + m.name_pad).min(max_cells),
-                ),
-                _ => w,
-            }
-        })
+        .map(|l| vge_ui::measure::text_cells(l) + m.name_pad)
         .collect();
     // Each tab carries the gap after it, so scrolling budgets it too.
     let tab_widths: Vec<f32> = (0..n)
