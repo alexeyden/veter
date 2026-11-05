@@ -30,10 +30,7 @@ pub const TABBAR_METRICS: TabbarMetrics = TabbarMetrics {
     status: StatusPlacement::InTab,
     // Gel tabs look right at one size, and each carries a status line
     // that wants the room.
-    sizing: TabSizing::Equal {
-        min: 14.0,
-        max: 32.0,
-    },
+    sizing: TabSizing::Equal { min: 14.0 },
 };
 /// The bar's height in cells.
 const BAR_H: f32 = TABBAR_METRICS.rows as f32;

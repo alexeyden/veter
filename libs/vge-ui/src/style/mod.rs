@@ -373,12 +373,12 @@ pub enum TabSizing {
     /// Each tab is as wide as its label, labels shortened uniformly only
     /// when they don't all fit.
     Fit,
-    /// Every tab is the same width, the bar's share per tab clamped to
-    /// `min..=max` cells (gap included), labels elided to it. A tab's
-    /// width then depends on how many tabs there are and nothing else,
-    /// so a retitle or a status never moves its neighbours. Past `min`
-    /// the bar scrolls, its visible tabs stretched to fill it.
-    Equal { min: f32, max: f32 },
+    /// The tabs share the whole bar equally, labels elided to their
+    /// share (gap included). A tab's width then depends on how many tabs
+    /// there are and nothing else, so a retitle or a status never moves
+    /// its neighbours. Below `min` cells a tab, the bar scrolls, its
+    /// visible tabs stretched to fill it.
+    Equal { min: f32 },
 }
 
 /// Where the tab bar shows status, which decides the room the client

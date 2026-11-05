@@ -1346,20 +1346,20 @@ fn tabbar_last_visible(widths: &[f32], host_w: f32, first: usize) -> usize {
     last
 }
 
-/// Every tab's width under [`TabSizing::Equal`]: the bar's share per tab,
-/// clamped to `min..=max`. Once `min` no longer fits them all the bar
+/// Every tab's width under [`TabSizing::Equal`]: the bar's share per
+/// tab. Once `min` no longer fits them all the bar
 /// scrolls, and the width is stretched so the tabs it shows fill it: as
 /// many as fit at `min` between both chevrons, sharing that room
 /// exactly. Rounded down to a binary fraction of a cell, so that
 /// [`tabbar_last_visible`]'s running sum of them is exact and the last
 /// tab is not dropped for a rounding error.
-fn equal_tab_width(n: usize, bar_w: f32, min: f32, max: f32) -> f32 {
+fn equal_tab_width(n: usize, bar_w: f32, min: f32) -> f32 {
     let snap = |w: f32| (w * 64.0).floor() / 64.0;
     if n == 0 {
         return min;
     }
     if n as f32 * min <= bar_w {
-        return snap((bar_w / n as f32).min(max));
+        return snap(bar_w / n as f32);
     }
     let room = bar_w - 2.0 * TABBAR_CHEVRON_W;
     let shown = ((room / min).floor() as usize).max(1);
@@ -1526,8 +1526,8 @@ fn compute_tabbar_layout(
                 .collect();
             (elided, name_widths, tab_widths)
         }
-        TabSizing::Equal { min, max } => {
-            let w = equal_tab_width(n, bar_w, min, max);
+        TabSizing::Equal { min } => {
+            let w = equal_tab_width(n, bar_w, min);
             // The number rect still fits its digits; the name rect takes
             // the rest, so a tab's whole extent is the same either way.
             let name_widths: Vec<f32> = num_widths
@@ -8200,18 +8200,18 @@ mod tests {
         assert_eq!(ids(&cmds), ["delete vmux-tabbar.status"]);
     }
 
-    /// Equal tabs share the bar up to their cap, and once they stop
+    /// Equal tabs share the whole bar, and once they stop
     /// fitting at their floor the ones in view fill the bar between the
     /// chevrons — at every scroll position, with none dropped for a
     /// rounding error.
     #[test]
     fn equal_tabs_share_the_bar_then_scroll_filling_it() {
-        let (min, max) = (14.0, 32.0);
-        assert_eq!(equal_tab_width(2, 200.0, min, max), 32.0);
-        assert_eq!(equal_tab_width(5, 100.0, min, max), 20.0);
+        let min = 14.0;
+        assert_eq!(equal_tab_width(1, 200.0, min), 200.0);
+        assert_eq!(equal_tab_width(5, 100.0, min), 20.0);
         let bar = 100.0;
         let n = 12;
-        let w = equal_tab_width(n, bar, min, max);
+        let w = equal_tab_width(n, bar, min);
         assert!(w >= min);
         let shown = ((bar - 2.0 * TABBAR_CHEVRON_W) / w).round() as usize;
         assert!((shown as f32 * w - (bar - 2.0 * TABBAR_CHEVRON_W)).abs() < 0.1);
