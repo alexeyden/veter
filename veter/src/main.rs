@@ -6230,8 +6230,18 @@ impl ApplicationHandler for App {
                 // scanning the grid here, keeps the question where the
                 // answer already is — and covers portals, which draw
                 // through the same pass.
+                //
+                // Only when no flip is already pending. Pushing the
+                // deadline out on every frame means a program (or a
+                // user typing) that redraws more often than
+                // `BLINK_PERIOD` never lets it elapse, so the phase
+                // freezes — and if it froze on the off half, a
+                // blinking cursor stays invisible until the output
+                // pauses. Arm the flip once and let it happen on
+                // schedule; the frame that follows it arms the next.
                 if let Some(tr) = &mut self.term_renderer
                     && tr.take_blink_seen()
+                    && self.blink_deadline.is_none()
                 {
                     self.blink_deadline = Some(Instant::now() + BLINK_PERIOD);
                 }
