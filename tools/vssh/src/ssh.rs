@@ -62,47 +62,60 @@ pub fn compression_opts(ssh_args: &[OsString]) -> &'static [&'static str] {
 /// Lightweight ssh-style argv scanner. Returns where the remote command
 /// starts in the user's `ssh_args`, or `None` when there is none — the
 /// args before it are the options and the destination, which is what
-/// vssh's own calls through the master need: anything after the host
-/// is a command, and a command of the user's in front of the probe
-/// turns `sh -c '…'` into arguments of it. We track ssh's
-/// short options that take a value so we don't mistake an option's
-/// argument for the host or the command.
+/// vssh's own calls through the master need: a command of the user's
+/// in front of the probe turns `sh -c '…'` into arguments of it.
+///
+/// It follows OpenSSH's own parse (`ssh.c`): options, the destination,
+/// then — unless a `--` came before the destination — options *again*,
+/// and the command is whatever follows those. So `ssh host -p 2222` is
+/// a host and a port, not a host and the command `-p 2222`; reading it
+/// as the latter dropped the port from every call through the master,
+/// which then probed and installed onto whatever answered on port 22.
+/// We track ssh's short options that take a value so we don't mistake
+/// an option's argument for the host or the command.
 ///
 /// We don't need to be 100% accurate on every obscure ssh flag — the
 /// failure mode for `exec_ssh` is "we don't inject when we could have"
 /// (user manually fixes PATH) or "we inject when we shouldn't" (user
 /// passes `--no-fix-path`). The single goal is to make the common cases
-/// (`vssh host`, `vssh -p 2222 user@host`, `vssh -J jump host`,
-/// `vssh host my-cmd ...`) all work right.
+/// (`vssh host`, `vssh -p 2222 user@host`, `vssh user@host -p 2222`,
+/// `vssh -J jump host`, `vssh host my-cmd ...`) all work right.
 pub fn command_start(ssh_args: &[OsString]) -> Option<usize> {
     // OpenSSH short options that consume the *next* argv as their
     // value. Sourced from ssh(1) on OpenSSH 9.x.
     const TAKES_ARG: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
 
-    let mut i = 0;
-    while i < ssh_args.len() {
-        let arg = ssh_args[i].as_bytes();
-        if arg == b"--" {
-            // After `--`, the next arg is the host, anything after is
-            // the command.
-            return (i + 2 < ssh_args.len()).then_some(i + 2);
+    /// getopt over `args[i..]`: the index of the first non-option, and
+    /// whether a `--` ended the run (getopt consumes it).
+    fn skip_options(args: &[OsString], mut i: usize) -> (usize, bool) {
+        while i < args.len() {
+            let arg = args[i].as_bytes();
+            if arg == b"--" {
+                return (i + 1, true);
+            }
+            if arg.len() == 2 && arg[0] == b'-' && TAKES_ARG.contains(&arg[1]) {
+                i += 2;
+            } else if arg.len() > 1 && arg[0] == b'-' {
+                // Standalone short flag (`-t`, `-v`, `-4`, …) or short
+                // option fused with its value (`-p2222`).
+                i += 1;
+            } else {
+                break;
+            }
         }
-        if arg.len() == 2 && arg[0] == b'-' && TAKES_ARG.contains(&arg[1]) {
-            i += 2;
-            continue;
-        }
-        if arg.len() > 1 && arg[0] == b'-' {
-            // Standalone short flag (`-t`, `-v`, `-4`, …) or short
-            // option fused with its value (`-p2222`). Both consume
-            // only this one argv element.
-            i += 1;
-            continue;
-        }
-        // First positional: this is the host. A command follows iff
-        // there's anything after.
-        return (i + 1 < ssh_args.len()).then_some(i + 1);
+        (i.min(args.len()), false)
     }
-    None
+
+    let (host, terminated) = skip_options(ssh_args, 0);
+    if host >= ssh_args.len() {
+        return None;
+    }
+    let start = if terminated {
+        host + 1
+    } else {
+        skip_options(ssh_args, host + 1).0
+    };
+    (start < ssh_args.len()).then_some(start)
 }
 
 pub struct Master {
@@ -292,6 +305,23 @@ mod tests {
         assert_command(&os(&["host", "ls"]));
         assert_command(&os(&["host", "ls", "-la"]));
         assert_command(&os(&["-p", "22", "host", "uptime"]));
+    }
+
+    #[test]
+    fn options_after_the_host_are_options() {
+        // OpenSSH parses options on both sides of the destination.
+        assert_no_command(&os(&["user@host", "-p", "8222"]));
+        assert_no_command(&os(&["host", "-p8222", "-v"]));
+        assert_no_command(&os(&["host", "-o", "User=foo"]));
+        assert_eq!(command_start(&os(&["host", "-p", "8222", "true"])), Some(3));
+        assert_eq!(command_start(&os(&["host", "-t", "--", "ls", "-la"])), Some(3));
+        assert_eq!(command_start(&os(&["host", "-p", "22", "--"])), None);
+    }
+
+    #[test]
+    fn double_dash_before_the_host_ends_all_options() {
+        // `ssh -- host -p 22` runs the command `-p 22`.
+        assert_eq!(command_start(&os(&["--", "host", "-p", "22"])), Some(2));
     }
 
     #[test]
