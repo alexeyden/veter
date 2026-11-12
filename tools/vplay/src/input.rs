@@ -42,6 +42,8 @@ pub enum Event {
     /// in both modes.
     NextFile,
     PrevFile,
+    /// `s` — step the upload resolution down a preset (wrapping to full).
+    CycleScale,
     /// Left-button press at a 0-indexed cell.
     MouseDown {
         col: u16,
@@ -242,6 +244,10 @@ impl InputParser {
                     out.push(Event::PrevFile);
                     i += 1;
                 }
+                b's' => {
+                    out.push(Event::CycleScale);
+                    i += 1;
+                }
                 _ => {
                     i += 1; // ignore other bytes
                 }
@@ -386,7 +392,7 @@ mod tests {
     #[test]
     fn parses_keys() {
         let mut p = InputParser::new();
-        let evs = p.feed(b"+-01.,npq");
+        let evs = p.feed(b"+-01.,npsq");
         assert_eq!(
             evs,
             vec![
@@ -398,6 +404,7 @@ mod tests {
                 Event::StepPrev,
                 Event::NextFile,
                 Event::PrevFile,
+                Event::CycleScale,
                 Event::Quit,
             ]
         );

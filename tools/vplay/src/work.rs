@@ -34,12 +34,18 @@ const PHASE_IDLE: u8 = 0;
 const PHASE_DECODING: u8 = 1;
 const PHASE_ENCODING: u8 = 2;
 
-/// The host's advertised limits, which decide the wire encoding.
+/// The host's advertised limits, which decide the wire encoding, and
+/// the resolution the picture travels at.
 #[derive(Clone, Copy)]
 pub struct EncodeParams {
     pub supported: u8,
     pub ssh: bool,
     pub max_image_bytes: u32,
+    /// Fraction of the source resolution to upload, in `(0, 1]` — `--scale`
+    /// and the `s` key. Only the texture shrinks: the frame handed back in
+    /// [`Ready`] stays full-size, so the viewport and the cursor readout
+    /// keep working in source pixels.
+    pub scale: f32,
 }
 
 /// A picture the worker has decoded (if it started from a file) and
@@ -52,6 +58,12 @@ pub struct Ready {
     pub frame: Frame,
     pub encoding: u8,
     pub payload: Vec<u8>,
+    /// The texture's size — `frame`'s, times the scale it was encoded at.
+    pub tex_w: u32,
+    pub tex_h: u32,
+    /// The scale it was encoded at. The user may have picked another
+    /// while the job ran, in which case the caller re-encodes.
+    pub scale: f32,
 }
 
 pub enum Done {
@@ -213,12 +225,15 @@ fn run_job(job: Job, phase: &AtomicU8) -> Done {
             };
             phase.store(PHASE_ENCODING, Ordering::Release);
             match encode(&frame, params) {
-                Ok((encoding, payload)) => Done::Ready(Ready {
+                Ok(Encoded { encoding, payload, tex_w, tex_h }) => Done::Ready(Ready {
                     seq,
                     path: Some(path),
                     frame,
                     encoding,
                     payload,
+                    tex_w,
+                    tex_h,
+                    scale: params.scale,
                 }),
                 Err(error) => Done::Failed {
                     seq,
@@ -230,12 +245,15 @@ fn run_job(job: Job, phase: &AtomicU8) -> Done {
         Job::Encode { seq, frame, params } => {
             phase.store(PHASE_ENCODING, Ordering::Release);
             match encode(&frame, params) {
-                Ok((encoding, payload)) => Done::Ready(Ready {
+                Ok(Encoded { encoding, payload, tex_w, tex_h }) => Done::Ready(Ready {
                     seq,
                     path: None,
                     frame,
                     encoding,
                     payload,
+                    tex_w,
+                    tex_h,
+                    scale: params.scale,
                 }),
                 Err(error) => Done::Failed {
                     seq,
@@ -247,28 +265,77 @@ fn run_job(job: Job, phase: &AtomicU8) -> Done {
     }
 }
 
-/// Raw locally, WebP when a full-resolution picture would exceed the
-/// host's advertised limit. The frame is kept (the cursor readout reads
-/// its pixels), so the payload is a copy of it rather than a move.
-fn encode(frame: &Frame, params: EncodeParams) -> Result<(u8, Vec<u8>), String> {
-    let enc = pick_encoding(
-        frame.w,
-        frame.h,
-        params.supported,
-        params.ssh,
-        params.max_image_bytes,
-    )
-    .map_err(|e| e.to_string())?;
+struct Encoded {
+    encoding: u8,
+    payload: Vec<u8>,
+    tex_w: u32,
+    tex_h: u32,
+}
+
+/// The texture size `w × h` becomes at `scale`, never below one pixel.
+pub fn scaled_size(w: u32, h: u32, scale: f32) -> (u32, u32) {
+    if scale >= 1.0 {
+        return (w, h);
+    }
+    let f = |v: u32| ((v as f32 * scale).round() as u32).clamp(1, v.max(1));
+    (f(w), f(h))
+}
+
+/// Shrink to `params.scale`, then encode: raw locally, WebP when the
+/// picture would exceed the host's advertised limit. The frame is kept
+/// at full size (the cursor readout reads its pixels), so the payload is
+/// built from a copy of it rather than a move.
+fn encode(frame: &Frame, params: EncodeParams) -> Result<Encoded, String> {
+    let (tex_w, tex_h) = scaled_size(frame.w, frame.h, params.scale);
+    let rgba = if (tex_w, tex_h) == (frame.w, frame.h) {
+        frame.rgba.clone()
+    } else {
+        let full = image::RgbaImage::from_raw(frame.w, frame.h, frame.rgba.clone())
+            .ok_or("frame buffer does not match its dimensions")?;
+        // `thumbnail` averages every source pixel into the one it lands
+        // on, so a quarter-size picture is a fair box-filtered one rather
+        // than a nearest-neighbour sampling of it — and it is the fast
+        // path, which matters for a 4K frame on every seek.
+        image::imageops::thumbnail(&full, tex_w, tex_h).into_raw()
+    };
+    let enc = pick_encoding(tex_w, tex_h, params.supported, params.ssh, params.max_image_bytes)
+        .map_err(|e| e.to_string())?;
     let (encoding, payload) =
-        encode_payload(frame.rgba.clone(), frame.w, frame.h, enc).map_err(|e| e.to_string())?;
+        encode_payload(rgba, tex_w, tex_h, enc).map_err(|e| e.to_string())?;
     if params.max_image_bytes > 0 && payload.len() > params.max_image_bytes as usize {
         return Err(format!(
-            "encoded {}x{} picture ({} bytes) exceeds the host limit of {} bytes",
-            frame.w,
-            frame.h,
+            "encoded {tex_w}x{tex_h} picture ({} bytes) exceeds the host limit of {} bytes",
             payload.len(),
             params.max_image_bytes
         ));
     }
-    Ok((encoding, payload))
+    Ok(Encoded { encoding, payload, tex_w, tex_h })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_size_rounds_and_never_vanishes() {
+        assert_eq!(scaled_size(3840, 2160, 1.0), (3840, 2160));
+        assert_eq!(scaled_size(3840, 2160, 0.25), (960, 540));
+        assert_eq!(scaled_size(3, 2, 0.25), (1, 1));
+    }
+
+    #[test]
+    fn encode_shrinks_the_texture_but_not_the_frame() {
+        let frame = Frame::new(8, 4, vec![200; 8 * 4 * 4]);
+        let params = EncodeParams {
+            supported: 0,
+            ssh: false,
+            max_image_bytes: 0,
+            scale: 0.5,
+        };
+        let e = encode(&frame, params).unwrap();
+        assert_eq!((e.tex_w, e.tex_h), (4, 2));
+        assert_eq!(e.payload.len(), 4 * 2 * 4);
+        assert_eq!(e.payload[0], 200);
+        assert_eq!((frame.w, frame.h), (8, 4));
+    }
 }

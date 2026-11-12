@@ -4,6 +4,9 @@
 //! the full-resolution texture is uploaded once per picture (once total
 //! for images, once per seek for video, ping-ponged between two ids) and
 //! pan/zoom is a pure host-side `source_rect` update — no pixels travel.
+//! The texture may be smaller than the picture (`--scale`, cycled with
+//! `s`, for slow links): the viewport still works in source pixels and
+//! each `source_rect` is mapped into the texture on the way out.
 //! A status bar and (for video) a draggable seek bar overlay the media.
 //! Video frames come from an external ffmpeg.
 
@@ -110,6 +113,46 @@ struct Cli {
     /// Milliseconds to wait for the terminal's VGE probe response.
     #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
+    /// Upload pictures at this fraction of their resolution, in (0, 1] —
+    /// e.g. 0.25 on a slow link. Pan and zoom still work in source pixels;
+    /// `s` cycles through 1, 0.5 and 0.25 at runtime.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
+    scale: f32,
+}
+
+fn parse_scale(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("{e}"))?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(format!("{v} is not in (0, 1]"))
+    }
+}
+
+/// What `s` steps through. Coarse on purpose: each step is a whole
+/// re-encode and re-upload, so a fine ladder would be a lot of waiting
+/// to get anywhere.
+const SCALES: [f32; 3] = [1.0, 0.5, 0.25];
+
+/// The preset after `cur`: the next smaller one, wrapping back to full
+/// resolution. An odd `--scale` joins the ladder where it fits.
+fn next_scale(cur: f32) -> f32 {
+    SCALES
+        .iter()
+        .copied()
+        .find(|&s| s < cur - 1e-3)
+        .unwrap_or(SCALES[0])
+}
+
+/// Map a `source_rect` from source pixels — what the viewport works in
+/// — to the pixels of a texture uploaded at `ratio` of that size.
+fn tex_rect(r: Rect, ratio: (f32, f32)) -> Rect {
+    Rect {
+        x: r.x * ratio.0,
+        y: r.y * ratio.1,
+        w: r.w * ratio.0,
+        h: r.h * ratio.1,
+    }
 }
 
 /// What the status bar calls a file: its name, or the whole path when it
@@ -205,8 +248,12 @@ fn pick_encoding(
 struct ChunkedUpload {
     id: String,
     encoding: u8,
+    /// The texture's size, which under `--scale` is smaller than the
+    /// picture's.
     width: u32,
     height: u32,
+    /// Texture pixels per source pixel on each axis, for [`tex_rect`].
+    ratio: (f32, f32),
     payload: Vec<u8>,
     offset: usize,
 }
@@ -699,13 +746,23 @@ fn pan(vp: &mut Viewport, dir: Dir) {
 /// when the final one goes out, so `cur_id` flips only then. Pan/zoom
 /// never re-enters this path — it is a host-side `source_rect` update on
 /// the already-uploaded texture.
-fn into_upload(cur_id: &str, frame: &Frame, encoding: u8, payload: Vec<u8>) -> ChunkedUpload {
+fn into_upload(
+    cur_id: &str,
+    frame: &Frame,
+    (tex_w, tex_h): (u32, u32),
+    encoding: u8,
+    payload: Vec<u8>,
+) -> ChunkedUpload {
     let next_id = if cur_id == IMG_ID_A { IMG_ID_B } else { IMG_ID_A };
     ChunkedUpload {
         id: next_id.to_string(),
         encoding,
-        width: frame.w,
-        height: frame.h,
+        width: tex_w,
+        height: tex_h,
+        ratio: (
+            tex_w as f32 / frame.w.max(1) as f32,
+            tex_h as f32 / frame.h.max(1) as f32,
+        ),
         payload,
         offset: 0,
     }
@@ -828,6 +885,10 @@ fn main() -> Result<()> {
     // first upload completes, which is also what tells the loop there is
     // nothing to point an element at yet.
     let mut cur_id = String::new();
+    // That texture's pixels per source pixel — below 1 under `--scale`.
+    // The viewport works in source pixels; every `source_rect` sent for
+    // `cur_id` goes through this.
+    let mut cur_ratio = (1.0f32, 1.0f32);
     // The picture's pixels, kept for the cursor's colour readout. A 1x1
     // stand-in until the first one is decoded; `have_picture` says which.
     let mut source_frame = Frame::new(1, 1, vec![0; 4]);
@@ -853,10 +914,11 @@ fn main() -> Result<()> {
     // Decoding and encoding run on a worker (see `work`), so neither
     // blocks the loop: keys keep working and the progress panel keeps
     // animating through both.
-    let enc_params = work::EncodeParams {
+    let mut enc_params = work::EncodeParams {
         supported,
         ssh,
         max_image_bytes,
+        scale: cli.scale,
     };
     let mut worker = work::Worker::spawn();
     // Background decode of the frame the user just seeked to — ffmpeg,
@@ -1136,6 +1198,18 @@ fn main() -> Result<()> {
                     dirty_status = true;
                     dirty_seek = true;
                 }
+                Event::CycleScale => {
+                    enc_params.scale = next_scale(enc_params.scale);
+                    // Re-encode the picture on screen at the new size.
+                    // Work already in flight is left alone: a decode
+                    // reads `enc_params` when it lands, and a worker job
+                    // started at the old scale is re-encoded when its
+                    // result arrives (see the `Ready` arm below).
+                    if have_picture && pending.is_none() && !worker.is_busy() {
+                        worker.encode(source_frame.clone(), enc_params);
+                    }
+                    dirty_status = true;
+                }
                 Event::StepNext | Event::StepPrev => {
                     if is_video {
                         let target =
@@ -1288,8 +1362,19 @@ fn main() -> Result<()> {
                 // until the last chunk lands and the pump swaps them in
                 // a single envelope — no gap where the element points at
                 // a texture that isn't there yet.
-                let up = into_upload(&cur_id, &r.frame, r.encoding, r.payload);
-                queue_upload(&mut out, &mut upload, up);
+                //
+                // Unless the user picked another scale while this one
+                // was encoding: then sending it would spend the link on
+                // exactly the resolution they just turned away from, so
+                // it is encoded again instead. The picture itself is
+                // adopted either way — the name and viewport above
+                // already belong to it.
+                if (r.scale - enc_params.scale).abs() > 1e-6 {
+                    worker.encode(r.frame.clone(), enc_params);
+                } else {
+                    let up = into_upload(&cur_id, &r.frame, (r.tex_w, r.tex_h), r.encoding, r.payload);
+                    queue_upload(&mut out, &mut upload, up);
+                }
                 source_frame = r.frame;
                 have_picture = true;
                 loading = None;
@@ -1334,8 +1419,9 @@ fn main() -> Result<()> {
         // texture — no pixels travel.
         if dirty_media && !cur_id.is_empty() {
             let l = vp.layout();
+            let source = Some(tex_rect(l.source, cur_ratio));
             let cmd = if created_img {
-                update_image_el(l.target, &cur_id, Some(l.source))
+                update_image_el(l.target, &cur_id, source)
             } else {
                 // After a resize the element is gone but the texture
                 // survives in the session image table — recreate the
@@ -1344,7 +1430,7 @@ fn main() -> Result<()> {
                 // reference would collect an `Auto` texture and this
                 // would name a dead id (see `RETENTION`).
                 created_img = true;
-                create_image_el(l.target, &cur_id, Some(l.source))
+                create_image_el(l.target, &cur_id, source)
             };
             send(&mut out, &[np(cmd)]);
             dirty_status = true;
@@ -1362,10 +1448,11 @@ fn main() -> Result<()> {
         if let Some(u) = upload.as_mut() {
             let follow_up = if u.next_is_last() {
                 let l = vp.layout();
+                let source = Some(tex_rect(l.source, u.ratio));
                 let mut fu = vec![if created_img {
-                    update_image_el(l.target, &u.id, Some(l.source))
+                    update_image_el(l.target, &u.id, source)
                 } else {
-                    create_image_el(l.target, &u.id, Some(l.source))
+                    create_image_el(l.target, &u.id, source)
                 }];
                 created_img = true;
                 // Retire the texture the element previously referenced
@@ -1386,6 +1473,7 @@ fn main() -> Result<()> {
             };
             if u.pump(&mut out, follow_up) {
                 cur_id = u.id.clone();
+                cur_ratio = u.ratio;
                 upload = None;
             }
         }
@@ -1403,12 +1491,19 @@ fn main() -> Result<()> {
             };
             // The left text comes in two parts, the file name and what
             // follows it, so the layout can shorten the name first.
+            // A reduced upload is worth a word: the picture is softer
+            // than its size and the zoom suggest.
+            let scale_tag = if enc_params.scale < 1.0 {
+                format!("  @{}x", enc_params.scale)
+            } else {
+                String::new()
+            };
             let (left_tail, center, right) = if is_video {
                 let totals = total_frames
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "?".into());
                 (
-                    format!("  {src_w}x{src_h}  {fps:.2}fps"),
+                    format!("  {src_w}x{src_h}{scale_tag}  {fps:.2}fps"),
                     format!(
                         "{}%  f {}/{}  {}{pos}",
                         vp.zoom_percent(),
@@ -1421,7 +1516,7 @@ fn main() -> Result<()> {
             } else {
                 (
                     if have_picture {
-                        format!("  {src_w}x{src_h}")
+                        format!("  {src_w}x{src_h}{scale_tag}")
                     } else {
                         String::new()
                     },
@@ -1918,5 +2013,37 @@ mod tests {
         assert_eq!(frame_at_time(0.0, &[], 25.0), 0);
         assert_eq!(frame_at_time(1.0, &[], 25.0), 25);
         assert_eq!(frame_at_time(0.5, &[], 25.0), 13); // round(12.5) -> 13
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn cycle_steps_down_and_wraps() {
+        assert_eq!(next_scale(1.0), 0.5);
+        assert_eq!(next_scale(0.5), 0.25);
+        assert_eq!(next_scale(0.25), 1.0);
+    }
+
+    #[test]
+    fn odd_scale_joins_the_ladder() {
+        assert_eq!(next_scale(0.75), 0.5);
+        assert_eq!(next_scale(0.1), 1.0);
+    }
+
+    #[test]
+    fn scale_flag_rejects_out_of_range() {
+        assert_eq!(parse_scale("0.25"), Ok(0.25));
+        assert!(parse_scale("0").is_err());
+        assert!(parse_scale("1.5").is_err());
+        assert!(parse_scale("x").is_err());
+    }
+
+    #[test]
+    fn source_rect_maps_into_the_smaller_texture() {
+        let r = tex_rect(Rect { x: 400.0, y: 200.0, w: 800.0, h: 600.0 }, (0.25, 0.25));
+        assert_eq!((r.x, r.y, r.w, r.h), (100.0, 50.0, 200.0, 150.0));
     }
 }
