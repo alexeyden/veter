@@ -25,7 +25,7 @@
 //! master directly — no input crosses the PRT wire (§9.1).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -2892,6 +2892,10 @@ struct State {
     /// Monotonic counter for allocating scroll request ids. Starts at
     /// `SCROLL_REQUEST_ID_BASE` and increments per request.
     next_scroll_req_id: u32,
+    /// Pane output sent to the host and not yet answered — the
+    /// end-to-end backpressure on a pane that floods (see
+    /// [`PANE_WRITE_WINDOW`]).
+    write_credit: WriteCredit,
     /// `Some(name)` when the host answered the SES probe as a `vsd`
     /// session — drives the tab-bar session segment and enables
     /// `prefix-D`. `None` for a plain local `veter` host.
@@ -2937,6 +2941,7 @@ impl State {
             separators_created: false,
             pending_scrolls: HashMap::new(),
             next_scroll_req_id: SCROLL_REQUEST_ID_BASE,
+            write_credit: WriteCredit::new(),
             session_name: None,
             resize_drag: None,
             window_title: String::new(),
@@ -3179,6 +3184,7 @@ impl State {
         // anyway, and we don't want a stale ack to resurrect state on
         // a freshly-allocated pane id (unlikely but cheap to defend).
         self.pending_scrolls.retain(|_, pid| pid != target);
+        self.write_credit.forget_pane(target);
         // If this pane holds the shell for a mirror group, hand the PTY
         // to a survivor before dropping it. The two views are equal on
         // the wire, so closing either must be survivable — and dropping
@@ -3705,6 +3711,7 @@ impl State {
         let mut out = Vec::new();
         for pane in &leaves {
             self.pending_scrolls.retain(|_, pid| pid != pane);
+            self.write_credit.forget_pane(pane);
             self.panes.remove(pane);
             self.visible_panes.remove(pane);
             out.extend(build_prt_envelope(&[(
@@ -4734,50 +4741,131 @@ impl Drop for TtyGuard {
 /// written prefix grows past this, so sustained partial draining can't leak.
 const OUT_COMPACT_THRESHOLD: usize = 64 * 1024;
 
-/// Once this many bytes are queued for the host *on one pane's account*,
-/// stop reading that pane so its inner shell blocks instead of vmux
-/// buffering without bound (backpressure).
+/// How many bytes of one pane's output may be on their way to the
+/// host at once — sent as `WritePortal`s the host has not yet answered.
+/// Past this, vmux stops reading that pane until acks come back, so its
+/// inner program blocks on write.
 ///
-/// Per pane, not per queue. The global form this replaces stopped
-/// reading *every* pane once the shared queue passed its mark, so one
-/// pane flooding the host — a `vsend` upload, a `cat` of something
-/// large — froze every other pane for the duration: they were not the
-/// ones filling the queue, but they paid for it. Gating each pane on
-/// its own contribution keeps the flooder waiting and everyone else
-/// live, and bounds the queue at roughly this times the pane count.
-const PANE_HIGH_WATER: usize = 64 * 1024;
+/// The ack is what makes this end-to-end. Gating on vmux's own queue
+/// alone (the `PANE_HIGH_WATER` this replaces) only bounded the first
+/// buffer on the way: everything downstream of vmux's stdout — the pty,
+/// a `vsd` daemon, sshd's channel window, both TCP socket buffers —
+/// still filled to capacity behind a flooding pane, and every other
+/// pane's output, and vmux's own chrome, queued behind all of it in the
+/// one byte stream to the renderer. Over a Wi-Fi SSH hop that is
+/// megabytes ahead of a keystroke's echo, i.e. seconds: a `vsend`
+/// upload or a `vplay` picture froze the whole terminal while it ran.
+/// A write is answered only once the host has parsed it (§7.1), so
+/// with this cap at most this much of a flooder is ever ahead of the
+/// next pane's bytes, wherever the renderer is.
+///
+/// Sizing: throughput per pane is capped at window / round trip. 128
+/// KiB over a 40 ms Wi-Fi RTT is ~3 MB/s, above what such a link
+/// carries; locally the round trip is a drain pass, well above what a
+/// renderer parses. What it costs everyone else is at most this much
+/// per flooding pane ahead of them.
+const PANE_WRITE_WINDOW: usize = 128 * 1024;
 
-/// Global backstop on the same queue, for the pathological pane count
-/// where `PANE_HIGH_WATER` alone would still add up to a lot of RAM
+/// An unanswered write stops counting against its pane after this long.
+/// Answers can be lost legitimately — a `vsd` renderer detaching with
+/// writes in flight takes their acks with it — and a pane gated on an
+/// ack that will never come would freeze for good. Expiring is the
+/// safe failure: at worst one more window goes out unpaced.
+const WRITE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Request ids for pane `WritePortal`s: a range of their own, below
+/// [`SCROLL_REQUEST_ID_BASE`], so an answer is routed by its id alone.
+const WRITE_REQUEST_ID_BASE: u32 = 0x57_00_00_00;
+
+/// Per-pane end-to-end flow control for pane output: which
+/// `WritePortal`s are still unanswered, and how many bytes that leaves
+/// each pane owing. See [`PANE_WRITE_WINDOW`].
+struct WriteCredit {
+    /// Request id → (pane, envelope bytes, when it was queued).
+    pending: HashMap<u32, (String, usize, Instant)>,
+    /// Unanswered bytes per pane. Entries go once they reach zero.
+    in_flight: HashMap<String, usize>,
+    next_rid: u32,
+}
+
+impl WriteCredit {
+    fn new() -> Self {
+        WriteCredit {
+            pending: HashMap::new(),
+            in_flight: HashMap::new(),
+            next_rid: WRITE_REQUEST_ID_BASE,
+        }
+    }
+
+    /// Record a write of `len` bytes for `pane` and return the request
+    /// id to send it under.
+    fn send(&mut self, pane: &str, len: usize, now: Instant) -> u32 {
+        let rid = self.next_rid;
+        self.next_rid = if rid + 1 >= SCROLL_REQUEST_ID_BASE {
+            WRITE_REQUEST_ID_BASE
+        } else {
+            rid + 1
+        };
+        self.pending.insert(rid, (pane.to_string(), len, now));
+        *self.in_flight.entry(pane.to_string()).or_default() += len;
+        rid
+    }
+
+    fn release(&mut self, pane: &str, len: usize) {
+        if let Some(v) = self.in_flight.get_mut(pane) {
+            *v = v.saturating_sub(len);
+            if *v == 0 {
+                self.in_flight.remove(pane);
+            }
+        }
+    }
+
+    /// The host answered `rid` — `Ok` or `Err` alike, either way it has
+    /// taken the bytes off the stream. False for an id that isn't ours.
+    fn ack(&mut self, rid: u32) -> bool {
+        let Some((pane, len, _)) = self.pending.remove(&rid) else {
+            return false;
+        };
+        self.release(&pane, len);
+        true
+    }
+
+    /// Bytes `pane` has sent that the host has not answered yet.
+    fn in_flight(&self, pane: &str) -> usize {
+        self.in_flight.get(pane).copied().unwrap_or(0)
+    }
+
+    /// Give up on writes unanswered for [`WRITE_ACK_TIMEOUT`].
+    fn expire(&mut self, now: Instant) {
+        let stale: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, _, at))| now.duration_since(*at) >= WRITE_ACK_TIMEOUT)
+            .map(|(rid, _)| *rid)
+            .collect();
+        for rid in stale {
+            self.ack(rid);
+        }
+    }
+
+    /// Drop everything `pane` owes — it is closing, and a late answer
+    /// must not credit whatever pane reuses the id.
+    fn forget_pane(&mut self, pane: &str) {
+        self.pending.retain(|_, (p, _, _)| p != pane);
+        self.in_flight.remove(pane);
+    }
+}
+
+/// Global backstop on vmux's own queue, for the pathological pane count
+/// where `PANE_WRITE_WINDOW` alone would still add up to a lot of RAM
 /// (and a lot of latency ahead of the chrome updates queued behind it).
 /// Reaching this pauses reads on every pane, as the old rule did.
 const OUT_HARD_CAP: usize = 2 * 1024 * 1024;
-
-/// One pane-owned run of bytes in the queue, recorded as the absolute
-/// stream offset it ends at. A run is credited back to its pane once
-/// `written` reaches that offset — whole runs only, which over-counts a
-/// partially drained one by at most a single read and costs nothing to
-/// track.
-struct OutSeg {
-    owner: String,
-    /// Absolute stream offset one past this run's last byte.
-    end: u64,
-    len: usize,
-}
 
 struct OutQueue {
     fd: RawFd,
     buf: Vec<u8>,
     head: usize,
-    /// Absolute bytes ever enqueued / ever written. Segments are keyed
-    /// off these rather than off `head`, which compaction resets.
-    enqueued: u64,
-    written: u64,
-    /// Pane-owned runs still queued, oldest first.
-    segs: VecDeque<OutSeg>,
-    /// Queued-but-unwritten bytes per pane. Entries are dropped as they
-    /// reach zero, so a closed pane leaves nothing behind.
-    owed: HashMap<String, usize>,
 }
 
 impl OutQueue {
@@ -4792,60 +4880,17 @@ impl OutQueue {
             fd,
             buf: Vec::new(),
             head: 0,
-            enqueued: 0,
-            written: 0,
-            segs: VecDeque::new(),
-            owed: HashMap::new(),
         }
     }
 
     fn enqueue(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
-        self.enqueued += bytes.len() as u64;
-    }
-
-    /// Enqueue bytes carrying `owner`'s pane output, so the loop can
-    /// see how much of the queue that one pane is responsible for.
-    fn enqueue_for(&mut self, owner: &str, bytes: &[u8]) {
-        self.enqueue(bytes);
-        match self.owed.get_mut(owner) {
-            Some(v) => *v += bytes.len(),
-            None => {
-                self.owed.insert(owner.to_string(), bytes.len());
-            }
-        }
-        self.segs.push_back(OutSeg {
-            owner: owner.to_string(),
-            end: self.enqueued,
-            len: bytes.len(),
-        });
-    }
-
-    /// Bytes queued on `owner`'s account.
-    fn owed_by(&self, owner: &str) -> usize {
-        self.owed.get(owner).copied().unwrap_or(0)
-    }
-
-    /// Credit back every pane run the last write finished off.
-    fn credit_written(&mut self) {
-        while self.segs.front().is_some_and(|seg| seg.end <= self.written) {
-            let seg = self.segs.pop_front().expect("front checked above");
-            if let Some(v) = self.owed.get_mut(&seg.owner) {
-                *v = v.saturating_sub(seg.len);
-                if *v == 0 {
-                    self.owed.remove(&seg.owner);
-                }
-            }
-        }
     }
 
     /// Drop all queued bytes — used when the destination fd is gone.
     fn clear(&mut self) {
         self.buf.clear();
         self.head = 0;
-        self.written = self.enqueued;
-        self.segs.clear();
-        self.owed.clear();
     }
 
     /// Try to drain the queue to the fd. On a non-blocking fd this stops at
@@ -4859,8 +4904,6 @@ impl OutQueue {
                 Ok(0) => break,
                 Ok(n) => {
                     self.head += n;
-                    self.written += n as u64;
-                    self.credit_written();
                 }
                 Err(Errno::EINTR) => continue,
                 Err(Errno::EAGAIN) => break,
@@ -4903,22 +4946,6 @@ fn out_pending() -> usize {
     OUT.with(|q| q.borrow().pending())
 }
 
-/// Queue `bytes` for the host on `pane`'s account — the per-pane
-/// backpressure in the main loop reads the totals this keeps.
-fn write_all_stdout_for_pane(pane: &str, bytes: &[u8]) -> Result<()> {
-    OUT.with(|q| {
-        let mut q = q.borrow_mut();
-        q.enqueue_for(pane, bytes);
-        q.flush()
-    })
-}
-
-/// Bytes still buffered for the host that came out of `pane`.
-fn out_pane_pending(pane: &str) -> usize {
-    OUT.with(|q| q.borrow().owed_by(pane))
-}
-
-/// Drain whatever the `POLLOUT` poll says is writable.
 fn out_flush() -> Result<()> {
     OUT.with(|q| q.borrow_mut().flush())
 }
@@ -5389,13 +5416,15 @@ fn main() -> Result<()> {
             None
         };
 
-        // Backpressure: once too much of what is queued for a slow host
-        // came out of one pane, stop reading *that* pane. Its kernel
-        // buffer fills, its inner shell blocks on write, and memory
-        // stays bounded — while every other pane keeps being read, and
-        // stdin and the POLLOUT drain keep running so the UI stays
-        // responsive. `OUT_HARD_CAP` is the global backstop; below it,
-        // whether a pane is read is entirely about that pane.
+        // Backpressure: once too much of one pane's output is on its
+        // way to the host unanswered, stop reading *that* pane. Its
+        // kernel buffer fills, its inner program blocks on write, and
+        // nothing downstream holds more than a window of it — while
+        // every other pane keeps being read, and stdin and the POLLOUT
+        // drain keep running so the UI stays responsive.
+        // `OUT_HARD_CAP` is the global backstop; below it, whether a
+        // pane is read is entirely about that pane.
+        state.write_credit.expire(Instant::now());
         let all_panes_paused = pending >= OUT_HARD_CAP;
         // Snapshot the pane fd ordering so we can map back to ids after
         // poll returns. (HashMap iteration is unstable; we capture once.)
@@ -5425,7 +5454,9 @@ fn main() -> Result<()> {
         // the host has not taken yet.
         let read_pane: Vec<bool> = pane_ids
             .iter()
-            .map(|id| !all_panes_paused && out_pane_pending(id) < PANE_HIGH_WATER)
+            .map(|id| {
+                !all_panes_paused && state.write_credit.in_flight(id) < PANE_WRITE_WINDOW
+            })
             .collect();
         // One pollfd per pane (preserving `pane_base + i` indexing): read
         // its output unless that pane is backpressured, and watch for
@@ -5568,16 +5599,19 @@ fn main() -> Result<()> {
                     continue;
                 }
                 dlog(&format!("pty>{pid}"), &rd_buf[..n]);
+                // On this pane's account: the host's answer to this
+                // id is what lets the pane be read again once it is
+                // a window ahead.
+                let data = rd_buf[..n].to_vec();
+                let rid = state.write_credit.send(pid, data.len(), Instant::now());
                 let env = build_prt_envelope(&[(
                     PrtCommand::WritePortal(WritePortalBody {
                         id: pid.clone(),
-                        data: rd_buf[..n].to_vec(),
+                        data,
                     }),
-                    0,
+                    rid,
                 )]);
-                // On this pane's account: it is the one pane whose
-                // reads we pause if the host can't keep up with it.
-                write_all_stdout_for_pane(pid, &env)?;
+                write_all_stdout(&env)?;
             } else if revents
                 .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
             {
@@ -5884,6 +5918,11 @@ fn handle_stdin_chunk(
                     style_changed |= theme::adopt_host_theme(&host);
                     theme_dirty = true;
                 }
+            } else if (ft == prt_protocol::frame::RSP_OK || ft == prt_protocol::frame::RSP_ERR)
+                && state.write_credit.ack(rid)
+            {
+                // A pane write answered: the host has parsed it, so it
+                // no longer counts against the pane's window.
             } else if ft == prt_protocol::frame::RSP_OK && body.len() >= 4 {
                 // §9.3 `SetPortalScrollback` ack: u32 applied_lines,
                 // u32 history_depth (history_depth is optional per the
@@ -7575,53 +7614,88 @@ mod tests {
     }
 
     #[test]
-    fn pane_bytes_are_owed_until_they_are_actually_written() {
+    fn queue_drains_into_the_fd_and_clears() {
         let (mut q, mut rd, _wr) = queue_on_pipe();
-        q.enqueue_for("p1", &[b'a'; 100]);
-        q.enqueue(&[b'c'; 10]); // chrome: owed by nobody
-        q.enqueue_for("p2", &[b'b'; 50]);
-        // Nothing flushed yet: every pane byte is still on its account.
-        assert_eq!(q.owed_by("p1"), 100);
-        assert_eq!(q.owed_by("p2"), 50);
-
+        q.enqueue(&[b'a'; 100]);
+        q.enqueue(&[b'c'; 10]);
+        assert_eq!(q.pending(), 110);
         q.flush().unwrap();
-        // The pipe took all of it, so both accounts clear — and clear
-        // completely, leaving no entry behind for a pane that may be
-        // about to close.
-        assert_eq!(q.owed_by("p1"), 0);
-        assert_eq!(q.owed_by("p2"), 0);
-        assert!(q.owed.is_empty());
         assert_eq!(q.pending(), 0);
-
         let mut buf = [0u8; 160];
         use std::io::Read;
-        assert_eq!(rd.read(&mut buf).unwrap(), 160);
+        assert_eq!(rd.read(&mut buf).unwrap(), 110);
+    }
+
+    #[test]
+    fn a_pane_owes_its_writes_until_the_host_answers() {
+        // Written to the fd is not enough: the bytes can sit in any of
+        // the buffers between here and the renderer. Only the answer
+        // takes them off the pane's account.
+        let mut c = WriteCredit::new();
+        let t = Instant::now();
+        let r1 = c.send("p1", 100, t);
+        let r2 = c.send("p1", 50, t);
+        let r3 = c.send("p2", 7, t);
+        assert_eq!(c.in_flight("p1"), 150);
+        assert_eq!(c.in_flight("p2"), 7);
+        assert!(c.ack(r1));
+        assert_eq!(c.in_flight("p1"), 50);
+        assert!(c.ack(r2));
+        assert!(c.ack(r3));
+        assert_eq!(c.in_flight("p1"), 0);
+        assert!(c.in_flight.is_empty() && c.pending.is_empty());
+        // An id that isn't a pane write (a scroll ack, a repeat) is
+        // left for the other handlers.
+        assert!(!c.ack(r1));
+        assert!(!c.ack(SCROLL_REQUEST_ID_BASE));
     }
 
     #[test]
     fn a_flooding_pane_owes_alone() {
-        // The point of the per-pane accounting: with the pipe full, the
-        // pane that filled it is over the high-water mark and the quiet
-        // one is not, so only the flooder stops being read.
-        let (mut q, _rd, _wr) = queue_on_pipe();
-        let flood = vec![b'x'; PANE_HIGH_WATER * 4];
-        q.enqueue_for("p1", &flood);
-        q.enqueue_for("p2", b"a keystroke's worth\r\n");
-        q.flush().unwrap();
-        assert!(q.owed_by("p1") >= PANE_HIGH_WATER);
-        assert!(q.owed_by("p2") < PANE_HIGH_WATER);
+        let mut c = WriteCredit::new();
+        let t = Instant::now();
+        for _ in 0..(PANE_WRITE_WINDOW / 8192 + 1) {
+            c.send("p1", 8192, t);
+        }
+        c.send("p2", 21, t);
+        assert!(c.in_flight("p1") >= PANE_WRITE_WINDOW);
+        assert!(c.in_flight("p2") < PANE_WRITE_WINDOW);
     }
 
     #[test]
-    fn dropping_the_queue_clears_every_account() {
-        // `clear` runs when the destination fd is gone; leaving stale
-        // per-pane debt behind would gate reads on a queue that no
-        // longer exists.
-        let (mut q, _rd, _wr) = queue_on_pipe();
-        q.enqueue_for("p1", &[b'a'; 10]);
-        q.clear();
-        assert_eq!(q.owed_by("p1"), 0);
-        assert_eq!(q.pending(), 0);
+    fn lost_answers_expire_instead_of_freezing_the_pane() {
+        let mut c = WriteCredit::new();
+        let t = Instant::now();
+        let old = c.send("p1", PANE_WRITE_WINDOW, t);
+        let later = t + WRITE_ACK_TIMEOUT / 2;
+        c.send("p1", 10, later);
+        c.expire(t + WRITE_ACK_TIMEOUT);
+        assert_eq!(c.in_flight("p1"), 10);
+        // A late answer to an expired write credits nothing twice.
+        assert!(!c.ack(old));
+        assert_eq!(c.in_flight("p1"), 10);
+    }
+
+    #[test]
+    fn a_closed_pane_leaves_no_debt_for_its_id() {
+        let mut c = WriteCredit::new();
+        let t = Instant::now();
+        let rid = c.send("p1", 500, t);
+        c.forget_pane("p1");
+        assert_eq!(c.in_flight("p1"), 0);
+        // A pane reusing the id must not be credited by the old answer.
+        c.send("p1", 30, t);
+        assert!(!c.ack(rid));
+        assert_eq!(c.in_flight("p1"), 30);
+    }
+
+    #[test]
+    fn write_ids_wrap_inside_their_own_range() {
+        let mut c = WriteCredit::new();
+        c.next_rid = SCROLL_REQUEST_ID_BASE - 1;
+        let last = c.send("p1", 1, Instant::now());
+        assert_eq!(last, SCROLL_REQUEST_ID_BASE - 1);
+        assert_eq!(c.send("p1", 1, Instant::now()), WRITE_REQUEST_ID_BASE);
     }
 
     #[test]

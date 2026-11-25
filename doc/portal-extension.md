@@ -733,6 +733,16 @@ input buffer; flow control is end-to-end (the client should not
 out-pace the host; if it does, the response latency degrades but
 nothing is lost).
 
+That response is the client's flow-control signal: it means the host
+has parsed the bytes, wherever it is. A multiplexer relaying a pane's
+output SHOULD bound how many bytes of one portal it has written and
+not yet seen answered, and stop reading that pane at the bound.
+Bounding only its own output queue is not enough: every buffer between
+it and the host (ptys, a session daemon, an SSH channel, socket
+buffers) would still fill behind a pane that floods — a file upload, an
+image — and every other portal's output would wait behind all of it in
+the one stream.
+
 The inner parser is *fully recursive*: nested PRT envelopes, OSC
 sequences, alt-screen toggles, mouse modes, sixel — and any other
 extension the host implements at top level — are honoured inside
